@@ -7,6 +7,10 @@ use rli_core::{GgmlType, QMatrix, simd};
 use rli_gguf::{Error, Gguf, Result};
 use std::any::Any;
 
+/// Prompt tokens per CPU pass: amortizes weight reads while keeping scratch buffers (and the
+/// quantized activations each weight block is multiplied against) cache-sized.
+const CPU_CHUNK: usize = 64;
+
 /// A weight matrix identified by its location in the mapped file, so CPU kernels and
 /// accelerator backends address the same bytes without copies.
 #[derive(Clone, Copy, Debug)]
@@ -322,13 +326,18 @@ impl Model {
         self.mat(w).matvec_with(x, y, self.precise);
     }
 
-    fn ffn(&self, e: &Expert, x: &[f32], out: &mut [f32]) {
-        let mut gate = vec![0.0; e.gate.rows];
-        let mut up = vec![0.0; e.up.rows];
-        self.matvec(&e.gate, x, &mut gate);
-        self.matvec(&e.up, x, &mut up);
+    fn matmul(&self, w: &Weight, xs: &[f32], ys: &mut [f32], n: usize) {
+        self.mat(w).matmul_with(xs, ys, n, self.precise);
+    }
+
+    /// SwiGLU FFN of `n` rows of `x` into `out`.
+    fn ffn(&self, e: &Expert, x: &[f32], out: &mut [f32], n: usize) {
+        let mut gate = vec![0.0; n * e.gate.rows];
+        let mut up = vec![0.0; n * e.up.rows];
+        self.matmul(&e.gate, x, &mut gate, n);
+        self.matmul(&e.up, x, &mut up, n);
         ops::swiglu(&mut gate, &up);
-        self.matvec(&e.down, &gate, out);
+        self.matmul(&e.down, &gate, out, n);
     }
 
     /// Runs one token at position `sess.len()` and appends it to the session. Returns logits when
@@ -376,8 +385,8 @@ impl Model {
                 return Some(logits);
             }
         }
-        for (i, x) in xs.chunks_exact_mut(n_embd).enumerate() {
-            self.cpu_layers(sess, x, pos + i, first_cpu_layer);
+        for (i, chunk) in xs.chunks_mut(CPU_CHUNK * n_embd).enumerate() {
+            self.cpu_layers(sess, chunk, pos + i * CPU_CHUNK, first_cpu_layer);
         }
         sess.tokens.extend_from_slice(tokens);
         if !want_logits {
@@ -390,10 +399,13 @@ impl Model {
         Some(logits)
     }
 
-    /// Runs layers `first..` on the CPU for one token at `pos`, appending to their KV cache.
-    fn cpu_layers(&self, sess: &mut Session, x: &mut [f32], pos: usize, first: usize) {
+    /// Runs layers `first..` on the CPU for the token rows in `xs` (positions `pos..`, in
+    /// place), appending to their KV cache. Rows are processed together, so each weight matrix
+    /// is read once per call; one row is the decode case.
+    fn cpu_layers(&self, sess: &mut Session, xs: &mut [f32], pos: usize, first: usize) {
         let c = &self.cfg;
-        let (hd, kv_dim) = (c.head_dim, c.kv_dim());
+        let (hd, kv_dim, q_dim, n_embd) = (c.head_dim, c.kv_dim(), c.q_dim(), c.n_embd);
+        let n = xs.len() / n_embd;
         let group = c.n_head / c.n_head_kv;
         let rope = Rope {
             head_dim: hd,
@@ -402,26 +414,31 @@ impl Model {
             neox: c.arch.neox_rope(),
             freq_factors: self.rope_freqs.as_deref(),
         };
-        let mut xb = vec![0.0; c.n_embd];
-        let mut q = vec![0.0; c.q_dim()];
-        let mut k = vec![0.0; kv_dim];
-        let mut v = vec![0.0; kv_dim];
-        let mut att = vec![0.0; c.q_dim()];
-        let mut tmp = vec![0.0; c.n_embd];
+        let mut xb = vec![0.0; n * n_embd];
+        let mut q = vec![0.0; n * q_dim];
+        let mut k = vec![0.0; n * kv_dim];
+        let mut v = vec![0.0; n * kv_dim];
+        let mut att = vec![0.0; n * q_dim];
+        let mut tmp = vec![0.0; n * n_embd];
         let scale = 1.0 / (hd as f32).sqrt();
+        let norm_rows = |out: &mut [f32], x: &[f32], w: &[f32]| {
+            for (o, r) in out.chunks_exact_mut(n_embd).zip(x.chunks_exact(n_embd)) {
+                ops::rmsnorm(o, r, w, c.rms_eps);
+            }
+        };
 
         for (l, layer) in self.layers.iter().enumerate().skip(first) {
-            ops::rmsnorm(&mut xb, x, &layer.attn_norm, c.rms_eps);
-            self.matvec(&layer.wq, &xb, &mut q);
-            self.matvec(&layer.wk, &xb, &mut k);
-            self.matvec(&layer.wv, &xb, &mut v);
-            for (t, b) in [
-                (&mut q, &layer.bq),
-                (&mut k, &layer.bk),
-                (&mut v, &layer.bv),
+            norm_rows(&mut xb, xs, &layer.attn_norm);
+            self.matmul(&layer.wq, &xb, &mut q, n);
+            self.matmul(&layer.wk, &xb, &mut k, n);
+            self.matmul(&layer.wv, &xb, &mut v, n);
+            for (t, b, dim) in [
+                (&mut q, &layer.bq, q_dim),
+                (&mut k, &layer.bk, kv_dim),
+                (&mut v, &layer.bv, kv_dim),
             ] {
                 if let Some(b) = b {
-                    ops::add_assign(t, b);
+                    t.chunks_exact_mut(dim).for_each(|r| ops::add_assign(r, b));
                 }
             }
             for (t, norm) in [(&mut q, &layer.q_norm), (&mut k, &layer.k_norm)] {
@@ -432,17 +449,21 @@ impl Model {
                     }
                 }
             }
-            rope.apply(&mut q, c.n_head, pos);
-            rope.apply(&mut k, c.n_head_kv, pos);
+            for i in 0..n {
+                rope.apply(&mut q[i * q_dim..(i + 1) * q_dim], c.n_head, pos + i);
+                rope.apply(&mut k[i * kv_dim..(i + 1) * kv_dim], c.n_head_kv, pos + i);
+            }
             sess.k[l].extend_from_slice(&k);
             sess.v[l].extend_from_slice(&v);
 
+            // Causal attention, parallel over (token, head): token i sees positions 0..=pos + i.
             let (kc, vc) = (&sess.k[l], &sess.v[l]);
-            let n_pos = pos + 1;
             att.par_chunks_mut(hd)
                 .zip(q.par_chunks(hd))
                 .enumerate()
-                .for_each(|(h, (out, qh))| {
+                .for_each(|(j, (out, qh))| {
+                    let (i, h) = (j / c.n_head, j % c.n_head);
+                    let n_pos = pos + i + 1;
                     let off = (h / group) * hd;
                     let mut scores: Vec<f32> = (0..n_pos)
                         .map(|t| {
@@ -460,19 +481,24 @@ impl Model {
                         }
                     }
                 });
-            self.matvec(&layer.wo, &att, &mut tmp);
-            ops::add_assign(x, &tmp);
+            self.matmul(&layer.wo, &att, &mut tmp, n);
+            ops::add_assign(xs, &tmp);
 
-            ops::rmsnorm(&mut xb, x, &layer.ffn_norm, c.rms_eps);
+            norm_rows(&mut xb, xs, &layer.ffn_norm);
             match &layer.ffn {
-                Ffn::Dense(e) => self.ffn(e, &xb, &mut tmp),
+                Ffn::Dense(e) => self.ffn(e, &xb, &mut tmp, n),
+                // Experts differ per token, so routing stays per row.
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
-                } => self.moe(router, experts, shared.as_ref(), &xb, &mut tmp),
+                } => {
+                    for (o, r) in tmp.chunks_exact_mut(n_embd).zip(xb.chunks_exact(n_embd)) {
+                        self.moe(router, experts, shared.as_ref(), r, o);
+                    }
+                }
             }
-            ops::add_assign(x, &tmp);
+            ops::add_assign(xs, &tmp);
         }
     }
 
@@ -500,7 +526,7 @@ impl Model {
         out.fill(0.0);
         let mut y = vec![0.0; out.len()];
         for &e in chosen {
-            self.ffn(&experts[e], x, &mut y);
+            self.ffn(&experts[e], x, &mut y, 1);
             let w = probs[e] / norm;
             for (o, &v) in out.iter_mut().zip(&y) {
                 *o += w * v;
@@ -510,7 +536,7 @@ impl Model {
             let mut g = [0.0];
             self.matvec(gate_inp, x, &mut g);
             let gate = 1.0 / (1.0 + (-g[0]).exp());
-            self.ffn(e, x, &mut y);
+            self.ffn(e, x, &mut y, 1);
             for (o, &v) in out.iter_mut().zip(&y) {
                 *o += gate * v;
             }

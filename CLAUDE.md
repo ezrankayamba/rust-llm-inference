@@ -56,6 +56,10 @@ Design points that span files:
   in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
   `attention_batch` with an online softmax. Decode keeps the matvec + `attention` kernels.
   head_dim not a multiple of 32 or above 256 falls back to one token at a time.
+- **CPU prompts are batched too**, in chunks of 64 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
+  runs each block of weight rows against every token of the chunk while it is in cache. One
+  row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
+  still route per row.
 - **MoE on Metal** (decode and prompts share one path): per layer and chunk, one router matmul
   and one sync; the CPU picks each token's top-k, then each used expert runs as a matmul over
   the rows gathered for it (`gather_rows`), added back weighted (`scatter_axpy`). A shared

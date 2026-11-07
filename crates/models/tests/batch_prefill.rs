@@ -1,9 +1,8 @@
-//! Batched prompt processing on Metal must give the same logits, and leave the same KV cache,
-//! as running the prompt one token at a time. Uses small random dense models with a prompt
+//! Batched prompt processing (CPU, and Metal when built in) must give the same logits, and
+//! leave the same KV cache, as running the prompt one token at a time. Uses small random dense models with a prompt
 //! longer than one batch chunk, at head_dim 32, 64 and 128 (the batched attention kernel splits
 //! keys across lanes differently for each), and MoE models (Mixtral-style, and Qwen2-MoE with a
 //! shared expert) whose experts run as gathered per-expert matmuls.
-#![cfg(all(feature = "metal", target_os = "macos"))]
 
 use rli_core::GgmlType;
 use rli_core::quant::{quantize_q4_0, quantize_q8_0};
@@ -167,7 +166,27 @@ fn check_with(arch: &str, heads: usize, kv_heads: usize, moe: bool) {
     let mut r = Rng(42);
     let prompt: Vec<u32> = (0..PROMPT).map(|_| r.next() % VOCAB as u32).collect();
 
-    let cpu = run(&load(&path, 0), &prompt, false);
+    let cpu_model = load(&path, 0);
+    let cpu = run(&cpu_model, &prompt, false);
+    let cpu_batched = run(&cpu_model, &prompt, true);
+    for (what, a, b) in [
+        (
+            "CPU batched vs per-token prompt logits",
+            &cpu_batched.0,
+            &cpu.0,
+        ),
+        (
+            "CPU batched vs per-token next-token logits",
+            &cpu_batched.1,
+            &cpu.1,
+        ),
+    ] {
+        let d = max_diff(a, b);
+        assert!(d < 1e-5, "{arch}: {what}: max diff {d}");
+    }
+    if !rli_models::backend::HAS_GPU {
+        return;
+    }
     for gpu_layers in [LAYERS, 1] {
         let m = load(&path, gpu_layers);
         let (seq, bat) = (run(&m, &prompt, false), run(&m, &prompt, true));

@@ -88,6 +88,40 @@ impl<'a> QMatrix<'a> {
                 }
             });
     }
+
+    /// `Y = X W^T` for `n` tokens: `xs` is `n x cols` and `ys` is `n x rows`, row-major. Each
+    /// parallel task takes a block of weight rows and runs it against every token while those
+    /// rows are in cache, so the weights are read from memory once per call, not once per token.
+    pub fn matmul_with(&self, xs: &[f32], ys: &mut [f32], n: usize, precise: bool) {
+        assert_eq!(xs.len(), n * self.cols);
+        assert_eq!(ys.len(), n * self.rows);
+        if n == 1 {
+            return self.matvec_with(xs, ys, precise);
+        }
+        let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
+        let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
+            .then(|| xs.chunks_exact(cols).map(Q8Act::new).collect());
+        let dot = |row: &[u8], t: usize| match &acts {
+            Some(a) => qdot::dot_row_q8(ty, row, &a[t]),
+            None => dot_row(ty, row, &xs[t * cols..(t + 1) * cols]),
+        };
+        // Computed as [row][token] so each task owns a contiguous slice, then transposed.
+        let mut yt = vec![0.0f32; rows * n];
+        yt.par_chunks_mut(ROWS_PER_TASK * n)
+            .zip(self.data.par_chunks(rb * ROWS_PER_TASK))
+            .for_each(|(out, block)| {
+                for (o, row) in out.chunks_exact_mut(n).zip(block.chunks_exact(rb)) {
+                    for (t, v) in o.iter_mut().enumerate() {
+                        *v = dot(row, t);
+                    }
+                }
+            });
+        for (r, col) in yt.chunks_exact(n).enumerate() {
+            for (t, &v) in col.iter().enumerate() {
+                ys[t * rows + r] = v;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +143,28 @@ mod tests {
         let a = Q8Act::new(&x);
         for (r, &got) in y.iter().enumerate() {
             assert_eq!(got, qdot::dot_row_q8(GgmlType::Q8_0, m.row(r), &a));
+        }
+    }
+
+    #[test]
+    fn matmul_matches_per_token_matvec() {
+        let mut rng = Rng::new(5);
+        let (rows, cols, n) = (37, 256, 5);
+        let data = quantize_q8_0(&rng.vec(rows * cols));
+        let m = QMatrix::new(GgmlType::Q8_0, rows, cols, &data);
+        let xs = rng.vec(n * cols);
+        for precise in [false, true] {
+            let mut ys = vec![0.0; n * rows];
+            m.matmul_with(&xs, &mut ys, n, precise);
+            for t in 0..n {
+                let mut y = vec![0.0; rows];
+                m.matvec_with(&xs[t * cols..(t + 1) * cols], &mut y, precise);
+                assert_eq!(
+                    &ys[t * rows..(t + 1) * rows],
+                    &y[..],
+                    "precise={precise} token {t}"
+                );
+            }
         }
     }
 }
