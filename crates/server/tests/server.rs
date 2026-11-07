@@ -27,10 +27,13 @@ fn start() -> Server {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn server");
+    // Skip any warnings (e.g. a GPU fallback) before the listening line.
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut line = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
+    while !line.contains("http://") {
+        line.clear();
+        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "server exited");
+    }
     let addr = line
         .trim()
         .rsplit("http://")

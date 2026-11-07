@@ -102,6 +102,15 @@ impl Gpu {
     /// Opens device 0, compiles the kernels and copies the byte `ranges` (offset, len) of
     /// `mapped` (the model file) into VRAM. Matvecs may only read weights inside those ranges.
     pub fn new(mapped: &[u8], ranges: &[(usize, usize)]) -> Result<Self, String> {
+        // cudarc panics on first use if a library is missing; probe so that becomes an error.
+        // SAFETY: only attempts to load the driver/NVRTC libraries (running their initializers),
+        // which cudarc would do anyway on first use.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Err("CUDA driver library (libcuda) not found".into());
+        }
+        if !unsafe { cudarc::nvrtc::sys::is_culib_present() } {
+            return Err("NVRTC library (libnvrtc) not found".into());
+        }
         let ctx = CudaContext::new(0).map_err(err("no CUDA device"))?;
         let stream = ctx.default_stream();
         let ptx = cudarc::nvrtc::compile_ptx(SOURCE)

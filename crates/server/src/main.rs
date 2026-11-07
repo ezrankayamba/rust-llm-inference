@@ -13,6 +13,8 @@ use std::time::Duration;
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
 
+--gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
+
 Endpoints: GET /healthz, GET /v1/models, POST /v1/chat/completions, POST /v1/completions
 ";
 
@@ -72,17 +74,26 @@ fn serve(app: &App, mut stream: TcpStream) {
 }
 
 fn run(a: Args) -> Result<(), String> {
-    #[allow(unused_mut)]
     let mut engine = Engine::load(&a.model).map_err(|e| format!("{}: {e}", a.model))?;
-    if let Some(n) = a.gpu_layers {
-        rli_models::backend::attach(&mut engine.model, n).map_err(|e| e.to_string())?;
+    if let Some(w) = rli_models::backend::attach_default(&mut engine.model, a.gpu_layers)
+        .map_err(|e| e.to_string())?
+    {
+        eprintln!("warning: {w}");
     }
     let session = Mutex::new(engine.new_session(a.ctx));
     let app = Arc::new(App { engine, session });
     let listener = TcpListener::bind((a.host.as_str(), a.port))
         .map_err(|e| format!("bind {}:{}: {e}", a.host, a.port))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    eprintln!("serving {} on http://{addr}", app.engine.model_name);
+    let backend = app
+        .engine
+        .model
+        .accelerator()
+        .map_or("cpu".into(), |(n, l)| format!("{n}, {l} layers"));
+    eprintln!(
+        "serving {} [{backend}] on http://{addr}",
+        app.engine.model_name
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {

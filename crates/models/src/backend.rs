@@ -13,6 +13,28 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Whether this build has a GPU backend for the current target.
+pub const HAS_GPU: bool = cfg!(any(
+    all(feature = "metal", target_os = "macos"),
+    feature = "cuda"
+));
+
+/// Applies a `--gpu-layers` choice. `Some(n)` offloads exactly `n` layers and fails loudly.
+/// `None` offloads every layer when this build has a GPU backend; if the GPU can't take the
+/// model, it stays on the CPU and the reason is returned as a warning to show the user.
+pub fn attach_default(
+    model: &mut Model,
+    requested: Option<usize>,
+) -> Result<Option<String>, BackendError> {
+    match requested {
+        Some(n) => attach(model, n).map(|()| None),
+        None if HAS_GPU => Ok(attach(model, model.cfg.n_layer)
+            .err()
+            .map(|e| format!("GPU offload unavailable, running on the CPU: {e}"))),
+        None => Ok(None),
+    }
+}
+
 /// Offloads the first `layers` layers' matvecs to the GPU backend of this build.
 #[allow(unused_variables)]
 pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {

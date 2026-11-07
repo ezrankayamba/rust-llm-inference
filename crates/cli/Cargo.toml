@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+# Metal is gated on macOS inside rli-core, so this default is a no-op on other targets.
+default = ["metal"]
 metal = ["rli-models/metal"]
 cuda = ["rli-models/cuda"]
 

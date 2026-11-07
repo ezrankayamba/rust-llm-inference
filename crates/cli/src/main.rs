@@ -18,7 +18,8 @@ usage: rli -m <model.gguf> [options]
       --top-p <f>           (default 0.95)
       --repeat-penalty <f>  (default 1.1, 1 = off)
       --seed <n>
-      --gpu-layers <n>      offload this many layers to the GPU backend (metal/cuda builds)
+      --gpu-layers <n>      layers to run on the GPU (default: all, if this build has a
+                            GPU backend; 0 = CPU only)
       --info                print model metadata and exit
 ";
 
@@ -100,10 +101,11 @@ fn print_info(e: &Engine) {
 }
 
 fn run(a: Args) -> Result<(), String> {
-    #[allow(unused_mut)]
     let mut engine = Engine::load(&a.model).map_err(|e| format!("{}: {e}", a.model))?;
-    if let Some(n) = a.gpu_layers {
-        rli_models::backend::attach(&mut engine.model, n).map_err(|e| e.to_string())?;
+    if let Some(w) = rli_models::backend::attach_default(&mut engine.model, a.gpu_layers)
+        .map_err(|e| e.to_string())?
+    {
+        eprintln!("warning: {w}");
     }
     if a.info {
         print_info(&engine);

@@ -64,20 +64,24 @@ Design points that span files:
 `CARGO_TARGET_DIR` is set globally on this machine, so binaries are at
 `$CARGO_TARGET_DIR/release/{rli,rli-server}`, not `./target`.
 
+`rli` and `rli-server` enable `metal` by default (a no-op off macOS), and offload every layer
+unless `--gpu-layers N` says otherwise (`0` = CPU only). Without the flag, a GPU that can't take
+the model (no device or driver, unsupported quant, not enough VRAM) falls back to the CPU with a
+warning; with the flag, that is an error (`rli_models::backend::attach_default`).
+
 ```sh
-cargo build --release                                  # CPU-only build
-cargo build --release --features rli/metal,rli-server/metal   # Apple Metal backend
-cargo build --release --features rli/cuda,rli-server/cuda     # CUDA (runtime-loads driver + NVRTC; no toolkit needed to build)
-cargo test --workspace --release                       # all tests (CPU)
-cargo test --workspace --release --features rli-models/metal   # plus the Metal tests
+cargo build --release                                  # macOS: CPU + Metal
+cargo build --release --no-default-features            # CPU only
+cargo build --release --no-default-features --features rli/cuda,rli-server/cuda   # CUDA (runtime-loads driver + NVRTC; no toolkit needed to build)
+cargo test --workspace --release                       # all tests, including Metal on macOS
+cargo test --workspace --release --no-default-features # CPU-only tests
 cargo test -p <crate> <test_name>                      # single test
-cargo clippy --workspace --all-targets -- -D warnings  # also run with --features rli-models/metal and rli-models/cuda
+cargo clippy --workspace --all-targets -- -D warnings  # also with --no-default-features and --features rli-models/cuda
 cargo fmt --all
 ```
 
-Run: `rli -m model.gguf -p "prompt" [--gpu-layers N]` (without `-p` it starts an interactive chat),
-or `rli-server -m model.gguf --port 8080 [--gpu-layers N]`. Real models go in `models/`, which is
-gitignored.
+Run: `rli -m model.gguf -p "prompt"` (without `-p` it starts an interactive chat), or
+`rli-server -m model.gguf --port 8080`. Real models go in `models/`, which is gitignored.
 
 ## Validation workflow
 
@@ -88,7 +92,9 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
 - Tokenizer: `python scripts/check_tokenizer.py <model.gguf> <hf-repo>`.
 - Fixtures: `scripts/gen_quant_fixture.py` (dequant reference) and `scripts/make_tiny_moe.py`
   (tiny MoE GGUFs plus their reference logits, used by `crates/models/tests/moe_reference.rs`).
-- Benchmarks: `cargo run --release -p rli-core --example bench_matvec` (and `bench_metal` with `--features metal`).
+- Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--reps 3] [--gpu-layers N]`
+  (fixed-length runs that ignore EOS; defaults to CPU). Kernel microbenchmarks: `-p rli-core --example bench_matvec` / `bench_metal`.
+  Background load (e.g. a Docker VM) makes Metal numbers swing by ~2x on this machine; measure on a quiet system.
 
 Performance-sensitive changes to kernels or the hot path need before/after benchmark numbers. Debug
 builds are not representative, so always measure with `--release`.
