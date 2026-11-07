@@ -256,6 +256,9 @@ pub fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
     if let Some(w) = as_f32(ty, row) {
         return simd::dot(&w[..x.len()], x);
     }
+    if ty == GgmlType::F16 {
+        return simd::dot_f16(&row[..2 * x.len()], x);
+    }
     // Half-precision rows are converted in chunks so the dot itself stays vectorized.
     let (bs, bb) = match ty {
         GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => (64, 64 * ty.block_bytes()),
