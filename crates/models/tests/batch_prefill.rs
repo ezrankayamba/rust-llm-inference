@@ -1,6 +1,7 @@
 //! Batched prompt processing on Metal must give the same logits, and leave the same KV cache,
-//! as running the prompt one token at a time. Uses small random dense models (head_dim 32, so
-//! they take the batched path) with a prompt longer than one batch chunk.
+//! as running the prompt one token at a time. Uses small random dense models with a prompt
+//! longer than one batch chunk, at head_dim 32, 64 and 128 (the batched attention kernel splits
+//! keys across lanes differently for each).
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use rli_core::GgmlType;
@@ -11,8 +12,6 @@ use rli_gguf::writer::Writer;
 use rli_models::Model;
 
 const D: usize = 128;
-const HEADS: usize = 4;
-const KV_HEADS: usize = 2;
 const FF: usize = 192;
 const LAYERS: usize = 2;
 const VOCAB: usize = 96;
@@ -35,10 +34,10 @@ impl Rng {
 }
 
 /// Writes a random `arch` model; qwen2 gets q/k/v biases (exercising the broadcast add).
-fn write_model(arch: &str, path: &std::path::Path) {
+fn write_model(arch: &str, heads: usize, kv_heads: usize, path: &std::path::Path) {
     let mut r = Rng(0x9e37_79b9);
-    let hd = D / HEADS;
-    let kv = KV_HEADS * hd;
+    let hd = D / heads;
+    let kv = kv_heads * hd;
     let mut w = Writer::new();
     let key = |k: &str| format!("{arch}.{k}");
     w.kv("general.architecture", Value::String(arch.into()))
@@ -46,8 +45,8 @@ fn write_model(arch: &str, path: &std::path::Path) {
         .kv(&key("context_length"), Value::U32(1024))
         .kv(&key("embedding_length"), Value::U32(D as u32))
         .kv(&key("feed_forward_length"), Value::U32(FF as u32))
-        .kv(&key("attention.head_count"), Value::U32(HEADS as u32))
-        .kv(&key("attention.head_count_kv"), Value::U32(KV_HEADS as u32))
+        .kv(&key("attention.head_count"), Value::U32(heads as u32))
+        .kv(&key("attention.head_count_kv"), Value::U32(kv_heads as u32))
         .kv(&key("attention.layer_norm_rms_epsilon"), Value::F32(1e-5))
         .kv(&key("rope.freq_base"), Value::F32(10000.0));
     // Alternate quant types across matrices so several matmul kernels are exercised.
@@ -117,9 +116,10 @@ fn run(m: &Model, prompt: &[u32], batched: bool) -> (Vec<f32>, Vec<f32>) {
     (after_prompt, next)
 }
 
-fn check(arch: &str) {
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("batch_{arch}.gguf"));
-    write_model(arch, &path);
+fn check(arch: &str, heads: usize, kv_heads: usize) {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("batch_{arch}_{heads}_{kv_heads}.gguf"));
+    write_model(arch, heads, kv_heads, &path);
     let mut r = Rng(42);
     let prompt: Vec<u32> = (0..PROMPT).map(|_| r.next() % VOCAB as u32).collect();
 
@@ -148,11 +148,21 @@ fn check(arch: &str) {
 }
 
 #[test]
-fn batched_prefill_matches_per_token_llama() {
-    check("llama");
+fn batched_prefill_matches_per_token_llama_head_dim_32() {
+    check("llama", 4, 2);
+}
+
+#[test]
+fn batched_prefill_matches_per_token_llama_head_dim_64() {
+    check("llama", 2, 1);
+}
+
+#[test]
+fn batched_prefill_matches_per_token_llama_head_dim_128() {
+    check("llama", 1, 1);
 }
 
 #[test]
 fn batched_prefill_matches_per_token_qwen2_with_biases() {
-    check("qwen2");
+    check("qwen2", 4, 2);
 }

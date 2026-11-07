@@ -52,6 +52,42 @@ fn main() {
             n as f64 / s
         );
     }
+    // Causal batched attention at TinyLlama's shape: a 256-token chunk at positions 0 and 256.
+    use rli_core::metal::{At, BatchAttnParams};
+    let (n_head, n_kv, hd, n) = (32u32, 4u32, 64u32, 256usize);
+    let kv_dim = (n_kv * hd) as usize;
+    let q = gpu.upload(&vec![0.01; n * (n_head * hd) as usize]);
+    let out = gpu.alloc(n * (n_head * hd) as usize);
+    let (k, v) = (
+        gpu.upload(&vec![0.01; 512 * kv_dim]),
+        gpu.upload(&vec![0.01; 512 * kv_dim]),
+    );
+    for pos in [0u32, 256] {
+        let p = BatchAttnParams {
+            n_head,
+            n_kv,
+            head_dim: hd,
+            pos,
+            kv_dim: kv_dim as u32,
+            scale: 0.125,
+        };
+        let run = || {
+            let mut b = gpu.batch();
+            b.attention_batch(At(&q, 0), &k, &v, At(&out, 0), n, &p);
+            b.finish();
+        };
+        run();
+        let iters = 20;
+        let t = Instant::now();
+        for _ in 0..iters {
+            run();
+        }
+        let s = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "attention_batch 32x64 heads, n={n} at pos {pos}: {:.3} ms",
+            s * 1e3
+        );
+    }
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
