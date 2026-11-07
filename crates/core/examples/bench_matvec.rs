@@ -1,4 +1,5 @@
-//! Matvec throughput per weight type on a TinyLlama-FFN-sized matrix (5632 x 2048).
+//! Matvec (decode) and 64-token matmul (prompt) throughput per weight type on a
+//! TinyLlama-FFN-sized matrix (5632 x 2048).
 //! usage: cargo run --release -p rli-core --example bench_matvec
 
 use rli_core::{GgmlType, QMatrix};
@@ -39,12 +40,23 @@ fn main() {
             m.matvec(&x, &mut y);
         }
         let secs = t.elapsed().as_secs_f64() / iters as f64;
+        let n = 64;
+        let xs: Vec<f32> = (0..n).flat_map(|_| x.iter().copied()).collect();
+        let mut ys = vec![0.0; n * rows];
+        m.matmul_with(&xs, &mut ys, n, false);
+        let t = Instant::now();
+        for _ in 0..5 {
+            m.matmul_with(&xs, &mut ys, n, false);
+        }
+        let mm = t.elapsed().as_secs_f64() / 5.0;
         println!(
-            "{:>5?}: {:7.3} ms  {:6.1} GB/s  ({:.1} MB)",
+            "{:>5?}: matvec {:7.3} ms  {:6.1} GB/s  ({:.1} MB) | matmul n={n} {:7.2} ms  {:6.1} GOP/s",
             ty,
             secs * 1e3,
             data.len() as f64 / secs / 1e9,
-            data.len() as f64 / 1e6
+            data.len() as f64 / 1e6,
+            mm * 1e3,
+            2.0 * (rows * cols * n) as f64 / mm / 1e9
         );
     }
 }

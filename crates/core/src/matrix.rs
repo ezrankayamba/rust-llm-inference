@@ -101,9 +101,22 @@ impl<'a> QMatrix<'a> {
         let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
         let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
             .then(|| xs.chunks_exact(cols).map(Q8Act::new).collect());
-        let dot = |row: &[u8], t: usize| match &acts {
-            Some(a) => qdot::dot_row_q8(ty, row, &a[t]),
-            None => dot_row(ty, row, &xs[t * cols..(t + 1) * cols]),
+        // One row against every token; quantized rows go `MAX_TOKENS` tokens per kernel call,
+        // so each weight block is unpacked once per group rather than once per token.
+        let dots = |row: &[u8], o: &mut [f32]| match &acts {
+            Some(a) => {
+                for (oc, ac) in o
+                    .chunks_mut(qdot::MAX_TOKENS)
+                    .zip(a.chunks(qdot::MAX_TOKENS))
+                {
+                    qdot::dot_rows_q8(ty, row, ac, oc);
+                }
+            }
+            None => {
+                for (t, v) in o.iter_mut().enumerate() {
+                    *v = dot_row(ty, row, &xs[t * cols..(t + 1) * cols]);
+                }
+            }
         };
         // Computed as [row][token] so each task owns a contiguous slice, then transposed.
         let mut yt = vec![0.0f32; rows * n];
@@ -111,9 +124,7 @@ impl<'a> QMatrix<'a> {
             .zip(self.data.par_chunks(rb * ROWS_PER_TASK))
             .for_each(|(out, block)| {
                 for (o, row) in out.chunks_exact_mut(n).zip(block.chunks_exact(rb)) {
-                    for (t, v) in o.iter_mut().enumerate() {
-                        *v = dot(row, t);
-                    }
+                    dots(row, o);
                 }
             });
         for (r, col) in yt.chunks_exact(n).enumerate() {
