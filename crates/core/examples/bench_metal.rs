@@ -62,6 +62,9 @@ fn main() {
     for (ty, rows, cols, n) in [
         (GgmlType::Q4_0, 5632, 2048, 256),
         (GgmlType::Q4_K, 4864, 1024, 256),
+        (GgmlType::Q4_K, 14336, 4096, 256),
+        (GgmlType::Q6_K, 4096, 14336, 256),
+        (GgmlType::Q8_0, 4096, 4096, 256),
     ] {
         let x = vec![0.5; n * cols];
         let mut y = vec![0.0; n * rows];
