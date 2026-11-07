@@ -22,7 +22,8 @@ W = lambda n: dequantize(T[n].data, T[n].tensor_type).astype(np.float32).reshape
 
 n_head, n_kv = kv[f"{arch}.attention.head_count"], kv[f"{arch}.attention.head_count_kv"]
 d = kv[f"{arch}.embedding_length"]
-hd = d // n_head
+hd = kv.get(f"{arch}.attention.key_length", d // n_head)  # Qwen3 heads are wider than d / n_head
+rope_dim = kv.get(f"{arch}.rope.dimension_count", hd)
 eps = kv[f"{arch}.attention.layer_norm_rms_epsilon"]
 theta = kv.get(f"{arch}.rope.freq_base", 10000.0)
 neox = arch != "llama"
@@ -33,21 +34,26 @@ def rms(x, w):
     return x / np.sqrt(np.mean(x * x, -1, keepdims=True) + eps) * w
 
 
-def rope(x):  # x: [seq, heads, hd]
+# Llama 3.1+ long-context scaling ships as per-frequency divisors (llama.cpp's rope_freqs).
+freq_factors = W("rope_freqs.weight").astype(np.float64) if "rope_freqs.weight" in T else 1.0
+
+
+def rope(x):  # x: [seq, heads, hd]; rotates the first rope_dim dims
     seq = x.shape[0]
-    inv = theta ** (-np.arange(0, hd, 2, dtype=np.float64) / hd)
+    inv = theta ** (-np.arange(0, rope_dim, 2, dtype=np.float64) / rope_dim) / freq_factors
     ang = np.arange(seq)[:, None] * inv[None]
     cos, sin = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]
+    r, half = x[..., :rope_dim], rope_dim // 2
     if neox:
-        a, b = x[..., : hd // 2], x[..., hd // 2:]
+        a, b = r[..., :half], r[..., half:]
     else:
-        a, b = x[..., 0::2], x[..., 1::2]
+        a, b = r[..., 0::2], r[..., 1::2]
     ra, rb = a * cos - b * sin, a * sin + b * cos
-    out = np.empty_like(x)
+    out = x.copy()
     if neox:
-        out[..., : hd // 2], out[..., hd // 2:] = ra, rb
+        out[..., :half], out[..., half:rope_dim] = ra, rb
     else:
-        out[..., 0::2], out[..., 1::2] = ra, rb
+        out[..., 0:rope_dim:2], out[..., 1:rope_dim:2] = ra, rb
     return out
 
 
@@ -62,8 +68,11 @@ for i in range(L):
     for name, t in (("q", q), ("k", k), ("v", v)):
         if p + f"attn_{name}.bias" in T:
             t += W(p + f"attn_{name}.bias")
-    q = rope(q.reshape(seq, n_head, hd))
-    k = rope(k.reshape(seq, n_kv, hd))
+    q, k = q.reshape(seq, n_head, hd), k.reshape(seq, n_kv, hd)
+    # Qwen3: per-head RMSNorm of q and k, before RoPE.
+    if p + "attn_q_norm.weight" in T:
+        q, k = rms(q, W(p + "attn_q_norm.weight")), rms(k, W(p + "attn_k_norm.weight"))
+    q, k = rope(q), rope(k)
     v = v.reshape(seq, n_kv, hd)
     rep = n_head // n_kv
     k, v = np.repeat(k, rep, 1), np.repeat(v, rep, 1)
