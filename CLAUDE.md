@@ -111,8 +111,8 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
 - Tokenizer: `python scripts/check_tokenizer.py <model.gguf> <hf-repo>`.
 - Fixtures: `scripts/gen_quant_fixture.py` (dequant reference) and `scripts/make_tiny_moe.py`
   (tiny MoE GGUFs plus their reference logits, used by `crates/models/tests/moe_reference.rs`).
-- Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--reps 3] [--gpu-layers N]`
-  (fixed-length runs that ignore EOS; defaults to CPU). Kernel microbenchmarks: `-p rli-core --example bench_matvec` / `bench_metal`.
+- Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--depth D] [--reps 3] [--gpu-layers N]`
+  (fixed-length runs that ignore EOS; `--depth` prefills D tokens before timing decode; defaults to CPU). Kernel microbenchmarks: `-p rli-core --example bench_matvec` / `bench_metal`.
   Background load (e.g. a Docker VM) makes Metal numbers swing by ~2x on this machine; measure on a quiet system.
 
 Performance-sensitive changes to kernels or the hot path need before/after benchmark numbers. Debug
