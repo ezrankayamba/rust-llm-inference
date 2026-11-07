@@ -1,0 +1,12 @@
+[package]
+name = "rli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+metal = ["rli-models/metal"]
+cuda = ["rli-models/cuda"]
+
+[dependencies]
+rli-models.workspace = true
