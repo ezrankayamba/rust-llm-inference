@@ -27,6 +27,9 @@ impl Default for SamplerConfig {
     }
 }
 
+/// Candidates sorted on the first top-p pass; more are sorted only if they fall short.
+const NUCLEUS_FIRST: usize = 64;
+
 pub struct Sampler {
     cfg: SamplerConfig,
     state: u64,
@@ -77,29 +80,41 @@ impl Sampler {
         } else {
             self.cfg.top_k.min(cand.len())
         };
+        let desc = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1);
         if k < cand.len() {
-            cand.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+            cand.select_nth_unstable_by(k - 1, desc);
             cand.truncate(k);
         }
-        cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        let max = cand[0].1;
+        let max = cand.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
         for c in cand.iter_mut() {
             c.1 = ((c.1 - max) / self.cfg.temperature).exp();
             sum += c.1;
         }
-        let mut cum = 0.0;
-        let mut keep = None;
-        for (i, c) in cand.iter_mut().enumerate() {
-            c.1 /= sum;
-            cum += c.1;
-            if cum >= self.cfg.top_p && keep.is_none() {
-                keep = Some(i + 1);
+        if self.cfg.top_p < 1.0 {
+            // The nucleus is usually a few dozen tokens: sort only the leading `m` candidates,
+            // doubling `m` until they reach the mass, instead of sorting the whole vocabulary.
+            let target = self.cfg.top_p * sum;
+            let mut m = NUCLEUS_FIRST.min(cand.len());
+            loop {
+                if m < cand.len() {
+                    cand.select_nth_unstable_by(m - 1, desc);
+                }
+                cand[..m].sort_unstable_by(desc);
+                let mut cum = 0.0;
+                if let Some(i) = cand[..m].iter().position(|c| {
+                    cum += c.1;
+                    cum >= target
+                }) {
+                    cand.truncate(i + 1);
+                    break;
+                }
+                if m == cand.len() {
+                    break; // rounding left the total just short of the target: keep them all
+                }
+                m = (2 * m).min(cand.len());
             }
-        }
-        if let Some(k) = keep {
-            cand.truncate(k);
         }
 
         let total: f32 = cand.iter().map(|c| c.1).sum();
@@ -169,6 +184,41 @@ mod tests {
         }
         assert_eq!(seen[2] + seen[3], 0);
         assert!(seen[0] > 150 && seen[1] > 150, "{seen:?}");
+    }
+
+    #[test]
+    fn top_p_nucleus_wider_than_first_pass_is_exact() {
+        // Logits fall linearly, so the nucleus is a prefix of token ids; at top_p 0.9 it is
+        // ~230 tokens, so the partial sort has to widen past its first pass.
+        let logits: Vec<f32> = (0..2000).map(|i| -0.01 * i as f32).collect();
+        let w: Vec<f64> = logits.iter().map(|&l| (l as f64).exp()).collect();
+        let total: f64 = w.iter().sum();
+        let mut cum = 0.0;
+        let cutoff = w.iter().position(|&x| {
+            cum += x / total;
+            cum >= 0.9
+        });
+        let cutoff = cutoff.expect("nucleus within vocab");
+        assert!(cutoff > NUCLEUS_FIRST);
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 0.9,
+            repeat_penalty: 1.0,
+            seed: 3,
+            ..Default::default()
+        });
+        let picks: Vec<u32> = (0..3000)
+            .map(|_| s.sample(&mut logits.clone(), &[]))
+            .collect();
+        assert!(
+            picks.iter().all(|&p| p as usize <= cutoff),
+            "sampled outside the nucleus"
+        );
+        assert!(
+            picks.iter().any(|&p| p as usize > 2 * NUCLEUS_FIRST),
+            "nucleus was cut short"
+        );
     }
 
     #[test]
