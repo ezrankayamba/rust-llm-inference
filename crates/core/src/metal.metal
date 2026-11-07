@@ -357,6 +357,23 @@ kernel void add_bcast(device float* a [[buffer(0)]], device const float* b [[buf
     if (i < p.n) a[i] += b[i % p.m];
 }
 
+// MoE routing: dst row r = src row idx[r] (p.n = rows * dim, p.m = dim).
+kernel void gather_rows(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                        device const uint* idx [[buffer(2)]], constant EltParams& p [[buffer(3)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i < p.n) dst[i] = src[ulong(idx[i / p.m]) * p.m + i % p.m];
+}
+
+// MoE combine: dst row idx[r] += w[r] * src row r. Indices within one call must be distinct.
+kernel void scatter_axpy(device float* dst [[buffer(0)]], device const float* src [[buffer(1)]],
+                         device const uint* idx [[buffer(2)]], device const float* w [[buffer(3)]],
+                         constant EltParams& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        uint r = i / p.m;
+        dst[ulong(idx[r]) * p.m + i % p.m] += w[r] * src[i];
+    }
+}
+
 kernel void axpy(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                  constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < p.n) a[i] += p.alpha * b[i];

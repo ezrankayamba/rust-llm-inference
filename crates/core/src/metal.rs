@@ -46,10 +46,12 @@ const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: usize = 32;
 const MATMUL_THREADS: usize = 128;
-const OTHER_KERNELS: [&str; 8] = [
+const OTHER_KERNELS: [&str; 10] = [
     "rmsnorm",
     "add",
     "add_bcast",
+    "gather_rows",
+    "scatter_axpy",
     "axpy",
     "swiglu",
     "rope",
@@ -88,6 +90,19 @@ impl GpuBuf {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_mut_slice(&self) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.buf.contents().as_ptr().cast(), self.len) }
+    }
+}
+
+impl GpuBuf {
+    /// Stores u32 values (e.g. row indices for [`Batch::gather_rows`]) at element `off`.
+    ///
+    /// # Safety
+    /// As [`GpuBuf::as_mut_slice`].
+    pub unsafe fn write_u32(&self, off: usize, vals: &[u32]) {
+        let dst = unsafe { &mut self.as_mut_slice()[off..off + vals.len()] };
+        for (d, &v) in dst.iter_mut().zip(vals) {
+            *d = f32::from_bits(v);
+        }
     }
 }
 
@@ -558,6 +573,48 @@ impl Batch<'_> {
     /// `a += b`
     pub fn add(&mut self, a: At<'_>, b: At<'_>, n: usize) {
         self.elementwise("add", a, b, n, 1.0);
+    }
+
+    /// Row `r` of `dst` = row `idx[r]` of `src`, for `rows` rows of `dim`. `idx` holds u32 row
+    /// indices (stored with [`GpuBuf::write_u32`]).
+    pub fn gather_rows(&mut self, src: At<'_>, dst: At<'_>, idx: At<'_>, rows: usize, dim: usize) {
+        assert!(dst.1 + rows * dim <= dst.0.len && idx.1 + rows <= idx.0.len);
+        self.bind(0, src);
+        self.bind(1, dst);
+        self.bind(2, idx);
+        self.indexed("gather_rows", 3, rows, dim);
+    }
+
+    /// Row `idx[r]` of `dst` += `w[r]` * row `r` of `src`; the `rows` indices must be distinct.
+    pub fn scatter_axpy(
+        &mut self,
+        dst: At<'_>,
+        src: At<'_>,
+        idx: At<'_>,
+        w: At<'_>,
+        rows: usize,
+        dim: usize,
+    ) {
+        assert!(src.1 + rows * dim <= src.0.len && idx.1 + rows <= idx.0.len);
+        assert!(w.1 + rows <= w.0.len);
+        self.bind(0, dst);
+        self.bind(1, src);
+        self.bind(2, idx);
+        self.bind(3, w);
+        self.indexed("scatter_axpy", 4, rows, dim);
+    }
+
+    fn indexed(&mut self, kernel: &str, params_at: usize, rows: usize, dim: usize) {
+        let n = rows * dim;
+        self.params(
+            params_at,
+            &EltParams {
+                n: n as u32,
+                alpha: 0.0,
+                m: dim as u32,
+            },
+        );
+        self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
     }
 
     /// `a += alpha * b`

@@ -4,7 +4,8 @@
 //! MoE layers add one sync each, for top-k routing on the CPU.
 //!
 //! Prompts are processed in chunks of up to [`BATCH_CHUNK`] tokens per pass (matmul instead of
-//! matvec, causal batched attention). MoE models process prompts token by token for now.
+//! matvec, causal batched attention). An MoE layer syncs once per chunk: the CPU routes every
+//! token, then each used expert runs as one matmul over the rows gathered for it.
 
 use crate::backend::BackendError;
 use crate::config::Config;
@@ -39,6 +40,10 @@ struct Scratch {
     up: GpuBuf,
     router: GpuBuf,
     shared_gate: GpuBuf,
+    /// Rows gathered for one expert.
+    gx: GpuBuf,
+    /// Per-expert token indices (u32 bits) in the first half, their weights in the second.
+    route: GpuBuf,
     logits: GpuBuf,
 }
 
@@ -61,8 +66,11 @@ impl Scratch {
             tmp: gpu.alloc(cap * c.n_embd),
             gate: gpu.alloc(cap * max_ff),
             up: gpu.alloc(cap * max_ff),
-            router: gpu.alloc(c.n_expert.max(1)),
-            shared_gate: gpu.alloc(1),
+            router: gpu.alloc(cap * c.n_expert.max(1)),
+            shared_gate: gpu.alloc(cap),
+            gx: gpu.alloc(if c.n_expert > 0 { cap * c.n_embd } else { 0 }),
+            // Each token is in n_expert_used expert lists, plus the shared expert's list.
+            route: gpu.alloc(2 * cap * (c.n_expert_used + 1)),
             logits: gpu.alloc(logits),
         }
     }
@@ -70,7 +78,7 @@ impl Scratch {
 
 struct Metal {
     gpu: Gpu,
-    /// Prompts can run as batches (no MoE layers, and head_dim fits `attention_batch`).
+    /// Prompts can run as batches (head_dim fits `attention_batch`).
     batchable: bool,
     max_ff: usize,
     layers: Vec<GpuLayer>,
@@ -100,10 +108,10 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
-/// SwiGLU FFN of `n` rows of `s.xb` into `out`.
-fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, out: At<'_>, n: usize) {
-    mm(b, &e.gate, At(&s.xb, 0), At(&s.gate, 0), n);
-    mm(b, &e.up, At(&s.xb, 0), At(&s.up, 0), n);
+/// SwiGLU FFN of `n` rows of `x` into `out`.
+fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, x: At<'_>, out: At<'_>, n: usize) {
+    mm(b, &e.gate, x, At(&s.gate, 0), n);
+    mm(b, &e.up, x, At(&s.up, 0), n);
     b.swiglu(At(&s.gate, 0), At(&s.up, 0), n * e.gate.rows);
     mm(b, &e.down, At(&s.gate, 0), out, n);
 }
@@ -190,7 +198,7 @@ impl Metal {
             b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
             match &layer.ffn {
                 Ffn::Dense(e) => {
-                    ffn(&mut b, s, e, At(&s.tmp, 0), n);
+                    ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
                     b.add(x_at, At(&s.tmp, 0), n * n_embd);
                 }
                 Ffn::Moe {
@@ -198,39 +206,7 @@ impl Metal {
                     experts,
                     shared,
                 } => {
-                    assert_eq!(n, 1, "MoE layers run one token at a time");
-                    // Routing needs the router output on the CPU: one sync per MoE layer.
-                    mm(&mut b, router, At(&s.xb, 0), At(&s.router, 0), 1);
-                    if let Some((gi, _)) = shared {
-                        mm(&mut b, gi, At(&s.xb, 0), At(&s.shared_gate, 0), 1);
-                    }
-                    b.finish();
-                    // SAFETY: the batch completed; nothing is in flight.
-                    let mut probs = unsafe { s.router.as_slice()[..experts.len()].to_vec() };
-                    let shared_gate = unsafe { s.shared_gate.as_slice()[0] };
-                    ops::softmax(&mut probs);
-                    let mut order: Vec<usize> = (0..experts.len()).collect();
-                    order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-                    let chosen = &order[..c.n_expert_used];
-                    let norm = if c.norm_topk {
-                        chosen.iter().map(|&e| probs[e]).sum::<f32>()
-                    } else {
-                        1.0
-                    };
-                    b = self.gpu.batch();
-                    for &e in chosen {
-                        ffn(&mut b, s, &experts[e], At(&s.tmp, 0), 1);
-                        b.axpy(x_at, At(&s.tmp, 0), probs[e] / norm, n_embd);
-                    }
-                    if let Some((_, e)) = shared {
-                        ffn(&mut b, s, e, At(&s.tmp, 0), 1);
-                        b.axpy(
-                            x_at,
-                            At(&s.tmp, 0),
-                            1.0 / (1.0 + (-shared_gate).exp()),
-                            n_embd,
-                        );
-                    }
+                    b = self.moe(model, b, s, router, experts, shared.as_ref(), n);
                 }
             }
         }
@@ -240,6 +216,83 @@ impl Metal {
             mm(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0), 1);
         }
         b.finish();
+    }
+
+    /// Queues an MoE FFN over `n` rows of `s.xb`, adding into `s.x`. Routing needs the router
+    /// output on the CPU, so this waits for `b` once and returns a fresh batch to continue in.
+    #[allow(clippy::too_many_arguments)]
+    fn moe<'g>(
+        &'g self,
+        model: &Model,
+        b: Batch<'g>,
+        s: &Scratch,
+        router: &Weight,
+        experts: &[Expert],
+        shared: Option<&(Weight, Expert)>,
+        n: usize,
+    ) -> Batch<'g> {
+        let (c, ne, n_embd) = (&model.cfg, experts.len(), model.cfg.n_embd);
+        let mut b = b;
+        mm(&mut b, router, At(&s.xb, 0), At(&s.router, 0), n);
+        if let Some((gi, _)) = shared {
+            mm(&mut b, gi, At(&s.xb, 0), At(&s.shared_gate, 0), n);
+        }
+        b.finish();
+        // SAFETY: the batch completed; nothing is in flight.
+        let (router_out, gates) = unsafe {
+            (
+                s.router.as_slice()[..n * ne].to_vec(),
+                s.shared_gate.as_slice()[..n].to_vec(),
+            )
+        };
+        // Softmax over all experts, top-k, optionally renormalized over the chosen k.
+        let mut lists: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne];
+        for (t, row) in router_out.chunks_exact(ne).enumerate() {
+            let mut probs = row.to_vec();
+            ops::softmax(&mut probs);
+            let mut order: Vec<usize> = (0..ne).collect();
+            order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+            let chosen = &order[..c.n_expert_used];
+            let norm = if c.norm_topk {
+                chosen.iter().map(|&e| probs[e]).sum::<f32>()
+            } else {
+                1.0
+            };
+            for &e in chosen {
+                lists[e].push((t as u32, probs[e] / norm));
+            }
+        }
+        let (mut idx, mut wts): (Vec<u32>, Vec<f32>) = lists.iter().flatten().copied().unzip();
+        if shared.is_some() {
+            idx.extend(0..n as u32);
+            wts.extend(gates.iter().map(|g| 1.0 / (1.0 + (-g).exp())));
+        }
+        let w0 = s.route.len() / 2;
+        // SAFETY: nothing is in flight.
+        unsafe {
+            s.route.write_u32(0, &idx);
+            s.route.as_mut_slice()[w0..w0 + wts.len()].copy_from_slice(&wts);
+        }
+        let mut b = self.gpu.batch();
+        let x_at = At(&s.x, 0);
+        let mut off = 0;
+        for (e, list) in experts.iter().zip(&lists) {
+            let m = list.len();
+            if m == 0 {
+                continue;
+            }
+            b.gather_rows(At(&s.xb, 0), At(&s.gx, 0), At(&s.route, off), m, n_embd);
+            ffn(&mut b, s, e, At(&s.gx, 0), At(&s.tmp, 0), m);
+            let (i, w) = (At(&s.route, off), At(&s.route, w0 + off));
+            b.scatter_axpy(x_at, At(&s.tmp, 0), i, w, m, n_embd);
+            off += m;
+        }
+        if let Some((_, e)) = shared {
+            ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
+            let (i, w) = (At(&s.route, off), At(&s.route, w0 + off));
+            b.scatter_axpy(x_at, At(&s.tmp, 0), i, w, n, n_embd);
+        }
+        b
     }
 
     /// Uploads `xs` (rows of n_embd), runs them, and copies the rows (and logits) back.
@@ -396,10 +449,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         .collect();
     let logits = if covers_all { model.output.rows } else { 0 };
     let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1);
-    let has_moe = model.layers[..n]
-        .iter()
-        .any(|l| matches!(l.ffn, Ffn::Moe { .. }));
-    let batchable = !has_moe && c.head_dim.is_multiple_of(32) && c.head_dim <= 256;
+    let batchable = c.head_dim.is_multiple_of(32) && c.head_dim <= 256;
     let accel = Metal {
         batchable,
         max_ff,

@@ -54,8 +54,12 @@ Design points that span files:
 - **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
   `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
   in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
-  `attention_batch` with an online softmax. Decode keeps the matvec + `attention` kernels. MoE
-  models, and head_dim not a multiple of 32 or above 256, fall back to one token at a time.
+  `attention_batch` with an online softmax. Decode keeps the matvec + `attention` kernels.
+  head_dim not a multiple of 32 or above 256 falls back to one token at a time.
+- **MoE on Metal** (decode and prompts share one path): per layer and chunk, one router matmul
+  and one sync; the CPU picks each token's top-k, then each used expert runs as a matmul over
+  the rows gathered for it (`gather_rows`), added back weighted (`scatter_axpy`). A shared
+  expert runs over all rows with a per-token sigmoid gate.
 - **Accuracy.** The fast CPU path quantizes activations to int8 (Q8 blocks): logits differ from
   f32 by ~0.1–0.6 but top-1 matches. `Model.precise` (the `--precise` flag in `dump_logits`)
   keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal
