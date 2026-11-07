@@ -1,5 +1,5 @@
-//! Metal matvec latency (kernel throughput on a big matrix vs. fixed per-call overhead), and
-//! batched matmul throughput for prompt processing.
+//! Metal matvec bandwidth (back to back over distinct matrices, as in decode), per-command-buffer
+//! overhead, and batched matmul throughput for prompt processing.
 //! usage: cargo run --release -p rli-core --features metal --example bench_metal
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -8,29 +8,56 @@ fn main() {
     use rli_core::metal::Gpu;
     use std::time::Instant;
     let page = 16 * 1024;
-    let layout = std::alloc::Layout::from_size_align(64 << 20, page).unwrap();
-    let mem = unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), 64 << 20) };
+    let len = 512 << 20;
+    let layout = std::alloc::Layout::from_size_align(len, page).unwrap();
+    let mem = unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), len) };
     let gpu = unsafe { Gpu::new(mem, 0..mem.len()) }.unwrap();
+    // Decode streams every weight once per token, so time matvecs back to back in one command
+    // buffer over 512 MB of distinct matrices (more than the caches hold).
+    let (x, y) = (gpu.alloc(14336), gpu.alloc(14336));
     for (ty, rows, cols) in [
-        (GgmlType::Q4_0, 5632, 2048),
-        (GgmlType::Q6_K, 32000, 2048),
-        (GgmlType::Q4_0, 64, 64),
+        (GgmlType::Q4_0, 4096, 4096),
+        (GgmlType::Q5_0, 4096, 4096),
+        (GgmlType::Q8_0, 4096, 4096),
+        (GgmlType::Q4_K, 4096, 4096),
+        (GgmlType::Q4_K, 14336, 4096),
+        (GgmlType::Q5_K, 4096, 4096),
+        (GgmlType::Q6_K, 4096, 4096),
+        (GgmlType::Q6_K, 4096, 14336),
+        (GgmlType::F16, 4096, 4096),
+        (GgmlType::Q4_K, 1024, 1024),
     ] {
-        let x = vec![0.5; cols];
-        let mut y = vec![0.0; rows];
-        gpu.matvec(ty, rows, cols, 0, &x, &mut y);
+        let bytes = ty.row_bytes(cols) * rows;
+        let count = len / bytes;
+        let run = || {
+            let mut b = gpu.batch();
+            for i in 0..count {
+                b.matvec(ty, rows, cols, i * bytes, (&x).into(), (&y).into());
+            }
+            b.finish();
+        };
+        run();
+        let reps = 5;
+        let t = Instant::now();
+        for _ in 0..reps {
+            run();
+        }
+        let s = t.elapsed().as_secs_f64() / (reps * count) as f64;
+        println!(
+            "matvec {ty:?} {rows}x{cols}: {:.1} us  {:.1} GB/s",
+            s * 1e6,
+            bytes as f64 / s / 1e9
+        );
+    }
+    {
+        let (xs, mut ys) = (vec![0.5; 64], vec![0.0; 64]);
         let iters = 100;
         let t = Instant::now();
         for _ in 0..iters {
-            gpu.matvec(ty, rows, cols, 0, &x, &mut y);
+            gpu.matvec(GgmlType::Q4_0, 64, 64, 0, &xs, &mut ys);
         }
         let s = t.elapsed().as_secs_f64() / iters as f64;
-        let bytes = ty.row_bytes(cols) * rows;
-        println!(
-            "{ty:?} {rows}x{cols}: {:.3} ms  {:.1} GB/s",
-            s * 1e3,
-            bytes as f64 / s / 1e9
-        );
+        println!("one-shot command buffer (64x64 matvec): {:.3} ms", s * 1e3);
     }
     for (ty, rows, cols, n) in [
         (GgmlType::Q4_0, 5632, 2048, 256),
