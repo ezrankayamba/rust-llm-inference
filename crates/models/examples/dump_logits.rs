@@ -26,10 +26,7 @@ fn main() {
             .join(",")
     );
     let mut sess = engine.new_session(4096);
-    let mut logits = None;
-    for (i, &t) in tokens.iter().enumerate() {
-        logits = engine.model.forward(&mut sess, t, i + 1 == tokens.len());
-    }
+    let logits = engine.model.forward_batch(&mut sess, &tokens, true);
     let bytes: Vec<u8> = logits
         .expect("non-empty prompt")
         .iter()

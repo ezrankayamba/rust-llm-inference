@@ -49,6 +49,37 @@ pub trait Accelerator: Send + Sync {
         pos: usize,
         logits: Option<&mut [f32]>,
     ) -> bool;
+    /// Like [`Accelerator::forward`] for `xs.len() / n_embd` consecutive tokens (row-major
+    /// embeddings, in place) at positions `pos..`; `logits` are for the last token. The default
+    /// runs them one at a time.
+    fn forward_batch(
+        &self,
+        model: &Model,
+        state: &mut (dyn Any + Send),
+        xs: &mut [f32],
+        pos: usize,
+        logits: Option<&mut [f32]>,
+    ) -> bool {
+        forward_each(self, model, state, xs, pos, logits)
+    }
+}
+
+/// [`Accelerator::forward_batch`] as one [`Accelerator::forward`] call per token.
+pub(crate) fn forward_each<A: Accelerator + ?Sized>(
+    accel: &A,
+    model: &Model,
+    state: &mut (dyn Any + Send),
+    xs: &mut [f32],
+    pos: usize,
+    mut logits: Option<&mut [f32]>,
+) -> bool {
+    let n = xs.len() / model.cfg.n_embd;
+    let mut done = false;
+    for (i, x) in xs.chunks_exact_mut(model.cfg.n_embd).enumerate() {
+        let l = if i + 1 == n { logits.take() } else { None };
+        done = accel.forward(model, state, x, pos + i, l);
+    }
+    done
 }
 
 pub(crate) struct Expert {
@@ -303,8 +334,65 @@ impl Model {
     /// Runs one token at position `sess.len()` and appends it to the session. Returns logits when
     /// `want_logits` (prompt tokens other than the last don't need the output head).
     pub fn forward(&self, sess: &mut Session, token: u32, want_logits: bool) -> Option<Vec<f32>> {
-        let c = &self.cfg;
+        self.forward_batch(sess, &[token], want_logits)
+    }
+
+    /// Runs `tokens` at positions `sess.len()..` and appends them to the session; the logits
+    /// (when wanted) are for the last token. An accelerator may process them as one batch.
+    pub fn forward_batch(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        want_logits: bool,
+    ) -> Option<Vec<f32>> {
+        let n_embd = self.cfg.n_embd;
         let pos = sess.len();
+        if tokens.is_empty() {
+            return None;
+        }
+        let embd = self.mat(&self.embd);
+        let mut xs = vec![0.0; tokens.len() * n_embd];
+        for (x, &t) in xs.chunks_exact_mut(n_embd).zip(tokens) {
+            embd.dequantize_row_into(t as usize, x);
+        }
+        let mut logits = if want_logits {
+            vec![0.0; self.output.rows]
+        } else {
+            Vec::new()
+        };
+        let mut first_cpu_layer = 0;
+        if let Some(a) = &self.accel {
+            let state = sess.accel.get_or_insert_with(|| a.new_state(sess.max_ctx));
+            let done = a.forward_batch(
+                self,
+                state.as_mut(),
+                &mut xs,
+                pos,
+                want_logits.then_some(&mut logits[..]),
+            );
+            first_cpu_layer = a.layers();
+            if done {
+                sess.tokens.extend_from_slice(tokens);
+                return Some(logits);
+            }
+        }
+        for (i, x) in xs.chunks_exact_mut(n_embd).enumerate() {
+            self.cpu_layers(sess, x, pos + i, first_cpu_layer);
+        }
+        sess.tokens.extend_from_slice(tokens);
+        if !want_logits {
+            return None;
+        }
+        let x = &xs[(tokens.len() - 1) * n_embd..];
+        let mut xb = vec![0.0; n_embd];
+        ops::rmsnorm(&mut xb, x, &self.output_norm, self.cfg.rms_eps);
+        self.matvec(&self.output, &xb, &mut logits);
+        Some(logits)
+    }
+
+    /// Runs layers `first..` on the CPU for one token at `pos`, appending to their KV cache.
+    fn cpu_layers(&self, sess: &mut Session, x: &mut [f32], pos: usize, first: usize) {
+        let c = &self.cfg;
         let (hd, kv_dim) = (c.head_dim, c.kv_dim());
         let group = c.n_head / c.n_head_kv;
         let rope = Rope {
@@ -314,31 +402,6 @@ impl Model {
             neox: c.arch.neox_rope(),
             freq_factors: self.rope_freqs.as_deref(),
         };
-
-        let mut x = vec![0.0; c.n_embd];
-        self.mat(&self.embd)
-            .dequantize_row_into(token as usize, &mut x);
-        let mut logits = if want_logits {
-            vec![0.0; self.output.rows]
-        } else {
-            Vec::new()
-        };
-        let mut first_cpu_layer = 0;
-        if let Some(a) = &self.accel {
-            let state = sess.accel.get_or_insert_with(|| a.new_state(sess.max_ctx));
-            let done = a.forward(
-                self,
-                state.as_mut(),
-                &mut x,
-                pos,
-                want_logits.then_some(&mut logits[..]),
-            );
-            first_cpu_layer = a.layers();
-            if done {
-                sess.tokens.push(token);
-                return Some(logits);
-            }
-        }
         let mut xb = vec![0.0; c.n_embd];
         let mut q = vec![0.0; c.q_dim()];
         let mut k = vec![0.0; kv_dim];
@@ -347,8 +410,8 @@ impl Model {
         let mut tmp = vec![0.0; c.n_embd];
         let scale = 1.0 / (hd as f32).sqrt();
 
-        for (l, layer) in self.layers.iter().enumerate().skip(first_cpu_layer) {
-            ops::rmsnorm(&mut xb, &x, &layer.attn_norm, c.rms_eps);
+        for (l, layer) in self.layers.iter().enumerate().skip(first) {
+            ops::rmsnorm(&mut xb, x, &layer.attn_norm, c.rms_eps);
             self.matvec(&layer.wq, &xb, &mut q);
             self.matvec(&layer.wk, &xb, &mut k);
             self.matvec(&layer.wv, &xb, &mut v);
@@ -398,9 +461,9 @@ impl Model {
                     }
                 });
             self.matvec(&layer.wo, &att, &mut tmp);
-            ops::add_assign(&mut x, &tmp);
+            ops::add_assign(x, &tmp);
 
-            ops::rmsnorm(&mut xb, &x, &layer.ffn_norm, c.rms_eps);
+            ops::rmsnorm(&mut xb, x, &layer.ffn_norm, c.rms_eps);
             match &layer.ffn {
                 Ffn::Dense(e) => self.ffn(e, &xb, &mut tmp),
                 Ffn::Moe {
@@ -409,16 +472,8 @@ impl Model {
                     shared,
                 } => self.moe(router, experts, shared.as_ref(), &xb, &mut tmp),
             }
-            ops::add_assign(&mut x, &tmp);
+            ops::add_assign(x, &tmp);
         }
-        sess.tokens.push(token);
-
-        if !want_logits {
-            return None;
-        }
-        ops::rmsnorm(&mut xb, &x, &self.output_norm, c.rms_eps);
-        self.matvec(&self.output, &xb, &mut logits);
-        Some(logits)
     }
 
     fn moe(

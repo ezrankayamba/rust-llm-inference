@@ -140,6 +140,160 @@ MATVEC(matvec_q4_k, chunk_q4_k)
 MATVEC(matvec_q5_k, chunk_q5_k)
 MATVEC(matvec_q6_k, chunk_q6_k)
 
+// ---- Batched matmul for prompt processing: Y[n][rows] = X[n][cols] . W^T ----
+
+inline void deq_f32(device const uchar* r, uint c, thread float* w) {
+    device const float* s = (device const float*)r + c * 32;
+    for (uint i = 0; i < 32; i++) w[i] = s[i];
+}
+
+inline void deq_f16(device const uchar* r, uint c, thread float* w) {
+    device const half* s = (device const half*)r + c * 32;
+    for (uint i = 0; i < 32; i++) w[i] = float(s[i]);
+}
+
+inline void deq_q4_0(device const uchar* r, uint c, thread float* w) {
+    device const uchar* b = r + c * 18;
+    float d = h(b);
+    for (uint j = 0; j < 16; j++) {
+        uchar q = b[2 + j];
+        w[j] = d * float(int(q & 15) - 8);
+        w[j + 16] = d * float(int(q >> 4) - 8);
+    }
+}
+
+inline void deq_q5_0(device const uchar* r, uint c, thread float* w) {
+    device const uchar* b = r + c * 22;
+    float d = h(b);
+    uint qh = uint(b[2]) | (uint(b[3]) << 8) | (uint(b[4]) << 16) | (uint(b[5]) << 24);
+    for (uint j = 0; j < 16; j++) {
+        uchar q = b[6 + j];
+        w[j] = d * float(int((q & 15) | (((qh >> j) << 4) & 0x10)) - 16);
+        w[j + 16] = d * float(int((q >> 4) | ((qh >> (j + 12)) & 0x10)) - 16);
+    }
+}
+
+inline void deq_q8_0(device const uchar* r, uint c, thread float* w) {
+    device const uchar* b = r + c * 34;
+    device const char* q = (device const char*)(b + 2);
+    float d = h(b);
+    for (uint i = 0; i < 32; i++) w[i] = d * float(q[i]);
+}
+
+inline void deq_q4_k(device const uchar* r, uint c, thread float* w) {
+    uint sub = c % 8;
+    device const uchar* b = r + (c / 8) * 144;
+    float sc, m;
+    scale_min_k4(sub, b + 4, sc, m);
+    float d = h(b) * sc, dm = h(b + 2) * m;
+    device const uchar* q = b + 16 + 32 * (sub / 2);
+    for (uint l = 0; l < 32; l++) w[l] = d * float((sub & 1) ? (q[l] >> 4) : (q[l] & 15)) - dm;
+}
+
+inline void deq_q5_k(device const uchar* r, uint c, thread float* w) {
+    uint sub = c % 8;
+    device const uchar* b = r + (c / 8) * 176;
+    float sc, m;
+    scale_min_k4(sub, b + 4, sc, m);
+    float d = h(b) * sc, dm = h(b + 2) * m;
+    device const uchar* qh = b + 16;
+    device const uchar* q = b + 48 + 32 * (sub / 2);
+    for (uint l = 0; l < 32; l++) {
+        uint v = ((sub & 1) ? (q[l] >> 4) : (q[l] & 15)) + (((qh[l] >> sub) & 1) << 4);
+        w[l] = d * float(v) - dm;
+    }
+}
+
+inline void deq_q6_k(device const uchar* r, uint c, thread float* w) {
+    uint j = c % 8, n = j / 4, k = j % 4;
+    device const uchar* b = r + (c / 8) * 210;
+    device const uchar* ql = b + 64 * n + 32 * (k % 2);
+    device const uchar* qh = b + 128 + 32 * n;
+    device const char* sc = (device const char*)(b + 192) + 8 * n + 2 * k;
+    float d = h(b + 208);
+    for (uint l = 0; l < 32; l++) {
+        uint lo = k < 2 ? (ql[l] & 15) : (ql[l] >> 4);
+        int q = int(lo | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
+        w[l] = d * float(sc[l / 16]) * float(q);
+    }
+}
+
+// Tiled matmul on the simdgroup 8x8 matrix units. A threadgroup (4 simdgroups) computes a
+// MM_R x MM_T tile of rows x tokens; per 32-column step, simdgroups 0-1 dequantize the weight
+// tile into threadgroup memory while 2-3 stage the activations, then each simdgroup multiplies
+// a 32-row x 16-token sub-tile. All f32, so results track the matvec path closely.
+constant uint MM_R = 64;
+constant uint MM_T = 32;
+
+struct MatmulParams {
+    ulong offset;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    uint n;           // tokens
+};
+
+#define MATMUL(NAME, DEQ)                                                                     \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant MatmulParams& p [[buffer(3)]],      \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint tid [[thread_index_in_threadgroup]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]]) {                                \
+    threadgroup float sa[MM_R * 32]; /* weights [row][k]; reused for the output tile */       \
+    threadgroup float sb[MM_T * 32]; /* activations [token][k] */                             \
+    uint r0 = tg.x * MM_R, t0 = tg.y * MM_T;                                                  \
+    uint rb = (sg % 2) * 32, tb = (sg / 2) * 16;                                              \
+    simdgroup_float8x8 acc[8];                                                                \
+    for (uint i = 0; i < 8; i++) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);       \
+    for (uint c = 0; c < p.cols / 32; c++) {                                                  \
+        if (tid < MM_R) {                                                                     \
+            uint row = r0 + tid;                                                              \
+            float wv[32];                                                                     \
+            if (row < p.rows) {                                                               \
+                DEQ(w + p.offset + ulong(row) * p.row_bytes, c, wv);                          \
+            } else {                                                                          \
+                for (uint i = 0; i < 32; i++) wv[i] = 0.0f;                                   \
+            }                                                                                 \
+            for (uint i = 0; i < 32; i++) sa[tid * 32 + i] = wv[i];                           \
+        } else {                                                                              \
+            uint j = tid - MM_R, tt = j / 2, half_k = (j % 2) * 16;                           \
+            uint t = t0 + tt;                                                                 \
+            device const float* xs = x + ulong(t) * p.cols + c * 32 + half_k;                 \
+            for (uint i = 0; i < 16; i++) sb[tt * 32 + half_k + i] = t < p.n ? xs[i] : 0.0f;  \
+        }                                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+        for (uint k = 0; k < 32; k += 8) {                                                    \
+            simdgroup_float8x8 a[4], b[2];                                                    \
+            for (uint i = 0; i < 4; i++) simdgroup_load(a[i], sa + (rb + 8 * i) * 32 + k, 32);\
+            for (uint j = 0; j < 2; j++)                                                      \
+                simdgroup_load(b[j], sb + (tb + 8 * j) * 32 + k, 32, ulong2(0, 0), true);     \
+            for (uint i = 0; i < 4; i++)                                                      \
+                for (uint j = 0; j < 2; j++)                                                  \
+                    simdgroup_multiply_accumulate(acc[i * 2 + j], a[i], b[j], acc[i * 2 + j]);\
+        }                                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+    }                                                                                         \
+    /* Stage the 64 x 32 tile as [row][token], then write y[token][row] with bounds. */       \
+    for (uint i = 0; i < 4; i++)                                                              \
+        for (uint j = 0; j < 2; j++)                                                          \
+            simdgroup_store(acc[i * 2 + j], sa + (rb + 8 * i) * MM_T + tb + 8 * j, MM_T);     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+    for (uint e = tid; e < MM_R * MM_T; e += 128) {                                           \
+        uint tt = e / MM_R, rr = e % MM_R;                                                    \
+        uint row = r0 + rr, t = t0 + tt;                                                      \
+        if (row < p.rows && t < p.n) y[ulong(t) * p.rows + row] = sa[rr * MM_T + tt];         \
+    }                                                                                         \
+}
+
+MATMUL(matmul_f32, deq_f32)
+MATMUL(matmul_f16, deq_f16)
+MATMUL(matmul_q4_0, deq_q4_0)
+MATMUL(matmul_q5_0, deq_q5_0)
+MATMUL(matmul_q8_0, deq_q8_0)
+MATMUL(matmul_q4_k, deq_q4_k)
+MATMUL(matmul_q5_k, deq_q5_k)
+MATMUL(matmul_q6_k, deq_q6_k)
+
 // ---- Elementwise / normalization / attention kernels for running whole layers on the GPU ----
 
 inline float tg_reduce_sum(float v, threadgroup float* red, uint lane, uint sg, uint n_sg) {
@@ -190,11 +344,17 @@ kernel void rmsnorm(device const float* x [[buffer(0)]], device float* out [[buf
     for (uint i = tid; i < p.n; i += tgs) o[i] = xr[i] * scale * w[i];
 }
 
-struct EltParams { uint n; float alpha; };
+struct EltParams { uint n; float alpha; uint m; };
 
 kernel void add(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                 constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < p.n) a[i] += b[i];
+}
+
+// a[i] += b[i % m]: adds a length-m vector (a bias) to each of n/m rows.
+kernel void add_bcast(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                      constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.n) a[i] += b[i % p.m];
 }
 
 kernel void axpy(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
@@ -212,16 +372,17 @@ kernel void swiglu(device float* g [[buffer(0)]], device const float* u [[buffer
 
 struct RopeParams { uint n_heads; uint head_dim; uint rope_dim; uint pos; float theta; uint neox; uint has_ff; };
 
+// Grid: x over n_heads * rope_dim / 2 pairs, y over tokens (token t is at position pos + t).
 kernel void rope(device float* x [[buffer(0)]], device const float* ff [[buffer(1)]],
-                 constant RopeParams& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+                 constant RopeParams& p [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
     uint half_dim = p.rope_dim / 2;
-    if (gid >= p.n_heads * half_dim) return;
-    uint h = gid / half_dim, i = gid % half_dim;
+    if (gid.x >= p.n_heads * half_dim) return;
+    uint h = gid.x / half_dim, i = gid.x % half_dim;
     float freq = precise::pow(p.theta, -2.0f * float(i) / float(p.rope_dim));
     if (p.has_ff) freq /= ff[i];
-    float ang = float(p.pos) * freq;
+    float ang = float(p.pos + gid.y) * freq;
     float c = precise::cos(ang), s = precise::sin(ang);
-    device float* hd = x + h * p.head_dim;
+    device float* hd = x + ulong(gid.y) * p.n_heads * p.head_dim + h * p.head_dim;
     uint a = p.neox ? i : 2 * i;
     uint b = p.neox ? i + half_dim : 2 * i + 1;
     float x0 = hd[a], x1 = hd[b];
@@ -266,4 +427,48 @@ kernel void attention(device const float* q [[buffer(0)]], device const float* k
         for (uint t = 0; t < p.n_pos; t++) o += sc[t] * vc[t * p.kv_dim + kv_off + d];
         out[h * p.head_dim + d] = o / sum;
     }
+}
+
+struct BatchAttnParams { uint n_head; uint n_kv; uint head_dim; uint pos; uint kv_dim; float scale; };
+
+// Causal attention for a chunk of queries: threadgroup (head h, token t), one simdgroup each.
+// Query t sits at position pos + t and sees cache rows 0..=pos + t. Softmax is computed online
+// (running max and sum over blocks of 32 keys), so no scores buffer is needed. Lane l owns
+// output dims l, l + 32, ... (head_dim must be a multiple of 32, at most 256).
+kernel void attention_batch(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]],
+                            device const float* vc [[buffer(2)]], device float* out [[buffer(3)]],
+                            constant BatchAttnParams& p [[buffer(4)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint h = tg.x, t = tg.y, hd = p.head_dim, dpl = hd / 32;
+    uint n_pos = p.pos + t + 1;
+    uint kv_off = (h / (p.n_head / p.n_kv)) * hd;
+    ulong q_dim = ulong(p.n_head) * hd;
+    device const float* qh = q + t * q_dim + h * hd;
+    float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float m = -INFINITY, l = 0;
+    for (uint base = 0; base < n_pos; base += 32) {
+        uint j = base + lane;
+        float s = -INFINITY;
+        if (j < n_pos) {
+            device const float* k = kc + ulong(j) * p.kv_dim + kv_off;
+            float d = 0;
+            for (uint i = 0; i < hd; i++) d += qh[i] * k[i];
+            s = d * p.scale;
+        }
+        float m_new = max(m, simd_max(s));
+        float corr = exp(m - m_new);
+        float pj = j < n_pos ? exp(s - m_new) : 0.0f;
+        l = l * corr + simd_sum(pj);
+        for (uint d = 0; d < dpl; d++) o[d] *= corr;
+        uint cnt = min(32u, n_pos - base);
+        for (uint jj = 0; jj < cnt; jj++) {
+            float pw = simd_shuffle(pj, jj);
+            device const float* v = vc + ulong(base + jj) * p.kv_dim + kv_off;
+            for (uint d = 0; d < dpl; d++) o[d] += pw * v[lane + 32 * d];
+        }
+        m = m_new;
+    }
+    device float* oh = out + t * q_dim + h * hd;
+    for (uint d = 0; d < dpl; d++) oh[lane + 32 * d] = o[d] / l;
 }

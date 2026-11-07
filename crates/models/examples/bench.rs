@@ -50,9 +50,7 @@ fn main() {
     let run_pp = || {
         let mut s = new_session();
         let t = Instant::now();
-        for (i, &tok) in prompt.iter().enumerate() {
-            m.forward(&mut s, tok, i + 1 == prompt.len());
-        }
+        m.forward_batch(&mut s, &prompt, true);
         pp as f64 / t.elapsed().as_secs_f64()
     };
     let run_tg = || {

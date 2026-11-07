@@ -32,7 +32,30 @@ const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::Q5_K, "matvec_q5_k"),
     (GgmlType::Q6_K, "matvec_q6_k"),
 ];
-const OTHER_KERNELS: [&str; 6] = ["rmsnorm", "add", "axpy", "swiglu", "rope", "attention"];
+const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
+    (GgmlType::F32, "matmul_f32"),
+    (GgmlType::F16, "matmul_f16"),
+    (GgmlType::Q4_0, "matmul_q4_0"),
+    (GgmlType::Q5_0, "matmul_q5_0"),
+    (GgmlType::Q8_0, "matmul_q8_0"),
+    (GgmlType::Q4_K, "matmul_q4_k"),
+    (GgmlType::Q5_K, "matmul_q5_k"),
+    (GgmlType::Q6_K, "matmul_q6_k"),
+];
+/// Matmul output tile (`MM_R` x `MM_T` in metal.metal), computed by 128 threads.
+const MATMUL_TILE_ROWS: usize = 64;
+const MATMUL_TILE_TOKENS: usize = 32;
+const MATMUL_THREADS: usize = 128;
+const OTHER_KERNELS: [&str; 8] = [
+    "rmsnorm",
+    "add",
+    "add_bcast",
+    "axpy",
+    "swiglu",
+    "rope",
+    "attention",
+    "attention_batch",
+];
 
 /// A shared (CPU- and GPU-visible) f32 buffer.
 pub struct GpuBuf {
@@ -84,6 +107,7 @@ pub struct Gpu {
     weights: Retained<ProtocolObject<dyn MTLBuffer>>,
     weights_len: usize,
     matvec: Vec<(GgmlType, Pipeline)>,
+    matmul: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
     name: String,
 }
@@ -104,6 +128,14 @@ struct MatvecParams {
     row_bytes: u32,
 }
 #[repr(C)]
+struct MatmulParams {
+    offset: u64,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    n: u32,
+}
+#[repr(C)]
 struct NormParams {
     n: u32,
     eps: f32,
@@ -112,6 +144,7 @@ struct NormParams {
 struct EltParams {
     n: u32,
     alpha: f32,
+    m: u32,
 }
 #[repr(C)]
 struct RopeParams {
@@ -134,8 +167,21 @@ pub struct AttnParams {
     pub scale: f32,
 }
 
-/// Rotary embedding settings for [`Batch::rope`].
+#[repr(C)]
+pub struct BatchAttnParams {
+    pub n_head: u32,
+    pub n_kv: u32,
+    pub head_dim: u32,
+    /// Position of the chunk's first query token.
+    pub pos: u32,
+    pub kv_dim: u32,
+    pub scale: f32,
+}
+
+/// Rotary embedding settings for [`Batch::rope`]: `n_tokens` consecutive rows of
+/// `n_heads * head_dim`, the first at position `pos`.
 pub struct RopeArgs<'a> {
+    pub n_tokens: usize,
     pub n_heads: usize,
     pub head_dim: usize,
     pub rope_dim: usize,
@@ -193,6 +239,10 @@ impl Gpu {
             .iter()
             .map(|&(t, n)| Ok((t, pipeline(n)?)))
             .collect::<Result<_, String>>()?;
+        let matmul = MATMUL_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, pipeline(n)?)))
+            .collect::<Result<_, String>>()?;
         let other = OTHER_KERNELS
             .iter()
             .map(|&n| Ok((n, pipeline(n)?)))
@@ -207,6 +257,7 @@ impl Gpu {
             weights,
             weights_len: mapped.len(),
             matvec,
+            matmul,
             other,
             name,
         })
@@ -274,6 +325,28 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    /// One-shot `Y = X W^T` for `n` row-major tokens (for tests and benchmarks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul(
+        &self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: &[f32],
+        y: &mut [f32],
+        n: usize,
+    ) {
+        let (xb, yb) = (self.upload(x), self.alloc(n * rows));
+        let mut b = self.batch();
+        b.matmul(ty, rows, cols, offset, (&xb).into(), (&yb).into(), n);
+        b.finish();
+        // SAFETY: the batch has completed.
+        y.copy_from_slice(unsafe { yb.as_slice() });
+    }
+}
+
 /// Recorded GPU work; dispatches run in order. Nothing executes until [`Batch::finish`].
 pub struct Batch<'a> {
     gpu: &'a Gpu,
@@ -302,11 +375,15 @@ impl Batch<'_> {
     }
 
     fn dispatch(&self, pipeline: &Pipeline, groups: usize, threads: usize) {
+        self.dispatch2(pipeline, (groups, 1), threads);
+    }
+
+    fn dispatch2(&self, pipeline: &Pipeline, groups: (usize, usize), threads: usize) {
         self.enc.setComputePipelineState(pipeline);
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
-                width: groups,
-                height: 1,
+                width: groups.0,
+                height: groups.1,
                 depth: 1,
             },
             MTLSize {
@@ -371,6 +448,70 @@ impl Batch<'_> {
         );
     }
 
+    /// `Y = X W^T` for `n` tokens: `X` is `n x cols` and `Y` is `n x rows`, both row-major.
+    /// `n == 1` uses the matvec kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        n: usize,
+    ) {
+        if n == 1 {
+            return self.matvec(ty, rows, cols, offset, x, y);
+        }
+        assert!(
+            cols.is_multiple_of(32),
+            "matmul cols must be a multiple of 32"
+        );
+        assert!(
+            x.1 + n * cols <= x.0.len && y.1 + n * rows <= y.0.len,
+            "matmul buffer too small"
+        );
+        let row_bytes = ty.row_bytes(cols);
+        assert!(
+            offset + rows * row_bytes <= self.gpu.weights_len,
+            "weights out of range"
+        );
+        let pipeline = &self
+            .gpu
+            .matmul
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("unsupported type for Metal")
+            .1;
+        self.enc.setComputePipelineState(pipeline);
+        // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.gpu.weights), 0, 0)
+        };
+        self.bind(1, x);
+        self.bind(2, y);
+        self.params(
+            3,
+            &MatmulParams {
+                offset: offset as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+                row_bytes: row_bytes as u32,
+                n: n as u32,
+            },
+        );
+        self.dispatch2(
+            pipeline,
+            (
+                rows.div_ceil(MATMUL_TILE_ROWS),
+                n.div_ceil(MATMUL_TILE_TOKENS),
+            ),
+            MATMUL_THREADS,
+        );
+    }
+
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
     pub fn rmsnorm(&mut self, x: At<'_>, out: At<'_>, w: &GpuBuf, rows: usize, n: usize, eps: f32) {
         self.bind(0, x);
@@ -383,8 +524,35 @@ impl Batch<'_> {
     fn elementwise(&mut self, kernel: &str, a: At<'_>, b: At<'_>, n: usize, alpha: f32) {
         self.bind(0, a);
         self.bind(1, b);
-        self.params(2, &EltParams { n: n as u32, alpha });
+        self.params(
+            2,
+            &EltParams {
+                n: n as u32,
+                alpha,
+                m: n as u32,
+            },
+        );
         self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
+    }
+
+    /// Adds the length-`m` vector `b` to each of the `n / m` rows of `a`.
+    pub fn add_bcast(&mut self, a: At<'_>, b: At<'_>, m: usize, n: usize) {
+        assert!(n.is_multiple_of(m) && a.1 + n <= a.0.len && b.1 + m <= b.0.len);
+        self.bind(0, a);
+        self.bind(1, b);
+        self.params(
+            2,
+            &EltParams {
+                n: n as u32,
+                alpha: 1.0,
+                m: m as u32,
+            },
+        );
+        self.dispatch(
+            self.gpu.other("add_bcast"),
+            n.div_ceil(ELT_THREADS),
+            ELT_THREADS,
+        );
     }
 
     /// `a += b`
@@ -417,8 +585,13 @@ impl Batch<'_> {
                 has_ff: r.freq_factors.is_some() as u32,
             },
         );
+        assert!(x.1 + r.n_tokens * r.n_heads * r.head_dim <= x.0.len);
         let n = r.n_heads * r.rope_dim / 2;
-        self.dispatch(self.gpu.other("rope"), n.div_ceil(ELT_THREADS), ELT_THREADS);
+        self.dispatch2(
+            self.gpu.other("rope"),
+            (n.div_ceil(ELT_THREADS), r.n_tokens),
+            ELT_THREADS,
+        );
     }
 
     /// Causal attention for one query position over `p.n_pos` cached positions.
@@ -442,6 +615,36 @@ impl Batch<'_> {
             self.gpu.other("attention"),
             p.n_head as usize,
             REDUCE_THREADS,
+        );
+    }
+
+    /// Causal attention for `n` query rows at positions `p.pos..p.pos + n`; `k`/`v` are the
+    /// caches (rows `0..p.pos + n` filled). Needs `head_dim % 32 == 0` and `head_dim <= 256`.
+    pub fn attention_batch(
+        &mut self,
+        q: At<'_>,
+        k: &GpuBuf,
+        v: &GpuBuf,
+        out: At<'_>,
+        n: usize,
+        p: &BatchAttnParams,
+    ) {
+        let (hd, q_dim) = (p.head_dim as usize, (p.n_head * p.head_dim) as usize);
+        assert!(
+            hd.is_multiple_of(32) && hd <= 256,
+            "unsupported head_dim {hd}"
+        );
+        assert!(q.1 + n * q_dim <= q.0.len && out.1 + n * q_dim <= out.0.len);
+        assert!((p.pos as usize + n) * p.kv_dim as usize <= k.len.min(v.len));
+        self.bind(0, q);
+        self.bind(1, k.into());
+        self.bind(2, v.into());
+        self.bind(3, out);
+        self.params(4, p);
+        self.dispatch2(
+            self.gpu.other("attention_batch"),
+            (p.n_head as usize, n),
+            32,
         );
     }
 

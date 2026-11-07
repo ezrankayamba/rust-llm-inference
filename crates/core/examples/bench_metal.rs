@@ -1,4 +1,5 @@
-//! Metal matvec latency: kernel throughput on a big matrix vs. fixed per-call overhead.
+//! Metal matvec latency (kernel throughput on a big matrix vs. fixed per-call overhead), and
+//! batched matmul throughput for prompt processing.
 //! usage: cargo run --release -p rli-core --features metal --example bench_metal
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -29,6 +30,26 @@ fn main() {
             "{ty:?} {rows}x{cols}: {:.3} ms  {:.1} GB/s",
             s * 1e3,
             bytes as f64 / s / 1e9
+        );
+    }
+    for (ty, rows, cols, n) in [
+        (GgmlType::Q4_0, 5632, 2048, 256),
+        (GgmlType::Q4_K, 4864, 1024, 256),
+    ] {
+        let x = vec![0.5; n * cols];
+        let mut y = vec![0.0; n * rows];
+        gpu.matmul(ty, rows, cols, 0, &x, &mut y, n);
+        let iters = 10;
+        let t = Instant::now();
+        for _ in 0..iters {
+            gpu.matmul(ty, rows, cols, 0, &x, &mut y, n);
+        }
+        let s = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "matmul {ty:?} {rows}x{cols} n={n}: {:.3} ms  {:.0} GFLOP/s  ({:.0} tok/s for this matrix)",
+            s * 1e3,
+            2.0 * (rows * cols * n) as f64 / s / 1e9,
+            n as f64 / s
         );
     }
 }

@@ -145,13 +145,10 @@ impl Engine {
         }
 
         let t0 = Instant::now();
-        let mut logits = Vec::new();
-        for (i, &t) in prompt[keep..].iter().enumerate() {
-            let last = keep + i + 1 == prompt.len();
-            if let Some(l) = self.model.forward(sess, t, last) {
-                logits = l;
-            }
-        }
+        let mut logits = self
+            .model
+            .forward_batch(sess, &prompt[keep..], true)
+            .expect("logits requested");
         out.prefill_secs = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();

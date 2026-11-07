@@ -1,4 +1,5 @@
-//! Metal kernels against the CPU reference (f32 activations) for every supported weight type.
+//! Metal matvec/matmul kernels against the CPU reference (f32 activations) for every supported
+//! weight type.
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use rli_core::half::f32_to_f16;
@@ -25,19 +26,23 @@ impl Drop for Pages {
     }
 }
 
-#[test]
-fn metal_matvec_matches_cpu_for_every_supported_type() {
-    let (rows, cols) = (37, 512); // rows not a multiple of the 4-row threadgroup
-    let types = [
-        GgmlType::F32,
-        GgmlType::F16,
-        GgmlType::Q4_0,
-        GgmlType::Q5_0,
-        GgmlType::Q8_0,
-        GgmlType::Q4_K,
-        GgmlType::Q5_K,
-        GgmlType::Q6_K,
-    ];
+const ROWS: usize = 37; // not a multiple of the 4-row threadgroup
+const COLS: usize = 512;
+const TYPES: [GgmlType; 8] = [
+    GgmlType::F32,
+    GgmlType::F16,
+    GgmlType::Q4_0,
+    GgmlType::Q5_0,
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
+/// Random `ROWS x COLS` matrices of every type, back to back at 32-byte-aligned offsets (as in a
+/// GGUF), with small finite f16 scales.
+fn fixture() -> (Pages, Vec<usize>) {
+    let (rows, cols, types) = (ROWS, COLS, TYPES);
     // Lay all matrices out back to back at 32-byte-aligned offsets, as in a GGUF.
     let mut offsets = Vec::new();
     let mut end = 0usize;
@@ -82,22 +87,65 @@ fn metal_matvec_matches_cpu_for_every_supported_type() {
             }
         }
     }
-    let x: Vec<f32> = (0..cols)
+    (mem, offsets)
+}
+
+fn input(n: usize) -> Vec<f32> {
+    (0..n * COLS)
         .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
-        .collect();
+        .collect()
+}
+
+fn cpu_matvec(buf: &[u8], ty: GgmlType, off: usize, x: &[f32]) -> Vec<f32> {
+    let m = QMatrix::new(ty, ROWS, COLS, &buf[off..off + ty.row_bytes(COLS) * ROWS]);
+    let mut y = vec![0.0; ROWS];
+    m.matvec_with(x, &mut y, true);
+    y
+}
+
+fn assert_close(ty: GgmlType, what: &str, got: &[f32], want: &[f32]) {
+    for (r, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+            "{ty:?} {what} row {r}: gpu {g} vs cpu {w}"
+        );
+    }
+}
+
+#[test]
+fn metal_matvec_matches_cpu_for_every_supported_type() {
+    let (mut mem, offsets) = fixture();
+    let buf = mem.bytes();
+    let x = input(1);
     let gpu = unsafe { Gpu::new(buf) }.expect("Metal device");
-    for (&ty, &off) in types.iter().zip(&offsets) {
+    for (&ty, &off) in TYPES.iter().zip(&offsets) {
         assert!(gpu.supports(ty));
-        let m = QMatrix::new(ty, rows, cols, &buf[off..off + ty.row_bytes(cols) * rows]);
-        let mut want = vec![0.0; rows];
-        m.matvec_with(&x, &mut want, true);
-        let mut got = vec![0.0; rows];
-        gpu.matvec(ty, rows, cols, off, &x, &mut got);
-        for (r, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
-                "{ty:?} row {r}: gpu {g} vs cpu {w}"
-            );
+        let mut got = vec![0.0; ROWS];
+        gpu.matvec(ty, ROWS, COLS, off, &x, &mut got);
+        assert_close(ty, "matvec", &got, &cpu_matvec(buf, ty, off, &x));
+    }
+}
+
+#[test]
+fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
+    let (mut mem, offsets) = fixture();
+    let buf = mem.bytes();
+    let gpu = unsafe { Gpu::new(buf) }.expect("Metal device");
+    // 2: one partial token tile; 17: two full tiles plus a partial one.
+    for n in [2, 17] {
+        let x = input(n);
+        for (&ty, &off) in TYPES.iter().zip(&offsets) {
+            let mut got = vec![0.0; n * ROWS];
+            gpu.matmul(ty, ROWS, COLS, off, &x, &mut got, n);
+            for t in 0..n {
+                let want = cpu_matvec(buf, ty, off, &x[t * COLS..(t + 1) * COLS]);
+                assert_close(
+                    ty,
+                    &format!("n={n} token {t}"),
+                    &got[t * ROWS..(t + 1) * ROWS],
+                    &want,
+                );
+            }
         }
     }
 }

@@ -51,9 +51,15 @@ Design points that span files:
 - **GPU offload is layer-level.** All offloaded layers of a token are queued as one batch with
   one sync, plus one sync per MoE layer for top-k routing on the CPU. Per-matvec offload was
   measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
+- **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
+  `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
+  in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
+  `attention_batch` with an online softmax. Decode keeps the matvec + `attention` kernels. MoE
+  models, and head_dim not a multiple of 32 or above 256, fall back to one token at a time.
 - **Accuracy.** The fast CPU path quantizes activations to int8 (Q8 blocks): logits differ from
   f32 by ~0.1–0.6 but top-1 matches. `Model.precise` (the `--precise` flag in `dump_logits`)
-  keeps f32 activations and matches the NumPy reference to ≤4e-5; tests that compare logits use it.
+  keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal
+  batched prompts (the matrix units accumulate in a different order); tests that compare logits use it.
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
 - **Unverified paths:** the AVX2 kernels (only exercised under Rosetta, which lacks AVX2) and the
   whole CUDA backend (never run on an NVIDIA GPU; only its weight decoders are checked, on the
