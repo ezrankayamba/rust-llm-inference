@@ -407,25 +407,35 @@ kernel void rope(device float* x [[buffer(0)]], device const float* ff [[buffer(
     hd[b] = x0 * s + x1 * c;
 }
 
+// ---- KV cache: stored as f16 (default) or f32 (precise mode); T is the storage type ----
+
+// dst[i] = src[i] for n elements, converting to the cache type.
+kernel void store_kv_f32(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                         constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.n) dst[i] = src[i];
+}
+
+kernel void store_kv_f16(device const float* src [[buffer(0)]], device half* dst [[buffer(1)]],
+                         constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.n) dst[i] = half(src[i]);
+}
+
 struct AttnParams { uint n_head; uint n_kv; uint head_dim; uint n_pos; uint kv_dim; uint max_ctx; float scale; };
 
 // One threadgroup per query head; `scores` is n_head * max_ctx scratch.
-kernel void attention(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]],
-                      device const float* vc [[buffer(2)]], device float* out [[buffer(3)]],
-                      device float* scores [[buffer(4)]], constant AttnParams& p [[buffer(5)]],
-                      uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
-                      uint tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                      uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float red[32];
+template <typename T>
+inline void attention_impl(device const float* q, device const T* kc, device const T* vc,
+                           device float* out, device float* scores, constant AttnParams& p,
+                           threadgroup float* red, uint h, uint tid, uint tgs, uint lane, uint sg) {
     uint n_sg = (tgs + 31) / 32;
     uint kv_off = (h / (p.n_head / p.n_kv)) * p.head_dim;
     device const float* qh = q + h * p.head_dim;
     device float* sc = scores + h * p.max_ctx;
     float mx = -INFINITY;
     for (uint t = tid; t < p.n_pos; t += tgs) {
-        device const float* k = kc + t * p.kv_dim + kv_off;
+        device const T* k = kc + t * p.kv_dim + kv_off;
         float s = 0;
-        for (uint d = 0; d < p.head_dim; d++) s += qh[d] * k[d];
+        for (uint d = 0; d < p.head_dim; d++) s += qh[d] * float(k[d]);
         s *= p.scale;
         sc[t] = s;
         mx = max(mx, s);
@@ -441,10 +451,25 @@ kernel void attention(device const float* q [[buffer(0)]], device const float* k
     threadgroup_barrier(mem_flags::mem_device);
     for (uint d = tid; d < p.head_dim; d += tgs) {
         float o = 0;
-        for (uint t = 0; t < p.n_pos; t++) o += sc[t] * vc[t * p.kv_dim + kv_off + d];
+        for (uint t = 0; t < p.n_pos; t++) o += sc[t] * float(vc[t * p.kv_dim + kv_off + d]);
         out[h * p.head_dim + d] = o / sum;
     }
 }
+
+#define ATTENTION(NAME, T)                                                                    \
+kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffer(1)]],      \
+                 device const T* vc [[buffer(2)]], device float* out [[buffer(3)]],          \
+                 device float* scores [[buffer(4)]], constant AttnParams& p [[buffer(5)]],   \
+                 uint h [[threadgroup_position_in_grid]],                                     \
+                 uint tid [[thread_position_in_threadgroup]],                                 \
+                 uint tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],\
+                 uint sg [[simdgroup_index_in_threadgroup]]) {                                \
+    threadgroup float red[32];                                                                \
+    attention_impl<T>(q, kc, vc, out, scores, p, red, h, tid, tgs, lane, sg);                 \
+}
+
+ATTENTION(attention_f32, float)
+ATTENTION(attention_f16, half)
 
 struct BatchAttnParams { uint n_head; uint n_kv; uint head_dim; uint pos; uint kv_dim; float scale; };
 
@@ -452,11 +477,10 @@ struct BatchAttnParams { uint n_head; uint n_kv; uint head_dim; uint pos; uint k
 // Query t sits at position pos + t and sees cache rows 0..=pos + t. Softmax is computed online
 // (running max and sum over blocks of 32 keys), so no scores buffer is needed. Lane l owns
 // output dims l, l + 32, ... (head_dim must be a multiple of 32, at most 256).
-kernel void attention_batch(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]],
-                            device const float* vc [[buffer(2)]], device float* out [[buffer(3)]],
-                            constant BatchAttnParams& p [[buffer(4)]],
-                            uint2 tg [[threadgroup_position_in_grid]],
-                            uint lane [[thread_index_in_simdgroup]]) {
+template <typename T>
+inline void attention_batch_impl(device const float* q, device const T* kc, device const T* vc,
+                                 device float* out, constant BatchAttnParams& p, uint2 tg,
+                                 uint lane) {
     uint h = tg.x, t = tg.y, hd = p.head_dim, dpl = hd / 32;
     uint n_pos = p.pos + t + 1;
     uint kv_off = (h / (p.n_head / p.n_kv)) * hd;
@@ -468,9 +492,9 @@ kernel void attention_batch(device const float* q [[buffer(0)]], device const fl
         uint j = base + lane;
         float s = -INFINITY;
         if (j < n_pos) {
-            device const float* k = kc + ulong(j) * p.kv_dim + kv_off;
+            device const T* k = kc + ulong(j) * p.kv_dim + kv_off;
             float d = 0;
-            for (uint i = 0; i < hd; i++) d += qh[i] * k[i];
+            for (uint i = 0; i < hd; i++) d += qh[i] * float(k[i]);
             s = d * p.scale;
         }
         float m_new = max(m, simd_max(s));
@@ -481,11 +505,23 @@ kernel void attention_batch(device const float* q [[buffer(0)]], device const fl
         uint cnt = min(32u, n_pos - base);
         for (uint jj = 0; jj < cnt; jj++) {
             float pw = simd_shuffle(pj, jj);
-            device const float* v = vc + ulong(base + jj) * p.kv_dim + kv_off;
-            for (uint d = 0; d < dpl; d++) o[d] += pw * v[lane + 32 * d];
+            device const T* v = vc + ulong(base + jj) * p.kv_dim + kv_off;
+            for (uint d = 0; d < dpl; d++) o[d] += pw * float(v[lane + 32 * d]);
         }
         m = m_new;
     }
     device float* oh = out + t * q_dim + h * hd;
     for (uint d = 0; d < dpl; d++) oh[lane + 32 * d] = o[d] / l;
 }
+
+#define ATTENTION_BATCH(NAME, T)                                                              \
+kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffer(1)]],      \
+                 device const T* vc [[buffer(2)]], device float* out [[buffer(3)]],          \
+                 constant BatchAttnParams& p [[buffer(4)]],                                   \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    attention_batch_impl<T>(q, kc, vc, out, p, tg, lane);                                     \
+}
+
+ATTENTION_BATCH(attention_batch_f32, float)
+ATTENTION_BATCH(attention_batch_f16, half)

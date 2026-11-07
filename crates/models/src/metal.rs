@@ -10,7 +10,7 @@
 use crate::backend::BackendError;
 use crate::config::Config;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, forward_each};
-use rli_core::metal::{At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, RopeArgs};
+use rli_core::metal::{At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs};
 use rli_core::ops;
 use std::any::Any;
 use std::sync::Mutex;
@@ -27,6 +27,8 @@ struct GpuLayer {
 
 /// Most prompt tokens processed per GPU pass; bounds the batch scratch buffers.
 const BATCH_CHUNK: usize = 256;
+/// Positions a session's GPU KV cache holds at first; it doubles as needed, up to `max_ctx`.
+const KV_INITIAL: usize = 256;
 
 /// Activation buffers for up to `cap` tokens, reused across calls.
 struct Scratch {
@@ -34,6 +36,9 @@ struct Scratch {
     x: GpuBuf,
     xb: GpuBuf,
     q: GpuBuf,
+    /// This pass's K and V rows in f32, before they are stored into the cache.
+    k: GpuBuf,
+    v: GpuBuf,
     att: GpuBuf,
     tmp: GpuBuf,
     gate: GpuBuf,
@@ -47,12 +52,55 @@ struct Scratch {
     logits: GpuBuf,
 }
 
-/// Per-session KV cache of the offloaded layers, preallocated for `max_ctx` positions.
+/// Per-session KV cache of the offloaded layers: `cap` positions allocated, grown on demand up
+/// to `max_ctx`. f16 unless the model is in precise mode.
 struct Kv {
-    k: Vec<GpuBuf>,
-    v: Vec<GpuBuf>,
+    k: Vec<KvBuf>,
+    v: Vec<KvBuf>,
+    /// Decode attention scratch, `n_head * cap`.
     scores: GpuBuf,
+    cap: usize,
     max_ctx: usize,
+}
+
+impl Kv {
+    fn new(m: &Metal, cap: usize, max_ctx: usize) -> Self {
+        let alloc = || {
+            (0..m.layers.len())
+                .map(|_| m.gpu.alloc_kv(cap * m.kv_dim, m.kv_half))
+                .collect()
+        };
+        Kv {
+            k: alloc(),
+            v: alloc(),
+            scores: m.gpu.alloc(m.n_head * cap),
+            cap,
+            max_ctx,
+        }
+    }
+
+    /// Makes room for positions `0..need`, keeping the cached rows.
+    fn reserve(&mut self, m: &Metal, need: usize) {
+        assert!(
+            need <= self.max_ctx,
+            "positions up to {need} beyond the GPU KV cache ({})",
+            self.max_ctx
+        );
+        if need <= self.cap {
+            return;
+        }
+        let grown = Kv::new(m, need.max(2 * self.cap).min(self.max_ctx), self.max_ctx);
+        for (new, old) in grown
+            .k
+            .iter()
+            .zip(&self.k)
+            .chain(grown.v.iter().zip(&self.v))
+        {
+            // SAFETY: every pass waits for the GPU, so none is in flight between calls.
+            unsafe { new.copy_from(old) };
+        }
+        *self = grown;
+    }
 }
 
 impl Scratch {
@@ -62,6 +110,8 @@ impl Scratch {
             x: gpu.alloc(cap * c.n_embd),
             xb: gpu.alloc(cap * c.n_embd),
             q: gpu.alloc(cap * c.q_dim()),
+            k: gpu.alloc(cap * c.kv_dim()),
+            v: gpu.alloc(cap * c.kv_dim()),
             att: gpu.alloc(cap * c.q_dim()),
             tmp: gpu.alloc(cap * c.n_embd),
             gate: gpu.alloc(cap * max_ff),
@@ -87,6 +137,8 @@ struct Metal {
     covers_all: bool,
     kv_dim: usize,
     n_head: usize,
+    /// KV cache stored as f16 (chosen at attach: f32 when the model is in precise mode).
+    kv_half: bool,
     scratch: Mutex<Scratch>,
     /// Allocated on the first batched call.
     batch: Mutex<Option<Scratch>>,
@@ -121,12 +173,7 @@ impl Metal {
     /// when `want_logits`, the output head on the last row into `s.logits`. Waits for the GPU.
     fn run(&self, model: &Model, kv: &Kv, s: &Scratch, n: usize, pos: usize, want_logits: bool) {
         assert!(n >= 1 && n <= s.cap);
-        assert!(
-            pos + n <= kv.max_ctx,
-            "positions up to {} beyond the GPU KV cache ({})",
-            pos + n,
-            kv.max_ctx
-        );
+        assert!(pos + n <= kv.cap, "KV cache not reserved");
         let c = &model.cfg;
         let (hd, kv_dim, n_embd) = (c.head_dim, c.kv_dim(), c.n_embd);
         let x_at = At(&s.x, 0);
@@ -142,7 +189,7 @@ impl Metal {
         };
         let mut b = self.gpu.batch();
         for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
-            let (k_at, v_at) = (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim));
+            let (k_at, v_at) = (At(&s.k, 0), At(&s.v, 0));
             b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
             mm(&mut b, &layer.wq, At(&s.xb, 0), At(&s.q, 0), n);
             mm(&mut b, &layer.wk, At(&s.xb, 0), k_at, n);
@@ -164,6 +211,8 @@ impl Metal {
             }
             b.rope(At(&s.q, 0), &rope(c.n_head));
             b.rope(k_at, &rope(c.n_head_kv));
+            b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
+            b.store_kv(v_at, &kv.v[l], pos * kv_dim, n * kv_dim);
             if n == 1 {
                 let p = AttnParams {
                     n_head: c.n_head as u32,
@@ -171,13 +220,13 @@ impl Metal {
                     head_dim: hd as u32,
                     n_pos: (pos + 1) as u32,
                     kv_dim: kv_dim as u32,
-                    max_ctx: kv.max_ctx as u32,
+                    max_ctx: kv.cap as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                 };
                 b.attention(
                     At(&s.q, 0),
-                    At(&kv.k[l], 0),
-                    At(&kv.v[l], 0),
+                    &kv.k[l],
+                    &kv.v[l],
                     At(&s.att, 0),
                     &kv.scores,
                     &p,
@@ -331,17 +380,7 @@ impl Accelerator for Metal {
     }
 
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send> {
-        let n = self.layers.len();
-        Box::new(Kv {
-            k: (0..n)
-                .map(|_| self.gpu.alloc(max_ctx * self.kv_dim))
-                .collect(),
-            v: (0..n)
-                .map(|_| self.gpu.alloc(max_ctx * self.kv_dim))
-                .collect(),
-            scores: self.gpu.alloc(self.n_head * max_ctx),
-            max_ctx,
-        })
+        Box::new(Kv::new(self, KV_INITIAL.min(max_ctx), max_ctx))
     }
 
     fn forward(
@@ -352,9 +391,10 @@ impl Accelerator for Metal {
         pos: usize,
         logits: Option<&mut [f32]>,
     ) -> bool {
-        let kv: &Kv = state
-            .downcast_ref()
+        let kv: &mut Kv = state
+            .downcast_mut()
             .expect("state created by this accelerator");
+        kv.reserve(self, pos + 1);
         let s = self.scratch.lock().unwrap_or_else(|p| p.into_inner());
         self.pass(model, kv, &s, x, pos, logits)
     }
@@ -371,9 +411,10 @@ impl Accelerator for Metal {
         if !self.batchable || xs.len() == n_embd {
             return forward_each(self, model, state, xs, pos, logits);
         }
-        let kv: &Kv = state
-            .downcast_ref()
+        let kv: &mut Kv = state
+            .downcast_mut()
             .expect("state created by this accelerator");
+        kv.reserve(self, pos + xs.len() / n_embd);
         let mut guard = self.batch.lock().unwrap_or_else(|p| p.into_inner());
         let s = guard.get_or_insert_with(|| {
             let logits = if self.covers_all {
@@ -452,6 +493,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
     let batchable = c.head_dim.is_multiple_of(32) && c.head_dim <= 256;
     let accel = Metal {
         batchable,
+        kv_half: !model.precise,
         max_ff,
         batch: Mutex::new(None),
         output_norm: gpu.upload(&model.output_norm),

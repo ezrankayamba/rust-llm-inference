@@ -58,11 +58,11 @@ fn main() {
     let kv_dim = (n_kv * hd) as usize;
     let q = gpu.upload(&vec![0.01; n * (n_head * hd) as usize]);
     let out = gpu.alloc(n * (n_head * hd) as usize);
-    let (k, v) = (
-        gpu.upload(&vec![0.01; 512 * kv_dim]),
-        gpu.upload(&vec![0.01; 512 * kv_dim]),
-    );
-    for pos in [0u32, 256] {
+    for (half, pos) in [(false, 0u32), (false, 256), (true, 0), (true, 256)] {
+        let (k, v) = (
+            gpu.alloc_kv(512 * kv_dim, half),
+            gpu.alloc_kv(512 * kv_dim, half),
+        );
         let p = BatchAttnParams {
             n_head,
             n_kv,
@@ -84,7 +84,8 @@ fn main() {
         }
         let s = t.elapsed().as_secs_f64() / iters as f64;
         println!(
-            "attention_batch 32x64 heads, n={n} at pos {pos}: {:.3} ms",
+            "attention_batch {} KV, 32x64 heads, n={n} at pos {pos}: {:.3} ms",
+            if half { "f16" } else { "f32" },
             s * 1e3
         );
     }

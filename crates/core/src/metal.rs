@@ -46,7 +46,7 @@ const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: usize = 32;
 const MATMUL_THREADS: usize = 128;
-const OTHER_KERNELS: [&str; 10] = [
+const OTHER_KERNELS: [&str; 14] = [
     "rmsnorm",
     "add",
     "add_bcast",
@@ -55,8 +55,12 @@ const OTHER_KERNELS: [&str; 10] = [
     "axpy",
     "swiglu",
     "rope",
-    "attention",
-    "attention_batch",
+    "store_kv_f32",
+    "store_kv_f16",
+    "attention_f32",
+    "attention_f16",
+    "attention_batch_f32",
+    "attention_batch_f16",
 ];
 
 /// A shared (CPU- and GPU-visible) f32 buffer.
@@ -103,6 +107,54 @@ impl GpuBuf {
         for (d, &v) in dst.iter_mut().zip(vals) {
             *d = f32::from_bits(v);
         }
+    }
+}
+
+/// A shared buffer for one layer's K or V cache, holding f16 or (precise mode) f32 elements.
+pub struct KvBuf {
+    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    len: usize,
+    half: bool,
+}
+
+// SAFETY: as for GpuBuf.
+unsafe impl Send for KvBuf {}
+unsafe impl Sync for KvBuf {}
+
+impl KvBuf {
+    /// Capacity in elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_half(&self) -> bool {
+        self.half
+    }
+
+    fn elem(&self) -> usize {
+        if self.half { 2 } else { 4 }
+    }
+
+    /// Copies all of `src` into the start of `self` (same element type, `self` at least as large).
+    ///
+    /// # Safety
+    /// No GPU work that touches either buffer may be in flight.
+    pub unsafe fn copy_from(&self, src: &KvBuf) {
+        assert!(self.half == src.half && self.len >= src.len);
+        let n = src.len * src.elem();
+        // SAFETY: both buffers are shared-storage and at least `n` bytes; caller guarantees no
+        // concurrent GPU access.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.buf.contents().as_ptr().cast::<u8>(),
+                self.buf.contents().as_ptr().cast::<u8>(),
+                n,
+            )
+        };
     }
 }
 
@@ -295,6 +347,16 @@ impl Gpu {
         GpuBuf { buf, len: n }
     }
 
+    /// A zeroed KV cache buffer of `n` elements, f16 when `half`.
+    pub fn alloc_kv(&self, n: usize, half: bool) -> KvBuf {
+        let size = if half { 2 } else { 4 };
+        let buf = self
+            .device
+            .newBufferWithLength_options((n * size).max(4), MTLResourceOptions::StorageModeShared)
+            .expect("Metal buffer allocation failed");
+        KvBuf { buf, len: n, half }
+    }
+
     pub fn upload(&self, data: &[f32]) -> GpuBuf {
         let b = self.alloc(data.len());
         // SAFETY: freshly allocated, not yet used by the GPU.
@@ -376,6 +438,11 @@ impl Batch<'_> {
             self.enc
                 .setBuffer_offset_atIndex(Some(&at.0.buf), at.1 * 4, index)
         };
+    }
+
+    fn bind_kv(&self, index: usize, kv: &KvBuf) {
+        // SAFETY: binding a live buffer at offset 0.
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(&kv.buf), 0, index) };
     }
 
     fn params<T>(&self, index: usize, p: &T) {
@@ -651,28 +718,56 @@ impl Batch<'_> {
         );
     }
 
-    /// Causal attention for one query position over `p.n_pos` cached positions.
+    /// Converts `n` f32s from `src` into `dst` starting at element `off`.
+    pub fn store_kv(&mut self, src: At<'_>, dst: &KvBuf, off: usize, n: usize) {
+        assert!(src.1 + n <= src.0.len && off + n <= dst.len);
+        self.bind(0, src);
+        // SAFETY: binding a live buffer at an in-bounds byte offset.
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&dst.buf), off * dst.elem(), 1)
+        };
+        self.params(
+            2,
+            &EltParams {
+                n: n as u32,
+                alpha: 0.0,
+                m: 0,
+            },
+        );
+        let kernel = if dst.half {
+            "store_kv_f16"
+        } else {
+            "store_kv_f32"
+        };
+        self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
+    }
+
+    /// Causal attention for one query position over `p.n_pos` cached positions. `scores` is
+    /// `p.n_head * p.max_ctx` scratch.
     pub fn attention(
         &mut self,
         q: At<'_>,
-        k: At<'_>,
-        v: At<'_>,
+        k: &KvBuf,
+        v: &KvBuf,
         out: At<'_>,
         scores: &GpuBuf,
         p: &AttnParams,
     ) {
-        assert!(scores.len >= (p.n_head * p.max_ctx) as usize);
+        assert!(scores.len >= (p.n_head * p.max_ctx) as usize && p.n_pos <= p.max_ctx);
+        assert!(k.half == v.half && p.n_pos as usize * p.kv_dim as usize <= k.len.min(v.len));
         self.bind(0, q);
-        self.bind(1, k);
-        self.bind(2, v);
+        self.bind_kv(1, k);
+        self.bind_kv(2, v);
         self.bind(3, out);
         self.bind(4, scores.into());
         self.params(5, p);
-        self.dispatch(
-            self.gpu.other("attention"),
-            p.n_head as usize,
-            REDUCE_THREADS,
-        );
+        let kernel = if k.half {
+            "attention_f16"
+        } else {
+            "attention_f32"
+        };
+        self.dispatch(self.gpu.other(kernel), p.n_head as usize, REDUCE_THREADS);
     }
 
     /// Causal attention for `n` query rows at positions `p.pos..p.pos + n`; `k`/`v` are the
@@ -680,8 +775,8 @@ impl Batch<'_> {
     pub fn attention_batch(
         &mut self,
         q: At<'_>,
-        k: &GpuBuf,
-        v: &GpuBuf,
+        k: &KvBuf,
+        v: &KvBuf,
         out: At<'_>,
         n: usize,
         p: &BatchAttnParams,
@@ -692,17 +787,18 @@ impl Batch<'_> {
             "unsupported head_dim {hd}"
         );
         assert!(q.1 + n * q_dim <= q.0.len && out.1 + n * q_dim <= out.0.len);
-        assert!((p.pos as usize + n) * p.kv_dim as usize <= k.len.min(v.len));
+        assert!(k.half == v.half && (p.pos as usize + n) * p.kv_dim as usize <= k.len.min(v.len));
         self.bind(0, q);
-        self.bind(1, k.into());
-        self.bind(2, v.into());
+        self.bind_kv(1, k);
+        self.bind_kv(2, v);
         self.bind(3, out);
         self.params(4, p);
-        self.dispatch2(
-            self.gpu.other("attention_batch"),
-            (p.n_head as usize, n),
-            32,
-        );
+        let kernel = if k.half {
+            "attention_batch_f16"
+        } else {
+            "attention_batch_f32"
+        };
+        self.dispatch2(self.gpu.other(kernel), (p.n_head as usize, n), 32);
     }
 
     /// Submits the recorded work and waits for it.

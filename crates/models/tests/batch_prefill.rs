@@ -2,7 +2,8 @@
 //! leave the same KV cache, as running the prompt one token at a time. Uses small random dense models with a prompt
 //! longer than one batch chunk, at head_dim 32, 64 and 128 (the batched attention kernel splits
 //! keys across lanes differently for each), and MoE models (Mixtral-style, and Qwen2-MoE with a
-//! shared expert) whose experts run as gathered per-expert matmuls.
+//! shared expert) whose experts run as gathered per-expert matmuls. The prompt also outgrows the
+//! GPU KV cache's initial 256 positions, and one test checks the f16 cache against the f32 one.
 
 use rli_core::GgmlType;
 use rli_core::quant::{quantize_q4_0, quantize_q8_0};
@@ -124,8 +125,13 @@ fn write_model(arch: &str, heads: usize, kv_heads: usize, moe: bool, path: &std:
 }
 
 fn load(path: &std::path::Path, gpu_layers: usize) -> Model {
+    load_with(path, gpu_layers, true)
+}
+
+/// `precise` also picks the GPU KV cache type: f32 when set, f16 otherwise.
+fn load_with(path: &std::path::Path, gpu_layers: usize, precise: bool) -> Model {
     let mut m = Model::load(Gguf::open(path).expect("open")).expect("load");
-    m.precise = true;
+    m.precise = precise;
     rli_models::backend::attach(&mut m, gpu_layers).expect("attach Metal");
     m
 }
@@ -155,16 +161,25 @@ fn run(m: &Model, prompt: &[u32], batched: bool) -> (Vec<f32>, Vec<f32>) {
     (after_prompt, next)
 }
 
+fn model_path(arch: &str, heads: usize, kv_heads: usize, moe: bool) -> std::path::PathBuf {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("batch_{arch}_{heads}_{kv_heads}_{moe}.gguf"));
+    write_model(arch, heads, kv_heads, moe, &path);
+    path
+}
+
+fn prompt() -> Vec<u32> {
+    let mut r = Rng(42);
+    (0..PROMPT).map(|_| r.next() % VOCAB as u32).collect()
+}
+
 fn check(arch: &str, heads: usize, kv_heads: usize) {
     check_with(arch, heads, kv_heads, false);
 }
 
 fn check_with(arch: &str, heads: usize, kv_heads: usize, moe: bool) {
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("batch_{arch}_{heads}_{kv_heads}_{moe}.gguf"));
-    write_model(arch, heads, kv_heads, moe, &path);
-    let mut r = Rng(42);
-    let prompt: Vec<u32> = (0..PROMPT).map(|_| r.next() % VOCAB as u32).collect();
+    let path = model_path(arch, heads, kv_heads, moe);
+    let prompt = prompt();
 
     let cpu_model = load(&path, 0);
     let cpu = run(&cpu_model, &prompt, false);
@@ -238,4 +253,41 @@ fn batched_prefill_matches_per_token_mixtral_style_moe() {
 #[test]
 fn batched_prefill_matches_per_token_qwen2moe_with_shared_expert() {
     check("qwen2moe", 4, 2);
+}
+
+/// With every layer offloaded, `precise` only changes the KV cache type, so this isolates the
+/// f16 cache's rounding error (decode and batched attention both read it).
+#[test]
+fn f16_kv_cache_stays_close_to_f32() {
+    if !rli_models::backend::HAS_GPU {
+        return;
+    }
+    let path = model_path("llama", 4, 2, false);
+    let prompt = prompt();
+    let f32_kv = run(&load_with(&path, LAYERS, true), &prompt, true);
+    let f16_model = load_with(&path, LAYERS, false);
+    let (f16_seq, f16_bat) = (
+        run(&f16_model, &prompt, false),
+        run(&f16_model, &prompt, true),
+    );
+    for (what, a, b, tol) in [
+        ("f16 vs f32 prompt logits", &f16_bat.0, &f32_kv.0, 1e-2),
+        ("f16 vs f32 next-token logits", &f16_bat.1, &f32_kv.1, 1e-2),
+        (
+            "f16 batched vs per-token prompt logits",
+            &f16_bat.0,
+            &f16_seq.0,
+            1e-3,
+        ),
+        (
+            "f16 batched vs per-token next-token logits",
+            &f16_bat.1,
+            &f16_seq.1,
+            1e-3,
+        ),
+    ] {
+        let d = max_diff(a, b);
+        eprintln!("{what}: max diff {d}");
+        assert!(d < tol, "{what}: max diff {d}");
+    }
 }
