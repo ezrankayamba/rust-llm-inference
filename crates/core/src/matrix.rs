@@ -92,6 +92,8 @@ impl<'a> QMatrix<'a> {
     /// `Y = X W^T` for `n` tokens: `xs` is `n x cols` and `ys` is `n x rows`, row-major. Each
     /// parallel task takes a block of weight rows and runs it against every token while those
     /// rows are in cache, so the weights are read from memory once per call, not once per token.
+    /// With quantized activations a token's result can differ from [`QMatrix::matvec_with`] by
+    /// float rounding (the i8mm kernel sums in a different order); `precise` results match.
     pub fn matmul_with(&self, xs: &[f32], ys: &mut [f32], n: usize, precise: bool) {
         assert_eq!(xs.len(), n * self.cols);
         assert_eq!(ys.len(), n * self.rows);
@@ -123,6 +125,12 @@ impl<'a> QMatrix<'a> {
         yt.par_chunks_mut(ROWS_PER_TASK * n)
             .zip(self.data.par_chunks(rb * ROWS_PER_TASK))
             .for_each(|(out, block)| {
+                // The whole block on the i8mm matrix instructions when the CPU has them.
+                if let Some(a) = &acts
+                    && qdot::dot_block(ty, block, rb, a, out)
+                {
+                    return;
+                }
                 for (o, row) in out.chunks_exact_mut(n).zip(block.chunks_exact(rb)) {
                     dots(row, o);
                 }
@@ -170,11 +178,17 @@ mod tests {
             for t in 0..n {
                 let mut y = vec![0.0; rows];
                 m.matvec_with(&xs[t * cols..(t + 1) * cols], &mut y, precise);
-                assert_eq!(
-                    &ys[t * rows..(t + 1) * rows],
-                    &y[..],
-                    "precise={precise} token {t}"
-                );
+                let got = &ys[t * rows..(t + 1) * rows];
+                if precise {
+                    assert_eq!(got, &y[..], "precise token {t}");
+                } else {
+                    for (g, w) in got.iter().zip(&y) {
+                        assert!(
+                            (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
+                            "token {t}: {g} vs {w}"
+                        );
+                    }
+                }
             }
         }
     }

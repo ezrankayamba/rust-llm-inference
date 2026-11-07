@@ -28,7 +28,8 @@ Workspace crates (dependencies flow downward only):
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` with runtime detection and a portable
-  fallback), and ops (RMSNorm, RoPE, softmax, SwiGLU). GPU primitives live here too:
+  fallback; batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, so batched
+  int8 results differ from per-token ones by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU). GPU primitives live here too:
   `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` + `cuda.cu` (feature `cuda`); both
   compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and
