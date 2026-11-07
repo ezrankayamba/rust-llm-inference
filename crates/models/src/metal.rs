@@ -10,7 +10,9 @@
 use crate::backend::BackendError;
 use crate::config::Config;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, forward_each};
-use rli_core::metal::{At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs};
+use rli_core::metal::{
+    At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs, attention_part_len,
+};
 use rli_core::ops;
 use std::any::Any;
 use std::ops::Range;
@@ -58,8 +60,8 @@ struct Scratch {
 struct Kv {
     k: Vec<KvBuf>,
     v: Vec<KvBuf>,
-    /// Decode attention scratch, `n_head * cap`.
-    scores: GpuBuf,
+    /// Decode attention partials for up to `cap` positions.
+    part: GpuBuf,
     cap: usize,
     max_ctx: usize,
 }
@@ -74,7 +76,7 @@ impl Kv {
         Kv {
             k: alloc(),
             v: alloc(),
-            scores: m.gpu.alloc(m.n_head * cap),
+            part: m.gpu.alloc(attention_part_len(m.n_head, m.head_dim, cap)),
             cap,
             max_ctx,
         }
@@ -138,6 +140,7 @@ struct Metal {
     covers_all: bool,
     kv_dim: usize,
     n_head: usize,
+    head_dim: usize,
     /// KV cache stored as f16 (chosen at attach: f32 when the model is in precise mode).
     kv_half: bool,
     scratch: Mutex<Scratch>,
@@ -221,17 +224,9 @@ impl Metal {
                     head_dim: hd as u32,
                     n_pos: (pos + 1) as u32,
                     kv_dim: kv_dim as u32,
-                    max_ctx: kv.cap as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                 };
-                b.attention(
-                    At(&s.q, 0),
-                    &kv.k[l],
-                    &kv.v[l],
-                    At(&s.att, 0),
-                    &kv.scores,
-                    &p,
-                );
+                b.attention(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), &kv.part, &p);
             } else {
                 let p = BatchAttnParams {
                     n_head: c.n_head as u32,
@@ -491,8 +486,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
     let mapped = model.gguf().mapped_bytes();
     // SAFETY: the GPU views the model's own mapping, and `Model` drops its accelerator before
     // the mapping (field order), so the view never outlives it.
-    let gpu = unsafe { Gpu::new(mapped, span(&weights)) }
-        .map_err(|e| BackendError(format!("{e}; offload fewer layers (--gpu-layers)")))?;
+    let gpu = unsafe { Gpu::new(mapped, span(&weights)) }.map_err(BackendError)?;
     if let Some(w) = weights
         .iter()
         .find(|w| !gpu.supports(w.ty) || w.cols % 32 != 0)
@@ -536,6 +530,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         covers_all,
         kv_dim: c.kv_dim(),
         n_head: c.n_head,
+        head_dim: c.head_dim,
         scratch: Mutex::new(scratch),
         gpu,
     };

@@ -47,7 +47,7 @@ const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: usize = 32;
 const MATMUL_THREADS: usize = 128;
-const OTHER_KERNELS: [&str; 14] = [
+const OTHER_KERNELS: [&str; 15] = [
     "rmsnorm",
     "add",
     "add_bcast",
@@ -58,8 +58,9 @@ const OTHER_KERNELS: [&str; 14] = [
     "rope",
     "store_kv_f32",
     "store_kv_f16",
-    "attention_f32",
-    "attention_f16",
+    "attention_part_f32",
+    "attention_part_f16",
+    "attention_merge",
     "attention_batch_f32",
     "attention_batch_f16",
 ];
@@ -252,8 +253,22 @@ pub struct AttnParams {
     pub head_dim: u32,
     pub n_pos: u32,
     pub kv_dim: u32,
-    pub max_ctx: u32,
     pub scale: f32,
+}
+
+/// Cached positions per decode-attention threadgroup (`ATTN_CHUNK` in metal.metal).
+const ATTN_CHUNK: usize = 256;
+const ATTN_THREADS: usize = 128;
+
+/// f32s of scratch [`Batch::attention`] needs for `n_pos` positions.
+pub fn attention_part_len(n_head: usize, head_dim: usize, n_pos: usize) -> usize {
+    n_head * n_pos.div_ceil(ATTN_CHUNK) * (head_dim + 2)
+}
+
+#[repr(C)]
+struct AttnMergeParams {
+    head_dim: u32,
+    n_chunks: u32,
 }
 
 #[repr(C)]
@@ -298,7 +313,8 @@ impl Gpu {
         let (base, len) = (page_floor(span.start), wrapped_len(&span));
         if len > device.maxBufferLength() {
             return Err(format!(
-                "the offloaded weights ({len} bytes) exceed Metal's maxBufferLength ({})",
+                "the offloaded weights ({len} bytes) exceed Metal's maxBufferLength ({}); \
+                 offload fewer layers (--gpu-layers)",
                 device.maxBufferLength()
             ));
         }
@@ -785,31 +801,44 @@ impl Batch<'_> {
         self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
     }
 
-    /// Causal attention for one query position over `p.n_pos` cached positions. `scores` is
-    /// `p.n_head * p.max_ctx` scratch.
+    /// Attention of one query over `p.n_pos` cached positions, split into chunks of positions
+    /// that run in parallel and are then merged. `part` is scratch of at least
+    /// [`attention_part_len`] f32s.
     pub fn attention(
         &mut self,
         q: At<'_>,
         k: &KvBuf,
         v: &KvBuf,
         out: At<'_>,
-        scores: &GpuBuf,
+        part: &GpuBuf,
         p: &AttnParams,
     ) {
-        assert!(scores.len >= (p.n_head * p.max_ctx) as usize && p.n_pos <= p.max_ctx);
-        assert!(k.half == v.half && p.n_pos as usize * p.kv_dim as usize <= k.len.min(v.len));
+        let (n_head, hd, n_pos) = (p.n_head as usize, p.head_dim as usize, p.n_pos as usize);
+        assert!(n_pos >= 1 && part.len >= attention_part_len(n_head, hd, n_pos));
+        assert!(k.half == v.half && n_pos * p.kv_dim as usize <= k.len.min(v.len));
+        assert!(q.1 + n_head * hd <= q.0.len && out.1 + n_head * hd <= out.0.len);
+        let n_chunks = n_pos.div_ceil(ATTN_CHUNK);
         self.bind(0, q);
         self.bind_kv(1, k);
         self.bind_kv(2, v);
-        self.bind(3, out);
-        self.bind(4, scores.into());
-        self.params(5, p);
+        self.bind(3, part.into());
+        self.params(4, p);
         let kernel = if k.half {
-            "attention_f16"
+            "attention_part_f16"
         } else {
-            "attention_f32"
+            "attention_part_f32"
         };
-        self.dispatch(self.gpu.other(kernel), p.n_head as usize, REDUCE_THREADS);
+        self.dispatch2(self.gpu.other(kernel), (n_head, n_chunks), ATTN_THREADS);
+        self.bind(0, part.into());
+        self.bind(1, out);
+        self.params(
+            2,
+            &AttnMergeParams {
+                head_dim: p.head_dim,
+                n_chunks: n_chunks as u32,
+            },
+        );
+        self.dispatch(self.gpu.other("attention_merge"), n_head, ATTN_THREADS);
     }
 
     /// Causal attention for `n` query rows at positions `p.pos..p.pos + n`; `k`/`v` are the

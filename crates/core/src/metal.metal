@@ -420,56 +420,89 @@ kernel void store_kv_f16(device const float* src [[buffer(0)]], device half* dst
     if (i < p.n) dst[i] = half(src[i]);
 }
 
-struct AttnParams { uint n_head; uint n_kv; uint head_dim; uint n_pos; uint kv_dim; uint max_ctx; float scale; };
+struct AttnParams { uint n_head; uint n_kv; uint head_dim; uint n_pos; uint kv_dim; float scale; };
 
-// One threadgroup per query head; `scores` is n_head * max_ctx scratch.
+// Decode attention, split over the cached positions ("flash decoding"): threadgroup (h, c)
+// handles positions c*ATTN_CHUNK.. of head h and writes its max, softmax sum and unnormalized
+// output to `part` (head_dim + 2 floats per (head, chunk)); attention_merge combines the chunks.
+constant uint ATTN_CHUNK = 256;
+
 template <typename T>
-inline void attention_impl(device const float* q, device const T* kc, device const T* vc,
-                           device float* out, device float* scores, constant AttnParams& p,
-                           threadgroup float* red, uint h, uint tid, uint tgs, uint lane, uint sg) {
-    uint n_sg = (tgs + 31) / 32;
-    uint kv_off = (h / (p.n_head / p.n_kv)) * p.head_dim;
-    device const float* qh = q + h * p.head_dim;
-    device float* sc = scores + h * p.max_ctx;
+inline void attention_part_impl(device const float* q, device const T* kc, device const T* vc,
+                                device float* part, constant AttnParams& p,
+                                threadgroup float* sc, threadgroup float* red, uint2 tg,
+                                uint n_chunks, uint tid, uint tgs, uint lane, uint sg) {
+    uint h = tg.x, c = tg.y, hd = p.head_dim, n_sg = (tgs + 31) / 32;
+    uint start = c * ATTN_CHUNK, cnt = min(ATTN_CHUNK, p.n_pos - start);
+    uint kv_off = (h / (p.n_head / p.n_kv)) * hd;
+    device const float* qh = q + h * hd;
     float mx = -INFINITY;
-    for (uint t = tid; t < p.n_pos; t += tgs) {
-        device const T* k = kc + t * p.kv_dim + kv_off;
+    for (uint i = tid; i < cnt; i += tgs) {
+        device const T* k = kc + ulong(start + i) * p.kv_dim + kv_off;
         float s = 0;
-        for (uint d = 0; d < p.head_dim; d++) s += qh[d] * float(k[d]);
+        for (uint d = 0; d < hd; d++) s += qh[d] * float(k[d]);
         s *= p.scale;
-        sc[t] = s;
+        sc[i] = s;
         mx = max(mx, s);
     }
     mx = tg_reduce_max(mx, red, lane, sg, n_sg);
     float sum = 0;
-    for (uint t = tid; t < p.n_pos; t += tgs) {
-        float e = exp(sc[t] - mx);
-        sc[t] = e;
+    for (uint i = tid; i < cnt; i += tgs) {
+        float e = exp(sc[i] - mx);
+        sc[i] = e;
         sum += e;
     }
     sum = tg_reduce_sum(sum, red, lane, sg, n_sg);
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint d = tid; d < p.head_dim; d += tgs) {
+    device float* out = part + (ulong(h) * n_chunks + c) * (hd + 2);
+    device const T* v = vc + ulong(start) * p.kv_dim + kv_off;
+    for (uint d = tid; d < hd; d += tgs) {
         float o = 0;
-        for (uint t = 0; t < p.n_pos; t++) o += sc[t] * float(vc[t * p.kv_dim + kv_off + d]);
-        out[h * p.head_dim + d] = o / sum;
+        for (uint i = 0; i < cnt; i++) o += sc[i] * float(v[ulong(i) * p.kv_dim + d]);
+        out[2 + d] = o;
+    }
+    if (tid == 0) {
+        out[0] = mx;
+        out[1] = sum;
     }
 }
 
-#define ATTENTION(NAME, T)                                                                    \
+#define ATTENTION_PART(NAME, T)                                                               \
 kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffer(1)]],      \
-                 device const T* vc [[buffer(2)]], device float* out [[buffer(3)]],          \
-                 device float* scores [[buffer(4)]], constant AttnParams& p [[buffer(5)]],   \
-                 uint h [[threadgroup_position_in_grid]],                                     \
-                 uint tid [[thread_position_in_threadgroup]],                                 \
-                 uint tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],\
+                 device const T* vc [[buffer(2)]], device float* part [[buffer(3)]],         \
+                 constant AttnParams& p [[buffer(4)]],                                        \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint2 n_tg [[threadgroups_per_grid]],                                        \
+                 uint tid [[thread_index_in_threadgroup]],                                    \
+                 uint2 tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],\
                  uint sg [[simdgroup_index_in_threadgroup]]) {                                \
+    threadgroup float sc[ATTN_CHUNK];                                                         \
     threadgroup float red[32];                                                                \
-    attention_impl<T>(q, kc, vc, out, scores, p, red, h, tid, tgs, lane, sg);                 \
+    attention_part_impl<T>(q, kc, vc, part, p, sc, red, tg, n_tg.y, tid, tgs.x, lane, sg);    \
 }
 
-ATTENTION(attention_f32, float)
-ATTENTION(attention_f16, half)
+ATTENTION_PART(attention_part_f32, float)
+ATTENTION_PART(attention_part_f16, half)
+
+struct AttnMergeParams { uint head_dim; uint n_chunks; };
+
+// out[h] = sum_c exp(m_c - M) o_c / sum_c exp(m_c - M) l_c, over the chunks of head h.
+kernel void attention_merge(device const float* part [[buffer(0)]], device float* out [[buffer(1)]],
+                            constant AttnMergeParams& p [[buffer(2)]],
+                            uint h [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint tgs [[threads_per_threadgroup]]) {
+    uint stride = p.head_dim + 2;
+    device const float* ph = part + ulong(h) * p.n_chunks * stride;
+    float m = -INFINITY;
+    for (uint c = 0; c < p.n_chunks; c++) m = max(m, ph[c * stride]);
+    float l = 0;
+    for (uint c = 0; c < p.n_chunks; c++) l += ph[c * stride + 1] * exp(ph[c * stride] - m);
+    for (uint d = tid; d < p.head_dim; d += tgs) {
+        float o = 0;
+        for (uint c = 0; c < p.n_chunks; c++) o += ph[c * stride + 2 + d] * exp(ph[c * stride] - m);
+        out[h * p.head_dim + d] = o / l;
+    }
+}
 
 struct BatchAttnParams { uint n_head; uint n_kv; uint head_dim; uint pos; uint kv_dim; float scale; };
 

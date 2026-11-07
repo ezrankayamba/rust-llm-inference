@@ -57,7 +57,9 @@ Design points that span files:
 - **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
   `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
   in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
-  `attention_batch` with an online softmax. Decode keeps the matvec + `attention` kernels.
+  `attention_batch` with an online softmax. Decode uses matvec, and attention split over
+  chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
+  `attention_merge`), so decode speed holds up at long context.
   head_dim not a multiple of 32 or above 256 falls back to one token at a time.
 - **CPU prompts are batched too**, in chunks of 64 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
