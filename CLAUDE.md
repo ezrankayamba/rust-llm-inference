@@ -45,8 +45,9 @@ Workspace crates (dependencies flow downward only):
 
 Design points that span files:
 
-- **Memory is the primary budget.** Weights stay in the mmap. Metal wraps the whole mapping as one
-  no-copy `MTLBuffer` (unified memory). CUDA copies only the offloaded layers' weights into a VRAM
+- **Memory is the primary budget.** Weights stay in the mmap. Metal wraps the file range holding the
+  offloaded layers' weights as one no-copy `MTLBuffer` (unified memory); a range above
+  `maxBufferLength` (14.3 GB on this 24 GB Mac) can't be offloaded. CUDA copies only the offloaded layers' weights into a VRAM
   arena (partial offload, `--gpu-layers N`); the remaining layers run on the CPU. The Metal KV
   cache is f16 (f32 when `Model.precise` is set at attach time), starts at 256 positions and
   doubles as needed up to the session's context; K/V are computed in f32 scratch, then stored.
@@ -82,9 +83,10 @@ Design points that span files:
 `$CARGO_TARGET_DIR/release/{rli,rli-server}`, not `./target`.
 
 `rli` and `rli-server` enable `metal` by default (a no-op off macOS), and offload every layer
-unless `--gpu-layers N` says otherwise (`0` = CPU only). Without the flag, a GPU that can't take
-the model (no device or driver, unsupported quant, not enough VRAM) falls back to the CPU with a
-warning; with the flag, that is an error (`rli_models::backend::attach_default`).
+unless `--gpu-layers N` says otherwise (`0` = CPU only). Without the flag, a model larger than
+one Metal buffer offloads as many leading layers as fit, and a GPU that can't take the model at
+all (no device or driver, unsupported quant, not enough VRAM) falls back to the CPU; both warn.
+With the flag, either is an error (`rli_models::backend::attach_default`).
 
 ```sh
 cargo build --release                                  # macOS: CPU + Metal

@@ -13,6 +13,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
     MTLResourceOptions, MTLSize,
 };
+use std::ops::Range;
 use std::ptr::NonNull;
 
 const SOURCE: &str = include_str!("metal.metal");
@@ -168,11 +169,32 @@ impl<'a> From<&'a GpuBuf> for At<'a> {
     }
 }
 
+fn page_size() -> usize {
+    // SAFETY: no preconditions.
+    unsafe { getpagesize() as usize }
+}
+
+fn page_floor(x: usize) -> usize {
+    x - x % page_size()
+}
+
+/// Bytes [`Gpu::new`] wraps for `span`: the span rounded out to whole pages.
+pub fn wrapped_len(span: &Range<usize>) -> usize {
+    (span.end - page_floor(span.start)).div_ceil(page_size()) * page_size()
+}
+
+/// The largest buffer the default Metal device can create, or `None` without a device.
+pub fn max_buffer_len() -> Option<usize> {
+    MTLCreateSystemDefaultDevice().map(|d| d.maxBufferLength())
+}
+
 pub struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     weights: Retained<ProtocolObject<dyn MTLBuffer>>,
-    weights_len: usize,
+    /// File offset of the first wrapped byte (page-aligned) and the end of the usable span.
+    weights_base: usize,
+    weights_end: usize,
     matvec: Vec<(GgmlType, Pipeline)>,
     matmul: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
@@ -259,26 +281,30 @@ pub struct RopeArgs<'a> {
 }
 
 impl Gpu {
-    /// Wraps `mapped` (a page-aligned memory mapping, e.g. the whole GGUF file) for GPU access.
+    /// Wraps the `span` bytes of `mapped` (a page-aligned memory mapping, e.g. the whole GGUF
+    /// file) for GPU access, rounded out to whole pages. Weight offsets passed to [`Batch`]
+    /// stay relative to `mapped` and must lie inside `span`.
     ///
     /// # Safety
     /// `mapped` must be the start of a memory mapping that stays valid and unmodified for the
     /// lifetime of the returned value; the pages up to the next page boundary must be mapped
     /// (true for any `mmap` of the file).
-    pub unsafe fn new(mapped: &[u8]) -> Result<Self, String> {
+    pub unsafe fn new(mapped: &[u8], span: Range<usize>) -> Result<Self, String> {
+        assert!(span.start <= span.end && span.end <= mapped.len());
         let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
-        let page = unsafe { getpagesize() } as usize;
-        if !(mapped.as_ptr() as usize).is_multiple_of(page) {
+        if !(mapped.as_ptr() as usize).is_multiple_of(page_size()) {
             return Err("weights mapping is not page-aligned".into());
         }
-        let len = mapped.len().div_ceil(page) * page;
+        let (base, len) = (page_floor(span.start), wrapped_len(&span));
         if len > device.maxBufferLength() {
             return Err(format!(
-                "model ({len} bytes) exceeds Metal maxBufferLength ({})",
+                "the offloaded weights ({len} bytes) exceed Metal's maxBufferLength ({})",
                 device.maxBufferLength()
             ));
         }
-        let ptr = NonNull::new(mapped.as_ptr() as *mut std::ffi::c_void).ok_or("null mapping")?;
+        // SAFETY: `base <= span.end <= mapped.len()`, so the pointer stays in the mapping.
+        let ptr = NonNull::new(unsafe { mapped.as_ptr().add(base) } as *mut std::ffi::c_void)
+            .ok_or("null mapping")?;
         // SAFETY: page-aligned, page-rounded, outlives `self` per the caller contract; the GPU
         // only reads it. No deallocator: the mapping is owned elsewhere.
         let weights = unsafe {
@@ -322,7 +348,8 @@ impl Gpu {
             device,
             queue,
             weights,
-            weights_len: mapped.len(),
+            weights_base: base,
+            weights_end: span.end,
             matvec,
             matmul,
             other,
@@ -332,6 +359,15 @@ impl Gpu {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Rebases a file offset of `bytes` weight bytes onto the wrapped span.
+    fn weight_offset(&self, offset: usize, bytes: usize) -> usize {
+        assert!(
+            offset >= self.weights_base && offset + bytes <= self.weights_end,
+            "weights out of range"
+        );
+        offset - self.weights_base
     }
 
     pub fn supports(&self, ty: GgmlType) -> bool {
@@ -371,6 +407,7 @@ impl Gpu {
             gpu: self,
             cmd,
             enc,
+            ended: false,
         }
     }
 
@@ -429,6 +466,17 @@ pub struct Batch<'a> {
     gpu: &'a Gpu,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    ended: bool,
+}
+
+/// A batch dropped unfinished (e.g. by a panic while recording) must still end its encoder:
+/// Metal aborts the process otherwise, hiding the panic message.
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.enc.endEncoding();
+        }
+    }
 }
 
 impl Batch<'_> {
@@ -495,10 +543,7 @@ impl Batch<'_> {
             "matvec buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
-        assert!(
-            offset + rows * row_bytes <= self.gpu.weights_len,
-            "weights out of range"
-        );
+        let offset = self.gpu.weight_offset(offset, rows * row_bytes);
         let pipeline = &self
             .gpu
             .matvec
@@ -555,10 +600,7 @@ impl Batch<'_> {
             "matmul buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
-        assert!(
-            offset + rows * row_bytes <= self.gpu.weights_len,
-            "weights out of range"
-        );
+        let offset = self.gpu.weight_offset(offset, rows * row_bytes);
         let pipeline = &self
             .gpu
             .matmul
@@ -802,8 +844,9 @@ impl Batch<'_> {
     }
 
     /// Submits the recorded work and waits for it.
-    pub fn finish(self) {
+    pub fn finish(mut self) {
         self.enc.endEncoding();
+        self.ended = true;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         if let Some(e) = self.cmd.error() {

@@ -10,7 +10,7 @@ fn main() {
     let page = 16 * 1024;
     let layout = std::alloc::Layout::from_size_align(64 << 20, page).unwrap();
     let mem = unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), 64 << 20) };
-    let gpu = unsafe { Gpu::new(mem) }.unwrap();
+    let gpu = unsafe { Gpu::new(mem, 0..mem.len()) }.unwrap();
     for (ty, rows, cols) in [
         (GgmlType::Q4_0, 5632, 2048),
         (GgmlType::Q6_K, 32000, 2048),

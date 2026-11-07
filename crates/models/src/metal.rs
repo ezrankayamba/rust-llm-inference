@@ -13,6 +13,7 @@ use crate::model::{Accelerator, Expert, Ffn, Model, Weight, forward_each};
 use rli_core::metal::{At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs};
 use rli_core::ops;
 use std::any::Any;
+use std::ops::Range;
 use std::sync::Mutex;
 
 struct GpuLayer {
@@ -438,10 +439,9 @@ impl Accelerator for Metal {
     }
 }
 
-pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
-    let c = model.cfg.clone();
-    let n = layers.min(c.n_layer);
-    let covers_all = n == c.n_layer;
+/// The matrices the GPU reads when the first `n` layers are offloaded (plus the output head
+/// when that is all of them).
+fn offloaded_weights(model: &Model, n: usize) -> Vec<&Weight> {
     let mut weights: Vec<&Weight> = Vec::new();
     for layer in &model.layers[..n] {
         weights.extend([&layer.wq, &layer.wk, &layer.wv, &layer.wo]);
@@ -453,12 +453,46 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
             weights.extend([&e.gate, &e.up, &e.down]);
         }
     }
-    if covers_all {
+    if n == model.cfg.n_layer {
         weights.push(&model.output);
     }
+    weights
+}
+
+/// The file byte range covering `weights`.
+fn span(weights: &[&Weight]) -> Range<usize> {
+    let start = weights.iter().map(|w| w.offset).min().unwrap_or(0);
+    let end = weights
+        .iter()
+        .map(|w| w.offset + w.rows * w.ty.row_bytes(w.cols))
+        .max()
+        .unwrap_or(0);
+    start..end.max(start)
+}
+
+/// The most leading layers whose weights fit in one Metal buffer (the whole model when it
+/// fits), or `None` without a Metal device.
+pub fn fitting_layers(model: &Model) -> Option<usize> {
+    let max = rli_core::metal::max_buffer_len()?;
+    let fits = |n| rli_core::metal::wrapped_len(&span(&offloaded_weights(model, n))) <= max;
+    Some(
+        (0..=model.cfg.n_layer)
+            .rev()
+            .find(|&n| fits(n))
+            .unwrap_or(0),
+    )
+}
+
+pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
+    let c = model.cfg.clone();
+    let n = layers.min(c.n_layer);
+    let covers_all = n == c.n_layer;
+    let weights = offloaded_weights(model, n);
+    let mapped = model.gguf().mapped_bytes();
     // SAFETY: the GPU views the model's own mapping, and `Model` drops its accelerator before
     // the mapping (field order), so the view never outlives it.
-    let gpu = unsafe { Gpu::new(model.gguf().mapped_bytes()) }.map_err(BackendError)?;
+    let gpu = unsafe { Gpu::new(mapped, span(&weights)) }
+        .map_err(|e| BackendError(format!("{e}; offload fewer layers (--gpu-layers)")))?;
     if let Some(w) = weights
         .iter()
         .find(|w| !gpu.supports(w.ty) || w.cols % 32 != 0)
