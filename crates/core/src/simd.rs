@@ -192,6 +192,90 @@ unsafe fn axpy_f16_neon(y: &mut [f32], a: f32, w: &[u8]) {
     }
 }
 
+/// `out = Σ_t w[t] · row_t`, row `t` being `out.len()` little-endian halves at byte `t * stride`
+/// of `rows` (attention's weighted sum of cached values). Bit-identical to zeroing `out` and
+/// calling [`axpy_f16`] per row, but the NEON path keeps 32 outputs in registers across all rows
+/// instead of loading and storing them for each one.
+pub fn weighted_rows_f16(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+    if let Some(last) = w.len().checked_sub(1) {
+        assert!(
+            rows.len() >= last * stride + 2 * out.len(),
+            "rows too short"
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64; bounds checked above.
+        unsafe { weighted_rows_f16_neon(out, w, rows, stride) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        weighted_rows_f16_scalar(out, w, rows, stride)
+    }
+}
+
+pub fn weighted_rows_f16_scalar(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+    out.fill(0.0);
+    for (t, &a) in w.iter().enumerate() {
+        axpy_f16_scalar(out, a, &rows[t * stride..t * stride + 2 * out.len()]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn weighted_rows_f16_neon(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+    use std::arch::aarch64::*;
+    /// Columns `c..c + 4 * N` over every row, accumulated in `N` registers.
+    #[inline(always)]
+    unsafe fn cols<const N: usize>(
+        out: *mut f32,
+        w: &[f32],
+        rows: *const u8,
+        stride: usize,
+        c: usize,
+    ) {
+        // SAFETY: the caller checked that every row holds these columns.
+        unsafe {
+            let mut acc = [vdupq_n_f32(0.0); N];
+            for (t, &a) in w.iter().enumerate() {
+                let r = rows.add(t * stride + 2 * c) as *const u16;
+                for j in 0..N / 2 {
+                    let (lo, hi) = widen(vld1q_u16(r.add(8 * j)));
+                    acc[2 * j] = vfmaq_n_f32(acc[2 * j], lo, a);
+                    acc[2 * j + 1] = vfmaq_n_f32(acc[2 * j + 1], hi, a);
+                }
+            }
+            for (j, v) in acc.iter().enumerate() {
+                vst1q_f32(out.add(c + 4 * j), *v);
+            }
+        }
+    }
+    let n = out.len();
+    let (po, pr) = (out.as_mut_ptr(), rows.as_ptr());
+    let mut c = 0;
+    // SAFETY: `weighted_rows_f16` checked the bounds; `rows` may be only byte-aligned, and the
+    // loads are unaligned-safe.
+    unsafe {
+        while c + 32 <= n {
+            cols::<8>(po, w, pr, stride, c);
+            c += 32;
+        }
+        while c + 8 <= n {
+            cols::<2>(po, w, pr, stride, c);
+            c += 8;
+        }
+        for i in c..n {
+            let mut s = 0.0;
+            for (t, &a) in w.iter().enumerate() {
+                s += a * crate::half::f16_to_f32(
+                    (pr.add(t * stride + 2 * i) as *const u16).read_unaligned(),
+                );
+            }
+            *po.add(i) = s;
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::sync::OnceLock;
@@ -278,6 +362,36 @@ mod tests {
             for (f, s) in fast.iter().zip(&slow) {
                 assert!((f - s).abs() <= 1e-6 * (1.0 + s.abs()), "n={n} {f} vs {s}");
             }
+        }
+    }
+
+    #[test]
+    fn weighted_rows_f16_equals_per_row_axpy_exactly() {
+        let mut rng = Rng::new(11);
+        for (n, rows) in [
+            (0, 3),
+            (5, 0),
+            (7, 4),
+            (8, 9),
+            (40, 33),
+            (64, 300),
+            (128, 17),
+            (70, 5),
+        ] {
+            let stride = 2 * n + 6; // rows padded apart, as K/V heads are inside a cache row
+            let bytes: Vec<u8> = rng
+                .vec(rows * stride / 2 + n)
+                .iter()
+                .flat_map(|&v| crate::half::f32_to_f16(v).to_le_bytes())
+                .collect();
+            let w = rng.vec(rows);
+            let mut got = vec![1.0; n];
+            weighted_rows_f16(&mut got, &w, &bytes, stride);
+            let mut want = vec![0.0; n];
+            for (t, &a) in w.iter().enumerate() {
+                axpy_f16(&mut want, a, &bytes[t * stride..t * stride + 2 * n]);
+            }
+            assert_eq!(got, want, "n={n} rows={rows}");
         }
     }
 

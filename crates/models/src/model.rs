@@ -180,16 +180,17 @@ impl KvCache {
         }
     }
 
-    /// `out += p * cache[at..at + out.len()]`.
-    fn axpy(&self, at: usize, p: f32, out: &mut [f32]) {
+    /// `out = Σ_t w[t] · cache[at + t * stride..][..out.len()]`.
+    fn weighted_sum(&self, at: usize, stride: usize, w: &[f32], out: &mut [f32]) {
         match self {
             KvCache::F32(c) => {
-                let n = out.len();
-                for (o, &v) in out.iter_mut().zip(&c[at..at + n]) {
-                    *o += p * v;
+                out.fill(0.0);
+                for (t, &p) in w.iter().enumerate() {
+                    let row = &c[at + t * stride..][..out.len()];
+                    out.iter_mut().zip(row).for_each(|(o, &v)| *o += p * v);
                 }
             }
-            KvCache::F16(c) => simd::axpy_f16(out, p, &c[2 * at..2 * (at + out.len())]),
+            KvCache::F16(c) => simd::weighted_rows_f16(out, w, &c[2 * at..], 2 * stride),
         }
     }
 }
@@ -535,10 +536,7 @@ impl Model {
                     scores.clear();
                     scores.extend((0..n_pos).map(|t| kc.dot(t * kv_dim + off, qh) * scale));
                     ops::softmax(scores);
-                    out.fill(0.0);
-                    for (t, &p) in scores.iter().enumerate() {
-                        vc.axpy(t * kv_dim + off, p, out);
-                    }
+                    vc.weighted_sum(off, kv_dim, scores, out);
                 });
             self.matmul(&layer.wo, &att, &mut tmp, n);
             ops::add_assign(xs, &tmp);
