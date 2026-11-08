@@ -1,7 +1,8 @@
 //! Metal accelerator: runs whole decoder layers on the GPU, reading weights in place from the
 //! model's file mapping (unified memory, no copies). All offloaded layers of a token are
-//! recorded into one command buffer, so a dense model costs one CPU/GPU round trip per token;
-//! MoE layers add one sync each, for top-k routing on the CPU.
+//! recorded into one command buffer, so decoding costs one CPU/GPU round trip per token. MoE
+//! decode routes on the GPU (top-k, then matvecs that read their expert id from a buffer); only
+//! experts stored as separate tensors (old Mixtral files) add a sync per layer for CPU routing.
 //!
 //! Prompts are processed in chunks of up to [`BATCH_CHUNK`] tokens per pass (matmul instead of
 //! matvec, causal batched attention). An MoE layer syncs once per chunk: the CPU routes every
@@ -26,6 +27,9 @@ struct GpuLayer {
     bv: Option<GpuBuf>,
     q_norm: Option<GpuBuf>,
     k_norm: Option<GpuBuf>,
+    /// Byte distance between consecutive experts' gate, up and down matrices, when the experts
+    /// are evenly spaced slices of stacked tensors (needed for routing on the GPU).
+    expert_strides: Option<[usize; 3]>,
 }
 
 /// Most prompt tokens processed per GPU pass; bounds the batch scratch buffers.
@@ -116,9 +120,10 @@ impl Scratch {
             k: gpu.alloc(cap * c.kv_dim()),
             v: gpu.alloc(cap * c.kv_dim()),
             att: gpu.alloc(cap * c.q_dim()),
-            tmp: gpu.alloc(cap * c.n_embd),
-            gate: gpu.alloc(cap * max_ff),
-            up: gpu.alloc(cap * max_ff),
+            // GPU-routed MoE decode keeps one row per chosen expert (plus the shared one).
+            tmp: gpu.alloc(cap.max(c.n_expert_used + 1) * c.n_embd),
+            gate: gpu.alloc(cap.max(c.n_expert_used) * max_ff),
+            up: gpu.alloc(cap.max(c.n_expert_used) * max_ff),
             router: gpu.alloc(cap * c.n_expert.max(1)),
             shared_gate: gpu.alloc(cap),
             gx: gpu.alloc(if c.n_expert > 0 { cap * c.n_embd } else { 0 }),
@@ -250,9 +255,12 @@ impl Metal {
                     router,
                     experts,
                     shared,
-                } => {
-                    b = self.moe(model, b, s, router, experts, shared.as_ref(), n);
-                }
+                } => match g.expert_strides {
+                    Some(strides) if n == 1 => {
+                        self.moe_decode(model, &mut b, s, router, experts, shared.as_ref(), strides)
+                    }
+                    _ => b = self.moe(model, b, s, router, experts, shared.as_ref(), n),
+                },
             }
         }
         if want_logits {
@@ -261,6 +269,64 @@ impl Metal {
             mm(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0), 1);
         }
         b.finish();
+    }
+
+    /// Queues one token's MoE FFN over `s.xb`, adding into `s.x`, routed on the GPU so the
+    /// batch needn't wait: the k chosen experts run as one id-indexed matvec per matrix.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_decode(
+        &self,
+        model: &Model,
+        b: &mut Batch<'_>,
+        s: &Scratch,
+        router: &Weight,
+        experts: &[Expert],
+        shared: Option<&(Weight, Expert)>,
+        [gate_stride, up_stride, down_stride]: [usize; 3],
+    ) {
+        let (c, ne, n_embd) = (&model.cfg, experts.len(), model.cfg.n_embd);
+        let k = c.n_expert_used;
+        mm(b, router, At(&s.xb, 0), At(&s.router, 0), 1);
+        if let Some((gi, _)) = shared {
+            mm(b, gi, At(&s.xb, 0), At(&s.shared_gate, 0), 1);
+        }
+        let (ids, w) = (At(&s.route, 0), At(&s.route, s.route.len() / 2));
+        let (rx, sg) = (At(&s.router, 0), At(&s.shared_gate, 0));
+        b.moe_topk(rx, sg, ids, w, ne, k, c.norm_topk, shared.is_some());
+        let e = &experts[0];
+        let ff = e.gate.rows;
+        let (xb, gate, up, tmp) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
+        for (m, stride, out) in [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)] {
+            b.matvec_id(
+                m.ty, m.rows, m.cols, m.offset, stride, ne, ids, xb, 0, out, ff, k,
+            );
+        }
+        b.swiglu(gate, up, k * ff);
+        let d = &e.down;
+        b.matvec_id(
+            d.ty,
+            d.rows,
+            d.cols,
+            d.offset,
+            down_stride,
+            ne,
+            ids,
+            gate,
+            ff,
+            tmp,
+            n_embd,
+            k,
+        );
+        if let Some((_, e)) = shared {
+            ffn(b, s, e, xb, At(&s.tmp, k * n_embd), 1);
+        }
+        b.moe_combine(
+            At(&s.x, 0),
+            tmp,
+            w,
+            k + usize::from(shared.is_some()),
+            n_embd,
+        );
     }
 
     /// Queues an MoE FFN over `n` rows of `s.xb`, adding into `s.x`. Routing needs the router
@@ -434,6 +500,31 @@ impl Accelerator for Metal {
     }
 }
 
+/// The byte strides between consecutive experts' gate, up and down matrices, if every expert
+/// sits at the same stride (slices of stacked tensors) with the same shape and type.
+fn expert_strides(experts: &[Expert]) -> Option<[usize; 3]> {
+    fn pick(e: &Expert, i: usize) -> &Weight {
+        [&e.gate, &e.up, &e.down][i]
+    }
+    let mut strides = [0; 3];
+    for (i, stride) in strides.iter_mut().enumerate() {
+        let first = pick(&experts[0], i);
+        *stride = match experts.get(1) {
+            Some(e) => pick(e, i).offset.checked_sub(first.offset)?,
+            None => 0,
+        };
+        let even = experts.iter().enumerate().all(|(j, e)| {
+            let m = pick(e, i);
+            m.offset == first.offset + j * *stride
+                && (m.ty, m.rows, m.cols) == (first.ty, first.rows, first.cols)
+        });
+        if !even {
+            return None;
+        }
+    }
+    Some(strides)
+}
+
 /// The matrices the GPU reads when the first `n` layers are offloaded (plus the output head
 /// when that is all of them).
 fn offloaded_weights(model: &Model, n: usize) -> Vec<&Weight> {
@@ -514,6 +605,10 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
             bv: opt(&l.bv),
             q_norm: opt(&l.q_norm),
             k_norm: opt(&l.k_norm),
+            expert_strides: match &l.ffn {
+                Ffn::Moe { experts, .. } => expert_strides(experts),
+                Ffn::Dense(_) => None,
+            },
         })
         .collect();
     let logits = if covers_all { model.output.rows } else { 0 };

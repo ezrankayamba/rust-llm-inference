@@ -43,11 +43,23 @@ const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::Q5_K, "matmul_q5_k"),
     (GgmlType::Q6_K, "matmul_q6_k"),
 ];
+const MATVEC_ID_KERNELS: [(GgmlType, &str); 8] = [
+    (GgmlType::F32, "matvec_id_f32"),
+    (GgmlType::F16, "matvec_id_f16"),
+    (GgmlType::Q4_0, "matvec_id_q4_0"),
+    (GgmlType::Q5_0, "matvec_id_q5_0"),
+    (GgmlType::Q8_0, "matvec_id_q8_0"),
+    (GgmlType::Q4_K, "matvec_id_q4_k"),
+    (GgmlType::Q5_K, "matvec_id_q5_k"),
+    (GgmlType::Q6_K, "matvec_id_q6_k"),
+];
 /// Matmul output tile (`MM_R` x `MM_T` in metal.metal), computed by 128 threads.
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: usize = 32;
 const MATMUL_THREADS: usize = 128;
-const OTHER_KERNELS: [&str; 15] = [
+const OTHER_KERNELS: [&str; 17] = [
+    "moe_topk",
+    "moe_combine",
     "rmsnorm",
     "add",
     "add_bcast",
@@ -198,6 +210,7 @@ pub struct Gpu {
     weights_end: usize,
     matvec: Vec<(GgmlType, Pipeline)>,
     matmul: Vec<(GgmlType, Pipeline)>,
+    matvec_id: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
     name: String,
 }
@@ -224,6 +237,28 @@ struct MatmulParams {
     cols: u32,
     row_bytes: u32,
     n: u32,
+}
+#[repr(C)]
+struct IdParams {
+    offset: u64,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    expert_stride: u64,
+    x_stride: u32,
+    y_stride: u32,
+}
+#[repr(C)]
+struct TopkParams {
+    n_expert: u32,
+    k: u32,
+    norm: u32,
+    shared: u32,
+}
+#[repr(C)]
+struct CombineParams {
+    n: u32,
+    m: u32,
 }
 #[repr(C)]
 struct NormParams {
@@ -352,6 +387,10 @@ impl Gpu {
             .iter()
             .map(|&(t, n)| Ok((t, pipeline(n)?)))
             .collect::<Result<_, String>>()?;
+        let matvec_id = MATVEC_ID_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, pipeline(n)?)))
+            .collect::<Result<_, String>>()?;
         let other = OTHER_KERNELS
             .iter()
             .map(|&n| Ok((n, pipeline(n)?)))
@@ -368,6 +407,7 @@ impl Gpu {
             weights_end: span.end,
             matvec,
             matmul,
+            matvec_id,
             other,
             name,
         })
@@ -649,6 +689,134 @@ impl Batch<'_> {
                 n.div_ceil(MATMUL_TILE_TOKENS),
             ),
             MATMUL_THREADS,
+        );
+    }
+
+    /// Routes one token's MoE layer on the GPU: from the `n_expert` router logits, writes the
+    /// top `k` expert ids (u32 bits) to `ids` and their softmax weights (renormalized over the
+    /// k when `norm`) to `w`; with `shared`, also `w[k]` = sigmoid(`shared_gate[0]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_topk(
+        &mut self,
+        logits: At<'_>,
+        shared_gate: At<'_>,
+        ids: At<'_>,
+        w: At<'_>,
+        n_expert: usize,
+        k: usize,
+        norm: bool,
+        shared: bool,
+    ) {
+        assert!(logits.1 + n_expert <= logits.0.len && ids.1 + k <= ids.0.len);
+        assert!(
+            k <= n_expert && n_expert <= 32 * 64,
+            "the kernel tracks 64 experts per lane"
+        );
+        assert!(w.1 + k + usize::from(shared) <= w.0.len && shared_gate.1 < shared_gate.0.len);
+        self.bind(0, logits);
+        self.bind(1, shared_gate);
+        self.bind(2, ids);
+        self.bind(3, w);
+        self.params(
+            4,
+            &TopkParams {
+                n_expert: n_expert as u32,
+                k: k as u32,
+                norm: norm.into(),
+                shared: shared.into(),
+            },
+        );
+        self.dispatch(self.gpu.other("moe_topk"), 1, 32);
+    }
+
+    /// `y[slot] = W[ids[slot]] x[slot]` for `slots` slots: `W[e]` is expert `e` of a stacked
+    /// tensor whose expert 0 (`rows x cols` of `ty`) starts at byte `offset` of the model
+    /// mapping, the `n_expert` experts `expert_stride` bytes apart. Slot inputs and outputs
+    /// are `x_stride` and `y_stride` floats apart (`x_stride` 0: all slots read one `x`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_id(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        expert_stride: usize,
+        n_expert: usize,
+        ids: At<'_>,
+        x: At<'_>,
+        x_stride: usize,
+        y: At<'_>,
+        y_stride: usize,
+        slots: usize,
+    ) {
+        assert!(
+            cols.is_multiple_of(32),
+            "matvec cols must be a multiple of 32"
+        );
+        assert!(slots >= 1 && ids.1 + slots <= ids.0.len);
+        assert!(
+            x.1 + (slots - 1) * x_stride + cols <= x.0.len,
+            "matvec_id x too small"
+        );
+        assert!(
+            y.1 + (slots - 1) * y_stride + rows <= y.0.len,
+            "matvec_id y too small"
+        );
+        let row_bytes = ty.row_bytes(cols);
+        let span = (n_expert - 1) * expert_stride + rows * row_bytes;
+        let offset = self.gpu.weight_offset(offset, span);
+        let pipeline = &self
+            .gpu
+            .matvec_id
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("unsupported type for Metal")
+            .1;
+        self.enc.setComputePipelineState(pipeline);
+        // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&self.gpu.weights), 0, 0)
+        };
+        self.bind(1, x);
+        self.bind(2, y);
+        self.params(
+            3,
+            &IdParams {
+                offset: offset as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+                row_bytes: row_bytes as u32,
+                expert_stride: expert_stride as u64,
+                x_stride: x_stride as u32,
+                y_stride: y_stride as u32,
+            },
+        );
+        self.bind(4, ids);
+        self.dispatch2(
+            pipeline,
+            (rows.div_ceil(MATVEC_ROWS_PER_TG), slots),
+            MATVEC_ROWS_PER_TG * 32,
+        );
+    }
+
+    /// `x += Σ_{r<m} w[r] · src[r]`, rows of `n`: the chosen experts' outputs, combined.
+    pub fn moe_combine(&mut self, x: At<'_>, src: At<'_>, w: At<'_>, m: usize, n: usize) {
+        assert!(x.1 + n <= x.0.len && src.1 + m * n <= src.0.len && w.1 + m <= w.0.len);
+        self.bind(0, x);
+        self.bind(1, src);
+        self.bind(2, w);
+        self.params(
+            3,
+            &CombineParams {
+                n: n as u32,
+                m: m as u32,
+            },
+        );
+        self.dispatch(
+            self.gpu.other("moe_combine"),
+            n.div_ceil(ELT_THREADS),
+            ELT_THREADS,
         );
     }
 

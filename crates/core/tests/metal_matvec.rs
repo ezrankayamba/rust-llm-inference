@@ -184,3 +184,69 @@ fn metal_matvec_outside_the_span_panics() {
     let mut got = vec![0.0; ROWS];
     gpu.matvec(TYPES[1], ROWS, COLS, offsets[1], &input(1), &mut got);
 }
+
+/// GPU MoE routing against a CPU reference with 128 experts (four per lane), a tie (the lower
+/// index wins), with and without renormalization, and the shared expert's sigmoid gate.
+#[test]
+fn moe_topk_matches_cpu_routing_with_many_experts() {
+    use rli_core::metal::At;
+    let mut mem = Pages::new(PAGE);
+    let gpu = unsafe { Gpu::new(mem.bytes(), 0..PAGE) }.unwrap();
+    let (ne, k) = (128, 8);
+    let mut seed = 0x9e37_79b9u32;
+    let mut logits: Vec<f32> = (0..ne)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10_000) as f32 / 1000.0 - 5.0
+        })
+        .collect();
+    // A tie for a top place between experts 70 and 101: 70 must win.
+    logits[70] = 9.0;
+    logits[101] = 9.0;
+    let gate = 0.3f32;
+    for norm in [false, true] {
+        let (lx, sg) = (gpu.upload(&logits), gpu.upload(&[gate]));
+        let (ids, w) = (gpu.alloc(k), gpu.alloc(k + 1));
+        let mut b = gpu.batch();
+        b.moe_topk(
+            At(&lx, 0),
+            At(&sg, 0),
+            At(&ids, 0),
+            At(&w, 0),
+            ne,
+            k,
+            norm,
+            true,
+        );
+        b.finish();
+        let (got_ids, got_w): (Vec<u32>, Vec<f32>) = unsafe {
+            (
+                ids.as_slice().iter().map(|v| v.to_bits()).collect(),
+                w.as_slice().to_vec(),
+            )
+        };
+        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
+        let mut order: Vec<usize> = (0..ne).collect();
+        order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        let want_ids: Vec<u32> = order[..k].iter().map(|&e| e as u32).collect();
+        let probs: Vec<f32> = order[..k]
+            .iter()
+            .map(|&e| (logits[e] - mx).exp() / sum)
+            .collect();
+        let total: f32 = if norm { probs.iter().sum() } else { 1.0 };
+        assert_eq!(got_ids, want_ids, "norm={norm}");
+        assert_eq!(&got_ids[..2], &[70, 101]);
+        for (g, p) in got_w.iter().zip(&probs) {
+            assert!(
+                (g - p / total).abs() < 1e-6,
+                "norm={norm}: {g} vs {}",
+                p / total
+            );
+        }
+        let sigmoid = 1.0 / (1.0 + (-gate).exp());
+        assert!((got_w[k] - sigmoid).abs() < 1e-6);
+    }
+}

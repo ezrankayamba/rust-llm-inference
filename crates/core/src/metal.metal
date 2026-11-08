@@ -140,6 +140,47 @@ MATVEC(matvec_q4_k, chunk_q4_k)
 MATVEC(matvec_q5_k, chunk_q5_k)
 MATVEC(matvec_q6_k, chunk_q6_k)
 
+// MoE decode without a CPU round trip: `MATVEC` for slot `tg.y` of the k chosen experts, whose
+// matrix is expert ids[slot] of a stacked tensor (`expert_stride` bytes apart). Slot inputs and
+// outputs are `x_stride` / `y_stride` floats apart (x_stride 0: every slot reads the same x).
+struct IdParams {
+    ulong offset;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    ulong expert_stride;
+    uint x_stride;
+    uint y_stride;
+};
+
+#define MATVEC_ID(NAME, CHUNK)                                                                \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant IdParams& p [[buffer(3)]],          \
+                 device const uint* ids [[buffer(4)]],                                        \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = tg.x * ROWS_PER_TG + sg;                                                       \
+    if (row >= p.rows) return;                                                                \
+    uint slot = tg.y;                                                                         \
+    device const uchar* r =                                                                   \
+        w + p.offset + ulong(ids[slot]) * p.expert_stride + ulong(row) * p.row_bytes;         \
+    device const float* xs = x + slot * p.x_stride;                                           \
+    float acc = 0;                                                                            \
+    for (uint c = lane; c < p.cols / 32; c += 32) acc += CHUNK(r, c, xs + c * 32);            \
+    acc = simd_sum(acc);                                                                      \
+    if (lane == 0) y[slot * p.y_stride + row] = acc;                                          \
+}
+
+MATVEC_ID(matvec_id_f32, chunk_f32)
+MATVEC_ID(matvec_id_f16, chunk_f16)
+MATVEC_ID(matvec_id_q4_0, chunk_q4_0)
+MATVEC_ID(matvec_id_q5_0, chunk_q5_0)
+MATVEC_ID(matvec_id_q8_0, chunk_q8_0)
+MATVEC_ID(matvec_id_q4_k, chunk_q4_k)
+MATVEC_ID(matvec_id_q5_k, chunk_q5_k)
+MATVEC_ID(matvec_id_q6_k, chunk_q6_k)
+
 // ---- Batched matmul for prompt processing: Y[n][rows] = X[n][cols] . W^T ----
 
 inline void deq_f32(device const uchar* r, uint c, thread float* w) {
@@ -362,6 +403,62 @@ kernel void gather_rows(device const float* src [[buffer(0)]], device float* dst
                         device const uint* idx [[buffer(2)]], constant EltParams& p [[buffer(3)]],
                         uint i [[thread_position_in_grid]]) {
     if (i < p.n) dst[i] = src[ulong(idx[i / p.m]) * p.m + i % p.m];
+}
+
+// MoE routing for one token: softmax over the router logits, the top k (ties go to the lower
+// index), weights optionally renormalized over the k; with a shared expert, w[k] is its
+// sigmoid gate. One simdgroup: lane l scans experts l, l + 32, ... (`taken` bit j = its j-th),
+// and each of the k rounds picks the best remaining expert with simd reductions.
+struct TopkParams { uint n_expert; uint k; uint norm; uint shared; };
+
+kernel void moe_topk(device const float* logits [[buffer(0)]],
+                     device const float* shared_gate [[buffer(1)]],
+                     device uint* ids [[buffer(2)]], device float* w [[buffer(3)]],
+                     constant TopkParams& p [[buffer(4)]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    float mx = -INFINITY;
+    for (uint e = lane; e < p.n_expert; e += 32) mx = max(mx, logits[e]);
+    mx = simd_max(mx);
+    float sum = 0;
+    for (uint e = lane; e < p.n_expert; e += 32) sum += exp(logits[e] - mx);
+    sum = simd_sum(sum);
+    ulong taken = 0;
+    float chosen = 0;
+    for (uint i = 0; i < p.k; i++) {
+        float bv = -INFINITY;
+        uint be = UINT_MAX;
+        for (uint e = lane, j = 0; e < p.n_expert; e += 32, j++) {
+            if (!((taken >> j) & 1) && logits[e] > bv) {
+                bv = logits[e];
+                be = e;
+            }
+        }
+        float best = simd_max(bv);
+        uint win = simd_min(bv == best ? be : UINT_MAX);
+        if (win == be) taken |= 1ul << (win / 32);
+        float wi = exp(best - mx) / sum;
+        chosen += wi;
+        if (lane == 0) {
+            ids[i] = win;
+            w[i] = wi;
+        }
+    }
+    if (lane == 0) {
+        if (p.norm) for (uint i = 0; i < p.k; i++) w[i] /= chosen;
+        if (p.shared) w[p.k] = 1.0f / (1.0f + exp(-shared_gate[0]));
+    }
+}
+
+// x += sum over r < m of w[r] * src row r (rows of n): the chosen experts' outputs, combined.
+struct CombineParams { uint n; uint m; };
+
+kernel void moe_combine(device float* x [[buffer(0)]], device const float* src [[buffer(1)]],
+                        device const float* w [[buffer(2)]], constant CombineParams& p [[buffer(3)]],
+                        uint j [[thread_position_in_grid]]) {
+    if (j >= p.n) return;
+    float s = 0;
+    for (uint r = 0; r < p.m; r++) s += w[r] * src[r * p.n + j];
+    x[j] += s;
 }
 
 // MoE combine: dst row idx[r] += w[r] * src row r. Indices within one call must be distinct.

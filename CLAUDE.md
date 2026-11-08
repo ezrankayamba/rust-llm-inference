@@ -55,8 +55,7 @@ Design points that span files:
   The CPU layers' KV cache is f16 too (`KvCache`; f32 when `precise` is set as the session is
   created), grown per token.
 - **GPU offload is layer-level.** All offloaded layers of a token are queued as one batch with
-  one sync, plus one sync per MoE layer for top-k routing on the CPU. Per-matvec offload was
-  measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
+  one sync (MoE included, see below). Per-matvec offload was measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
 - **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
   `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
   in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
@@ -68,7 +67,12 @@ Design points that span files:
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
   still route per row.
-- **MoE on Metal** (decode and prompts share one path): per layer and chunk, one router matmul
+- **MoE on Metal.** Decode routes on the GPU, with no sync: `moe_topk` (one simdgroup) writes
+  the k expert ids and weights, `matvec_id` runs all k experts' gate/up/down as one dispatch
+  each (expert id read from the buffer, experts at a fixed stride in the stacked tensor), and
+  `moe_combine` adds the weighted outputs. A per-layer sync cost ~0.35 ms; removing it took
+  Qwen3-30B-A3B decode from 19.6 to 29.1 tok/s. Experts stored as separate tensors (old
+  Mixtral files) and prompts take the CPU-routed path: per layer and chunk, one router matmul
   and one sync; the CPU picks each token's top-k, then each used expert runs as a matmul over
   the rows gathered for it (`gather_rows`), added back weighted (`scatter_axpy`). A shared
   expert runs over all rows with a per-token sigmoid gate.
