@@ -196,18 +196,61 @@ pub fn wrapped_len(span: &Range<usize>) -> usize {
     (span.end - page_floor(span.start)).div_ceil(page_size()) * page_size()
 }
 
+/// Units further apart than this go in separate buffers rather than wrapping the gap.
+const MAX_GAP: usize = 64 << 20;
+
+/// Groups `units` (file byte ranges, each kept whole) into the page-rounded spans [`Gpu::new`]
+/// wraps as buffers: in file order, a span grows while it stays within `max` bytes and the next
+/// unit starts within [`MAX_GAP`]. Neighbouring spans may share a page. Errors if a unit alone
+/// exceeds `max`.
+pub fn buffer_spans(units: &[Range<usize>], max: usize) -> Result<Vec<Range<usize>>, String> {
+    let mut sorted: Vec<Range<usize>> = units.iter().filter(|u| u.start < u.end).cloned().collect();
+    sorted.sort_by_key(|u| u.start);
+    let mut spans: Vec<Range<usize>> = Vec::new();
+    for u in sorted {
+        if wrapped_len(&u) > max {
+            return Err(format!(
+                "a weight tensor of {} bytes exceeds the largest Metal buffer ({max} bytes)",
+                u.end - u.start
+            ));
+        }
+        match spans.last_mut() {
+            Some(s)
+                if u.start <= s.end + MAX_GAP
+                    && wrapped_len(&(s.start..u.end.max(s.end))) <= max =>
+            {
+                s.end = s.end.max(u.end)
+            }
+            _ => spans.push(u),
+        }
+    }
+    Ok(spans)
+}
+
 /// The largest buffer the default Metal device can create, or `None` without a device.
 pub fn max_buffer_len() -> Option<usize> {
     MTLCreateSystemDefaultDevice().map(|d| d.maxBufferLength())
 }
 
+/// How much memory the default Metal device should keep resident before performance suffers
+/// (`recommendedMaxWorkingSetSize`), or `None` without a device.
+pub fn working_set_len() -> Option<usize> {
+    MTLCreateSystemDefaultDevice().map(|d| d.recommendedMaxWorkingSetSize() as usize)
+}
+
+/// One no-copy view of the mapping: file bytes `base..end` (`base` page-aligned).
+struct WeightBuf {
+    base: usize,
+    end: usize,
+    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
 pub struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    weights: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// File offset of the first wrapped byte (page-aligned) and the end of the usable span.
-    weights_base: usize,
-    weights_end: usize,
+    /// The weight spans, each wrapped as its own buffer (one buffer is capped at
+    /// `maxBufferLength`), in file order.
+    weights: Vec<WeightBuf>,
     matvec: Vec<(GgmlType, Pipeline)>,
     matmul: Vec<(GgmlType, Pipeline)>,
     matvec_id: Vec<(GgmlType, Pipeline)>,
@@ -335,38 +378,75 @@ impl Gpu {
     /// file) for GPU access, rounded out to whole pages. Weight offsets passed to [`Batch`]
     /// stay relative to `mapped` and must lie inside `span`.
     ///
+    /// Wraps the file byte ranges `units` of `mapped` (each kept whole, e.g. one tensor or one
+    /// layer's weights) as no-copy buffers of at most `maxBufferLength` bytes.
+    ///
     /// # Safety
     /// `mapped` must be the start of a memory mapping that stays valid and unmodified for the
     /// lifetime of the returned value; the pages up to the next page boundary must be mapped
     /// (true for any `mmap` of the file).
-    pub unsafe fn new(mapped: &[u8], span: Range<usize>) -> Result<Self, String> {
-        assert!(span.start <= span.end && span.end <= mapped.len());
+    pub unsafe fn new(mapped: &[u8], units: &[Range<usize>]) -> Result<Self, String> {
         let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+        let max = device.maxBufferLength();
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::with_device(device, mapped, units, max) }
+    }
+
+    /// [`Gpu::new`] with buffers capped at `max` bytes (below `maxBufferLength`), so tests can
+    /// exercise weights split across several buffers.
+    ///
+    /// # Safety
+    /// As for [`Gpu::new`].
+    pub unsafe fn new_capped(
+        mapped: &[u8],
+        units: &[Range<usize>],
+        max: usize,
+    ) -> Result<Self, String> {
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device available")?;
+        let max = max.min(device.maxBufferLength());
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::with_device(device, mapped, units, max) }
+    }
+
+    /// # Safety
+    /// As for [`Gpu::new`].
+    unsafe fn with_device(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        mapped: &[u8],
+        units: &[Range<usize>],
+        max: usize,
+    ) -> Result<Self, String> {
+        assert!(
+            units
+                .iter()
+                .all(|u| u.start <= u.end && u.end <= mapped.len())
+        );
         if !(mapped.as_ptr() as usize).is_multiple_of(page_size()) {
             return Err("weights mapping is not page-aligned".into());
         }
-        let (base, len) = (page_floor(span.start), wrapped_len(&span));
-        if len > device.maxBufferLength() {
-            return Err(format!(
-                "the offloaded weights ({len} bytes) exceed Metal's maxBufferLength ({}); \
-                 offload fewer layers (--gpu-layers)",
-                device.maxBufferLength()
-            ));
+        let mut weights = Vec::new();
+        for span in buffer_spans(units, max)? {
+            let (base, len) = (page_floor(span.start), wrapped_len(&span));
+            // SAFETY: `base <= span.end <= mapped.len()`, so the pointer stays in the mapping.
+            let ptr = NonNull::new(unsafe { mapped.as_ptr().add(base) } as *mut std::ffi::c_void)
+                .ok_or("null mapping")?;
+            // SAFETY: page-aligned, page-rounded, outlives `self` per the caller contract; the
+            // GPU only reads it. No deallocator: the mapping is owned elsewhere.
+            let buf = unsafe {
+                device.newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr,
+                    len,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            }
+            .ok_or("could not wrap the model mapping as a Metal buffer")?;
+            weights.push(WeightBuf {
+                base,
+                end: span.end,
+                buf,
+            });
         }
-        // SAFETY: `base <= span.end <= mapped.len()`, so the pointer stays in the mapping.
-        let ptr = NonNull::new(unsafe { mapped.as_ptr().add(base) } as *mut std::ffi::c_void)
-            .ok_or("null mapping")?;
-        // SAFETY: page-aligned, page-rounded, outlives `self` per the caller contract; the GPU
-        // only reads it. No deallocator: the mapping is owned elsewhere.
-        let weights = unsafe {
-            device.newBufferWithBytesNoCopy_length_options_deallocator(
-                ptr,
-                len,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
-        }
-        .ok_or("could not wrap the model mapping as a Metal buffer")?;
 
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
@@ -403,8 +483,6 @@ impl Gpu {
             device,
             queue,
             weights,
-            weights_base: base,
-            weights_end: span.end,
             matvec,
             matmul,
             matvec_id,
@@ -417,13 +495,14 @@ impl Gpu {
         &self.name
     }
 
-    /// Rebases a file offset of `bytes` weight bytes onto the wrapped span.
-    fn weight_offset(&self, offset: usize, bytes: usize) -> usize {
-        assert!(
-            offset >= self.weights_base && offset + bytes <= self.weights_end,
-            "weights out of range"
-        );
-        offset - self.weights_base
+    /// The buffer holding file bytes `offset..offset + bytes`, and `offset` rebased onto it.
+    fn weight_buf(&self, offset: usize, bytes: usize) -> (&ProtocolObject<dyn MTLBuffer>, usize) {
+        let w = self
+            .weights
+            .iter()
+            .find(|w| offset >= w.base && offset + bytes <= w.end)
+            .expect("weights out of range");
+        (&w.buf, offset - w.base)
     }
 
     pub fn supports(&self, ty: GgmlType) -> bool {
@@ -599,7 +678,7 @@ impl Batch<'_> {
             "matvec buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
-        let offset = self.gpu.weight_offset(offset, rows * row_bytes);
+        let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
         let pipeline = &self
             .gpu
             .matvec
@@ -609,10 +688,7 @@ impl Batch<'_> {
             .1;
         self.enc.setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.gpu.weights), 0, 0)
-        };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.params(
@@ -656,7 +732,7 @@ impl Batch<'_> {
             "matmul buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
-        let offset = self.gpu.weight_offset(offset, rows * row_bytes);
+        let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
         let pipeline = &self
             .gpu
             .matmul
@@ -666,10 +742,7 @@ impl Batch<'_> {
             .1;
         self.enc.setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.gpu.weights), 0, 0)
-        };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.params(
@@ -764,7 +837,7 @@ impl Batch<'_> {
         );
         let row_bytes = ty.row_bytes(cols);
         let span = (n_expert - 1) * expert_stride + rows * row_bytes;
-        let offset = self.gpu.weight_offset(offset, span);
+        let (wbuf, offset) = self.gpu.weight_buf(offset, span);
         let pipeline = &self
             .gpu
             .matvec_id
@@ -774,10 +847,7 @@ impl Batch<'_> {
             .1;
         self.enc.setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe {
-            self.enc
-                .setBuffer_offset_atIndex(Some(&self.gpu.weights), 0, 0)
-        };
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.params(
@@ -1049,5 +1119,35 @@ impl Batch<'_> {
         if let Some(e) = self.cmd.error() {
             panic!("Metal command failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_GAP, buffer_spans};
+
+    #[test]
+    fn buffer_spans_pack_units_in_file_order_up_to_the_cap() {
+        let p = super::page_size();
+        // Out of order; 0..p and p..2p fit one 2-page span, the third starts a new one.
+        let units = [p..2 * p, 0..p, 2 * p + 10..3 * p];
+        assert_eq!(
+            buffer_spans(&units, 2 * p).unwrap(),
+            vec![0..2 * p, 2 * p + 10..3 * p]
+        );
+        // A cap that holds everything gives one span.
+        assert_eq!(buffer_spans(&units, 3 * p).unwrap(), vec![0..3 * p]);
+    }
+
+    #[test]
+    fn buffer_spans_split_at_large_gaps_and_reject_oversized_units() {
+        let p = super::page_size();
+        let far = MAX_GAP + 2 * p;
+        assert_eq!(
+            buffer_spans(&[0..p, far..far + p], usize::MAX).unwrap(),
+            vec![0..p, far..far + p]
+        );
+        assert!(buffer_spans(std::slice::from_ref(&(0..3 * p)), 2 * p).is_err());
+        assert!(buffer_spans(&[], p).unwrap().is_empty());
     }
 }

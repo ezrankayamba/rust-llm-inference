@@ -525,20 +525,23 @@ fn expert_strides(experts: &[Expert]) -> Option<[usize; 3]> {
     Some(strides)
 }
 
+/// The matrices one layer's offload reads.
+fn layer_weights(layer: &crate::model::Layer) -> Vec<&Weight> {
+    let mut weights = vec![&layer.wq, &layer.wk, &layer.wv, &layer.wo];
+    if let Ffn::Moe { router, shared, .. } = &layer.ffn {
+        weights.push(router);
+        weights.extend(shared.as_ref().map(|(g, _)| g));
+    }
+    for e in experts_of(&layer.ffn) {
+        weights.extend([&e.gate, &e.up, &e.down]);
+    }
+    weights
+}
+
 /// The matrices the GPU reads when the first `n` layers are offloaded (plus the output head
 /// when that is all of them).
 fn offloaded_weights(model: &Model, n: usize) -> Vec<&Weight> {
-    let mut weights: Vec<&Weight> = Vec::new();
-    for layer in &model.layers[..n] {
-        weights.extend([&layer.wq, &layer.wk, &layer.wv, &layer.wo]);
-        if let Ffn::Moe { router, shared, .. } = &layer.ffn {
-            weights.push(router);
-            weights.extend(shared.as_ref().map(|(g, _)| g));
-        }
-        for e in experts_of(&layer.ffn) {
-            weights.extend([&e.gate, &e.up, &e.down]);
-        }
-    }
+    let mut weights: Vec<&Weight> = model.layers[..n].iter().flat_map(layer_weights).collect();
     if n == model.cfg.n_layer {
         weights.push(&model.output);
     }
@@ -556,11 +559,35 @@ fn span(weights: &[&Weight]) -> Range<usize> {
     start..end.max(start)
 }
 
-/// The most leading layers whose weights fit in one Metal buffer (the whole model when it
-/// fits), or `None` without a Metal device.
+/// The file ranges the GPU wraps when the first `n` layers are offloaded: one per layer (so a
+/// stacked expert tensor is never split across buffers) and the output head with all of them.
+fn offload_units(model: &Model, n: usize) -> Vec<Range<usize>> {
+    let mut units: Vec<Range<usize>> = model.layers[..n]
+        .iter()
+        .map(|l| span(&layer_weights(l)))
+        .collect();
+    if n == model.cfg.n_layer {
+        units.push(span(&[&model.output]));
+    }
+    units
+}
+
+/// Room left in Metal's recommended working set for the KV cache, scratch buffers and the
+/// window server when choosing how many layers to offload.
+const WORKING_SET_MARGIN: usize = 1 << 30;
+
+/// The most leading layers whose weights fit Metal's recommended working set (less
+/// [`WORKING_SET_MARGIN`]) in buffers of at most `maxBufferLength`, or `None` without a device.
 pub fn fitting_layers(model: &Model) -> Option<usize> {
-    let max = rli_core::metal::max_buffer_len()?;
-    let fits = |n| rli_core::metal::wrapped_len(&span(&offloaded_weights(model, n))) <= max;
+    use rli_core::metal::{buffer_spans, max_buffer_len, working_set_len, wrapped_len};
+    let (max, budget) = (
+        max_buffer_len()?,
+        working_set_len()?.saturating_sub(WORKING_SET_MARGIN),
+    );
+    let fits = |n| {
+        buffer_spans(&offload_units(model, n), max)
+            .is_ok_and(|spans| spans.iter().map(wrapped_len).sum::<usize>() <= budget)
+    };
     Some(
         (0..=model.cfg.n_layer)
             .rev()
@@ -570,14 +597,34 @@ pub fn fitting_layers(model: &Model) -> Option<usize> {
 }
 
 pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
+    attach_with(model, layers, None)
+}
+
+/// [`attach`] with the weights wrapped in buffers of at most `max_buffer` bytes, so tests can
+/// split a small model across several buffers.
+#[doc(hidden)]
+pub fn attach_capped(
+    model: &mut Model,
+    layers: usize,
+    max_buffer: usize,
+) -> Result<(), BackendError> {
+    attach_with(model, layers, Some(max_buffer))
+}
+
+fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(), BackendError> {
     let c = model.cfg.clone();
     let n = layers.min(c.n_layer);
     let covers_all = n == c.n_layer;
     let weights = offloaded_weights(model, n);
+    let units = offload_units(model, n);
     let mapped = model.gguf().mapped_bytes();
     // SAFETY: the GPU views the model's own mapping, and `Model` drops its accelerator before
     // the mapping (field order), so the view never outlives it.
-    let gpu = unsafe { Gpu::new(mapped, span(&weights)) }.map_err(BackendError)?;
+    let gpu = match cap {
+        None => unsafe { Gpu::new(mapped, &units) },
+        Some(max) => unsafe { Gpu::new_capped(mapped, &units, max) },
+    }
+    .map_err(BackendError)?;
     if let Some(w) = weights
         .iter()
         .find(|w| !gpu.supports(w.ty) || w.cols % 32 != 0)

@@ -21,7 +21,8 @@ pub const HAS_GPU: bool = cfg!(any(
 
 /// Applies a `--gpu-layers` choice. `Some(n)` offloads exactly `n` layers and fails loudly.
 /// `None` offloads as many layers as the GPU backend can take (every layer, unless the model
-/// is larger than one Metal buffer); if the GPU can't take any, the model stays on the CPU.
+/// exceeds Metal's recommended working set); if the GPU can't take any, the model stays on
+/// the CPU.
 /// Either shortfall is returned as a warning to show the user.
 pub fn attach_default(
     model: &mut Model,
@@ -37,14 +38,14 @@ pub fn attach_default(
     let n = default_layers(model);
     if n == 0 {
         return Ok(Some(
-            "GPU offload unavailable, running on the CPU: no layer's weights fit in one Metal buffer"
+            "GPU offload unavailable, running on the CPU: no layer's weights fit the GPU's memory"
                 .into(),
         ));
     }
     Ok(match attach(model, n) {
         Err(e) => Some(format!("GPU offload unavailable, running on the CPU: {e}")),
         Ok(()) if n < total => Some(format!(
-            "offloading {n} of {total} layers to the GPU (the rest exceed Metal's buffer limit); \
+            "offloading {n} of {total} layers to the GPU (the rest don't fit its memory); \
              the other layers run on the CPU"
         )),
         Ok(()) => None,
@@ -60,6 +61,18 @@ fn default_layers(model: &Model) -> usize {
     }
     #[allow(unreachable_code)]
     model.cfg.n_layer
+}
+
+/// Metal [`attach`] with the weights wrapped in buffers of at most `max_buffer` bytes, so
+/// tests can split a small model across several buffers.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[doc(hidden)]
+pub fn attach_capped(
+    model: &mut Model,
+    layers: usize,
+    max_buffer: usize,
+) -> Result<(), BackendError> {
+    crate::metal::attach_capped(model, layers, max_buffer)
 }
 
 /// Offloads the first `layers` layers' matvecs to the GPU backend of this build.

@@ -117,7 +117,8 @@ fn metal_matvec_matches_cpu_for_every_supported_type() {
     let (mut mem, offsets) = fixture();
     let buf = mem.bytes();
     let x = input(1);
-    let gpu = unsafe { Gpu::new(buf, 0..buf.len()) }.expect("Metal device");
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
     for (&ty, &off) in TYPES.iter().zip(&offsets) {
         assert!(gpu.supports(ty));
         let mut got = vec![0.0; ROWS];
@@ -130,7 +131,8 @@ fn metal_matvec_matches_cpu_for_every_supported_type() {
 fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
     let (mut mem, offsets) = fixture();
     let buf = mem.bytes();
-    let gpu = unsafe { Gpu::new(buf, 0..buf.len()) }.expect("Metal device");
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
     // 2: one partial token tile; 17: two full tiles plus a partial one.
     for n in [2, 17] {
         let x = input(n);
@@ -150,6 +152,33 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
     }
 }
 
+/// Each matrix its own unit, buffers capped at six pages: the matrices land in several
+/// buffers (neighbours sharing a page), and each matvec must bind the right one.
+#[test]
+fn metal_matvec_across_several_buffers_matches_cpu() {
+    let (mut mem, offsets) = fixture();
+    let buf = mem.bytes();
+    let units: Vec<_> = TYPES
+        .iter()
+        .zip(&offsets)
+        .map(|(ty, &off)| off..off + ty.row_bytes(COLS) * ROWS)
+        .collect();
+    let spans = rli_core::metal::buffer_spans(&units, 6 * PAGE).unwrap();
+    assert!(spans.len() >= 3, "only {} buffers", spans.len());
+    let gpu = unsafe { Gpu::new_capped(buf, &units, 6 * PAGE) }.expect("Metal device");
+    let x = input(1);
+    for (&ty, &off) in TYPES.iter().zip(&offsets) {
+        let mut got = vec![0.0; ROWS];
+        gpu.matvec(ty, ROWS, COLS, off, &x, &mut got);
+        assert_close(
+            ty,
+            "multi-buffer matvec",
+            &got,
+            &cpu_matvec(buf, ty, off, &x),
+        );
+    }
+}
+
 /// Wrapping only part of the mapping, starting mid-page: offsets stay file-relative.
 #[test]
 fn metal_matvec_on_a_partial_span_matches_cpu() {
@@ -161,7 +190,7 @@ fn metal_matvec_on_a_partial_span_matches_cpu() {
         "span must start mid-page, past page 0"
     );
     let end = offsets[TYPES.len() - 1] + TYPES[TYPES.len() - 1].row_bytes(COLS) * ROWS;
-    let gpu = unsafe { Gpu::new(buf, start..end) }.expect("Metal device");
+    let gpu = unsafe { Gpu::new(buf, std::slice::from_ref(&(start..end))) }.expect("Metal device");
     let x = input(1);
     for (&ty, &off) in TYPES.iter().zip(&offsets).skip(2) {
         let mut got = vec![0.0; ROWS];
@@ -180,7 +209,8 @@ fn metal_matvec_on_a_partial_span_matches_cpu() {
 fn metal_matvec_outside_the_span_panics() {
     let (mut mem, offsets) = fixture();
     let buf = mem.bytes();
-    let gpu = unsafe { Gpu::new(buf, offsets[2]..buf.len()) }.expect("Metal device");
+    let gpu = unsafe { Gpu::new(buf, std::slice::from_ref(&(offsets[2]..buf.len()))) }
+        .expect("Metal device");
     let mut got = vec![0.0; ROWS];
     gpu.matvec(TYPES[1], ROWS, COLS, offsets[1], &input(1), &mut got);
 }
@@ -191,7 +221,7 @@ fn metal_matvec_outside_the_span_panics() {
 fn moe_topk_matches_cpu_routing_with_many_experts() {
     use rli_core::metal::At;
     let mut mem = Pages::new(PAGE);
-    let gpu = unsafe { Gpu::new(mem.bytes(), 0..PAGE) }.unwrap();
+    let gpu = unsafe { Gpu::new(mem.bytes(), std::slice::from_ref(&(0..PAGE))) }.unwrap();
     let (ne, k) = (128, 8);
     let mut seed = 0x9e37_79b9u32;
     let mut logits: Vec<f32> = (0..ne)

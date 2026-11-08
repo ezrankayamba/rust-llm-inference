@@ -11,7 +11,7 @@ fn main() {
     let len = 512 << 20;
     let layout = std::alloc::Layout::from_size_align(len, page).unwrap();
     let mem = unsafe { std::slice::from_raw_parts_mut(std::alloc::alloc_zeroed(layout), len) };
-    let gpu = unsafe { Gpu::new(mem, 0..mem.len()) }.unwrap();
+    let gpu = unsafe { Gpu::new(mem, std::slice::from_ref(&(0..mem.len()))) }.unwrap();
     // Decode streams every weight once per token, so time matvecs back to back in one command
     // buffer over 512 MB of distinct matrices (more than the caches hold).
     let (x, y) = (gpu.alloc(14336), gpu.alloc(14336));

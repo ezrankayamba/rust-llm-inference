@@ -320,3 +320,39 @@ fn cpu_f16_kv_cache_stays_close_to_f32_at_half_the_memory() {
     }
     assert_eq!(2 * s16.kv_bytes(), s32.kv_bytes());
 }
+
+/// Weights split across several Metal buffers (the smallest cap that holds each layer whole)
+/// must give exactly the logits of one buffer: the kernels are the same, only the binding
+/// differs. Dense, and Qwen2-MoE whose stacked experts run through id-indexed matvecs.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn weights_split_across_metal_buffers_give_identical_logits() {
+    for (arch, moe) in [("llama", false), ("qwen2moe", true)] {
+        let path = model_path(arch, 4, 2, moe);
+        let prompt = &prompt()[..40];
+        let single = load(&path, LAYERS);
+        let mut cap = 16 * 1024;
+        let split = loop {
+            let mut m = Model::load(Gguf::open(&path).expect("open")).expect("load");
+            m.precise = true;
+            if rli_models::backend::attach_capped(&mut m, LAYERS, cap).is_ok() {
+                break m;
+            }
+            cap += 16 * 1024;
+        };
+        // Below the file size, so the offloaded weights need at least two buffers.
+        let file = std::fs::metadata(&path).expect("model file").len() as usize;
+        assert!(
+            cap < file,
+            "{arch}: a {cap}-byte cap can't split a {file}-byte model"
+        );
+        for batched in [true, false] {
+            let want = run(&single, prompt, batched);
+            assert_eq!(
+                run(&split, prompt, batched),
+                want,
+                "{arch}, batched={batched}"
+            );
+        }
+    }
+}
