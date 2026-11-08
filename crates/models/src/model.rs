@@ -55,8 +55,8 @@ pub trait Accelerator: Send + Sync {
         logits: Option<&mut [f32]>,
     ) -> bool;
     /// Like [`Accelerator::forward`] for `xs.len() / n_embd` consecutive tokens (row-major
-    /// embeddings, in place) at positions `pos..`; `logits` are for the last token. The default
-    /// runs them one at a time.
+    /// embeddings, in place) at positions `pos..`. `logits` holds one vocab row (the last
+    /// token's) or one per token. The default runs them one at a time.
     fn forward_batch(
         &self,
         model: &Model,
@@ -78,10 +78,17 @@ pub(crate) fn forward_each<A: Accelerator + ?Sized>(
     pos: usize,
     mut logits: Option<&mut [f32]>,
 ) -> bool {
-    let n = xs.len() / model.cfg.n_embd;
+    let (n, vocab) = (xs.len() / model.cfg.n_embd, model.output.rows);
+    let every = n > 1 && logits.as_ref().is_some_and(|l| l.len() == n * vocab);
     let mut done = false;
     for (i, x) in xs.chunks_exact_mut(model.cfg.n_embd).enumerate() {
-        let l = if i + 1 == n { logits.take() } else { None };
+        let l = if every {
+            logits.as_mut().map(|l| &mut l[i * vocab..(i + 1) * vocab])
+        } else if i + 1 == n {
+            logits.take()
+        } else {
+            None
+        };
         done = accel.forward(model, state, x, pos + i, l);
     }
     done
@@ -193,6 +200,9 @@ impl KvCache {
         }
     }
 }
+
+/// Most tokens [`Model::forward_batch_all`] takes.
+pub const MAX_VERIFY: usize = 16;
 
 /// Per-conversation state: KV cache (grown on demand, so memory tracks tokens actually used)
 /// and the token history it corresponds to.
@@ -421,21 +431,36 @@ impl Model {
         tokens: &[u32],
         want_logits: bool,
     ) -> Option<Vec<f32>> {
-        let n_embd = self.cfg.n_embd;
-        let pos = sess.len();
         if tokens.is_empty() {
             return None;
         }
+        let logits = self.run(sess, tokens, usize::from(want_logits));
+        want_logits.then_some(logits)
+    }
+
+    /// Like [`Model::forward_batch`], but returns the logits after every token (`tokens.len()`
+    /// rows of [`Model::vocab_size`], at most [`MAX_VERIFY`]), e.g. to check several speculated
+    /// tokens in one pass.
+    pub fn forward_batch_all(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
+        assert!(tokens.len() <= MAX_VERIFY, "at most {MAX_VERIFY} tokens");
+        self.run(sess, tokens, tokens.len())
+    }
+
+    /// Runs `tokens` and returns the logits after the last `logit_rows` of them (0, 1 or all).
+    fn run(&self, sess: &mut Session, tokens: &[u32], logit_rows: usize) -> Vec<f32> {
+        let n_embd = self.cfg.n_embd;
+        let n = tokens.len();
+        let pos = sess.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        assert!(logit_rows <= 1 || logit_rows == n);
         let embd = self.mat(&self.embd);
-        let mut xs = vec![0.0; tokens.len() * n_embd];
+        let mut xs = vec![0.0; n * n_embd];
         for (x, &t) in xs.chunks_exact_mut(n_embd).zip(tokens) {
             embd.dequantize_row_into(t as usize, x);
         }
-        let mut logits = if want_logits {
-            vec![0.0; self.output.rows]
-        } else {
-            Vec::new()
-        };
+        let mut logits = vec![0.0; logit_rows * self.output.rows];
         let mut first_cpu_layer = 0;
         if let Some(a) = &self.accel {
             let state = sess.accel.get_or_insert_with(|| a.new_state(sess.max_ctx));
@@ -444,26 +469,28 @@ impl Model {
                 state.as_mut(),
                 &mut xs,
                 pos,
-                want_logits.then_some(&mut logits[..]),
+                (logit_rows > 0).then_some(&mut logits[..]),
             );
             first_cpu_layer = a.layers();
             if done {
                 sess.tokens.extend_from_slice(tokens);
-                return Some(logits);
+                return logits;
             }
         }
         for (i, chunk) in xs.chunks_mut(CPU_CHUNK * n_embd).enumerate() {
             self.cpu_layers(sess, chunk, pos + i * CPU_CHUNK, first_cpu_layer);
         }
         sess.tokens.extend_from_slice(tokens);
-        if !want_logits {
-            return None;
+        if logit_rows == 0 {
+            return logits;
         }
-        let x = &xs[(tokens.len() - 1) * n_embd..];
-        let mut xb = vec![0.0; n_embd];
-        ops::rmsnorm(&mut xb, x, &self.output_norm, self.cfg.rms_eps);
-        self.matvec(&self.output, &xb, &mut logits);
-        Some(logits)
+        let last = &xs[(n - logit_rows) * n_embd..];
+        let mut xb = vec![0.0; logit_rows * n_embd];
+        for (o, x) in xb.chunks_exact_mut(n_embd).zip(last.chunks_exact(n_embd)) {
+            ops::rmsnorm(o, x, &self.output_norm, self.cfg.rms_eps);
+        }
+        self.matmul(&self.output, &xb, &mut logits, logit_rows);
+        logits
     }
 
     /// Runs layers `first..` on the CPU for the token rows in `xs` (positions `pos..`, in

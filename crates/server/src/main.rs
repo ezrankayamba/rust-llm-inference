@@ -12,8 +12,10 @@ use std::time::Duration;
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
+                  [--lookahead N]
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
+--lookahead guesses up to N tokens per step from repeats in the context (default 0 = off).
 
 Endpoints: GET /healthz, GET /v1/models, POST /v1/chat/completions, POST /v1/completions
 ";
@@ -26,6 +28,7 @@ struct Args {
     port: u16,
     ctx: usize,
     gpu_layers: Option<usize>,
+    lookahead: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -36,6 +39,7 @@ fn parse_args() -> Result<Args, String> {
         port: 8080,
         ctx: 4096,
         gpu_layers: None,
+        lookahead: 0,
     };
     let mut model = None;
     while let Some(flag) = it.next() {
@@ -47,6 +51,9 @@ fn parse_args() -> Result<Args, String> {
             "-c" | "--ctx" => a.ctx = val()?.parse().map_err(|_| "--ctx: invalid value")?,
             "--gpu-layers" => {
                 a.gpu_layers = Some(val()?.parse().map_err(|_| "--gpu-layers: invalid value")?)
+            }
+            "--lookahead" => {
+                a.lookahead = val()?.parse().map_err(|_| "--lookahead: invalid value")?
             }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -81,7 +88,11 @@ fn run(a: Args) -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     let session = Mutex::new(engine.new_session(a.ctx));
-    let app = Arc::new(App { engine, session });
+    let app = Arc::new(App {
+        engine,
+        session,
+        lookahead: a.lookahead,
+    });
     let listener = TcpListener::bind((a.host.as_str(), a.port))
         .map_err(|e| format!("bind {}:{}: {e}", a.host, a.port))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;

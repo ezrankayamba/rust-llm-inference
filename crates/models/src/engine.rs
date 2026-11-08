@@ -1,7 +1,7 @@
 //! Model + tokenizer + chat template, and the token generation loop shared by the CLI and server.
 
 use crate::chat::{ChatTemplate, Message};
-use crate::model::{Model, Session};
+use crate::model::{MAX_VERIFY, Model, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use rli_gguf::{Gguf, Result};
@@ -20,6 +20,11 @@ pub struct Engine {
 pub struct GenParams {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
+    /// Prompt-lookup speculative decoding: up to this many tokens guessed per step from an
+    /// earlier repeat of the latest n-gram, checked in one batched pass (0 = off). Output
+    /// follows the same distribution; with quantized activations batched logits differ from
+    /// one-token ones by float rounding, so a near-tie can resolve differently.
+    pub lookahead: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +47,24 @@ pub struct GenOutput {
     pub finish: Finish,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+}
+
+/// Longest and shortest n-gram (ending at the newest token) that prompt lookup matches.
+const LOOKUP_NGRAM: (usize, usize) = (3, 2);
+
+/// Up to `max` tokens that followed the most recent earlier occurrence of the last n-gram of
+/// `hist`, trying the longest n-gram first; empty when nothing repeats.
+fn lookup_drafts(hist: &[u32], max: usize) -> &[u32] {
+    let (longest, shortest) = LOOKUP_NGRAM;
+    for n in (shortest..=longest.min(hist.len())).rev() {
+        let tail = &hist[hist.len() - n..];
+        // Latest start first; the match must end before the tail itself does.
+        if let Some(start) = (0..hist.len() - n).rev().find(|&i| &hist[i..i + n] == tail) {
+            let from = start + n;
+            return &hist[from..(from + max).min(hist.len())];
+        }
+    }
+    &[]
 }
 
 /// End-of-turn markers used by common chat formats, in addition to the declared EOS/EOT.
@@ -109,6 +132,33 @@ impl Engine {
         self.stop.binary_search(&id).is_ok()
     }
 
+    /// Counts `token` as generated and passes any text it completes to `on_text`; `false` if
+    /// that asked to cancel.
+    fn emit(
+        &self,
+        token: u32,
+        pending: &mut Vec<u8>,
+        out: &mut GenOutput,
+        on_text: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        out.completion_tokens += 1;
+        self.tokenizer.decode_bytes(token, pending);
+        let valid = match std::str::from_utf8(pending) {
+            Ok(s) => s.len(),
+            // An incomplete trailing sequence waits for the next token; invalid bytes are
+            // emitted lossily so a bad token can't stall output forever.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => pending.len(),
+        };
+        if valid == 0 {
+            return true;
+        }
+        let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+        pending.drain(..valid);
+        out.text.push_str(&chunk);
+        on_text(&chunk)
+    }
+
     /// Generates a continuation of `prompt` (the full token sequence, BOS included).
     ///
     /// If the session already holds a prefix of `prompt`, that prefix's KV cache is reused.
@@ -154,40 +204,69 @@ impl Engine {
         let t1 = Instant::now();
         let mut sampler = Sampler::new(params.sampler.clone());
         let mut pending: Vec<u8> = Vec::new();
-        loop {
+        let vocab = self.model.vocab_size();
+        let lookahead = params.lookahead.min(MAX_VERIFY - 1);
+        // A token sampled while checking guesses, still to be emitted and run.
+        let mut carried: Option<u32> = None;
+        'decode: loop {
             if out.completion_tokens >= params.max_tokens || sess.len() >= sess.max_ctx {
                 out.finish = Finish::Length;
                 break;
             }
-            let next = sampler.sample(&mut logits, &sess.tokens);
+            let next = match carried.take() {
+                Some(t) => t,
+                None => sampler.sample(&mut logits, &sess.tokens),
+            };
             if self.is_stop(next) {
                 out.finish = Finish::Stop;
                 break;
             }
-            out.completion_tokens += 1;
-            self.tokenizer.decode_bytes(next, &mut pending);
-            let valid = match std::str::from_utf8(&pending) {
-                Ok(s) => s.len(),
-                // An incomplete trailing sequence waits for the next token; invalid bytes are
-                // emitted lossily so a bad token can't stall output forever.
-                Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => pending.len(),
-            };
-            if valid > 0 {
-                let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                pending.drain(..valid);
-                out.text.push_str(&chunk);
-                if !on_text(&chunk) {
+            if !self.emit(next, &mut pending, &mut out, &mut on_text) {
+                out.finish = Finish::Cancelled;
+                // Keep the KV cache consistent with the tokens actually produced.
+                self.model.forward(sess, next, false);
+                break;
+            }
+            let room = lookahead
+                .min(params.max_tokens - out.completion_tokens)
+                .min(sess.max_ctx - sess.len() - 1);
+            let mut batch = sess.tokens.clone();
+            batch.push(next);
+            let drafts = lookup_drafts(&batch, room).to_vec();
+            if drafts.is_empty() {
+                logits = self
+                    .model
+                    .forward(sess, next, true)
+                    .expect("logits requested");
+                continue;
+            }
+            // Run `next` and the guesses together; guess i stands if the token sampled after
+            // everything before it equals it (exact for a guess with all its mass on one token).
+            let base = sess.len();
+            batch.drain(..base);
+            batch.extend_from_slice(&drafts);
+            let all = self.model.forward_batch_all(sess, &batch);
+            let kv_dim = self.model.cfg.kv_dim();
+            for (i, &guess) in drafts.iter().enumerate() {
+                let mut l = all[i * vocab..(i + 1) * vocab].to_vec();
+                let t = sampler.sample(&mut l, &sess.tokens[..base + 1 + i]);
+                if t != guess {
+                    sess.truncate(base + 1 + i, kv_dim);
+                    carried = Some(t);
+                    continue 'decode;
+                }
+                if self.is_stop(t) {
+                    sess.truncate(base + 1 + i, kv_dim);
+                    out.finish = Finish::Stop;
+                    break 'decode;
+                }
+                if !self.emit(t, &mut pending, &mut out, &mut on_text) {
+                    sess.truncate(base + 2 + i, kv_dim);
                     out.finish = Finish::Cancelled;
-                    // Keep the KV cache consistent with the tokens actually produced.
-                    self.model.forward(sess, next, false);
-                    break;
+                    break 'decode;
                 }
             }
-            logits = self
-                .model
-                .forward(sess, next, true)
-                .expect("logits requested");
+            logits = all[drafts.len() * vocab..].to_vec();
         }
         if !pending.is_empty() {
             let rest = String::from_utf8_lossy(&pending).into_owned();
@@ -196,5 +275,28 @@ impl Engine {
         }
         out.decode_secs = t1.elapsed().as_secs_f64();
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lookup_drafts;
+
+    #[test]
+    fn lookup_drafts_follows_the_latest_longest_match() {
+        // The trigram [1, 2, 3] last occurred at 5..8, so its continuation is [9, 4].
+        let hist = [1, 2, 3, 4, 0, 1, 2, 3, 9, 4, 7, 1, 2, 3];
+        assert_eq!(lookup_drafts(&hist, 2), &[9, 4]);
+        // Capped by `max` and by the end of the history.
+        assert_eq!(lookup_drafts(&hist, 1), &[9]);
+        assert_eq!(lookup_drafts(&[5, 6, 7, 5, 6], 8), &[7, 5, 6]);
+    }
+
+    #[test]
+    fn lookup_drafts_falls_back_to_bigrams_and_ignores_single_tokens() {
+        assert_eq!(lookup_drafts(&[8, 2, 3, 6, 1, 2, 3], 3), &[6, 1, 2]);
+        assert_eq!(lookup_drafts(&[4, 9, 1, 4], 3), &[] as &[u32]);
+        assert_eq!(lookup_drafts(&[4], 3), &[] as &[u32]);
+        assert_eq!(lookup_drafts(&[], 3), &[] as &[u32]);
     }
 }

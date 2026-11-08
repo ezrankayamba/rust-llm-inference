@@ -30,6 +30,8 @@ struct GpuLayer {
 
 /// Most prompt tokens processed per GPU pass; bounds the batch scratch buffers.
 const BATCH_CHUNK: usize = 256;
+/// Every-row logits passes (speculative checks) use a scratch sized for this many tokens.
+const VERIFY_CAP: usize = crate::model::MAX_VERIFY;
 /// Positions a session's GPU KV cache holds at first; it doubles as needed, up to `max_ctx`.
 const KV_INITIAL: usize = 256;
 
@@ -146,6 +148,8 @@ struct Metal {
     scratch: Mutex<Scratch>,
     /// Allocated on the first batched call.
     batch: Mutex<Option<Scratch>>,
+    /// For passes that return every row's logits; allocated on first use.
+    verify: Mutex<Option<Scratch>>,
 }
 
 fn experts_of(f: &Ffn) -> Vec<&Expert> {
@@ -174,8 +178,9 @@ fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, x: At<'_>, out: At<'_>, n: us
 
 impl Metal {
     /// Runs the offloaded layers on the `n` token rows in `s.x` (positions `pos..pos + n`) and,
-    /// when `want_logits`, the output head on the last row into `s.logits`. Waits for the GPU.
-    fn run(&self, model: &Model, kv: &Kv, s: &Scratch, n: usize, pos: usize, want_logits: bool) {
+    /// when `logit_rows` > 0 (1 or `n`), the output head on that many last rows into `s.logits`.
+    /// Waits for the GPU.
+    fn run(&self, model: &Model, kv: &Kv, s: &Scratch, n: usize, pos: usize, logit_rows: usize) {
         assert!(n >= 1 && n <= s.cap);
         assert!(pos + n <= kv.cap, "KV cache not reserved");
         let c = &model.cfg;
@@ -255,10 +260,11 @@ impl Metal {
                 }
             }
         }
-        if want_logits {
-            let last = At(&s.x, (n - 1) * n_embd);
-            b.rmsnorm(last, At(&s.xb, 0), &self.output_norm, 1, n_embd, c.rms_eps);
-            mm(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0), 1);
+        if logit_rows > 0 {
+            let first = At(&s.x, (n - logit_rows) * n_embd);
+            let xb = At(&s.xb, 0);
+            b.rmsnorm(first, xb, &self.output_norm, logit_rows, n_embd, c.rms_eps);
+            mm(&mut b, &model.output, xb, At(&s.logits, 0), logit_rows);
         }
         b.finish();
     }
@@ -351,18 +357,32 @@ impl Metal {
         logits: Option<&mut [f32]>,
     ) -> bool {
         let n = xs.len() / model.cfg.n_embd;
-        let want_logits = self.covers_all && logits.is_some();
+        // `logits` holds the last row's or every row's (only the head's owner can fill them).
+        let rows = match &logits {
+            Some(l) if self.covers_all => l.len() / model.output.rows,
+            _ => 0,
+        };
+        assert!(
+            rows <= 1 || rows == n,
+            "logits for the last token or every token"
+        );
+        assert!(
+            rows * model.output.rows <= s.logits.len(),
+            "logits scratch too small"
+        );
         // SAFETY: callers hold the scratch lock and no GPU work is in flight.
         unsafe { s.x.as_mut_slice()[..xs.len()].copy_from_slice(xs) };
-        self.run(model, kv, s, n, pos, want_logits);
+        self.run(model, kv, s, n, pos, rows);
         // SAFETY: `run` waited for the GPU.
         unsafe {
             xs.copy_from_slice(&s.x.as_slice()[..xs.len()]);
-            if want_logits && let Some(out) = logits {
+            if rows > 0
+                && let Some(out) = logits
+            {
                 out.copy_from_slice(&s.logits.as_slice()[..out.len()]);
             }
         }
-        want_logits
+        rows > 0
     }
 }
 
@@ -410,7 +430,26 @@ impl Accelerator for Metal {
         let kv: &mut Kv = state
             .downcast_mut()
             .expect("state created by this accelerator");
-        kv.reserve(self, pos + xs.len() / n_embd);
+        let n = xs.len() / n_embd;
+        kv.reserve(self, pos + n);
+        let vocab = model.output.rows;
+        if self.covers_all && logits.as_ref().is_some_and(|l| l.len() == n * vocab) {
+            assert!(
+                n <= VERIFY_CAP,
+                "every-row logits for at most {VERIFY_CAP} tokens"
+            );
+            let mut guard = self.verify.lock().unwrap_or_else(|p| p.into_inner());
+            let s = guard.get_or_insert_with(|| {
+                Scratch::new(
+                    &self.gpu,
+                    &model.cfg,
+                    self.max_ff,
+                    VERIFY_CAP * vocab,
+                    VERIFY_CAP,
+                )
+            });
+            return self.pass(model, kv, s, xs, pos, logits);
+        }
         let mut guard = self.batch.lock().unwrap_or_else(|p| p.into_inner());
         let s = guard.get_or_insert_with(|| {
             let logits = if self.covers_all {
@@ -524,6 +563,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         kv_half: !model.precise,
         max_ff,
         batch: Mutex::new(None),
+        verify: Mutex::new(None),
         output_norm: gpu.upload(&model.output_norm),
         rope_freqs: opt(&model.rope_freqs),
         layers: gpu_layers,

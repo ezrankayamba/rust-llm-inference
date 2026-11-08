@@ -18,6 +18,8 @@ usage: rli -m <model.gguf> [options]
       --top-p <f>           (default 0.95)
       --repeat-penalty <f>  (default 1.1, 1 = off)
       --seed <n>
+      --lookahead <n>       guess up to n tokens per step from repeats in the context,
+                            checked in one batch (default 0 = off)
       --gpu-layers <n>      layers to run on the GPU (default: all, if this build has a
                             GPU backend; 0 = CPU only)
       --info                print model metadata and exit
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
         params: GenParams {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
+            lookahead: 0,
         },
     };
     fn num<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
@@ -70,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
             "--top-p" => s.top_p = num(&flag, it.next())?,
             "--repeat-penalty" => s.repeat_penalty = num(&flag, it.next())?,
             "--seed" => s.seed = num(&flag, it.next())?,
+            "--lookahead" => a.params.lookahead = num(&flag, it.next())?,
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),

@@ -320,3 +320,50 @@ fn cpu_f16_kv_cache_stays_close_to_f32_at_half_the_memory() {
     }
     assert_eq!(2 * s16.kv_bytes(), s32.kv_bytes());
 }
+
+/// Speculative decoding's check pass: `forward_batch_all` gives every token's logits as if run
+/// one at a time, and truncating the rejected guesses leaves a session that continues exactly
+/// like one that never saw them. CPU, Metal with every layer (head on the GPU), and Metal with
+/// one layer (head on the CPU).
+#[test]
+fn every_row_logits_and_rollback_match_one_token_decoding() {
+    let path = model_path("llama", 4, 2, false);
+    let prompt = &prompt()[..40];
+    let guesses = [5u32, 17, 3, 88, 41, 9];
+    let mut setups = vec![(0, 1e-5)];
+    if rli_models::backend::HAS_GPU {
+        setups.extend([(LAYERS, 1e-4), (1, 1e-4)]);
+    }
+    for (gpu_layers, tol) in setups {
+        let m = load(&path, gpu_layers);
+        let vocab = m.vocab_size();
+        let kv_dim = m.cfg.kv_dim();
+
+        let mut spec = m.new_session(512);
+        m.forward_batch(&mut spec, prompt, false);
+        let all = m.forward_batch_all(&mut spec, &guesses);
+        let mut seq = m.new_session(512);
+        m.forward_batch(&mut seq, prompt, false);
+        for (i, &t) in guesses.iter().enumerate() {
+            let one = m.forward(&mut seq, t, true).expect("logits");
+            let d = max_diff(&all[i * vocab..(i + 1) * vocab], &one);
+            assert!(d < tol, "{gpu_layers} GPU layers: row {i}: max diff {d}");
+        }
+
+        // Keep three guesses, then continue with a different token.
+        spec.truncate(prompt.len() + 3, kv_dim);
+        let after = m.forward(&mut spec, 60, true).expect("logits");
+        let mut fresh = m.new_session(512);
+        m.forward_batch(&mut fresh, prompt, false);
+        for &t in &guesses[..3] {
+            m.forward(&mut fresh, t, false);
+        }
+        let want = m.forward(&mut fresh, 60, true).expect("logits");
+        assert_eq!(spec.tokens, fresh.tokens);
+        let d = max_diff(&after, &want);
+        assert!(
+            d < tol,
+            "{gpu_layers} GPU layers: after rollback: max diff {d}"
+        );
+    }
+}

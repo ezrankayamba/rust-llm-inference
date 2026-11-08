@@ -13,6 +13,8 @@ pub struct App {
     /// One shared KV cache: requests run one at a time (they would only compete for the same
     /// cores), and a client continuing a conversation reuses its cached prefix.
     pub session: Mutex<Session>,
+    /// `GenParams::lookahead` for every request (`--lookahead`).
+    pub lookahead: usize,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +53,7 @@ pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
             repeat_last_n: 64,
             seed: u("seed").unwrap_or_else(|| NEXT_ID.fetch_add(1, Ordering::Relaxed) ^ now()),
         },
+        lookahead: 0,
     })
 }
 
@@ -145,7 +148,10 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
         );
     }
     let params = match gen_params(&req, sess.max_ctx - tokens.len()) {
-        Ok(p) => p,
+        Ok(p) => GenParams {
+            lookahead: app.lookahead,
+            ..p
+        },
         Err(msg) => return bad(w, &msg),
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
