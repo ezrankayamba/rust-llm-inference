@@ -164,7 +164,11 @@ fn run(m: &Model, prompt: &[u32], batched: bool) -> (Vec<f32>, Vec<f32>) {
 fn model_path(arch: &str, heads: usize, kv_heads: usize, moe: bool) -> std::path::PathBuf {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("batch_{arch}_{heads}_{kv_heads}_{moe}.gguf"));
-    write_model(arch, heads, kv_heads, moe, &path);
+    // Tests share these files and run in parallel: rewriting one in place would pull pages from
+    // under another test's mapping (SIGBUS), so write a private copy and rename it over.
+    let tmp = path.with_extension(format!("{:?}.tmp", std::thread::current().id()));
+    write_model(arch, heads, kv_heads, moe, &tmp);
+    std::fs::rename(&tmp, &path).expect("rename");
     path
 }
 
