@@ -102,7 +102,7 @@ impl<'a> QMatrix<'a> {
         }
         let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
         let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
-            .then(|| xs.chunks_exact(cols).map(Q8Act::new).collect());
+            .then(|| xs.par_chunks_exact(cols).map(Q8Act::new).collect());
         // One row against every token; quantized rows go `MAX_TOKENS` tokens per kernel call,
         // so each weight block is unpacked once per group rather than once per token.
         let dots = |row: &[u8], o: &mut [f32]| match &acts {
@@ -135,11 +135,11 @@ impl<'a> QMatrix<'a> {
                     dots(row, o);
                 }
             });
-        for (r, col) in yt.chunks_exact(n).enumerate() {
-            for (t, &v) in col.iter().enumerate() {
-                ys[t * rows + r] = v;
+        ys.par_chunks_mut(rows).enumerate().for_each(|(t, y)| {
+            for (v, col) in y.iter_mut().zip(yt.chunks_exact(n)) {
+                *v = col[t];
             }
-        }
+        });
     }
 }
 
