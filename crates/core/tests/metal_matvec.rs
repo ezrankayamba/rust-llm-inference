@@ -133,8 +133,8 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
     let buf = mem.bytes();
     let gpu =
         unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
-    // 2: one partial token tile; 17: two full tiles plus a partial one.
-    for n in [2, 17] {
+    // 2, 4: one matvec per token; 5: one partial token tile; 17: two full tiles plus a partial one.
+    for n in [2, 4, 5, 17] {
         let x = input(n);
         for (&ty, &off) in TYPES.iter().zip(&offsets) {
             let mut got = vec![0.0; n * ROWS];

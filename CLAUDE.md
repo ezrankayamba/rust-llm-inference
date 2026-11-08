@@ -59,7 +59,8 @@ Design points that span files:
   one sync (MoE included, see below). Per-matvec offload was measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
 - **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
   `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
-  in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32), and causal
+  in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32; under 5 tokens, one
+  matvec per token, since a tile costs about 5-6 matvecs however few tokens it holds), and causal
   `attention_batch` with an online softmax. Decode uses matvec, and attention split over
   chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
   `attention_merge`), so decode speed holds up at long context.

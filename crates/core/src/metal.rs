@@ -53,6 +53,9 @@ const MATVEC_ID_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::Q5_K, "matvec_id_q5_k"),
     (GgmlType::Q6_K, "matvec_id_q6_k"),
 ];
+/// Below this many tokens a matmul runs as one matvec per token: a tile costs about six matvecs
+/// (measured 4.5x-6x) however few of its 32 tokens are used. MoE experts often get only a few.
+const MATMUL_MIN_TOKENS: usize = 5;
 /// Matmul output tile (`MM_R` x `MM_T` in metal.metal), computed by 128 threads.
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: usize = 32;
@@ -708,7 +711,7 @@ impl Batch<'_> {
     }
 
     /// `Y = X W^T` for `n` tokens: `X` is `n x cols` and `Y` is `n x rows`, both row-major.
-    /// `n == 1` uses the matvec kernel.
+    /// Below [`MATMUL_MIN_TOKENS`] tokens this is one matvec per token.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         &mut self,
@@ -720,8 +723,12 @@ impl Batch<'_> {
         y: At<'_>,
         n: usize,
     ) {
-        if n == 1 {
-            return self.matvec(ty, rows, cols, offset, x, y);
+        if n < MATMUL_MIN_TOKENS {
+            for t in 0..n {
+                let (xt, yt) = (At(x.0, x.1 + t * cols), At(y.0, y.1 + t * rows));
+                self.matvec(ty, rows, cols, offset, xt, yt);
+            }
+            return;
         }
         assert!(
             cols.is_multiple_of(32),
