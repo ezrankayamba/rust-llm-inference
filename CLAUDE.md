@@ -68,7 +68,7 @@ Design points that span files:
 - **CPU prompts are batched too**, in chunks of 64 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
-  still route per row.
+  route each row, then run each used expert once over the rows that picked it.
 - **MoE on Metal.** Decode routes on the GPU, with no sync: `moe_topk` (one simdgroup) writes
   the k expert ids and weights, `matvec_id` runs all k experts' gate/up/down as one dispatch
   each (expert id read from the buffer, experts at a fixed stride in the stacked tensor), and

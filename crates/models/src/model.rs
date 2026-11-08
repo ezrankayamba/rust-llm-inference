@@ -544,59 +544,77 @@ impl Model {
             norm_rows(&mut xb, xs, &layer.ffn_norm);
             match &layer.ffn {
                 Ffn::Dense(e) => self.ffn(e, &xb, &mut tmp, n),
-                // Experts differ per token, so routing stays per row.
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
-                } => {
-                    for (o, r) in tmp.chunks_exact_mut(n_embd).zip(xb.chunks_exact(n_embd)) {
-                        self.moe(router, experts, shared.as_ref(), r, o);
-                    }
-                }
+                } => self.moe(router, experts, shared.as_ref(), &xb, &mut tmp, n),
             }
             ops::add_assign(xs, &tmp);
         }
     }
 
+    /// MoE FFN of `n` rows: routes each row, then runs every used expert once, over the rows
+    /// that picked it, so its weights are read once per call as in the dense case.
     fn moe(
         &self,
         router: &Weight,
         experts: &[Expert],
         shared: Option<&(Weight, Expert)>,
-        x: &[f32],
+        xs: &[f32],
         out: &mut [f32],
+        n: usize,
     ) {
         let c = &self.cfg;
-        let mut probs = vec![0.0; experts.len()];
-        self.matvec(router, x, &mut probs);
-        ops::softmax(&mut probs);
+        let mut probs = vec![0.0; n * experts.len()];
+        self.matmul(router, xs, &mut probs, n);
+        let mut rows: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts.len()];
         let mut order: Vec<usize> = (0..experts.len()).collect();
-        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-        let chosen = &order[..c.n_expert_used];
-        let norm = if c.norm_topk {
-            chosen.iter().map(|&e| probs[e]).sum::<f32>()
-        } else {
-            1.0
-        };
+        for (t, p) in probs.chunks_exact_mut(experts.len()).enumerate() {
+            ops::softmax(p);
+            order.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]));
+            let chosen = &order[..c.n_expert_used];
+            let norm = if c.norm_topk {
+                chosen.iter().map(|&e| p[e]).sum::<f32>()
+            } else {
+                1.0
+            };
+            for &e in chosen {
+                rows[e].push((t, p[e] / norm));
+            }
+        }
 
         out.fill(0.0);
-        let mut y = vec![0.0; out.len()];
-        for &e in chosen {
-            self.ffn(&experts[e], x, &mut y, 1);
-            let w = probs[e] / norm;
-            for (o, &v) in out.iter_mut().zip(&y) {
-                *o += w * v;
+        let (mut gathered, mut y) = (Vec::new(), Vec::new());
+        for (e, rows) in experts.iter().zip(&rows).filter(|(_, r)| !r.is_empty()) {
+            gathered.clear();
+            for &(t, _) in rows {
+                gathered.extend_from_slice(&xs[t * c.n_embd..(t + 1) * c.n_embd]);
+            }
+            y.resize(gathered.len(), 0.0);
+            self.ffn(e, &gathered, &mut y, rows.len());
+            for (&(t, w), r) in rows.iter().zip(y.chunks_exact(c.n_embd)) {
+                axpy(&mut out[t * c.n_embd..(t + 1) * c.n_embd], w, r);
             }
         }
         if let Some((gate_inp, e)) = shared {
-            let mut g = [0.0];
-            self.matvec(gate_inp, x, &mut g);
-            let gate = 1.0 / (1.0 + (-g[0]).exp());
-            self.ffn(e, x, &mut y, 1);
-            for (o, &v) in out.iter_mut().zip(&y) {
-                *o += gate * v;
+            let mut g = vec![0.0; n];
+            self.matmul(gate_inp, xs, &mut g, n);
+            y.resize(out.len(), 0.0);
+            self.ffn(e, xs, &mut y, n);
+            for ((o, r), &g) in out
+                .chunks_exact_mut(c.n_embd)
+                .zip(y.chunks_exact(c.n_embd))
+                .zip(&g)
+            {
+                axpy(o, 1.0 / (1.0 + (-g).exp()), r);
             }
         }
+    }
+}
+
+fn axpy(out: &mut [f32], w: f32, x: &[f32]) {
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o += w * v;
     }
 }
