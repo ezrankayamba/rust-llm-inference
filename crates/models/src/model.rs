@@ -528,14 +528,13 @@ impl Model {
             att.par_chunks_mut(hd)
                 .zip(q.par_chunks(hd))
                 .enumerate()
-                .for_each(|(j, (out, qh))| {
+                .for_each_init(Vec::new, |scores, (j, (out, qh))| {
                     let (i, h) = (j / c.n_head, j % c.n_head);
                     let n_pos = pos + i + 1;
                     let off = (h / group) * hd;
-                    let mut scores: Vec<f32> = (0..n_pos)
-                        .map(|t| kc.dot(t * kv_dim + off, qh) * scale)
-                        .collect();
-                    ops::softmax(&mut scores);
+                    scores.clear();
+                    scores.extend((0..n_pos).map(|t| kc.dot(t * kv_dim + off, qh) * scale));
+                    ops::softmax(scores);
                     out.fill(0.0);
                     for (t, &p) in scores.iter().enumerate() {
                         vc.axpy(t * kv_dim + off, p, out);
