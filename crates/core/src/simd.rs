@@ -87,35 +87,44 @@ pub fn dot_f16_scalar(w: &[u8], x: &[f32]) -> f32 {
         .sum()
 }
 
-/// Halves to f32 eight at a time with `fcvtl`/`fcvtl2` (base AArch64; Rust's f16 vector
-/// intrinsics are not stable yet), fused into the multiply-adds.
+/// Eight halves to two f32 vectors with `fcvtl`/`fcvtl2` (base AArch64; Rust's f16 vector
+/// intrinsics are not stable yet).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn widen(
+    h: std::arch::aarch64::uint16x8_t,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
+    let (lo, hi);
+    // SAFETY: register-only conversions.
+    unsafe {
+        std::arch::asm!(
+            "fcvtl {lo:v}.4s, {h:v}.4h",
+            "fcvtl2 {hi:v}.4s, {h:v}.8h",
+            h = in(vreg) h,
+            // `out`, not `lateout`: `h` is still read after `lo` is written.
+            lo = out(vreg) lo,
+            hi = lateout(vreg) hi,
+            options(pure, nomem, nostack),
+        );
+    }
+    (lo, hi)
+}
+
+/// The f16 dot, converting eight halves per step and fusing them into the multiply-adds.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn dot_f16_neon(w: &[u8], x: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    #[inline(always)]
-    fn widen(h: uint16x8_t) -> (float32x4_t, float32x4_t) {
-        let (lo, hi);
-        // SAFETY: register-only conversions.
-        unsafe {
-            std::arch::asm!(
-                "fcvtl {lo:v}.4s, {h:v}.4h",
-                "fcvtl2 {hi:v}.4s, {h:v}.8h",
-                h = in(vreg) h,
-                // `out`, not `lateout`: `h` is still read after `lo` is written.
-                lo = out(vreg) lo,
-                hi = lateout(vreg) hi,
-                options(pure, nomem, nostack),
-            );
-        }
-        (lo, hi)
-    }
     let n = x.len();
     let (pw, px) = (w.as_ptr() as *const u16, x.as_ptr());
     let mut acc = [vdupq_n_f32(0.0); 4];
     let mut i = 0;
-    // SAFETY: every load stays within `n` elements, which `w` (as halves) and `x` share; u16
-    // loads need no alignment beyond a byte for `vld1q_u16`.
+    // SAFETY: every load stays within `n` elements, which `w` (as halves) and `x` share. `w`
+    // may be only byte-aligned: `vld1q_u16` doesn't require alignment, and the scalar tail
+    // reads unaligned.
     unsafe {
         while i + 16 <= n {
             let (a, b) = widen(vld1q_u16(pw.add(i)));
@@ -131,10 +140,55 @@ unsafe fn dot_f16_neon(w: &[u8], x: &[f32]) -> f32 {
             vaddq_f32(acc[2], acc[3]),
         ));
         while i < n {
-            s += crate::half::f16_to_f32(*pw.add(i)) * *px.add(i);
+            s += crate::half::f16_to_f32(pw.add(i).read_unaligned()) * *px.add(i);
             i += 1;
         }
         s
+    }
+}
+
+/// `y += a * w` with `w` as little-endian IEEE halves (`2 * y.len()` bytes).
+#[inline]
+pub fn axpy_f16(y: &mut [f32], a: f32, w: &[u8]) {
+    assert_eq!(w.len(), 2 * y.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64; lengths checked above.
+        unsafe { axpy_f16_neon(y, a, w) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        axpy_f16_scalar(y, a, w)
+    }
+}
+
+pub fn axpy_f16_scalar(y: &mut [f32], a: f32, w: &[u8]) {
+    for (o, h) in y.iter_mut().zip(w.as_chunks::<2>().0) {
+        *o += a * crate::half::f16_to_f32(u16::from_le_bytes(*h));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn axpy_f16_neon(y: &mut [f32], a: f32, w: &[u8]) {
+    use std::arch::aarch64::*;
+    let n = y.len();
+    let (pw, py) = (w.as_ptr() as *const u16, y.as_mut_ptr());
+    let mut i = 0;
+    // SAFETY: every access stays within `n` elements, which `w` (as halves) and `y` share. `w`
+    // may be only byte-aligned: `vld1q_u16` doesn't require alignment, and the scalar tail
+    // reads unaligned.
+    unsafe {
+        while i + 8 <= n {
+            let (lo, hi) = widen(vld1q_u16(pw.add(i)));
+            vst1q_f32(py.add(i), vfmaq_n_f32(vld1q_f32(py.add(i)), lo, a));
+            vst1q_f32(py.add(i + 4), vfmaq_n_f32(vld1q_f32(py.add(i + 4)), hi, a));
+            i += 8;
+        }
+        while i < n {
+            *py.add(i) += a * crate::half::f16_to_f32(pw.add(i).read_unaligned());
+            i += 1;
+        }
     }
 }
 
@@ -205,6 +259,25 @@ mod tests {
                 (fast - slow).abs() <= 1e-4 * (1.0 + slow.abs()),
                 "n={n} {fast} vs {slow}"
             );
+        }
+    }
+
+    #[test]
+    fn axpy_f16_matches_scalar_for_all_tail_lengths() {
+        let mut rng = Rng::new(9);
+        for n in (0..40).chain([128, 1000]) {
+            let w: Vec<u8> = rng
+                .vec(n)
+                .iter()
+                .flat_map(|&v| crate::half::f32_to_f16(v).to_le_bytes())
+                .collect();
+            let y0 = rng.vec(n);
+            let (mut fast, mut slow) = (y0.clone(), y0);
+            axpy_f16(&mut fast, 0.37, &w);
+            axpy_f16_scalar(&mut slow, 0.37, &w);
+            for (f, s) in fast.iter().zip(&slow) {
+                assert!((f - s).abs() <= 1e-6 * (1.0 + s.abs()), "n={n} {f} vs {s}");
+            }
         }
     }
 

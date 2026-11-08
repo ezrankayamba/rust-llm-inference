@@ -295,3 +295,28 @@ fn f16_kv_cache_stays_close_to_f32() {
         assert!(d < tol, "{what}: max diff {d}");
     }
 }
+
+/// CPU layers: the KV cache type is fixed when a session is created, so a session made before
+/// `precise` is switched on keeps f16 KV while computing in f32, isolating the cache's rounding.
+#[test]
+fn cpu_f16_kv_cache_stays_close_to_f32_at_half_the_memory() {
+    let path = model_path("llama", 4, 2, false);
+    let prompt = prompt();
+    let mut m = load_with(&path, 0, false);
+    let mut s16 = m.new_session(512);
+    m.precise = true;
+    let mut s32 = m.new_session(512);
+    let p16 = m.forward_batch(&mut s16, &prompt, true).expect("logits");
+    let p32 = m.forward_batch(&mut s32, &prompt, true).expect("logits");
+    let n16 = m.forward(&mut s16, 7, true).expect("logits");
+    let n32 = m.forward(&mut s32, 7, true).expect("logits");
+    for (what, a, b) in [
+        ("f16 vs f32 KV prompt logits", &p16, &p32),
+        ("f16 vs f32 KV next-token logits", &n16, &n32),
+    ] {
+        let d = max_diff(a, b);
+        eprintln!("{what}: max diff {d}");
+        assert!(d > 0.0 && d < 1e-2, "{what}: max diff {d}");
+    }
+    assert_eq!(2 * s16.kv_bytes(), s32.kv_bytes());
+}

@@ -52,6 +52,8 @@ Design points that span files:
   arena (partial offload, `--gpu-layers N`); the remaining layers run on the CPU. The Metal KV
   cache is f16 (f32 when `Model.precise` is set at attach time), starts at 256 positions and
   doubles as needed up to the session's context; K/V are computed in f32 scratch, then stored.
+  The CPU layers' KV cache is f16 too (`KvCache`; f32 when `precise` is set as the session is
+  created), grown per token.
 - **GPU offload is layer-level.** All offloaded layers of a token are queued as one batch with
   one sync, plus one sync per MoE layer for top-k routing on the CPU. Per-matvec offload was
   measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
@@ -74,7 +76,8 @@ Design points that span files:
   f32 by ~0.1–0.6 but top-1 matches. `Model.precise` (the `--precise` flag in `dump_logits`)
   keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal
   batched prompts (the matrix units accumulate in a different order); tests that compare logits use it.
-  The f16 Metal KV cache moves logits by up to ~0.015 against f32 on real models (top-1 unchanged).
+  The f16 KV caches (Metal and CPU) move logits by up to ~0.015 against f32 on real models
+  (top-1 unchanged).
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
 - **Unverified paths:** the AVX2 kernels (only exercised under Rosetta, which lacks AVX2) and the
   whole CUDA backend (never run on an NVIDIA GPU; only its weight decoders are checked, on the

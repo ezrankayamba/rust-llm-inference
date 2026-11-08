@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use rayon::prelude::*;
+use rli_core::half::f32_to_f16;
 use rli_core::ops::{self, Rope};
 use rli_core::{GgmlType, QMatrix, simd};
 use rli_gguf::{Error, Gguf, Result};
@@ -131,11 +132,73 @@ pub struct Model {
     pub precise: bool,
 }
 
+/// One layer's cached keys or values for the CPU layers: f16 (half the memory), or f32 when the
+/// session was created in precise mode (the f16 rounding moves logits by ~0.01).
+#[derive(Clone)]
+enum KvCache {
+    F32(Vec<f32>),
+    /// Little-endian IEEE halves.
+    F16(Vec<u8>),
+}
+
+impl KvCache {
+    fn new(half: bool) -> Self {
+        if half {
+            KvCache::F16(Vec::new())
+        } else {
+            KvCache::F32(Vec::new())
+        }
+    }
+
+    fn push(&mut self, x: &[f32]) {
+        match self {
+            KvCache::F32(c) => c.extend_from_slice(x),
+            KvCache::F16(c) => c.extend(x.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes())),
+        }
+    }
+
+    /// Keeps the first `n` values.
+    fn truncate(&mut self, n: usize) {
+        match self {
+            KvCache::F32(c) => c.truncate(n),
+            KvCache::F16(c) => c.truncate(2 * n),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            KvCache::F32(c) => 4 * c.len(),
+            KvCache::F16(c) => c.len(),
+        }
+    }
+
+    /// `q · cache[at..at + q.len()]`.
+    fn dot(&self, at: usize, q: &[f32]) -> f32 {
+        match self {
+            KvCache::F32(c) => simd::dot(q, &c[at..at + q.len()]),
+            KvCache::F16(c) => simd::dot_f16(&c[2 * at..2 * (at + q.len())], q),
+        }
+    }
+
+    /// `out += p * cache[at..at + out.len()]`.
+    fn axpy(&self, at: usize, p: f32, out: &mut [f32]) {
+        match self {
+            KvCache::F32(c) => {
+                let n = out.len();
+                for (o, &v) in out.iter_mut().zip(&c[at..at + n]) {
+                    *o += p * v;
+                }
+            }
+            KvCache::F16(c) => simd::axpy_f16(out, p, &c[2 * at..2 * (at + out.len())]),
+        }
+    }
+}
+
 /// Per-conversation state: KV cache (grown on demand, so memory tracks tokens actually used)
 /// and the token history it corresponds to.
 pub struct Session {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
+    k: Vec<KvCache>,
+    v: Vec<KvCache>,
     pub tokens: Vec<u32>,
     pub max_ctx: usize,
     /// The accelerator's per-session state (its layers' KV cache), created on first use.
@@ -160,8 +223,9 @@ impl Session {
         }
     }
 
+    /// Bytes held by the CPU layers' KV cache.
     pub fn kv_bytes(&self) -> usize {
-        self.k.iter().chain(&self.v).map(|c| c.len() * 4).sum()
+        self.k.iter().chain(&self.v).map(KvCache::bytes).sum()
     }
 }
 
@@ -302,11 +366,14 @@ impl Model {
         self.output.rows
     }
 
+    /// The CPU layers' KV cache is f16, or f32 if `precise` is set now (it is fixed for the
+    /// session's lifetime).
     pub fn new_session(&self, max_ctx: usize) -> Session {
         let n = self.cfg.n_layer;
+        let half = !self.precise;
         Session {
-            k: vec![Vec::new(); n],
-            v: vec![Vec::new(); n],
+            k: vec![KvCache::new(half); n],
+            v: vec![KvCache::new(half); n],
             tokens: Vec::new(),
             max_ctx,
             accel: None,
@@ -453,8 +520,8 @@ impl Model {
                 rope.apply(&mut q[i * q_dim..(i + 1) * q_dim], c.n_head, pos + i);
                 rope.apply(&mut k[i * kv_dim..(i + 1) * kv_dim], c.n_head_kv, pos + i);
             }
-            sess.k[l].extend_from_slice(&k);
-            sess.v[l].extend_from_slice(&v);
+            sess.k[l].push(&k);
+            sess.v[l].push(&v);
 
             // Causal attention, parallel over (token, head): token i sees positions 0..=pos + i.
             let (kc, vc) = (&sess.k[l], &sess.v[l]);
@@ -466,19 +533,12 @@ impl Model {
                     let n_pos = pos + i + 1;
                     let off = (h / group) * hd;
                     let mut scores: Vec<f32> = (0..n_pos)
-                        .map(|t| {
-                            simd::dot(qh, &kc[t * kv_dim + off..t * kv_dim + off + hd]) * scale
-                        })
+                        .map(|t| kc.dot(t * kv_dim + off, qh) * scale)
                         .collect();
                     ops::softmax(&mut scores);
                     out.fill(0.0);
                     for (t, &p) in scores.iter().enumerate() {
-                        for (o, &vv) in out
-                            .iter_mut()
-                            .zip(&vc[t * kv_dim + off..t * kv_dim + off + hd])
-                        {
-                            *o += p * vv;
-                        }
+                        vc.axpy(t * kv_dim + off, p, out);
                     }
                 });
             self.matmul(&layer.wo, &att, &mut tmp, n);
