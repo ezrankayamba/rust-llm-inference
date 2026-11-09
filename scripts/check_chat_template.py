@@ -4,9 +4,9 @@ usage: python scripts/check_chat_template.py <model.gguf>
 needs: pip install gguf jinja2; builds and runs the `render_chat` example.
 
 Assistant turns start with a space because that is how replies are generated, and how the engine
-replays them. Differences mean the engine's format and the file's template disagree; some are known
-and accepted (see the printed diff), so read them rather than treating this as pass/fail alone.
+replays them. Exits non-zero if the engine's format and the file's template disagree.
 """
+import datetime
 import json
 import os
 import subprocess
@@ -49,6 +49,8 @@ def main(model):
 
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     env.globals["raise_exception"] = raise_exception
+    # The engine fills in today's date in UTC, so Jinja has to as well.
+    env.globals["strftime_now"] = lambda fmt: datetime.datetime.now(datetime.timezone.utc).strftime(fmt)
     template = env.from_string(jinja)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

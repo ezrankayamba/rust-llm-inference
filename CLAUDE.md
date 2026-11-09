@@ -36,8 +36,8 @@ Workspace crates (dependencies flow downward only):
   weights stay zero-copy. `writer.rs` is a minimal writer for tests.
 - **rli-models** (`crates/models`): `config.rs` (`Arch`: Llama, Qwen2, Qwen3, Qwen2Moe, Qwen3Moe),
   `model.rs` (decoder forward, KV `Session`, MoE routing, the `Accelerator` trait), `tokenizer.rs`
-  (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers), `chat.rs` (template chosen by
-  fingerprinting the GGUF Jinja template), `sampler.rs`, and `engine.rs` (the generation API the
+  (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers), `chat.rs` (format chosen by
+  fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, and `engine.rs` (the generation API the
   binaries share, including KV prefix reuse). `metal.rs` / `cuda.rs` implement `Accelerator`, and
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is

@@ -1,5 +1,6 @@
 //! Chat prompt formatting. GGUF ships a Jinja template; rather than embed a Jinja engine, the
-//! template text is fingerprinted to pick one of the common formats below.
+//! template text is fingerprinted to pick one of the common formats below, and any default system
+//! text it carries is read from it, so models get what their authors wrote without per-model code.
 
 use std::ops::Range;
 
@@ -47,6 +48,92 @@ impl Message {
     }
 }
 
+/// What a template adds when the conversation doesn't say otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatDefaults {
+    /// ChatML system prompt used when the first message isn't a system message.
+    pub system: Option<String>,
+    /// Llama 3.x always writes a system turn with this cutoff and today's date.
+    pub knowledge_cutoff: Option<String>,
+}
+
+impl ChatDefaults {
+    pub fn from_jinja(template: ChatTemplate, jinja: &str) -> Self {
+        Self {
+            system: (template == ChatTemplate::ChatMl)
+                .then(|| chatml_default_system(jinja))
+                .flatten(),
+            knowledge_cutoff: (template == ChatTemplate::Llama3)
+                .then(|| llama3_cutoff(jinja))
+                .flatten(),
+        }
+    }
+}
+
+/// The first string literal holding a whole system turn, e.g.
+/// `'<|im_start|>system\nYou are helpful.<|im_end|>\n'`. Templates that insert the message there
+/// close the literal first (`'<|im_start|>system\n' + message`), so they don't match.
+fn chatml_default_system(jinja: &str) -> Option<String> {
+    const OPEN: &str = "<|im_start|>system";
+    jinja.match_indices(OPEN).find_map(|(pos, _)| {
+        let quote = jinja[..pos]
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '\'' | '"'))?;
+        let rest = &jinja[pos + OPEN.len()..];
+        let rest = rest
+            .strip_prefix("\\n")
+            .or_else(|| rest.strip_prefix('\n'))?;
+        let body = &rest[..rest.find("<|im_end|>")?];
+        let text = unescape_literal(body, quote)?;
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+/// A Jinja string literal's value, or `None` if the literal ends before `body` does.
+fn unescape_literal(body: &str, quote: char) -> Option<String> {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            c if c == quote => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+fn llama3_cutoff(jinja: &str) -> Option<String> {
+    const KEY: &str = "Cutting Knowledge Date: ";
+    let rest = &jinja[jinja.find(KEY)? + KEY.len()..];
+    let end = rest.find(['\\', '\n', '\'', '"'])?;
+    (end > 0).then(|| rest[..end].to_owned())
+}
+
+/// `%d %b %Y` in UTC, the format Llama 3.x templates ask for. The standard library has no
+/// calendar; this is the usual days-to-civil conversion over 400-year eras.
+pub fn format_date(unix_secs: u64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // Days since 0000-03-01, so a leap day falls at the end of a year.
+    let z = unix_secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{day:02} {} {year}", MONTHS[month as usize - 1])
+}
+
 impl ChatTemplate {
     /// The format a template's text fingerprints as, if any.
     pub fn detect(jinja: &str) -> Option<Self> {
@@ -61,11 +148,17 @@ impl ChatTemplate {
     }
 
     /// Renders the conversation, ending with the assistant turn opener. BOS is not included:
-    /// the tokenizer adds it when the model requests one.
-    pub fn render(self, messages: &[Message]) -> Rendered {
+    /// the tokenizer adds it when the model requests one. `today` goes in Llama 3.x's date line.
+    pub fn render(self, messages: &[Message], defaults: &ChatDefaults, today: &str) -> Rendered {
         let mut r = Rendered::default();
         match self {
             Self::ChatMl => {
+                let first = messages.first().map(|m| m.role.as_str());
+                if let Some(sys) = &defaults.system
+                    && !matches!(first, Some("system" | "developer"))
+                {
+                    r.text += &format!("<|im_start|>system\n{sys}<|im_end|>\n");
+                }
                 for m in messages {
                     r.text += &format!("<|im_start|>{}\n", m.role);
                     r.push_untrusted(&m.content);
@@ -74,6 +167,20 @@ impl ChatTemplate {
                 r.text += "<|im_start|>assistant\n";
             }
             Self::Llama3 => {
+                let mut messages = messages;
+                if let Some(cutoff) = &defaults.knowledge_cutoff {
+                    r.text += &format!(
+                        "<|start_header_id|>system<|end_header_id|>\n\n\
+                         Cutting Knowledge Date: {cutoff}\nToday Date: {today}\n\n"
+                    );
+                    if let Some((m, rest)) = messages.split_first()
+                        && m.role == "system"
+                    {
+                        r.push_untrusted(m.content.trim());
+                        messages = rest;
+                    }
+                    r.text += "<|eot_id|>";
+                }
                 for m in messages {
                     r.text += &format!("<|start_header_id|>{}<|end_header_id|>\n\n", m.role);
                     r.push_untrusted(m.content.trim());
@@ -157,6 +264,10 @@ impl ChatTemplate {
 mod tests {
     use super::*;
 
+    fn plain(t: ChatTemplate, msgs: &[Message]) -> Rendered {
+        t.render(msgs, &ChatDefaults::default(), "")
+    }
+
     #[test]
     fn detects_formats_from_jinja_markers() {
         for (jinja, want) in [
@@ -179,7 +290,7 @@ mod tests {
             Message::new("user", "U2"),
         ];
         assert_eq!(
-            ChatTemplate::Mistral.render(&msgs).text,
+            plain(ChatTemplate::Mistral, &msgs).text,
             "[INST] U1 [/INST] A1</s>[INST] U2 [/INST]"
         );
     }
@@ -194,7 +305,7 @@ mod tests {
                 Message::new("user", "U2"),
             ];
             assert_eq!(
-                ChatTemplate::Mistral.render(&msgs).text,
+                plain(ChatTemplate::Mistral, &msgs).text,
                 "[INST] S\n\nU1 [/INST] A1</s>[INST] U2 [/INST]"
             );
         }
@@ -203,14 +314,14 @@ mod tests {
     #[test]
     fn mistral_gives_a_lone_system_message_its_own_turn() {
         let msgs = [Message::new("system", "S")];
-        assert_eq!(ChatTemplate::Mistral.render(&msgs).text, "[INST] S [/INST]");
+        assert_eq!(plain(ChatTemplate::Mistral, &msgs).text, "[INST] S [/INST]");
     }
 
     #[test]
     fn llama2_treats_developer_as_system() {
         let msgs = [Message::new("developer", "S"), Message::new("user", "U")];
         assert_eq!(
-            ChatTemplate::Llama2.render(&msgs).text,
+            plain(ChatTemplate::Llama2, &msgs).text,
             "[INST] <<SYS>>\nS\n<</SYS>>\n\nU [/INST]"
         );
     }
@@ -222,7 +333,7 @@ mod tests {
             Message::new("user", "Hi"),
         ];
         assert_eq!(
-            ChatTemplate::ChatMl.render(&msgs).text,
+            plain(ChatTemplate::ChatMl, &msgs).text,
             "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
     }
@@ -236,7 +347,7 @@ mod tests {
             Message::new("user", "U2"),
         ];
         assert_eq!(
-            ChatTemplate::Llama2.render(&msgs).text,
+            plain(ChatTemplate::Llama2, &msgs).text,
             "[INST] <<SYS>>\nS\n<</SYS>>\n\nU1 [/INST] A1</s><s>[INST] U2 [/INST]"
         );
     }
@@ -256,9 +367,139 @@ mod tests {
             (ChatTemplate::Llama2, vec!["S", "U", "A", "V"]),
             (ChatTemplate::Mistral, vec!["S", " U ", "A", "V"]),
         ] {
-            let r = template.render(&msgs);
+            let r = plain(template, &msgs);
             let got: Vec<&str> = r.untrusted.iter().map(|x| &r.text[x.clone()]).collect();
             assert_eq!(got, want, "{template:?}");
+        }
+    }
+
+    #[test]
+    fn chatml_default_reads_a_literal_with_real_or_escaped_newlines() {
+        for jinja in [
+            "{{ '<|im_start|>system\nYou are helpful.<|im_end|>\n' }}",
+            "{{ '<|im_start|>system\\nYou are helpful.<|im_end|>\\n' }}",
+            "{{ \"<|im_start|>system\\nYou are helpful.<|im_end|>\\n\" }}",
+        ] {
+            assert_eq!(
+                chatml_default_system(jinja).as_deref(),
+                Some("You are helpful."),
+                "{jinja}"
+            );
+        }
+    }
+
+    #[test]
+    fn chatml_default_keeps_quotes_and_escapes_in_the_text() {
+        let jinja = r#"{{ '<|im_start|>system\nIt\'s "Bob".\nHi.<|im_end|>' }}"#;
+        assert_eq!(
+            chatml_default_system(jinja).as_deref(),
+            Some("It's \"Bob\".\nHi.")
+        );
+    }
+
+    #[test]
+    fn chatml_default_ignores_templates_that_insert_the_message() {
+        let jinja = "{{ '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}";
+        assert_eq!(chatml_default_system(jinja), None);
+    }
+
+    #[test]
+    fn chatml_default_skips_an_inserting_branch_to_find_the_literal() {
+        let jinja = "{{ '<|im_start|>system\\n' }}{{ m }}<|im_end|>\
+                     {{ '<|im_start|>system\\nDefault.<|im_end|>' }}";
+        assert_eq!(chatml_default_system(jinja).as_deref(), Some("Default."));
+    }
+
+    #[test]
+    fn default_extraction_tolerates_broken_templates() {
+        for jinja in [
+            "",
+            "<|im_start|>system",
+            "'<|im_start|>system",
+            "'<|im_start|>system\n",
+            "'<|im_start|>system\nno end",
+            "'<|im_start|>system\n<|im_end|>",
+            "'<|im_start|>system\ntrailing\\<|im_end|>",
+            "Cutting Knowledge Date: ",
+            "Cutting Knowledge Date: \\n",
+            "é'<|im_start|>system\nü<|im_end|>",
+        ] {
+            let d = ChatDefaults::from_jinja(ChatTemplate::ChatMl, jinja);
+            let e = ChatDefaults::from_jinja(ChatTemplate::Llama3, jinja);
+            assert_eq!(e.system, None, "{jinja}");
+            assert_eq!(d.knowledge_cutoff, None, "{jinja}");
+        }
+    }
+
+    #[test]
+    fn llama3_cutoff_stops_at_the_end_of_the_line() {
+        let jinja = r#"{{- "Cutting Knowledge Date: December 2023\n" }}"#;
+        assert_eq!(llama3_cutoff(jinja).as_deref(), Some("December 2023"));
+        assert_eq!(llama3_cutoff("no date here"), None);
+    }
+
+    #[test]
+    fn chatml_adds_the_default_unless_a_system_message_comes_first() {
+        let d = ChatDefaults {
+            system: Some("D".into()),
+            knowledge_cutoff: None,
+        };
+        let user = [Message::new("user", "U")];
+        assert_eq!(
+            ChatTemplate::ChatMl.render(&user, &d, "").text,
+            "<|im_start|>system\nD<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n"
+        );
+        for role in ["system", "developer"] {
+            let msgs = [Message::new(role, "S"), Message::new("user", "U")];
+            assert!(
+                !ChatTemplate::ChatMl
+                    .render(&msgs, &d, "")
+                    .text
+                    .contains('D')
+            );
+        }
+    }
+
+    #[test]
+    fn chatml_default_is_not_marked_untrusted() {
+        let d = ChatDefaults {
+            system: Some("D".into()),
+            knowledge_cutoff: None,
+        };
+        let r = ChatTemplate::ChatMl.render(&[Message::new("user", "U")], &d, "");
+        let got: Vec<&str> = r.untrusted.iter().map(|x| &r.text[x.clone()]).collect();
+        assert_eq!(got, ["U"]);
+    }
+
+    #[test]
+    fn llama3_header_holds_the_date_and_the_first_system_message() {
+        let d = ChatDefaults {
+            system: None,
+            knowledge_cutoff: Some("December 2023".into()),
+        };
+        let head = "<|start_header_id|>system<|end_header_id|>\n\n\
+                    Cutting Knowledge Date: December 2023\nToday Date: 09 Nov 2026\n\n";
+        let tail = "<|start_header_id|>user<|end_header_id|>\n\nU<|eot_id|>\
+                    <|start_header_id|>assistant<|end_header_id|>\n\n";
+        let user = Message::new("user", "U");
+        let bare = ChatTemplate::Llama3.render(std::slice::from_ref(&user), &d, "09 Nov 2026");
+        assert_eq!(bare.text, format!("{head}<|eot_id|>{tail}"));
+        let sys = Message::new("system", " S ");
+        let with = ChatTemplate::Llama3.render(&[sys, user], &d, "09 Nov 2026");
+        assert_eq!(with.text, format!("{head}S<|eot_id|>{tail}"));
+    }
+
+    #[test]
+    fn format_date_handles_epoch_leap_days_and_year_ends() {
+        for (secs, want) in [
+            (0, "01 Jan 1970"),
+            (1_709_164_800, "29 Feb 2024"),
+            (1_709_251_200, "01 Mar 2024"),
+            (1_721_952_000, "26 Jul 2024"),
+            (1_735_689_599, "31 Dec 2024"),
+            (1_735_689_600, "01 Jan 2025"),
+        ] {
+            assert_eq!(format_date(secs), want);
         }
     }
 }

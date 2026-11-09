@@ -1,17 +1,18 @@
 //! Model + tokenizer + chat template, and the token generation loop shared by the CLI and server.
 
-use crate::chat::{ChatTemplate, Message};
+use crate::chat::{self, ChatDefaults, ChatTemplate, Message, Rendered};
 use crate::model::{Model, PROMPT_SLICE, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use rli_gguf::{Error, Gguf, Result};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Engine {
     pub model: Model,
     pub tokenizer: Tokenizer,
     pub template: ChatTemplate,
+    pub chat_defaults: ChatDefaults,
     /// Set when `template` is a guess, for binaries to show if they use chat formatting.
     pub template_warning: Option<String>,
     pub model_name: String,
@@ -64,6 +65,9 @@ impl Engine {
         let jinja = gguf.get("tokenizer.chat_template").and_then(|v| v.as_str());
         let detected = jinja.and_then(ChatTemplate::detect);
         let template = detected.unwrap_or(ChatTemplate::ChatMl);
+        let chat_defaults = jinja.map_or_else(ChatDefaults::default, |j| {
+            ChatDefaults::from_jinja(template, j)
+        });
         let template_warning = detected.is_none().then(|| {
             let problem = if jinja.is_some() {
                 "has an unrecognized chat template"
@@ -108,6 +112,7 @@ impl Engine {
             model,
             tokenizer,
             template,
+            chat_defaults,
             template_warning,
             model_name,
             stop,
@@ -119,8 +124,17 @@ impl Engine {
             .new_session(max_ctx.min(self.model.cfg.n_ctx_train))
     }
 
+    /// The chat prompt for `messages`, with today's date (UTC) where the template wants one.
+    pub fn render_chat(&self, messages: &[Message]) -> Rendered {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.template
+            .render(messages, &self.chat_defaults, &chat::format_date(now))
+    }
+
     pub fn chat_tokens(&self, messages: &[Message]) -> Vec<u32> {
-        let prompt = self.template.render(messages);
+        let prompt = self.render_chat(messages);
         self.tokenizer
             .encode_untrusted(&prompt.text, self.tokenizer.add_bos, &prompt.untrusted)
     }
