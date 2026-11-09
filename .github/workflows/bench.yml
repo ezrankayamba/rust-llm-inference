@@ -4,6 +4,9 @@ name: Benchmark
 on:
   workflow_dispatch:
     inputs:
+      base:
+        description: Compare this engine at HEAD with this revision, instead of with llama.cpp
+        default: ""
       threads:
         description: Comma-separated thread counts
         default: "1"
@@ -20,7 +23,50 @@ permissions:
   contents: read
 
 jobs:
+  revisions:
+    if: inputs.base != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE: ${{ inputs.base }}
+      THREADS: ${{ inputs.threads }}
+      MODELS: ${{ inputs.models }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - name: Build both revisions
+        run: |
+          git worktree add -q --detach "$RUNNER_TEMP/base" "$BASE"
+          for dir in . "$RUNNER_TEMP/base"; do
+            (cd "$dir" && cargo build --release --locked -p rli-models --example bench \
+              && cargo build --release --locked -p rli-core --example bench_matvec)
+          done
+      - name: Compare
+        run: |
+          lscpu | grep 'Model name'
+          run() { # label, target dir
+            for t in ${THREADS//,/ }; do
+              echo "== $1, kernels, $t threads"
+              RAYON_NUM_THREADS=$t "$2/examples/bench_matvec" | grep -E '^ *Q'
+              for model in "$RUNNER_TEMP"/*.gguf; do
+                echo "== $1, $(basename "$model"), $t threads"
+                "$2/examples/bench" "$model" --pp 256 --tg 64 --threads "$t" | grep -E '^(pp|tg)'
+              done
+            done
+          }
+          for url in $MODELS; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$(basename "$url")" "$url"
+          done
+          # Twice, alternating, to expose drift on the shared runner.
+          for i in 1 2; do
+            run base "$RUNNER_TEMP/base/target/release"
+            run head target/release
+          done
+
   compare:
+    if: inputs.base == ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
