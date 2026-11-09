@@ -38,8 +38,8 @@ jobs:
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v7
-      # This is the only run of the AVX2 `dot`; without these features it would fall back unnoticed.
-      - run: grep -q avx2 /proc/cpuinfo && grep -q fma /proc/cpuinfo
+      # This is the only run of the AVX2 kernels; without these features they'd fall back unnoticed.
+      - run: grep -q avx2 /proc/cpuinfo && grep -q fma /proc/cpuinfo && grep -q f16c /proc/cpuinfo
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --release --locked

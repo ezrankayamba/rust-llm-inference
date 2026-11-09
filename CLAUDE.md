@@ -27,8 +27,8 @@ Workspace crates (dependencies flow downward only):
 
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel), fast integer kernels over
-  Q8-quantized activations (`qdot.rs`, NEON `dotprod` with runtime detection and a portable
-  fallback; batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, so batched int8
+  Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
+  fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, so batched int8
   results differ from per-token ones by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
@@ -85,7 +85,10 @@ Design points that span files:
   keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal
   batched prompts (the matrix units accumulate in a different order); tests that compare logits use it.
   The f16 KV caches (Metal and CPU) move logits by up to ~0.015 against f32 on real models
-  (top-1 unchanged). These differences are enough to change sampled output: at high temperature, the
+  (top-1 unchanged). Int8 activations also amplify float rounding: a tiny difference flips a value
+  across a `round()` boundary and cascades through the layers, so NEON, AVX2 and portable kernels
+  each give logits about 0.4 apart and can differ in temperature-0 text on near-ties. Compare a
+  kernel with `--precise`, not with another kernel's text. These differences are enough to change sampled output: at high temperature, the
   same seed gives one reply when a prompt is evaluated in full and another when its prefix is cached.
 - **Model files are untrusted.** `rli-gguf` rejects malformed headers, and `Model::load` and
   `Tokenizer::from_gguf` check tensor shapes and metadata against each other, because GPU kernels
@@ -121,7 +124,7 @@ cargo fmt --all
 ```
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on PRs: fmt and clippy, plus the tests
-on Linux x86-64 (the only run of the AVX2 `dot`). Each job has a 4-minute timeout, so a change that
+on Linux x86-64 (the only run of the AVX2 kernels; this Mac can't run them, even under Rosetta). Each job has a 4-minute timeout, so a change that
 makes it slower fails rather than creeping up. There is no macOS job, to avoid its billing: Metal
 and NEON are checked only locally, so run the tests and clippy above before pushing changes to them.
 
