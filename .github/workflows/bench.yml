@@ -14,6 +14,9 @@ on:
       threads:
         description: Comma-separated thread counts
         default: "1"
+      depth:
+        description: With base, tokens of context to prefill before timing decode
+        default: "0"
       llama_ref:
         description: llama.cpp tag to compare with
         default: v0.9.0
@@ -60,6 +63,7 @@ jobs:
     env:
       BASE: ${{ inputs.base }}
       THREADS: ${{ inputs.threads }}
+      DEPTH: ${{ inputs.depth }}
       MODELS: ${{ inputs.models }}
     steps:
       - uses: actions/checkout@v7
@@ -84,7 +88,7 @@ jobs:
               RAYON_NUM_THREADS=$t "$2/examples/bench_matvec" | grep -E '^ *Q'
               for model in "$RUNNER_TEMP"/*.gguf; do
                 echo "== $1, $(basename "$model"), $t threads"
-                "$2/examples/bench" "$model" --pp 256 --tg 64 --threads "$t" | grep -E '^(pp|tg)'
+                "$2/examples/bench" "$model" --pp 256 --tg 64 --depth "$DEPTH" --threads "$t" | grep -E '^(pp|tg)'
               done
             done
           }

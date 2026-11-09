@@ -176,11 +176,15 @@ impl KvCache {
         }
     }
 
-    /// `q · cache[at..at + q.len()]`.
-    fn dot(&self, at: usize, q: &[f32]) -> f32 {
+    /// `out[t] = q · cache[at + t * stride..][..q.len()]`.
+    fn dots(&self, at: usize, stride: usize, q: &[f32], out: &mut [f32]) {
         match self {
-            KvCache::F32(c) => simd::dot(q, &c[at..at + q.len()]),
-            KvCache::F16(c) => simd::dot_f16(&c[2 * at..2 * (at + q.len())], q),
+            KvCache::F32(c) => {
+                for (t, o) in out.iter_mut().enumerate() {
+                    *o = simd::dot(q, &c[at + t * stride..][..q.len()]);
+                }
+            }
+            KvCache::F16(c) => simd::dot_f16_rows(q, &c[2 * at..], 2 * stride, out),
         }
     }
 
@@ -623,8 +627,9 @@ impl Model {
                     let (i, h) = (j / c.n_head, j % c.n_head);
                     let n_pos = pos + i + 1;
                     let off = (h / group) * hd;
-                    scores.clear();
-                    scores.extend((0..n_pos).map(|t| kc.dot(t * kv_dim + off, qh) * scale));
+                    scores.resize(n_pos, 0.0);
+                    kc.dots(off, kv_dim, qh, scores);
+                    scores.iter_mut().for_each(|s| *s *= scale);
                     ops::softmax(scores);
                     vc.weighted_sum(off, kv_dim, scores, out);
                 });
