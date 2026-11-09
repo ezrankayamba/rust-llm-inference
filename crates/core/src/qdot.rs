@@ -82,6 +82,19 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
     (s as f32, m as f32)
 }
 
+/// All eight 6-bit scales and mins of a Q4_K/Q5_K super-block from its 12 packed bytes, the
+/// same values [`scale_min_k4`] gives one at a time, as a little-endian u64 of bytes each.
+#[inline]
+fn scales_mins_k4(q: &[u8]) -> (u64, u64) {
+    let u = |i: usize| u32::from_le_bytes([q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]]);
+    let (u0, u1, u2) = (u(0), u(1), u(2));
+    let (low6, low4, top2) = (0x3f3f_3f3f, 0x0f0f_0f0f, 0x0303_0303);
+    let sc = [u0 & low6, (u2 & low4) | (((u0 >> 6) & top2) << 4)];
+    let mn = [u1 & low6, ((u2 >> 4) & low4) | (((u1 >> 6) & top2) << 4)];
+    let pack = |v: [u32; 2]| v[0] as u64 | (v[1] as u64) << 32;
+    (pack(sc), pack(mn))
+}
+
 /// Dot product of one encoded row with quantized activations. Panics for float types.
 pub fn dot_row_q8(ty: GgmlType, row: &[u8], a: &Q8Act) -> f32 {
     let mut out = [0.0];
@@ -861,7 +874,7 @@ mod neon {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{Q8Act, QK, scale_min_k4};
+    use super::{Q8Act, QK, scale_min_k4, scales_mins_k4};
     use crate::quant::{GgmlType, QK_K};
     use crate::simd::x86::hsum;
     use std::arch::x86_64::*;
@@ -869,8 +882,14 @@ mod avx2 {
     #[target_feature(enable = "avx2,f16c")]
     #[inline]
     fn le16(b: &[u8], at: usize) -> f32 {
-        let h = u16::from_le_bytes([b[at], b[at + 1]]);
-        _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
+        // Loading four bytes (only the low two are converted) writes the whole register. A 16-bit
+        // value compiles to an insert into whatever the register last held, chaining every
+        // block's conversion onto the previous block's.
+        let v = match b.get(at..at + 4) {
+            Some(w) => _mm_cvtsi32_si128(i32::from_le_bytes([w[0], w[1], w[2], w[3]])),
+            None => _mm_set1_epi16(u16::from_le_bytes([b[at], b[at + 1]]) as i16),
+        };
+        _mm_cvtss_f32(_mm_cvtph_ps(v))
     }
 
     /// Eight partial sums of `w · x` over 32 lanes, the low four covering lanes 0..16. `maddubs`
@@ -885,6 +904,78 @@ mod avx2 {
         let x = unsafe { _mm256_loadu_si256(x.cast()) };
         let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
         _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+    }
+
+    /// [`dot32`] with each 16-bit pair sum multiplied by `scale`'s matching lane, in the same
+    /// `madd` (exact: a pair is at most 2 · 128 · 127, and a scale fits in an i8).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dot32_scaled(w: __m256i, x: *const i8, scale: __m256i) -> __m256i {
+        // SAFETY: the caller guarantees 32 readable values at `x`.
+        let x = unsafe { _mm256_loadu_si256(x.cast()) };
+        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+        _mm256_madd_epi16(pairs, scale)
+    }
+
+    /// [`dot_rows`] for Q4_K (`FIVE` false) and Q5_K, with each super-block's scales and mins
+    /// decoded once rather than per 32 weights.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    #[inline]
+    unsafe fn k_rows<const N: usize, const FIVE: bool>(
+        row: &[u8],
+        xq: [*const i8; N],
+        xd: [*const f32; N],
+        xs: [*const f32; N],
+        acc: &mut [__m256; N],
+        extra: &mut [f32; N],
+    ) {
+        let bb = if FIVE { 176 } else { 144 };
+        let ql_at = if FIVE { 48 } else { 16 };
+        let m4 = _mm256_set1_epi8(0xf);
+        let sixteen = _mm256_set1_epi8(16);
+        // SAFETY: per `dot_rows`, whose block count bounds every token's activations.
+        unsafe {
+            for (i, b) in row.chunks_exact(bb).enumerate() {
+                // Each sub-block's d·scale and dmin·min, all eight at once.
+                let (sc, mn) = scales_mins_k4(&b[4..16]);
+                let times = |bytes: u64, f: f32| {
+                    let v =
+                        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes as i64)));
+                    let mut out = [0f32; 8];
+                    _mm256_storeu_ps(out.as_mut_ptr(), _mm256_mul_ps(v, _mm256_set1_ps(f)));
+                    out
+                };
+                let (dsc, dm) = (times(sc, le16(b, 0)), times(mn, le16(b, 2)));
+                let qh = if FIVE {
+                    _mm256_loadu_si256(b.as_ptr().add(16).cast())
+                } else {
+                    _mm256_setzero_si256()
+                };
+                for g in 0..4 {
+                    let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * g).cast());
+                    for half in 0..2 {
+                        let sub = 2 * g + half;
+                        let mut w = if half == 0 {
+                            _mm256_and_si256(q, m4)
+                        } else {
+                            high_nibbles(q)
+                        };
+                        if FIVE {
+                            let bit = _mm256_set1_epi8(1 << sub);
+                            let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
+                            w = _mm256_or_si256(w, _mm256_and_si256(set, sixteen));
+                        }
+                        let xb = i * (QK_K / QK) + sub;
+                        for t in 0..N {
+                            let s = dot32_unsigned(w, xq[t].add(xb * QK));
+                            let scale = _mm256_set1_ps(dsc[sub] * *xd[t].add(xb));
+                            acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, acc[t]);
+                            extra[t] -= dm[sub] * *xs[t].add(xb);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// [`dot32`] for weights known to be non-negative, which skips moving the sign.
@@ -947,101 +1038,67 @@ mod avx2 {
             assert_eq!(n_blocks * ty.block_size(), a.qs.len());
         }
         let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
+        // Activation scales and sums, read unchecked in the loops below: indexing them cost a
+        // bounds check per token every 32 weights.
+        let xd: [*const f32; N] = std::array::from_fn(|t| acts[t].d.as_ptr());
+        let xs: [*const f32; N] = std::array::from_fn(|t| acts[t].sum.as_ptr());
+        for a in acts {
+            assert!(a.d.len() * QK == a.qs.len() && a.sum.len() == a.d.len());
+        }
         let mut acc = [_mm256_setzero_ps(); N];
         // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
         let mut extra = [0f32; N];
         let add = |acc: __m256, s: __m256i, scale: f32| -> __m256 {
             _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), _mm256_set1_ps(scale), acc)
         };
-        // SAFETY (all blocks below): every pointer offset stays inside `row` (n_blocks * bb bytes)
-        // or each token's `qs` (n_blocks * block_size values), as asserted above.
+        let blocks = row.chunks_exact(bb).enumerate();
+        // SAFETY (all blocks below): every pointer offset stays inside the current block of `row`
+        // or each token's activations (n_blocks * block_size values and n_blocks * block_size / 32
+        // scales and sums), as asserted above.
         unsafe {
             match ty {
                 GgmlType::Q8_0 => {
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..];
+                    for (i, b) in blocks {
                         let w = _mm256_loadu_si256(b.as_ptr().add(2).cast());
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
                 GgmlType::Q4_0 => {
                     let eight = _mm256_set1_epi8(8);
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..];
+                    for (i, b) in blocks {
                         let w = _mm256_sub_epi8(unpack_nibbles(b.as_ptr().add(2)), eight);
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
                 GgmlType::Q5_0 => {
                     let sixteen = _mm256_set1_epi8(16);
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..];
-                        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                    for (i, b) in blocks {
+                        let qh = b.as_ptr().add(2).cast::<u32>().read_unaligned().to_le();
                         let w = _mm256_or_si256(unpack_nibbles(b.as_ptr().add(6)), high_bits(qh));
                         let w = _mm256_sub_epi8(w, sixteen);
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
-                GgmlType::Q4_K | GgmlType::Q5_K => {
-                    let five = ty == GgmlType::Q5_K;
-                    let ql_at = if five { 48 } else { 16 };
-                    let m4 = _mm256_set1_epi8(0xf);
-                    let sixteen = _mm256_set1_epi8(16);
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..(i + 1) * bb];
-                        let (d, dmin) = (le16(b, 0), le16(b, 2));
-                        let scales = &b[4..16];
-                        let qh = if five {
-                            _mm256_loadu_si256(b.as_ptr().add(16).cast())
-                        } else {
-                            _mm256_setzero_si256()
-                        };
-                        for g in 0..4 {
-                            let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * g).cast());
-                            for half in 0..2 {
-                                let sub = 2 * g + half;
-                                let mut w = if half == 0 {
-                                    _mm256_and_si256(q, m4)
-                                } else {
-                                    high_nibbles(q)
-                                };
-                                if five {
-                                    let bit = _mm256_set1_epi8(1 << sub);
-                                    let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
-                                    w = _mm256_or_si256(w, _mm256_and_si256(set, sixteen));
-                                }
-                                let xb = i * (QK_K / QK) + sub;
-                                let (sc, m) = scale_min_k4(sub, scales);
-                                let (dsc, dm) = (d * sc, dmin * m);
-                                for t in 0..N {
-                                    let s = dot32_unsigned(w, xq[t].add(xb * QK));
-                                    acc[t] = add(acc[t], s, dsc * acts[t].d[xb]);
-                                    extra[t] -= dm * acts[t].sum[xb];
-                                }
-                            }
-                        }
-                    }
-                }
+                GgmlType::Q4_K => k_rows::<N, false>(row, xq, xd, xs, &mut acc, &mut extra),
+                GgmlType::Q5_K => k_rows::<N, true>(row, xq, xd, xs, &mut acc, &mut extra),
                 GgmlType::Q6_K => {
                     let m4 = _mm256_set1_epi8(0xf);
                     let three = _mm256_set1_epi8(3);
                     let off = _mm256_set1_epi8(32);
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..(i + 1) * bb];
+                    for (i, b) in blocks {
                         let d = le16(b, 208);
-                        let sc = &b[192..208];
                         let p = b.as_ptr();
                         for n in 0..2 {
                             let ql = [
@@ -1062,16 +1119,16 @@ mod avx2 {
                                 let w = _mm256_sub_epi8(w, off);
                                 let xb = i * (QK_K / QK) + 4 * n + k;
                                 // Each half's i8 scale goes on in integer arithmetic (exact)
-                                // before the one float multiply; the halves are the two 128-bit
-                                // lanes of the partial sums.
+                                // before the one float multiply, as the `madd` multiplier: the
+                                // halves are the two 128-bit lanes of the partial sums.
+                                let sc = p.add(192 + 8 * n + 2 * k).cast::<i8>();
                                 let scale = _mm256_set_m128i(
-                                    _mm_set1_epi32(sc[8 * n + 2 * k + 1] as i8 as i32),
-                                    _mm_set1_epi32(sc[8 * n + 2 * k] as i8 as i32),
+                                    _mm_set1_epi16(*sc.add(1) as i16),
+                                    _mm_set1_epi16(*sc as i16),
                                 );
                                 for t in 0..N {
-                                    let s = dot32(w, xq[t].add(xb * QK));
-                                    let s = _mm256_mullo_epi32(s, scale);
-                                    acc[t] = add(acc[t], s, d * acts[t].d[xb]);
+                                    let s = dot32_scaled(w, xq[t].add(xb * QK), scale);
+                                    acc[t] = add(acc[t], s, d * *xd[t].add(xb));
                                 }
                             }
                         }
@@ -1423,6 +1480,20 @@ mod tests {
             }
         }
         row
+    }
+
+    #[test]
+    fn packed_k4_scales_match_one_at_a_time() {
+        let mut rng = Rng::new(5);
+        for _ in 0..1000 {
+            let q: Vec<u8> = (0..12).map(|_| rng.next_u32() as u8).collect();
+            let (sc, mn) = scales_mins_k4(&q);
+            for j in 0..8 {
+                let want = scale_min_k4(j, &q);
+                let got = ((sc >> (8 * j)) as u8 as f32, (mn >> (8 * j)) as u8 as f32);
+                assert_eq!(got, want, "sub-block {j} of {q:?}");
+            }
+        }
     }
 
     #[test]
