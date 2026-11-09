@@ -1,6 +1,6 @@
 //! SIMD f32 dot products, also against f16 weights. NEON is architecturally guaranteed on
-//! aarch64; on x86_64 AVX2+FMA is detected at runtime. Every path has the scalar version as its
-//! fallback and test reference.
+//! aarch64; on x86_64 AVX2+FMA+F16C is detected at runtime. Every path has the scalar version as
+//! its fallback and test reference.
 
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
@@ -17,7 +17,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if x86::has_avx2_fma() {
+        if x86::has_avx2() {
             // SAFETY: CPU support verified at runtime; lengths checked above.
             unsafe { x86::dot_avx2(a, b) }
         } else {
@@ -72,7 +72,16 @@ pub fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
         // SAFETY: NEON is mandatory on aarch64; lengths checked above.
         unsafe { dot_f16_neon(w, x) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx2() {
+            // SAFETY: CPU support verified at runtime; lengths checked above.
+            unsafe { x86::dot_f16_avx2(w, x) }
+        } else {
+            dot_f16_scalar(w, x)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         dot_f16_scalar(w, x)
     }
@@ -156,7 +165,16 @@ pub fn axpy_f16(y: &mut [f32], a: f32, w: &[u8]) {
         // SAFETY: NEON is mandatory on aarch64; lengths checked above.
         unsafe { axpy_f16_neon(y, a, w) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx2() {
+            // SAFETY: CPU support verified at runtime; lengths checked above.
+            unsafe { x86::axpy_f16_avx2(y, a, w) }
+        } else {
+            axpy_f16_scalar(y, a, w)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         axpy_f16_scalar(y, a, w)
     }
@@ -194,7 +212,7 @@ unsafe fn axpy_f16_neon(y: &mut [f32], a: f32, w: &[u8]) {
 
 /// `out = Σ_t w[t] · row_t`, row `t` being `out.len()` little-endian halves at byte `t * stride`
 /// of `rows` (attention's weighted sum of cached values). Bit-identical to zeroing `out` and
-/// calling [`axpy_f16`] per row, but the NEON path keeps 32 outputs in registers across all rows
+/// calling [`axpy_f16`] per row, but the SIMD paths keep the outputs in registers across all rows
 /// instead of loading and storing them for each one.
 pub fn weighted_rows_f16(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
     if let Some(last) = w.len().checked_sub(1) {
@@ -208,7 +226,16 @@ pub fn weighted_rows_f16(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize)
         // SAFETY: NEON is mandatory on aarch64; bounds checked above.
         unsafe { weighted_rows_f16_neon(out, w, rows, stride) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx2() {
+            // SAFETY: CPU support verified at runtime; bounds checked above.
+            unsafe { x86::weighted_rows_f16_avx2(out, w, rows, stride) }
+        } else {
+            weighted_rows_f16_scalar(out, w, rows, stride)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         weighted_rows_f16_scalar(out, w, rows, stride)
     }
@@ -277,17 +304,30 @@ unsafe fn weighted_rows_f16_neon(out: &mut [f32], w: &[f32], rows: &[u8], stride
 }
 
 #[cfg(target_arch = "x86_64")]
-mod x86 {
+pub(crate) mod x86 {
+    use std::arch::x86_64::*;
     use std::sync::OnceLock;
 
-    pub fn has_avx2_fma() -> bool {
+    /// Every CPU with AVX2 has FMA and F16C too, so all the x86 kernels share one check.
+    pub fn has_avx2() -> bool {
         static HAS: OnceLock<bool> = OnceLock::new();
-        *HAS.get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"))
+        *HAS.get_or_init(|| {
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c")
+        })
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub fn hsum(v: __m256) -> f32 {
+        let s4 = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        _mm_cvtss_f32(_mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1)))
     }
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
-        use std::arch::x86_64::*;
         let n = a.len();
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
         let mut acc0 = _mm256_setzero_ps();
@@ -305,18 +345,120 @@ mod x86 {
                 );
                 i += 16;
             }
-            let acc = _mm256_add_ps(acc0, acc1);
-            let lo = _mm256_castps256_ps128(acc);
-            let hi = _mm256_extractf128_ps(acc, 1);
-            let s4 = _mm_add_ps(lo, hi);
-            let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
-            let mut s = _mm_cvtss_f32(s1);
+            let mut s = hsum(_mm256_add_ps(acc0, acc1));
             while i < n {
                 s += *pa.add(i) * *pb.add(i);
                 i += 1;
             }
             s
+        }
+    }
+
+    /// Eight halves at `p`, which may be only byte-aligned, as f32s.
+    #[target_feature(enable = "avx2,f16c")]
+    #[inline]
+    unsafe fn load_halves(p: *const u16) -> __m256 {
+        // SAFETY: the caller guarantees eight readable halves; the load is unaligned-safe.
+        _mm256_cvtph_ps(unsafe { _mm_loadu_si128(p.cast()) })
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_f16_avx2(w: &[u8], x: &[f32]) -> f32 {
+        let n = x.len();
+        let (pw, px) = (w.as_ptr() as *const u16, x.as_ptr());
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut i = 0;
+        // SAFETY: every load stays within `n` elements, which `w` (as halves) and `x` share.
+        unsafe {
+            while i + 16 <= n {
+                acc0 = _mm256_fmadd_ps(load_halves(pw.add(i)), _mm256_loadu_ps(px.add(i)), acc0);
+                acc1 = _mm256_fmadd_ps(
+                    load_halves(pw.add(i + 8)),
+                    _mm256_loadu_ps(px.add(i + 8)),
+                    acc1,
+                );
+                i += 16;
+            }
+            let mut s = hsum(_mm256_add_ps(acc0, acc1));
+            while i < n {
+                s += crate::half::f16_to_f32(pw.add(i).read_unaligned()) * *px.add(i);
+                i += 1;
+            }
+            s
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn axpy_f16_avx2(y: &mut [f32], a: f32, w: &[u8]) {
+        let n = y.len();
+        let (pw, py) = (w.as_ptr() as *const u16, y.as_mut_ptr());
+        let va = _mm256_set1_ps(a);
+        let mut i = 0;
+        // SAFETY: every access stays within `n` elements, which `w` (as halves) and `y` share.
+        unsafe {
+            while i + 8 <= n {
+                let v = _mm256_fmadd_ps(load_halves(pw.add(i)), va, _mm256_loadu_ps(py.add(i)));
+                _mm256_storeu_ps(py.add(i), v);
+                i += 8;
+            }
+            while i < n {
+                *py.add(i) += a * crate::half::f16_to_f32(pw.add(i).read_unaligned());
+                i += 1;
+            }
+        }
+    }
+
+    /// Columns `c..c + 8 * N` over every row, accumulated in `N` registers.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    #[inline]
+    unsafe fn weighted_cols<const N: usize>(
+        out: *mut f32,
+        w: &[f32],
+        rows: *const u8,
+        stride: usize,
+        c: usize,
+    ) {
+        // SAFETY: the caller checked that every row holds these columns.
+        unsafe {
+            let mut acc = [_mm256_setzero_ps(); N];
+            for (t, &a) in w.iter().enumerate() {
+                let r = rows.add(t * stride + 2 * c) as *const u16;
+                let va = _mm256_set1_ps(a);
+                for (j, slot) in acc.iter_mut().enumerate() {
+                    *slot = _mm256_fmadd_ps(load_halves(r.add(8 * j)), va, *slot);
+                }
+            }
+            for (j, v) in acc.iter().enumerate() {
+                _mm256_storeu_ps(out.add(c + 8 * j), *v);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn weighted_rows_f16_avx2(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+        let n = out.len();
+        let (po, pr) = (out.as_mut_ptr(), rows.as_ptr());
+        let mut c = 0;
+        // SAFETY: `weighted_rows_f16` checked the bounds.
+        unsafe {
+            while c + 64 <= n {
+                weighted_cols::<8>(po, w, pr, stride, c);
+                c += 64;
+            }
+            while c + 8 <= n {
+                weighted_cols::<1>(po, w, pr, stride, c);
+                c += 8;
+            }
+            for i in c..n {
+                let mut s = 0.0;
+                for (t, &a) in w.iter().enumerate() {
+                    s += a * crate::half::f16_to_f32(
+                        (pr.add(t * stride + 2 * i) as *const u16).read_unaligned(),
+                    );
+                }
+                *po.add(i) = s;
+            }
         }
     }
 }
