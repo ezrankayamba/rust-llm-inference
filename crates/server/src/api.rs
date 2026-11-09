@@ -50,6 +50,32 @@ fn error_body(msg: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Bounds the matching work per token, which grows with these. OpenAI allows 4 stops, but some
+/// local clients send more.
+const MAX_STOPS: usize = 16;
+const MAX_STOP_BYTES: usize = 256;
+
+/// `stop`: absent, null, a string or an array of strings.
+fn parse_stop(req: &Value) -> Result<Vec<String>, String> {
+    let values = match req.get("stop") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(a)) => a.as_slice(),
+        Some(v) => std::slice::from_ref(v),
+    };
+    if values.len() > MAX_STOPS {
+        return Err(format!("`stop` allows at most {MAX_STOPS} strings"));
+    }
+    values
+        .iter()
+        .map(|v| match v.as_str() {
+            Some(s) if !s.is_empty() && s.len() <= MAX_STOP_BYTES => Ok(s.to_owned()),
+            _ => Err(format!(
+                "`stop` must be strings of 1 to {MAX_STOP_BYTES} bytes"
+            )),
+        })
+        .collect()
+}
+
 /// Sampling parameters with OpenAI's defaults (temperature 1, top_p 1, no penalty).
 /// `top_k`, `repeat_penalty` and `seed` are accepted as extensions.
 pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
@@ -63,6 +89,7 @@ pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
         return Err("temperature must be between 0 and 2".into());
     }
     Ok(GenParams {
+        stop: parse_stop(req)?,
         max_tokens,
         sampler: SamplerConfig {
             temperature,

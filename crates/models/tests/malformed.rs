@@ -126,6 +126,7 @@ fn exercise(path: &std::path::Path) -> bool {
     for temperature in [0.0, 1.0] {
         let params = GenParams {
             max_tokens: 2,
+            stop: vec!["x".into()],
             sampler: SamplerConfig {
                 temperature,
                 top_k: 4,

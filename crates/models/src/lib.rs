@@ -5,6 +5,7 @@ pub mod config;
 pub mod engine;
 pub mod model;
 pub mod sampler;
+mod stop;
 pub mod tokenizer;
 
 pub use chat::{ChatDefaults, ChatTemplate, Message, Rendered};

@@ -381,6 +381,7 @@ fn gpu_layer_counts() -> Vec<usize> {
 
 fn greedy(max_tokens: usize) -> GenParams {
     GenParams {
+        stop: Vec::new(),
         max_tokens,
         sampler: SamplerConfig {
             temperature: 0.0,
@@ -476,4 +477,90 @@ fn generate_cancelled_while_decoding_keeps_the_generated_tokens() {
         assert_eq!(out.completion_tokens, 3);
         assert_eq!(s.len(), PROMPT + 3, "gpu_layers={gpu_layers}");
     }
+}
+
+/// Runs a greedy generation, returning the output and the text chunks it was streamed in.
+fn generate_with_stop(
+    e: &Engine,
+    s: &mut rli_models::Session,
+    stop: &[&str],
+    max_tokens: usize,
+    is_cancelled: impl Fn() -> bool,
+) -> (rli_models::GenOutput, String) {
+    let params = GenParams {
+        stop: stop.iter().map(|s| s.to_string()).collect(),
+        ..greedy(max_tokens)
+    };
+    let mut streamed = String::new();
+    let out = e.generate(s, &[1, 2, 3], &params, is_cancelled, |t| {
+        streamed.push_str(t);
+        true
+    });
+    (out, streamed)
+}
+
+#[test]
+fn generate_cuts_the_reply_at_a_stop_spanning_tokens() {
+    let e = engine(0);
+    let (full, _) = generate_with_stop(&e, &mut e.new_session(64), &[], 12, || false);
+    // Tokens decode to "t12 ", so this spans the end of one and the start of the next.
+    let cut = full.text.len() / 2;
+    let next_token = full.text[cut..].find(' ').expect("token end") + cut;
+    let stop = &full.text[next_token - 1..next_token + 2];
+    let want = &full.text[..full.text.find(stop).expect("in text")];
+
+    let mut s = e.new_session(64);
+    let (out, streamed) = generate_with_stop(&e, &mut s, &[stop], 12, || false);
+    assert_eq!(out.text, want);
+    assert_eq!(streamed, want);
+    assert_eq!(out.finish, Finish::Stop);
+    assert!(out.completion_tokens < 12);
+    // The token that completed the match was counted but never evaluated.
+    assert_eq!(s.len(), 3 + out.completion_tokens - 1);
+}
+
+#[test]
+fn generate_session_stays_usable_after_a_stop() {
+    let e = engine(0);
+    let (full, _) = generate_with_stop(&e, &mut e.new_session(64), &[], 12, || false);
+    let stop = full.text.split(' ').nth(2).expect("third token");
+
+    let mut s = e.new_session(64);
+    generate_with_stop(&e, &mut s, &[stop], 12, || false);
+    let (again, _) = generate_with_stop(&e, &mut s, &[], 12, || false);
+    assert_eq!(again.text, full.text);
+}
+
+#[test]
+fn generate_releases_a_partial_match_when_the_token_limit_ends_it() {
+    let e = engine(0);
+    let (full, _) = generate_with_stop(&e, &mut e.new_session(64), &[], 4, || false);
+    // Begins with the reply's last token, then asks for text that never comes.
+    let last = full.text.trim_end().rsplit(' ').next().expect("token");
+    let stop = format!("{last} never");
+
+    let (out, streamed) = generate_with_stop(&e, &mut e.new_session(64), &[&stop], 4, || false);
+    assert_eq!(out.text, full.text);
+    assert_eq!(streamed, full.text);
+    assert_eq!(out.finish, Finish::Length);
+}
+
+#[test]
+fn generate_releases_a_partial_match_when_cancelled() {
+    let e = engine(0);
+    let (full, _) = generate_with_stop(&e, &mut e.new_session(64), &[], 4, || false);
+    let last = full.text.trim_end().rsplit(' ').next().expect("token");
+    let stop = format!("{last} never");
+
+    // Polls: before starting, then one per token; cancels before a fifth token.
+    let (out, streamed) = generate_with_stop(
+        &e,
+        &mut e.new_session(64),
+        &[&stop],
+        50,
+        cancel_after(1 + 4),
+    );
+    assert_eq!(out.text, full.text);
+    assert_eq!(streamed, full.text);
+    assert_eq!(out.finish, Finish::Cancelled);
 }

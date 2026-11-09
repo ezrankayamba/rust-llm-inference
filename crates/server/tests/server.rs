@@ -140,3 +140,117 @@ fn serves_openai_compatible_endpoints() {
         400
     );
 }
+
+fn body_text(path: &str, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap();
+    let choice = &v["choices"][0];
+    let text = if path.contains("chat") {
+        &choice["message"]["content"]
+    } else {
+        &choice["text"]
+    };
+    text.as_str().unwrap().to_owned()
+}
+
+/// Joins an SSE body's text, and returns it with the last event's finish reason.
+fn stream_text(path: &str, body: &str) -> (String, String) {
+    let chunks: Vec<Value> = body
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    let text = chunks
+        .iter()
+        .filter_map(|c| {
+            let choice = &c["choices"][0];
+            if path.contains("chat") {
+                choice["delta"]["content"].as_str()
+            } else {
+                choice["text"].as_str()
+            }
+        })
+        .collect();
+    let finish = chunks.last().unwrap()["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (text, finish)
+}
+
+#[test]
+fn stop_ends_the_reply_before_the_match_on_both_endpoints() {
+    let srv = start();
+    let a = srv.addr.as_str();
+    for (path, base) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+        ),
+        ("/v1/completions", json!({"prompt": "hello"})),
+    ] {
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let full_req = with(json!({"max_tokens": 20, "temperature": 0}));
+        let (st, full) = request(a, "POST", path, Some(&full_req));
+        assert_eq!(st, 200, "{full}");
+        let full = body_text(path, &full);
+        // Long enough to span tokens, and away from the start so text comes before it.
+        let chars: Vec<char> = full.chars().collect();
+        assert!(chars.len() >= 8, "{full:?}");
+        let stop: String = chars[4..7].iter().collect();
+        let want = &full[..full.find(&stop).unwrap()];
+
+        for stop_value in [json!(stop), json!(["never appears", stop])] {
+            let req = with(json!({"max_tokens": 20, "temperature": 0, "stop": stop_value}));
+            let (st, body) = request(a, "POST", path, Some(&req));
+            assert_eq!(st, 200, "{body}");
+            assert_eq!(body_text(path, &body), want, "{path}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["choices"][0]["finish_reason"], "stop");
+
+            let req = with(
+                json!({"max_tokens": 20, "temperature": 0, "stop": stop_value, "stream": true}),
+            );
+            let (st, body) = request(a, "POST", path, Some(&req));
+            assert_eq!(st, 200, "{body}");
+            let (text, finish) = stream_text(path, &body);
+            assert_eq!(text, want, "{path} streamed");
+            assert_eq!(finish, "stop");
+        }
+    }
+}
+
+#[test]
+fn stop_rejects_invalid_values() {
+    let srv = start();
+    let long = "x".repeat(257);
+    let many: Vec<String> = (0..17).map(|i| i.to_string()).collect();
+    for stop in [
+        json!(""),
+        json!(5),
+        json!(["ok", ""]),
+        json!(["ok", 5]),
+        json!(long),
+        json!(many),
+    ] {
+        let req = json!({"prompt": "hello", "max_tokens": 1, "stop": stop});
+        let (st, body) = request(&srv.addr, "POST", "/v1/completions", Some(&req));
+        assert_eq!(st, 400, "{stop}: {body}");
+    }
+}
+
+#[test]
+fn stop_accepts_null_and_an_empty_list() {
+    let srv = start();
+    for stop in [json!(null), json!([])] {
+        let req = json!({"prompt": "hello", "max_tokens": 1, "stop": stop});
+        let (st, body) = request(&srv.addr, "POST", "/v1/completions", Some(&req));
+        assert_eq!(st, 200, "{stop}: {body}");
+    }
+}

@@ -10,6 +10,7 @@ usage: rli -m <model.gguf> [options]
   -m, --model <path>        GGUF model file (required)
   -p, --prompt <text>       one-shot prompt; omit for interactive chat
       --raw                 send the prompt as-is, without the chat template
+      --stop <text>         end the reply before this text; repeatable
   -s, --system <text>       system message for chat
   -n, --max-tokens <n>      tokens to generate per reply (default 256)
   -c, --ctx <n>             context size (default 4096, capped at the model's)
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
         params: GenParams {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
+            stop: Vec::new(),
         },
     };
     fn num<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {
@@ -62,6 +64,12 @@ fn parse_args() -> Result<Args, String> {
             "-p" | "--prompt" => a.prompt = Some(it.next().ok_or("--prompt needs a value")?),
             "-s" | "--system" => a.system = Some(it.next().ok_or("--system needs a value")?),
             "--raw" => a.raw = true,
+            "--stop" => {
+                let stop = it.next().filter(|s| !s.is_empty());
+                a.params
+                    .stop
+                    .push(stop.ok_or("--stop needs non-empty text")?)
+            }
             "--info" => a.info = true,
             "-n" | "--max-tokens" => a.params.max_tokens = num(&flag, it.next())?,
             "-c" | "--ctx" => a.ctx = num(&flag, it.next())?,

@@ -3,6 +3,7 @@
 use crate::chat::{self, ChatDefaults, ChatTemplate, Message, Rendered};
 use crate::model::{Model, PROMPT_SLICE, Session};
 use crate::sampler::{Sampler, SamplerConfig};
+use crate::stop::StopMatcher;
 use crate::tokenizer::Tokenizer;
 use rli_gguf::{Error, Gguf, Result};
 use std::path::Path;
@@ -23,11 +24,13 @@ pub struct Engine {
 pub struct GenParams {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
+    /// Generation ends before the first of these appears in the output.
+    pub stop: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
-    /// End-of-turn token generated.
+    /// End-of-turn token generated, or a stop string reached.
     Stop,
     /// `max_tokens` or the context limit was reached.
     Length,
@@ -216,6 +219,8 @@ impl Engine {
         let t1 = Instant::now();
         let mut sampler = Sampler::new(params.sampler.clone());
         let mut pending: Vec<u8> = Vec::new();
+        let mut stops = StopMatcher::new(&params.stop);
+        let mut stopped = false;
         loop {
             if out.completion_tokens >= params.max_tokens || sess.len() >= sess.max_ctx {
                 out.finish = Finish::Length;
@@ -242,8 +247,15 @@ impl Engine {
             if valid > 0 {
                 let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
-                out.text.push_str(&chunk);
-                if !on_text(&chunk) {
+                let (ready, hit) = stops.push(&chunk);
+                out.text.push_str(&ready);
+                let wanted = ready.is_empty() || on_text(&ready);
+                if hit {
+                    out.finish = Finish::Stop;
+                    stopped = true;
+                    break;
+                }
+                if !wanted {
                     out.finish = Finish::Cancelled;
                     // Keep the KV cache consistent with the tokens actually produced.
                     self.model.forward(sess, next, false);
@@ -255,10 +267,19 @@ impl Engine {
                 .forward(sess, next, true)
                 .expect("logits requested");
         }
-        if !pending.is_empty() {
+        if !stopped {
             let rest = String::from_utf8_lossy(&pending).into_owned();
-            on_text(&rest);
-            out.text.push_str(&rest);
+            let (ready, hit) = stops.push(&rest);
+            let mut tail = ready.into_owned();
+            if hit {
+                out.finish = Finish::Stop;
+            } else {
+                tail.push_str(&stops.finish());
+            }
+            if !tail.is_empty() {
+                on_text(&tail);
+                out.text.push_str(&tail);
+            }
         }
         out.decode_secs = t1.elapsed().as_secs_f64();
         out

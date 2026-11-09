@@ -38,7 +38,7 @@ Workspace crates (dependencies flow downward only):
   `model.rs` (decoder forward, KV `Session`, MoE routing, the `Accelerator` trait), `tokenizer.rs`
   (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers), `chat.rs` (format chosen by
   fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, and `engine.rs` (the generation API the
-  binaries share, including KV prefix reuse). `metal.rs` / `cuda.rs` implement `Accelerator`, and
+  binaries share, including KV prefix reuse and `stop.rs`'s stop strings). `metal.rs` / `cuda.rs` implement `Accelerator`, and
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
