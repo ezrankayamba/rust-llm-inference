@@ -123,6 +123,8 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
 - Logits: `cargo run --release -p rli-models --example dump_logits -- <model> "<prompt>" out.f32 --precise [--gpu-layers=N]`,
   then `python scripts/ref_forward.py <model> <ids> out.f32` (an independent NumPy forward pass).
 - Tokenizer: `python scripts/check_tokenizer.py <model.gguf> <hf-repo>`.
+- Chat format: `python scripts/check_chat_template.py <model.gguf>` renders the file's real Jinja
+  template and compares it with `ChatTemplate::render` (needs `pip install gguf jinja2`).
 - Fixtures: `scripts/gen_quant_fixture.py` (dequant reference) and `scripts/make_tiny_moe.py`
   (tiny MoE GGUFs plus their reference logits, used by `crates/models/tests/moe_reference.rs`).
 - Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--depth D] [--reps 3] [--gpu-layers N]`

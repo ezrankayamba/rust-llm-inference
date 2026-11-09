@@ -12,6 +12,8 @@ pub struct Engine {
     pub model: Model,
     pub tokenizer: Tokenizer,
     pub template: ChatTemplate,
+    /// Set when `template` is a guess, for binaries to show if they use chat formatting.
+    pub template_warning: Option<String>,
     pub model_name: String,
     stop: Vec<u32>,
 }
@@ -59,8 +61,17 @@ impl Engine {
         let path = path.as_ref();
         let gguf = Gguf::open(path)?;
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
-        let template =
-            ChatTemplate::detect(gguf.get("tokenizer.chat_template").and_then(|v| v.as_str()));
+        let jinja = gguf.get("tokenizer.chat_template").and_then(|v| v.as_str());
+        let detected = jinja.and_then(ChatTemplate::detect);
+        let template = detected.unwrap_or(ChatTemplate::ChatMl);
+        let template_warning = detected.is_none().then(|| {
+            let problem = if jinja.is_some() {
+                "has an unrecognized chat template"
+            } else {
+                "has no chat template"
+            };
+            format!("model {problem}; assuming ChatML, so chat output may be wrong")
+        });
         let model_name = gguf
             .get("general.name")
             .and_then(|v| v.as_str())
@@ -90,6 +101,7 @@ impl Engine {
             model,
             tokenizer,
             template,
+            template_warning,
             model_name,
             stop,
         })

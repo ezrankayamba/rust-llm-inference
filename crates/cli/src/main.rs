@@ -107,6 +107,11 @@ fn run(a: Args) -> Result<(), String> {
     {
         eprintln!("warning: {w}");
     }
+    if !a.raw
+        && let Some(w) = &engine.template_warning
+    {
+        eprintln!("warning: {w}");
+    }
     if a.info {
         print_info(&engine);
         return Ok(());

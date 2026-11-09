@@ -87,6 +87,9 @@ fn run(a: Args) -> Result<(), String> {
     {
         eprintln!("warning: {w}");
     }
+    if let Some(w) = &engine.template_warning {
+        eprintln!("warning: {w}");
+    }
     let session = engine.new_session(a.ctx);
     let app = Arc::new(App {
         max_ctx: session.max_ctx,
