@@ -14,6 +14,11 @@ concurrency:
 
 env:
   RUST_BACKTRACE: "1"
+  # Most of the test jobs' time is compiling our own crates, which the cache doesn't keep, so build
+  # quickly at the same opt-level instead of with the shipped profile's LTO and single codegen unit.
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
   lint:
