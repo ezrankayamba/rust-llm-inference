@@ -133,14 +133,20 @@ pub fn dot_rows_q8(ty: GgmlType, row: &[u8], acts: &[Q8Act], out: &mut [f32]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub use avx2::BlockActs;
 #[cfg(target_arch = "aarch64")]
 pub use neon::BlockActs;
 
-/// Only the i8mm kernel uses this; elsewhere [`BlockActs::new`] always says no.
-#[cfg(not(target_arch = "aarch64"))]
+/// Fewest tokens a matmul hands to [`dot_block`]. The x86 kernel decodes its weights into a
+/// scratch panel, which only pays off once enough tokens share it.
+pub const BLOCK_MIN_TOKENS: usize = if cfg!(target_arch = "x86_64") { 8 } else { 2 };
+
+/// No block kernel on this architecture: [`BlockActs::new`] always says no.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub struct BlockActs;
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl BlockActs {
     pub fn new(_: GgmlType, _: &[Q8Act]) -> Option<Self> {
         None
@@ -148,10 +154,10 @@ impl BlockActs {
 }
 
 /// Dot products of a block of encoded rows (`rows`, `row_bytes` each) with the tokens in `acts`,
-/// into `out` as `[row][token]`, on the i8mm matrix-multiply instructions (2 rows x 2 tokens per
-/// instruction). A result does not depend on how tokens are grouped, but differs from
-/// [`dot_row_q8`] by float rounding: decode keeps that kernel, which streams one row at a time
-/// faster than any pairing.
+/// into `out` as `[row][token]`: on ARM with the i8mm matrix instructions (2 rows x 2 tokens
+/// each), on x86 over 8 rows at once decoded into an interleaved panel. A result does not depend
+/// on how rows and tokens are grouped, but differs from [`dot_row_q8`] by float rounding: decode
+/// keeps that kernel, which streams one row at a time faster.
 pub fn dot_block(ty: GgmlType, rows: &[u8], row_bytes: usize, acts: &BlockActs, out: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `BlockActs::new` checked for i8mm (and dotprod, which every i8mm CPU has); sizes
@@ -159,7 +165,12 @@ pub fn dot_block(ty: GgmlType, rows: &[u8], row_bytes: usize, acts: &BlockActs, 
     unsafe {
         neon::dot_block(ty, rows, row_bytes, acts, out)
     };
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `BlockActs::new` checked for AVX2, FMA and F16C; sizes are asserted inside.
+    unsafe {
+        avx2::dot_block(ty, rows, row_bytes, acts, out)
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (ty, rows, row_bytes, acts, out);
         unreachable!("BlockActs::new is always None here");
@@ -1074,6 +1085,320 @@ mod avx2 {
         }
         true
     }
+
+    /// Tokens' activations for [`dot_block`], each field in one buffer, token after token.
+    pub struct BlockActs {
+        n_tokens: usize,
+        n_chunks: usize,
+        qs: Vec<i8>,
+        d: Vec<f32>,
+        sum: Vec<f32>,
+    }
+
+    impl BlockActs {
+        /// `None` for a single token, when the CPU lacks AVX2, or when `ty` has no kernel.
+        pub fn new(ty: GgmlType, acts: &[Q8Act]) -> Option<Self> {
+            if acts.len() < 2 || !crate::simd::x86::has_avx2() || kind(ty).is_none() {
+                return None;
+            }
+            let n_chunks = acts[0].d.len();
+            let mut b = BlockActs {
+                n_tokens: acts.len(),
+                n_chunks,
+                qs: Vec::with_capacity(acts.len() * n_chunks * QK),
+                d: Vec::with_capacity(acts.len() * n_chunks),
+                sum: Vec::with_capacity(acts.len() * n_chunks),
+            };
+            for a in acts {
+                assert!(a.d.len() == n_chunks && a.qs.len() == n_chunks * QK);
+                b.qs.extend_from_slice(&a.qs);
+                b.d.extend_from_slice(&a.d);
+                b.sum.extend_from_slice(&a.sum);
+            }
+            Some(b)
+        }
+    }
+
+    /// Q8_0: signed weights.
+    const SIGNED: u8 = 0;
+    /// Q4_0, Q5_0, Q4_K, Q5_K: unsigned weights `q`, with the offset or min as a separate term:
+    /// weight = d·q − m.
+    const OFFSET: u8 = 1;
+    /// Q6_K: signed weights with an integer scale per 16.
+    const HALVES: u8 = 2;
+
+    fn kind(ty: GgmlType) -> Option<u8> {
+        Some(match ty {
+            GgmlType::Q8_0 => SIGNED,
+            GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q4_K | GgmlType::Q5_K => OFFSET,
+            GgmlType::Q6_K => HALVES,
+            _ => return None,
+        })
+    }
+
+    /// Chunk `j` (weights `32j..32j + 32`) of `row` as 32 bytes (i8 for [`SIGNED`] and
+    /// [`HALVES`], u8 for [`OFFSET`]), with its float scale `d`, its offset `m`, and the
+    /// integer scales of its two halves.
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn decode(ty: GgmlType, row: &[u8], j: usize) -> (__m256i, f32, f32, [i16; 2]) {
+        let bb = ty.block_bytes();
+        let m4 = _mm256_set1_epi8(0xf);
+        // SAFETY: the caller passes `j` below the row's chunk count, so every block read is in
+        // `row` (sliced, so a bad `j` panics rather than reading out of bounds).
+        unsafe {
+            match ty {
+                GgmlType::Q8_0 => {
+                    let b = &row[j * bb..(j + 1) * bb];
+                    let w = _mm256_loadu_si256(b.as_ptr().add(2).cast());
+                    (w, le16(b, 0), 0.0, [1, 1])
+                }
+                GgmlType::Q4_0 => {
+                    let b = &row[j * bb..(j + 1) * bb];
+                    let d = le16(b, 0);
+                    (unpack_nibbles(b.as_ptr().add(2)), d, 8.0 * d, [1, 1])
+                }
+                GgmlType::Q5_0 => {
+                    let b = &row[j * bb..(j + 1) * bb];
+                    let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                    let w = _mm256_or_si256(unpack_nibbles(b.as_ptr().add(6)), high_bits(qh));
+                    let d = le16(b, 0);
+                    (w, d, 16.0 * d, [1, 1])
+                }
+                GgmlType::Q4_K | GgmlType::Q5_K => {
+                    let five = ty == GgmlType::Q5_K;
+                    let ql_at = if five { 48 } else { 16 };
+                    let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                    let sub = j % 8;
+                    let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * (sub / 2)).cast());
+                    let mut w = if sub.is_multiple_of(2) {
+                        _mm256_and_si256(q, m4)
+                    } else {
+                        high_nibbles(q)
+                    };
+                    if five {
+                        let qh = _mm256_loadu_si256(b.as_ptr().add(16).cast());
+                        let bit = _mm256_set1_epi8(1 << sub);
+                        let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
+                        w = _mm256_or_si256(w, _mm256_and_si256(set, _mm256_set1_epi8(16)));
+                    }
+                    let (sc, mn) = scale_min_k4(sub, &b[4..16]);
+                    (w, le16(b, 0) * sc, le16(b, 2) * mn, [1, 1])
+                }
+                GgmlType::Q6_K => {
+                    let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                    let (n, k) = ((j % 8) / 4, j % 4);
+                    let p = b.as_ptr();
+                    let l = _mm256_loadu_si256(p.add(64 * n + 32 * (k % 2)).cast());
+                    let lo = if k < 2 {
+                        _mm256_and_si256(l, m4)
+                    } else {
+                        high_nibbles(l)
+                    };
+                    let qh = _mm256_loadu_si256(p.add(128 + 32 * n).cast());
+                    let shift = _mm_cvtsi32_si128(2 * k as i32);
+                    let hi = _mm256_and_si256(_mm256_srl_epi16(qh, shift), _mm256_set1_epi8(3));
+                    let w = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
+                    let w = _mm256_sub_epi8(w, _mm256_set1_epi8(32));
+                    let sc = &b[192..208];
+                    let hs = [
+                        sc[8 * n + 2 * k] as i8 as i16,
+                        sc[8 * n + 2 * k + 1] as i8 as i16,
+                    ];
+                    (w, le16(b, 208), 0.0, hs)
+                }
+                _ => unreachable!("checked by BlockActs::new"),
+            }
+        }
+    }
+
+    /// Chunks of eight rows decoded and interleaved, so that one 4-byte group of a token's
+    /// activations, broadcast, meets the matching group of all eight rows: vector `8c + k` holds,
+    /// in its i32 lane `r`, weights `4k..4k + 4` of chunk `c` of row `r`.
+    struct Panel {
+        w: Vec<__m256i>,
+        /// Per chunk, each row's `d` and `m`.
+        d: Vec<__m256>,
+        m: Vec<__m256>,
+        /// Per chunk and half, each row's integer scale (twice, as the i16 pairs `madd` takes).
+        hs: Vec<[__m256i; 2]>,
+    }
+
+    impl Panel {
+        #[target_feature(enable = "avx2,f16c")]
+        unsafe fn fill(&mut self, ty: GgmlType, rows: [&[u8]; 8], chunks: std::ops::Range<usize>) {
+            self.w.clear();
+            self.d.clear();
+            self.m.clear();
+            self.hs.clear();
+            for j in chunks {
+                let mut lanes = [[0i32; 8]; 8];
+                let (mut d, mut m, mut hs) = ([0f32; 8], [0f32; 8], [[0i16; 16]; 2]);
+                for (r, row) in rows.iter().enumerate() {
+                    // SAFETY: `j` is a chunk of the row, per the caller.
+                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                    let mut bytes = [0i32; 8];
+                    // SAFETY: 32 writable bytes.
+                    unsafe { _mm256_storeu_si256(bytes.as_mut_ptr().cast(), w) };
+                    for (k, v) in bytes.into_iter().enumerate() {
+                        lanes[k][r] = v;
+                    }
+                    (d[r], m[r]) = (rd, rm);
+                    for h in 0..2 {
+                        hs[h][2 * r] = rh[h];
+                        hs[h][2 * r + 1] = rh[h];
+                    }
+                }
+                // SAFETY: each source holds 32 bytes.
+                unsafe {
+                    for l in &lanes {
+                        self.w.push(_mm256_loadu_si256(l.as_ptr().cast()));
+                    }
+                    self.d.push(_mm256_loadu_ps(d.as_ptr()));
+                    self.m.push(_mm256_loadu_ps(m.as_ptr()));
+                    self.hs
+                        .push(hs.map(|h| _mm256_loadu_si256(h.as_ptr().cast())));
+                }
+            }
+        }
+    }
+
+    /// Panel chunks `0..n` (chunks `j0..j0 + n` of the rows) against tokens `t0..t0 + NT`,
+    /// accumulating into `acc[t]` (the scaled integer sums) and `ex[t]` (the offsets), lane `r`
+    /// for row `r`. Each lane does the same operations in the same order for its row and token,
+    /// whatever else is in the panel or the group.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run<const K: u8, const NT: usize>(
+        p: &Panel,
+        j0: usize,
+        n: usize,
+        acts: &BlockActs,
+        t0: usize,
+        acc: &mut [__m256],
+        ex: &mut [__m256],
+    ) {
+        let nc = acts.n_chunks;
+        let ones = _mm256_set1_epi16(1);
+        let mut a: [__m256; NT] = std::array::from_fn(|i| acc[t0 + i]);
+        let mut e: [__m256; NT] = std::array::from_fn(|i| ex[t0 + i]);
+        // SAFETY: tokens `t0..t0 + NT` and chunks `j0..j0 + n` are inside `acts`, and the panel
+        // holds `n` chunks, per the caller.
+        unsafe {
+            let x: [*const i8; NT] =
+                std::array::from_fn(|i| acts.qs.as_ptr().add(((t0 + i) * nc + j0) * QK));
+            for c in 0..n {
+                let mut isum = [_mm256_setzero_si256(); NT];
+                for k in 0..8 {
+                    let w = *p.w.get_unchecked(8 * c + k);
+                    let aw = if K == OFFSET { w } else { _mm256_abs_epi8(w) };
+                    let mult = if K == HALVES {
+                        p.hs.get_unchecked(c)[k / 4]
+                    } else {
+                        ones
+                    };
+                    for i in 0..NT {
+                        let g = x[i].add(c * QK + 4 * k).cast::<i32>().read_unaligned();
+                        let xb = _mm256_set1_epi32(g);
+                        // `maddubs` needs one unsigned side; see `dot32` for why the sign moves
+                        // onto the activations.
+                        let xs = if K == OFFSET {
+                            xb
+                        } else {
+                            _mm256_sign_epi8(xb, w)
+                        };
+                        let pairs = _mm256_maddubs_epi16(aw, xs);
+                        isum[i] = _mm256_add_epi32(isum[i], _mm256_madd_epi16(pairs, mult));
+                    }
+                }
+                let at = |i: usize| (t0 + i) * nc + j0 + c;
+                for i in 0..NT {
+                    let xd = _mm256_set1_ps(*acts.d.get_unchecked(at(i)));
+                    let scale = _mm256_mul_ps(*p.d.get_unchecked(c), xd);
+                    a[i] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum[i]), scale, a[i]);
+                    if K == OFFSET {
+                        let xs = _mm256_set1_ps(*acts.sum.get_unchecked(at(i)));
+                        e[i] = _mm256_fnmadd_ps(*p.m.get_unchecked(c), xs, e[i]);
+                    }
+                }
+            }
+        }
+        acc[t0..t0 + NT].copy_from_slice(&a);
+        ex[t0..t0 + NT].copy_from_slice(&e);
+    }
+
+    /// Chunks per panel: 8 KB of weights, with a token's matching activations (1 KB), stays
+    /// in L1 while every token passes over it.
+    const PANEL_CHUNKS: usize = 32;
+
+    /// [`super::dot_block`]: rows in eights (the last row repeated to fill the final one) and
+    /// tokens in fours.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_block(
+        ty: GgmlType,
+        rows: &[u8],
+        rb: usize,
+        acts: &BlockActs,
+        out: &mut [f32],
+    ) {
+        let k = kind(ty).expect("checked by BlockActs::new");
+        let (n_rows, nt, nc) = (rows.len() / rb, acts.n_tokens, acts.n_chunks);
+        assert!(n_rows > 0 && out.len() == n_rows * nt && rows.len() == n_rows * rb);
+        assert_eq!(rb / ty.block_bytes() * ty.block_size(), nc * QK);
+        let mut panel = Panel {
+            w: Vec::with_capacity(8 * PANEL_CHUNKS),
+            d: Vec::with_capacity(PANEL_CHUNKS),
+            m: Vec::with_capacity(PANEL_CHUNKS),
+            hs: Vec::with_capacity(PANEL_CHUNKS),
+        };
+        let mut acc = vec![_mm256_setzero_ps(); nt];
+        let mut ex = vec![_mm256_setzero_ps(); nt];
+        for r0 in (0..n_rows).step_by(8) {
+            let eight: [&[u8]; 8] = std::array::from_fn(|r| {
+                let r = (r0 + r).min(n_rows - 1);
+                &rows[r * rb..(r + 1) * rb]
+            });
+            acc.fill(_mm256_setzero_ps());
+            ex.fill(_mm256_setzero_ps());
+            for j0 in (0..nc).step_by(PANEL_CHUNKS) {
+                let n = PANEL_CHUNKS.min(nc - j0);
+                // SAFETY: chunks `j0..j0 + n` are in every row (sizes asserted above), and the
+                // token ranges below are inside `acts`.
+                unsafe {
+                    panel.fill(ty, eight, j0..j0 + n);
+                    let mut t = 0;
+                    macro_rules! go {
+                        ($nt:literal) => {
+                            match k {
+                                SIGNED => {
+                                    run::<SIGNED, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                OFFSET => {
+                                    run::<OFFSET, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                _ => run::<HALVES, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex),
+                            }
+                        };
+                    }
+                    while t + 4 <= nt {
+                        go!(4);
+                        t += 4;
+                    }
+                    while t < nt {
+                        go!(1);
+                        t += 1;
+                    }
+                }
+            }
+            for t in 0..nt {
+                let mut lanes = [0f32; 8];
+                // SAFETY: 8 writable floats.
+                unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), _mm256_add_ps(acc[t], ex[t])) };
+                for (r, &v) in lanes.iter().enumerate().take(n_rows - r0) {
+                    out[(r0 + r) * nt + t] = v;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1141,6 +1466,21 @@ mod tests {
         GgmlType::Q6_K,
     ];
 
+    /// Whether this CPU has a block kernel for `ty`.
+    fn has_block(ty: GgmlType) -> bool {
+        let a = Q8Act::new(&[0.0; QK]);
+        BlockActs::new(ty, &[a.clone(), a]).is_some()
+    }
+
+    /// The block kernel's result for one row and token (given as a pair of the same token).
+    fn block_dot(ty: GgmlType, row: &[u8], a: &Q8Act) -> Option<f32> {
+        let b = BlockActs::new(ty, &[a.clone(), a.clone()])?;
+        let mut out = [0.0; 2];
+        dot_block(ty, row, row.len(), &b, &mut out);
+        assert_eq!(out[0], out[1]);
+        Some(out[0])
+    }
+
     /// Exact dot of a row with the dequantized Q8 activations, and the scale of its terms.
     fn exact_dot(ty: GgmlType, row: &[u8], a: &Q8Act) -> (f32, f32) {
         let n = a.qs.len();
@@ -1155,9 +1495,9 @@ mod tests {
     fn block_kernel_matches_exact_dots_however_rows_and_tokens_are_grouped() {
         let mut rng = Rng::new(13);
         let n = 512;
-        // Odd row and token counts exercise the self-paired last row and token, and 11 tokens
-        // span a full group of 8 plus a partial one.
-        let (n_rows, n_tok) = (5, 11);
+        // Odd row and token counts exercise the self-paired last row and token, 11 tokens span
+        // a full group of 8 plus a partial one, and 13 rows a full eight plus a partial one.
+        let (n_rows, n_tok) = (13, 11);
         for ty in INT_TYPES {
             let rows: Vec<u8> = (0..n_rows)
                 .flat_map(|_| random_row(ty, n, &mut rng))
@@ -1218,11 +1558,9 @@ mod tests {
                     })
                     .collect();
                 let a = Q8Act::new(&x);
-                assert_eq!(
-                    dot_row_q8(ty, &row, &a),
-                    dot_row_q8_portable(ty, &row, &a),
-                    "{ty:?}"
-                );
+                let want = dot_row_q8_portable(ty, &row, &a);
+                assert_eq!(dot_row_q8(ty, &row, &a), want, "{ty:?}");
+                assert_eq!(block_dot(ty, &row, &a), has_block(ty).then_some(want));
             }
         }
     }
@@ -1241,6 +1579,9 @@ mod tests {
             let a = Q8Act::new(&vec![sign; n]);
             let expected = want * (128 * 127 * n as i32) as f32;
             assert_eq!(dot_row_q8(ty, &row, &a), expected, "activations {sign}");
+            if has_block(ty) {
+                assert_eq!(block_dot(ty, &row, &a), Some(expected));
+            }
             assert_eq!(dot_row_q8_portable(ty, &row, &a), expected);
         }
     }
