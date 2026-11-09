@@ -102,7 +102,8 @@ impl Engine {
 
     pub fn chat_tokens(&self, messages: &[Message]) -> Vec<u32> {
         let prompt = self.template.render(messages);
-        self.tokenizer.encode(&prompt, self.tokenizer.add_bos, true)
+        self.tokenizer
+            .encode_untrusted(&prompt.text, self.tokenizer.add_bos, &prompt.untrusted)
     }
 
     pub fn is_stop(&self, id: u32) -> bool {

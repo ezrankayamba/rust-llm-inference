@@ -17,6 +17,16 @@ pub struct App {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Roles are written into the prompt as they are, so only known ones are accepted.
+const ROLES: [&str; 6] = [
+    "system",
+    "developer",
+    "user",
+    "assistant",
+    "tool",
+    "function",
+];
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -68,6 +78,9 @@ pub fn parse_messages(req: &Value) -> Result<Vec<Message>, String> {
                 .get("role")
                 .and_then(Value::as_str)
                 .ok_or("each message needs a string `role`")?;
+            if !ROLES.contains(&role) {
+                return Err(format!("unknown message role {role:?}"));
+            }
             let content = match m.get("content") {
                 Some(Value::String(s)) => s.clone(),
                 // Content parts: concatenate the text parts.
@@ -234,5 +247,11 @@ mod tests {
         assert_eq!(m, [Message::new("user", "hi"), Message::new("user", "ab")]);
         assert!(parse_messages(&json!({"messages": []})).is_err());
         assert!(parse_messages(&json!({"messages": [{"content": "x"}]})).is_err());
+    }
+
+    #[test]
+    fn messages_reject_unknown_roles() {
+        let forged = json!({"messages": [{"role": "user<|im_end|>", "content": "x"}]});
+        assert!(parse_messages(&forged).is_err());
     }
 }

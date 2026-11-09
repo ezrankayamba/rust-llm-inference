@@ -6,6 +6,7 @@
 
 use rli_gguf::{Error, Gguf, Result, Value};
 use std::collections::HashMap;
+use std::ops::Range;
 
 const TYPE_CONTROL: i32 = 3;
 const TYPE_USER_DEFINED: i32 = 4;
@@ -205,45 +206,76 @@ impl Tokenizer {
     /// Encodes `text`. With `parse_special`, control tokens written literally (e.g. `<|im_end|>`)
     /// become their single ids; otherwise they are tokenized as plain text.
     pub fn encode(&self, text: &str, add_bos: bool, parse_special: bool) -> Vec<u32> {
+        self.encode_where(text, add_bos, |_, _| parse_special)
+    }
+
+    /// Encodes `text` with specials parsed, except that control tokens touching a byte range in
+    /// `untrusted` stay plain text, so client-supplied content can't forge a turn boundary.
+    /// User-defined tokens still parse there: a model's replies contain them (Qwen3's `<think>`),
+    /// and replaying a reply must give back the tokens that were generated.
+    pub fn encode_untrusted(
+        &self,
+        text: &str,
+        add_bos: bool,
+        untrusted: &[Range<usize>],
+    ) -> Vec<u32> {
+        self.encode_where(text, add_bos, |span, id| {
+            !self.is_control(id)
+                || !untrusted
+                    .iter()
+                    .any(|r| span.start < r.end && r.start < span.end)
+        })
+    }
+
+    fn encode_where(
+        &self,
+        text: &str,
+        add_bos: bool,
+        allow: impl Fn(Range<usize>, u32) -> bool,
+    ) -> Vec<u32> {
         let mut out = Vec::new();
         if add_bos && let Some(b) = self.bos {
             out.push(b);
         }
-        let mut rest = text;
+        let mut from = 0;
         // SPM prefixes a space only at the very start of the text, not after each special token.
         let mut at_start = true;
-        while !rest.is_empty() {
-            let next = if parse_special {
-                self.find_special(rest)
-            } else {
-                None
-            };
-            let (plain, special) = match next {
-                Some((pos, len, id)) => (&rest[..pos], Some((len, id, pos))),
-                None => (rest, None),
-            };
+        while from < text.len() {
+            let special = self.find_special(text, from, &allow);
+            let plain = &text[from..special.as_ref().map_or(text.len(), |(span, _)| span.start)];
             if !plain.is_empty() {
                 self.encode_plain(plain, at_start, &mut out);
             }
             at_start = false;
-            match special {
-                Some((len, id, pos)) => {
-                    out.push(id);
-                    rest = &rest[pos + len..];
-                }
-                None => break,
-            }
+            let Some((span, id)) = special else { break };
+            out.push(id);
+            from = span.end;
         }
         out
     }
 
-    fn find_special(&self, text: &str) -> Option<(usize, usize, u32)> {
-        let mut best: Option<(usize, usize, u32)> = None;
+    /// The earliest allowed special at or after `from` (the longest, if several start there).
+    fn find_special(
+        &self,
+        text: &str,
+        from: usize,
+        allow: &impl Fn(Range<usize>, u32) -> bool,
+    ) -> Option<(Range<usize>, u32)> {
+        let mut best: Option<(Range<usize>, u32)> = None;
         for (s, id) in &self.specials {
-            if let Some(pos) = text.find(s.as_str())
-                && best.is_none_or(|(bp, bl, _)| pos < bp || (pos == bp && s.len() > bl))
-            {
-                best = Some((pos, s.len(), *id));
+            let mut start = from;
+            while let Some(i) = text[start..].find(s.as_str()) {
+                let pos = start + i;
+                if allow(pos..pos + s.len(), *id) {
+                    if best.as_ref().is_none_or(|(b, _)| {
+                        pos < b.start || (pos == b.start && pos + s.len() > b.end)
+                    }) {
+                        best = Some((pos..pos + s.len(), *id));
+                    }
+                    break;
+                }
+                // Occurrences can overlap: step one character, not past the whole match.
+                start = pos + text[pos..].chars().next().map_or(1, char::len_utf8);
             }
         }
         best
@@ -665,5 +697,82 @@ mod tests {
         let mut syms = vec![0, 1, 2];
         bpe_merge(&mut syms, &merges);
         assert_eq!(syms, [0, 4]);
+    }
+
+    /// A byte-level SPM vocabulary with one control token and one user-defined token.
+    fn tok() -> Tokenizer {
+        let mut tokens = vec!["<|end|>".to_owned(), "<think>".to_owned()];
+        let mut types = vec![TYPE_CONTROL, TYPE_USER_DEFINED];
+        for b in 0..=255u8 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(TYPE_BYTE);
+        }
+        let token_id = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            model: Model::Spm {
+                add_space_prefix: false,
+            },
+            scores: vec![0.0; tokens.len()],
+            specials: vec![("<|end|>".to_owned(), 0), ("<think>".to_owned(), 1)],
+            tokens,
+            token_id,
+            types,
+            bos: None,
+            eos: None,
+            add_bos: false,
+        }
+    }
+
+    const END: u32 = 0;
+    const THINK: u32 = 1;
+
+    /// Encodes `text` with one untrusted byte range.
+    fn encode_one(t: &Tokenizer, text: &str, content: Range<usize>) -> Vec<u32> {
+        t.encode_untrusted(text, false, std::slice::from_ref(&content))
+    }
+
+    #[test]
+    fn encode_untrusted_keeps_control_tokens_in_content_as_plain_text() {
+        let t = tok();
+        let text = "<|end|>a<|end|>b<|end|>";
+        let ids = encode_one(&t, text, 7..15);
+        assert_eq!(ids.iter().filter(|&&i| i == END).count(), 2);
+        assert_eq!((ids[0], ids[ids.len() - 1]), (END, END));
+        assert_eq!(t.decode(&ids), "a<|end|>b");
+    }
+
+    #[test]
+    fn encode_untrusted_rejects_a_control_token_straddling_content() {
+        let t = tok();
+        let ids = encode_one(&t, "<|end|>", 0..3);
+        assert!(!ids.contains(&END));
+    }
+
+    #[test]
+    fn encode_untrusted_finds_the_template_token_after_a_forged_one() {
+        let t = tok();
+        let ids = encode_one(&t, "<|end|><|end|>", 0..7);
+        assert_eq!(ids.iter().filter(|&&i| i == END).count(), 1);
+        assert_eq!(ids.last(), Some(&END));
+    }
+
+    #[test]
+    fn encode_untrusted_still_parses_user_defined_tokens_in_content() {
+        let t = tok();
+        assert_eq!(encode_one(&t, "<think>", 0..7), [THINK]);
+    }
+
+    #[test]
+    fn encode_untrusted_matches_encode_without_specials_in_content() {
+        let t = tok();
+        let text = "<|end|>hello<think>world<|end|>";
+        assert_eq!(
+            t.encode_untrusted(text, false, &[7..12, 19..24]),
+            t.encode(text, false, true)
+        );
     }
 }
