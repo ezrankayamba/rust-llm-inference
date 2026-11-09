@@ -145,6 +145,13 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
 - Tokenizer: `python scripts/check_tokenizer.py <model.gguf> <hf-repo>`.
 - Chat format: `python scripts/check_chat_template.py <model.gguf>` renders the file's real Jinja
   template and compares it with `ChatTemplate::render` (needs `pip install gguf jinja2`).
+- Int8 accuracy: `cargo run --release -p rli-models --example eval_quant -- <model> <text file> [--tokens 512]`
+  runs a text through the decode path with f32 (`precise`) and int8 activations and prints both
+  perplexities, the KL divergence of int8 from f32, and top-1 agreement. Measured 2026-11-09 (prose and
+  code, 256-512 tokens): dense models KL mean 0.0003-0.002, top-1 agreement 96-99.6%, perplexity
+  within ±0.3%; Qwen3-30B-A3B (MoE) KL mean 0.004-0.015, max ~1.0, as int8 noise flips expert choices.
+  One activation scale per 256 values for K-quants (llama.cpp's Q8_K) raised KL 1.4-6x and cut top-1
+  agreement by 1-3 points, so we keep one per 32.
 - Fixtures: `scripts/gen_quant_fixture.py` (dequant reference) and `scripts/make_tiny_moe.py`
   (tiny MoE GGUFs plus their reference logits, used by `crates/models/tests/moe_reference.rs`).
 - Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--depth D] [--reps 3] [--gpu-layers N]`
