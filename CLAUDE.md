@@ -28,8 +28,9 @@ Workspace crates (dependencies flow downward only):
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
-  fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, so batched int8
-  results differ from per-token ones by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
+  fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
+  laid out in token pairs once per matmul (`BlockActs`), so batched int8 results differ from per-token ones
+  by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and
@@ -151,7 +152,10 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
 - Against llama.cpp: `python3 scripts/bench_compare.py --bin-dir <dir> --llama-dir <dir> --model <model> [--threads 1,4]`
   prints throughput, first-token time and peak memory on the CPU. The manual `Benchmark` workflow
   (`.github/workflows/bench.yml`) runs it on x86; GitHub runners vary in CPU and have 2 vCPUs on one core, so
-  compare only within one run and don't read thread scaling from it.
+  compare only within one run and don't read thread scaling from it. On macOS build llama.cpp with
+  `-DGGML_BLAS=OFF`: its default BLAS backend dequantizes Q5_0 and similar weights and runs prompts on
+  Apple's matrix hardware (Qwen2.5 0.5B on the M4: 517 tok/s against 110.6 without), so that's not a
+  comparison of int8 kernels, and it doesn't carry over to x86.
 
 Performance-sensitive changes to kernels or the hot path need before/after benchmark numbers. Debug
 builds are not representative, so always measure with `--release`.

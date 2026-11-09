@@ -133,28 +133,37 @@ pub fn dot_rows_q8(ty: GgmlType, row: &[u8], acts: &[Q8Act], out: &mut [f32]) {
     }
 }
 
-/// Dot products of a block of encoded rows (`rows`, `row_bytes` each) with two or more tokens
-/// in `acts`, into `out` as `[row][token]`, on the i8mm matrix-multiply instructions (2 rows x
-/// 2 tokens per instruction). A result does not depend on how tokens are grouped, but differs
-/// from [`dot_row_q8`] by float rounding: decode keeps that kernel, which streams one row at a
-/// time faster than any pairing. `false` (nothing written) for a single token, when the CPU
-/// lacks i8mm, or when the type has no kernel; callers then use [`dot_rows_q8`].
-pub fn dot_block(
-    ty: GgmlType,
-    rows: &[u8],
-    row_bytes: usize,
-    acts: &[Q8Act],
-    out: &mut [f32],
-) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    if acts.len() >= 2 && neon::has_i8mm() && neon::mm_supports(ty) {
-        // SAFETY: i8mm (and dotprod, which every i8mm CPU has) checked at runtime; sizes are
-        // asserted inside.
-        unsafe { neon::dot_block(ty, rows, row_bytes, acts, out) };
-        return true;
+#[cfg(target_arch = "aarch64")]
+pub use neon::BlockActs;
+
+/// Only the i8mm kernel uses this; elsewhere [`BlockActs::new`] always says no.
+#[cfg(not(target_arch = "aarch64"))]
+pub struct BlockActs;
+
+#[cfg(not(target_arch = "aarch64"))]
+impl BlockActs {
+    pub fn new(_: GgmlType, _: &[Q8Act]) -> Option<Self> {
+        None
     }
-    let _ = (ty, rows, row_bytes, acts, out);
-    false
+}
+
+/// Dot products of a block of encoded rows (`rows`, `row_bytes` each) with the tokens in `acts`,
+/// into `out` as `[row][token]`, on the i8mm matrix-multiply instructions (2 rows x 2 tokens per
+/// instruction). A result does not depend on how tokens are grouped, but differs from
+/// [`dot_row_q8`] by float rounding: decode keeps that kernel, which streams one row at a time
+/// faster than any pairing.
+pub fn dot_block(ty: GgmlType, rows: &[u8], row_bytes: usize, acts: &BlockActs, out: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `BlockActs::new` checked for i8mm (and dotprod, which every i8mm CPU has); sizes
+    // are asserted inside.
+    unsafe {
+        neon::dot_block(ty, rows, row_bytes, acts, out)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (ty, rows, row_bytes, acts, out);
+        unreachable!("BlockActs::new is always None here");
+    }
 }
 
 /// Portable kernels; the reference for the SIMD versions.
@@ -510,8 +519,53 @@ mod neon {
         })
     }
 
-    pub fn mm_supports(ty: GgmlType) -> bool {
-        mm_type(ty).is_some()
+    /// Two or more tokens' activations laid out for the matrix instructions: tokens in pairs
+    /// (an odd last one paired with itself), so each instruction's inputs are one 16-byte load.
+    pub struct BlockActs {
+        n_tokens: usize,
+        n_chunks: usize,
+        /// `[pair][chunk][k < 4]`: 8 values of the pair's first token, then 8 of its second.
+        qs: Vec<i8>,
+        /// `[pair][chunk]`: `[t0, t1, t0, t1]`, the lanes of an `smmla` result.
+        d: Vec<[f32; 4]>,
+        sum: Vec<[f32; 4]>,
+    }
+
+    impl BlockActs {
+        /// `None` for a single token, when the CPU lacks i8mm, or when `ty` has no kernel.
+        pub fn new(ty: GgmlType, acts: &[Q8Act]) -> Option<Self> {
+            if acts.len() < 2 || !has_i8mm() || mm_type(ty).is_none() {
+                return None;
+            }
+            let n_chunks = acts[0].qs.len() / QK;
+            let n_pairs = acts.len().div_ceil(2);
+            let mut b = BlockActs {
+                n_tokens: acts.len(),
+                n_chunks,
+                qs: Vec::with_capacity(n_pairs * n_chunks * 2 * QK),
+                d: Vec::with_capacity(n_pairs * n_chunks),
+                sum: Vec::with_capacity(n_pairs * n_chunks),
+            };
+            for p in acts.chunks(2) {
+                let (a0, a1) = (&p[0], &p[p.len() - 1]);
+                assert_eq!(a0.qs.len(), a1.qs.len());
+                for (q0, q1) in a0
+                    .qs
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .zip(a1.qs.as_chunks::<8>().0)
+                {
+                    b.qs.extend_from_slice(q0);
+                    b.qs.extend_from_slice(q1);
+                }
+                for j in 0..n_chunks {
+                    b.d.push([a0.d[j], a1.d[j], a0.d[j], a1.d[j]]);
+                    b.sum.push([a0.sum[j], a1.sum[j], a0.sum[j], a1.sum[j]]);
+                }
+            }
+            Some(b)
+        }
     }
 
     /// One 32-weight chunk of a row as i8 (`lo` = weights 0..16, `hi` = 16..32), with its
@@ -574,9 +628,9 @@ mod neon {
                 T_Q4_K | T_Q5_K => {
                     let five = T == T_Q5_K;
                     let (bb, ql_at) = if five { (176, 48) } else { (144, 16) };
-                    let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                    let b = row.as_ptr().add((j / 8) * bb);
                     let sub = j % 8;
-                    let q = b.as_ptr().add(ql_at + 32 * (sub / 2));
+                    let q = b.add(ql_at + 32 * (sub / 2));
                     let (q0, q1) = (vld1q_u8(q), vld1q_u8(q.add(16)));
                     let (mut w0, mut w1) = if sub.is_multiple_of(2) {
                         (vandq_u8(q0, m4), vandq_u8(q1, m4))
@@ -586,16 +640,16 @@ mod neon {
                     if five {
                         let bit = vdupq_n_u8(1 << sub);
                         let sixteen = vdupq_n_u8(16);
-                        let (h0, h1) = (vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)));
+                        let (h0, h1) = (vld1q_u8(b.add(16)), vld1q_u8(b.add(32)));
                         w0 = vorrq_u8(w0, vandq_u8(vtstq_u8(h0, bit), sixteen));
                         w1 = vorrq_u8(w1, vandq_u8(vtstq_u8(h1, bit), sixteen));
                     }
-                    let (sc, mn) = scale_min_k4(sub, &b[4..16]);
+                    // `rows2` decodes these once per block: see `k_scales`.
                     Chunk {
                         lo: s8(w0),
                         hi: s8(w1),
-                        d: le16(b, 0) * sc,
-                        m: le16(b, 2) * mn,
+                        d: 0.0,
+                        m: 0.0,
                         half_scales: [1, 1],
                     }
                 }
@@ -631,24 +685,59 @@ mod neon {
         }
     }
 
-    /// Rows `r0`, `r1` (type `T`) against the token pairs `acts[2p]`, `acts[2p + 1]` for
-    /// `p < NP`; `out[p]` = `[r0·t0, r0·t1, r1·t0, r1·t1]`. Every lane does the same
-    /// operations in the same order for its row and token, whatever it is paired with.
+    /// For the Q4_K/Q5_K block holding chunk `j` of both rows, each chunk's `[d, d, d, d]` and
+    /// `[m, m, m, m]`, with `r0` in the low lanes and `r1` in the high ones.
+    #[inline]
+    fn k_scales(
+        block_bytes: usize,
+        r0: &[u8],
+        r1: &[u8],
+        j: usize,
+    ) -> ([[f32; 4]; 8], [[f32; 4]; 8]) {
+        let (mut ds, mut ms) = ([[0.0; 4]; 8], [[0.0; 4]; 8]);
+        let at = (j / 8) * block_bytes;
+        for (lane, row) in [r0, r1].into_iter().enumerate() {
+            let b = &row[at..at + block_bytes];
+            let (d, m) = (le16(b, 0), le16(b, 2));
+            for sub in 0..8 {
+                let (sc, mn) = scale_min_k4(sub, &b[4..16]);
+                ds[sub][2 * lane] = d * sc;
+                ds[sub][2 * lane + 1] = d * sc;
+                ms[sub][2 * lane] = m * mn;
+                ms[sub][2 * lane + 1] = m * mn;
+            }
+        }
+        (ds, ms)
+    }
+
+    /// Rows `r0`, `r1` (type `T`) against token pairs `first..first + NP`; `out[p]` =
+    /// `[r0·t0, r0·t1, r1·t0, r1·t1]`. Every lane does the same operations in the same order
+    /// for its row and token, whatever it is paired with.
     #[target_feature(enable = "neon,dotprod,i8mm")]
     unsafe fn rows2<const T: u8, const NP: usize>(
         r0: &[u8],
         r1: &[u8],
-        acts: &[&Q8Act; 8],
+        acts: &BlockActs,
+        first: usize,
         out: &mut [[f32; 4]; 4],
     ) {
-        let n_chunks = acts[0].qs.len() / QK;
+        let n_chunks = acts.n_chunks;
         let mut acc = [vdupq_n_f32(0.0); NP];
         let mut ex = [vdupq_n_f32(0.0); NP];
         let pair = |a: f32, b: f32| vcombine_f32(vdup_n_f32(a), vdup_n_f32(b));
-        // SAFETY: `j < n_chunks`, and the caller checked that rows and activations hold
-        // `n_chunks` chunks.
+        // SAFETY: `first + NP` pairs and `j < n_chunks` are inside `acts`, per the caller, whose
+        // rows also hold `n_chunks` chunks.
         unsafe {
+            let qs = acts.qs.as_ptr().add(first * n_chunks * 2 * QK);
+            let ds = acts.d.as_ptr().add(first * n_chunks) as *const f32;
+            let sums = acts.sum.as_ptr().add(first * n_chunks) as *const f32;
+            let is_k = T == T_Q4_K || T == T_Q5_K;
+            let block_bytes = if T == T_Q5_K { 176 } else { 144 };
+            let (mut k_d, mut k_m) = ([[0.0; 4]; 8], [[0.0; 4]; 8]);
             for j in 0..n_chunks {
+                if is_k && j.is_multiple_of(8) {
+                    (k_d, k_m) = k_scales(block_bytes, r0, r1, j);
+                }
                 let (c0, c1) = (chunk::<T>(r0, j), chunk::<T>(r1, j));
                 let zip = |a: int8x16_t, b: int8x16_t, hi: bool| {
                     let (a, b) = (vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b));
@@ -665,15 +754,21 @@ mod neon {
                     zip(c0.hi, c1.hi, false),
                     zip(c0.hi, c1.hi, true),
                 ];
-                let vd = pair(c0.d, c1.d);
-                let vm = pair(c0.m, c1.m);
+                let (vd, vm) = if is_k {
+                    (
+                        vld1q_f32(k_d[j % 8].as_ptr()),
+                        vld1q_f32(k_m[j % 8].as_ptr()),
+                    )
+                } else {
+                    (pair(c0.d, c1.d), pair(c0.m, c1.m))
+                };
                 let hs = |h: usize| {
                     vcombine_s32(vdup_n_s32(c0.half_scales[h]), vdup_n_s32(c1.half_scales[h]))
                 };
                 for p in 0..NP {
-                    let (a0, a1) = (acts[2 * p], acts[2 * p + 1]);
-                    let (x0, x1) = (a0.qs.as_ptr().add(j * QK), a1.qs.as_ptr().add(j * QK));
-                    let x = |k: usize| vcombine_s8(vld1_s8(x0.add(8 * k)), vld1_s8(x1.add(8 * k)));
+                    let at = p * n_chunks + j;
+                    let x = qs.add(at * 2 * QK);
+                    let x = |k: usize| vld1q_s8(x.add(16 * k));
                     let zero = vdupq_n_s32(0);
                     let s = if T == T_Q6_K {
                         let s0 = smmla(smmla(zero, w[0], x(0)), w[1], x(1));
@@ -686,14 +781,10 @@ mod neon {
                             x(3),
                         )
                     };
-                    let ad = vcombine_f32(
-                        vld1_f32([a0.d[j], a1.d[j]].as_ptr()),
-                        vld1_f32([a0.d[j], a1.d[j]].as_ptr()),
-                    );
+                    let ad = vld1q_f32(ds.add(at * 4));
                     acc[p] = vfmaq_f32(acc[p], vcvtq_f32_s32(s), vmulq_f32(vd, ad));
-                    if T == T_Q4_K || T == T_Q5_K {
-                        let su = vld1_f32([a0.sum[j], a1.sum[j]].as_ptr());
-                        ex[p] = vfmsq_f32(ex[p], vm, vcombine_f32(su, su));
+                    if is_k {
+                        ex[p] = vfmsq_f32(ex[p], vm, vld1q_f32(sums.add(at * 4)));
                     }
                 }
             }
@@ -703,36 +794,41 @@ mod neon {
         }
     }
 
-    /// [`super::dot_block`]: rows in pairs and tokens in groups of up to 8, an odd last row or
-    /// token paired with itself.
+    /// [`super::dot_block`]: rows in pairs and tokens in groups of up to 8, an odd last row
+    /// paired with itself.
     #[target_feature(enable = "neon,dotprod,i8mm")]
-    pub unsafe fn dot_block(ty: GgmlType, rows: &[u8], rb: usize, acts: &[Q8Act], out: &mut [f32]) {
-        let t = mm_type(ty).expect("checked by mm_supports");
-        let (n_rows, nt) = (rows.len() / rb, acts.len());
-        assert!(nt > 0 && out.len() == n_rows * nt && rows.len() == n_rows * rb);
-        for a in acts {
-            assert_eq!(rb / ty.block_bytes() * ty.block_size(), a.qs.len());
-        }
-        for rp in (0..n_rows).step_by(2) {
-            let r0 = &rows[rp * rb..(rp + 1) * rb];
-            let two = rp + 1 < n_rows;
-            let r1 = if two {
-                &rows[(rp + 1) * rb..(rp + 2) * rb]
-            } else {
-                r0
-            };
-            for t0 in (0..nt).step_by(8) {
-                let k = (nt - t0).min(8);
-                let group: [&Q8Act; 8] = std::array::from_fn(|i| &acts[t0 + i.min(k - 1)]);
+    pub unsafe fn dot_block(
+        ty: GgmlType,
+        rows: &[u8],
+        rb: usize,
+        acts: &BlockActs,
+        out: &mut [f32],
+    ) {
+        let t = mm_type(ty).expect("checked by BlockActs::new");
+        let (n_rows, nt) = (rows.len() / rb, acts.n_tokens);
+        assert!(out.len() == n_rows * nt && rows.len() == n_rows * rb);
+        assert_eq!(rb / ty.block_bytes() * ty.block_size(), acts.n_chunks * QK);
+        // Tokens outside rows: a group's activations stay in L1 while it meets every row, where
+        // the other way round each row would cycle through all the tokens' activations.
+        for t0 in (0..nt).step_by(8) {
+            let k = (nt - t0).min(8);
+            for rp in (0..n_rows).step_by(2) {
+                let r0 = &rows[rp * rb..(rp + 1) * rb];
+                let two = rp + 1 < n_rows;
+                let r1 = if two {
+                    &rows[(rp + 1) * rb..(rp + 2) * rb]
+                } else {
+                    r0
+                };
                 let mut res = [[0.0f32; 4]; 4];
                 macro_rules! run {
                     ($($t:ident),*) => {
                         match (t, k.div_ceil(2)) {
                             $(
-                                ($t, 1) => rows2::<$t, 1>(r0, r1, &group, &mut res),
-                                ($t, 2) => rows2::<$t, 2>(r0, r1, &group, &mut res),
-                                ($t, 3) => rows2::<$t, 3>(r0, r1, &group, &mut res),
-                                ($t, _) => rows2::<$t, 4>(r0, r1, &group, &mut res),
+                                ($t, 1) => rows2::<$t, 1>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 2) => rows2::<$t, 2>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 3) => rows2::<$t, 3>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, _) => rows2::<$t, 4>(r0, r1, acts, t0 / 2, &mut res),
                             )*
                             _ => unreachable!(),
                         }
@@ -1069,9 +1165,10 @@ mod tests {
             let rb = ty.row_bytes(n);
             let acts: Vec<Q8Act> = (0..n_tok).map(|_| Q8Act::new(&rng.vec(n))).collect();
             let mut out = vec![0.0; n_rows * n_tok];
-            if !dot_block(ty, &rows, rb, &acts, &mut out) {
+            let Some(block) = BlockActs::new(ty, &acts) else {
                 continue; // no i8mm on this CPU, or no kernel for the type
-            }
+            };
+            dot_block(ty, &rows, rb, &block, &mut out);
             for r in 0..n_rows {
                 let row = &rows[r * rb..(r + 1) * rb];
                 for (t, a) in acts.iter().enumerate() {
@@ -1079,7 +1176,8 @@ mod tests {
                     // Regrouped: this row alone (paired with itself) and the token in a pair.
                     let pair = [a.clone(), a.clone()];
                     let mut two = [0.0; 2];
-                    assert!(dot_block(ty, row, rb, &pair, &mut two));
+                    let pair = BlockActs::new(ty, &pair).unwrap();
+                    dot_block(ty, row, rb, &pair, &mut two);
                     assert_eq!(got, two[0], "{ty:?} row {r} token {t} regrouped");
                     let (exact, scale) = exact_dot(ty, row, a);
                     assert!(
