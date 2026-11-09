@@ -29,8 +29,10 @@ Workspace crates (dependencies flow downward only):
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
   fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
-  laid out in token pairs once per matmul (`BlockActs`), so batched int8 results differ from per-token ones
-  by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
+  laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
+  decode 8 weight rows at a time into an interleaved panel in L1, so one broadcast activation load serves
+  all 8 rows (weights stay in the mapping; no repacked copy). Either way batched int8 results differ from
+  per-token ones by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and
