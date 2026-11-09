@@ -1,7 +1,7 @@
 //! Fixed-length throughput benchmark, independent of EOS and sampling.
 //!
 //! usage: bench <model.gguf> [--pp 512] [--tg 128] [--depth 0] [--reps 3] [--gpu-layers N]
-//!        [--precise]
+//!        [--threads N] [--precise]
 //!
 //! `pp`: prompt processing of N tokens into an empty session (logits for the last one only).
 //! `tg`: N greedy decode steps, ignoring EOS, after `depth` prompt tokens (prefilled untimed),
@@ -35,6 +35,9 @@ fn main() {
     let (pp, tg, reps) = (opt("--pp", 512), opt("--tg", 128), opt("--reps", 3));
     let depth = opt("--depth", 0);
     let gpu_layers = opt("--gpu-layers", 0);
+    if a.iter().any(|x| x == "--threads") {
+        rli_models::set_threads(opt("--threads", 0)).expect("--threads");
+    }
     let mut engine = Engine::load(&a[1]).expect("load model");
     engine.model.precise = a.iter().any(|x| x == "--precise");
     rli_models::backend::attach(&mut engine.model, gpu_layers).expect("attach backend");

@@ -12,8 +12,10 @@ use std::time::Duration;
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
+                  [--threads N]
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
+--threads defaults to one CPU thread per logical core.
 
 Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/completions,
 POST /v1/completions
@@ -51,6 +53,10 @@ fn parse_args() -> Result<Args, String> {
             "-c" | "--ctx" => a.ctx = val()?.parse().map_err(|_| "--ctx: invalid value")?,
             "--gpu-layers" => {
                 a.gpu_layers = Some(val()?.parse().map_err(|_| "--gpu-layers: invalid value")?)
+            }
+            "-t" | "--threads" => {
+                let n = val()?.parse().map_err(|_| "--threads: invalid value")?;
+                rli_models::set_threads(n)?
             }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),

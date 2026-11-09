@@ -21,7 +21,8 @@ usage: rli -m <model.gguf> [options]
       --seed <n>
       --gpu-layers <n>      layers to run on the GPU (default: all, if this build has a
                             GPU backend; 0 = CPU only)
-      --info                print model metadata and exit
+  -t, --threads <n>         CPU threads (default: one per logical core)
+      --info               print model metadata and exit
 ";
 
 struct Args {
@@ -79,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
             "--repeat-penalty" => s.repeat_penalty = num(&flag, it.next())?,
             "--seed" => s.seed = num(&flag, it.next())?,
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
+            "-t" | "--threads" => rli_models::set_threads(num(&flag, it.next())?)?,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
         }
