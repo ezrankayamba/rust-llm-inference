@@ -84,6 +84,7 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
 
 /// All eight 6-bit scales and mins of a Q4_K/Q5_K super-block from its 12 packed bytes, the
 /// same values [`scale_min_k4`] gives one at a time, as a little-endian u64 of bytes each.
+#[cfg(any(test, target_arch = "x86_64"))]
 #[inline]
 fn scales_mins_k4(q: &[u8]) -> (u64, u64) {
     let u = |i: usize| u32::from_le_bytes([q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]]);
