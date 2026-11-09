@@ -43,7 +43,8 @@ Workspace crates (dependencies flow downward only):
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
   mutex held only during generation. A client disconnect or a 30 s write stall cancels generation;
-  `Engine::generate` polls between 256-token prompt slices and before each token.
+  `Engine::generate` polls between 256-token prompt slices and before each token. Responses carry
+  OpenAI's `usage` (streams need `stream_options.include_usage`) plus a non-standard `timings`.
 
 Design points that span files:
 

@@ -2,7 +2,7 @@
 //! `/` serves a small chat page for trying a model by hand.
 
 use crate::http::{self, Request};
-use rli_models::{Engine, Finish, GenParams, Message, SamplerConfig, Session};
+use rli_models::{Engine, Finish, GenOutput, GenParams, Message, SamplerConfig, Session};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,6 +141,29 @@ pub fn parse_messages(req: &Value) -> Result<Vec<Message>, String> {
         .collect()
 }
 
+fn usage(out: &GenOutput) -> Value {
+    json!({
+        "prompt_tokens": out.prompt_tokens,
+        "completion_tokens": out.completion_tokens,
+        "total_tokens": out.prompt_tokens + out.completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": out.prompt_tokens - out.prompt_evaluated},
+    })
+}
+
+/// A non-standard extension, named as llama.cpp's server names it. `prompt_n` counts the prompt
+/// tokens evaluated, not those reused from the cache.
+fn timings(out: &GenOutput) -> Value {
+    let per_second = |n: usize, secs: f64| if secs > 0.0 { n as f64 / secs } else { 0.0 };
+    json!({
+        "prompt_n": out.prompt_evaluated,
+        "prompt_ms": out.prefill_secs * 1000.0,
+        "prompt_per_second": per_second(out.prompt_evaluated, out.prefill_secs),
+        "predicted_n": out.completion_tokens,
+        "predicted_ms": out.decode_secs * 1000.0,
+        "predicted_per_second": per_second(out.completion_tokens, out.decode_secs),
+    })
+}
+
 fn finish_reason(f: Finish) -> &'static str {
     match f {
         Finish::Stop | Finish::Cancelled => "stop",
@@ -213,6 +236,10 @@ fn complete(
         Err(msg) => return bad(w, &msg),
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let include_usage = req
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let id = format!(
         "{}-{}",
         if chat { "chatcmpl" } else { "cmpl" },
@@ -237,8 +264,7 @@ fn complete(
         };
         let body = json!({
             "id": id, "object": object, "created": created, "model": model, "choices": [choice],
-            "usage": {"prompt_tokens": out.prompt_tokens, "completion_tokens": out.completion_tokens,
-                      "total_tokens": out.prompt_tokens + out.completion_tokens},
+            "usage": usage(&out), "timings": timings(&out),
         });
         return http::respond(w, 200, "application/json", body.to_string().as_bytes());
     }
@@ -268,6 +294,11 @@ fn complete(
         return Ok(());
     }
     http::sse_event(w, &chunk(json!({}), Some(finish_reason(out.finish))))?;
+    if include_usage {
+        let last = json!({"id": id, "object": chunk_object, "created": created, "model": model,
+            "choices": [], "usage": usage(&out), "timings": timings(&out)});
+        http::sse_event(w, &last.to_string())?;
+    }
     http::sse_event(w, "[DONE]")
 }
 

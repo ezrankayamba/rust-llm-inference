@@ -274,3 +274,87 @@ fn root_rejects_other_methods() {
     let (st, _) = request(&srv.addr, "POST", "/", None);
     assert_eq!(st, 405);
 }
+
+fn last_data_chunks(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+#[test]
+fn stream_reports_usage_and_timings_only_when_asked() {
+    let srv = start();
+    let a = srv.addr.as_str();
+    for (path, base) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+        ),
+        ("/v1/completions", json!({"prompt": "hello"})),
+    ] {
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let common = json!({"max_tokens": 6, "temperature": 0});
+        let (_, plain) = request(a, "POST", path, Some(&with(common.clone())));
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+
+        let silent = with(json!({"max_tokens": 6, "temperature": 0, "stream": true}));
+        let (_, body) = request(a, "POST", path, Some(&silent));
+        assert!(
+            last_data_chunks(&body)
+                .iter()
+                .all(|c| c.get("usage").is_none()),
+            "{path}: usage sent without being asked for"
+        );
+
+        let asked = with(json!({"max_tokens": 6, "temperature": 0, "stream": true,
+            "stream_options": {"include_usage": true}}));
+        let (_, body) = request(a, "POST", path, Some(&asked));
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{path}");
+        let chunks = last_data_chunks(&body);
+        let last = chunks.last().unwrap();
+        assert_eq!(last["choices"], json!([]), "{path}");
+        for key in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+            assert_eq!(last["usage"][key], plain["usage"][key], "{path}: {key}");
+        }
+        assert_eq!(
+            last["timings"]["predicted_n"],
+            last["usage"]["completion_tokens"]
+        );
+        assert!(last["timings"]["prompt_per_second"].as_f64().unwrap() > 0.0);
+        assert!(last["timings"]["predicted_per_second"].as_f64().unwrap() > 0.0);
+    }
+}
+
+#[test]
+fn usage_reports_cached_prompt_tokens() {
+    let srv = start();
+    let req = json!({"prompt": "hello there", "max_tokens": 2, "temperature": 0});
+    let ask = || {
+        let (st, body) = request(&srv.addr, "POST", "/v1/completions", Some(&req));
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let first = ask();
+    assert_eq!(first["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    assert_eq!(
+        first["timings"]["prompt_n"],
+        first["usage"]["prompt_tokens"]
+    );
+
+    // The last prompt token is always evaluated again, for its logits.
+    let again = ask();
+    let prompt = again["usage"]["prompt_tokens"].as_u64().unwrap();
+    assert_eq!(
+        again["usage"]["prompt_tokens_details"]["cached_tokens"],
+        prompt - 1
+    );
+    assert_eq!(again["timings"]["prompt_n"], 1);
+}
