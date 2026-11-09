@@ -1,0 +1,54 @@
+name: Benchmark
+
+# Manual only: it builds llama.cpp and downloads models, which CI's time limit has no room for.
+on:
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: Comma-separated thread counts
+        default: "1,2"
+      llama_ref:
+        description: llama.cpp tag to compare with
+        default: v0.9.0
+      models:
+        description: Space-separated GGUF URLs
+        default: >-
+          https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      THREADS: ${{ inputs.threads }}
+      LLAMA_REF: ${{ inputs.llama_ref }}
+      MODELS: ${{ inputs.models }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      # The shipped release profile, unlike CI's quick test builds: this measures what users run.
+      - run: |
+          cargo build --release --locked -p rli
+          cargo build --release --locked -p rli-models --example bench
+      - name: Build llama.cpp
+        run: |
+          git clone -q --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$RUNNER_TEMP/llama.cpp"
+          cd "$RUNNER_TEMP/llama.cpp"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+          cmake --build build -j "$(nproc)" --target llama-bench llama-completion
+      - name: Compare
+        run: |
+          grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|avx512_vnni|avx_vnni|amx_int8)$' | paste -sd' '
+          for url in $MODELS; do
+            model="$RUNNER_TEMP/$(basename "$url")"
+            curl -fsSL --retry 3 -o "$model" "$url"
+            python3 scripts/bench_compare.py --bin-dir target/release \
+              --llama-dir "$RUNNER_TEMP/llama.cpp/build/bin" --model "$model" --threads "$THREADS" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            rm "$model"
+          done

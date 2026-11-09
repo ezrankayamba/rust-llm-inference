@@ -148,5 +148,10 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
   (fixed-length runs that ignore EOS; `--depth` prefills D tokens before timing decode; defaults to CPU). Kernel microbenchmarks: `-p rli-core --example bench_matvec` / `bench_metal`.
   Background load (e.g. a Docker VM) makes Metal numbers swing by ~2x on this machine; measure on a quiet system.
 
+- Against llama.cpp: `python3 scripts/bench_compare.py --bin-dir <dir> --llama-dir <dir> --model <model> [--threads 1,4]`
+  prints throughput, first-token time and peak memory on the CPU. The manual `Benchmark` workflow
+  (`.github/workflows/bench.yml`) runs it on x86; GitHub runners vary in CPU and have 2 vCPUs on one core, so
+  compare only within one run and don't read thread scaling from it.
+
 Performance-sensitive changes to kernels or the hot path need before/after benchmark numbers. Debug
 builds are not representative, so always measure with `--release`.
