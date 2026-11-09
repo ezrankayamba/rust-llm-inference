@@ -2,135 +2,565 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>rli chat</title>
 <style>
   :root {
     color-scheme: light dark;
-    --bg: light-dark(#fafafa, #16181c);
-    --panel: light-dark(#ffffff, #1f2228);
-    --text: light-dark(#1c1e21, #e6e7e9);
-    --muted: light-dark(#616770, #9aa0a8);
-    --line: light-dark(#d9dbe0, #33373f);
-    --accent: light-dark(#2257c9, #7ba4ff);
-    --on-accent: light-dark(#ffffff, #10131a);
-    --user: light-dark(#e8effc, #26324a);
-    --error: light-dark(#b3261e, #ff8a80);
+    --bg: light-dark(#ffffff, #15171a);
+    --surface: light-dark(#f4f5f7, #1f2226);
+    --surface-hover: light-dark(#e9ebef, #2a2e33);
+    --text: light-dark(#1b1d20, #e8e9eb);
+    --muted: light-dark(#5a616b, #a0a7b0);
+    --line: light-dark(#dcdfe4, #33373d);
+    --accent: light-dark(#1f5fd1, #8ab4ff);
+    --on-accent: light-dark(#ffffff, #0f1726);
+    --bubble: light-dark(#e9f0fd, #28324a);
+    --error: light-dark(#b3261e, #ff9a90);
+    --code: light-dark(#f4f5f7, #101214);
+    --column: 760px;
+    --target: 36px;
   }
+  @media (pointer: coarse) { :root { --target: 44px; } }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: column; height: 100dvh;
     background: var(--bg); color: var(--text);
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  header, #composer { max-width: 860px; width: 100%; margin: 0 auto; padding: 12px 16px; }
-  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
-  h1 { font-size: 15px; margin: 0; }
-  #model { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; flex: 1; min-width: 120px; }
-  button {
-    font: inherit; padding: 6px 14px; cursor: pointer; border-radius: 6px;
-    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: .45; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  [hidden] { display: none !important; }
+  svg.icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round; flex: none; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+  /* Header */
+  header { border-bottom: 1px solid var(--line); padding: 8px 16px; }
+  .bar { display: flex; align-items: center; gap: 6px; max-width: var(--column); margin: 0 auto; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; white-space: nowrap; }
+  #model { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; margin-left: 6px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    min-width: var(--target); min-height: var(--target); padding: 0 8px;
+    background: none; border: 0; border-radius: 8px; color: var(--muted); font-size: 13px; }
+  .tool:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+  .tool[aria-pressed="true"] { background: var(--surface-hover); color: var(--text); }
+
+  /* Session totals */
+  #session { display: flex; flex-wrap: wrap; gap: 2px 18px; max-width: var(--column); margin: 4px auto 0;
+    color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  #session b { color: var(--text); font-weight: 600; }
+
+  /* Conversation */
+  main { flex: 1; min-height: 0; overflow-y: auto; position: relative; scrollbar-gutter: stable both-edges; }
+  #log { max-width: var(--column); margin: 0 auto; padding: 20px 16px 8px; display: flex; flex-direction: column; gap: 18px; }
+  #welcome { text-align: center; padding: 8vh 0 0; }
+  #welcome h2 { font-size: 22px; font-weight: 600; margin: 0 0 16px; }
+  #starters { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 8px; }
+  #starters button { min-height: 44px; padding: 10px 12px; background: var(--surface); text-align: left;
+    border: 1px solid var(--line); border-radius: 10px; font-size: 14px; }
+  #starters button:hover { background: var(--surface-hover); }
+
+  .turn { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .turn.user { align-items: flex-end; }
+  .body { overflow-wrap: anywhere; min-width: 0; max-width: 100%; }
+  .turn.user .body, .raw { white-space: pre-wrap; }
+  .turn.user .body { background: var(--bubble); padding: 8px 14px; border-radius: 16px; max-width: 85%; }
+  .body > :first-child { margin-top: 0; }
+  .body > :last-child { margin-bottom: 0; }
+  .body p { margin: 0 0 10px; white-space: pre-wrap; }
+  .body ul, .body ol { margin: 0 0 10px; padding-left: 24px; }
+  .body li.nested { margin-left: 20px; }
+  .body h3, .body h4, .body h5, .body h6 { margin: 14px 0 6px; line-height: 1.3; }
+  .body h3 { font-size: 18px; } .body h4 { font-size: 16px; } .body h5, .body h6 { font-size: 15px; }
+  .body blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
+  .body hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+  code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  :not(pre) > code { background: var(--surface); padding: 1px 5px; border-radius: 5px; }
+  .code { margin: 0 0 10px; background: var(--code); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .code-head { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 12px;
+    color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+  .code pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
+  details.think { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+  details.think summary { cursor: pointer; min-height: 28px; }
+  details.think div { white-space: pre-wrap; padding-left: 12px; border-left: 2px solid var(--line); }
+
+  .footer { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-height: var(--target); }
+  .stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 6px; }
+  .turn:not(.user) .footer { margin-left: -8px; }
+  /* Actions wait for hover or focus where hovering exists; touch screens always show them. */
+  @media (hover: hover) {
+    .turn.user .footer .tool { opacity: 0; }
+    .turn.user:hover .footer .tool, .turn.user:focus-within .footer .tool { opacity: 1; }
   }
-  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-  button:disabled { opacity: .5; cursor: default; }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  details { flex-basis: 100%; }
-  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
-  #settings {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 10px; padding-top: 10px;
-  }
-  label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
-  label.wide { grid-column: 1 / -1; }
-  input, textarea {
-    font: inherit; color: var(--text); background: var(--panel); width: 100%;
-    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
-  }
-  textarea { resize: vertical; }
-  main { flex: 1; overflow-y: auto; border-block: 1px solid var(--line); }
-  #log { max-width: 860px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-  #empty { color: var(--muted); text-align: center; padding: 32px 0; }
-  .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .user { align-self: flex-end; max-width: 85%; background: var(--user); padding: 8px 12px; border-radius: 10px; }
-  .assistant:empty::before { content: "…"; color: var(--muted); }
-  .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .error { color: var(--error); }
-  #composer { display: flex; gap: 8px; align-items: flex-end; }
-  #input { flex: 1; min-height: 40px; max-height: 40vh; }
+  .notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--error); font-size: 14px; }
+  .notice button { min-height: var(--target); padding: 0 12px; background: none; color: inherit;
+    border: 1px solid currentColor; border-radius: 8px; font-size: 13px; }
+  .typing { display: inline-flex; gap: 4px; padding: 8px 0; }
+  .typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); animation: pulse 1.2s infinite ease-in-out; }
+  .typing i:nth-child(2) { animation-delay: .2s; } .typing i:nth-child(3) { animation-delay: .4s; }
+  @keyframes pulse { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .typing i { animation: none; } html { scroll-behavior: auto; } }
+
+  #jump { position: sticky; bottom: 10px; display: flex; margin: 0 auto; width: var(--target); height: var(--target);
+    align-items: center; justify-content: center; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 50%; box-shadow: 0 1px 4px #0003; }
+  #jump:hover { background: var(--surface-hover); }
+
+  /* Composer */
+  #composer-wrap { padding: 8px 16px calc(8px + env(safe-area-inset-bottom)); }
+  #composer { display: flex; align-items: flex-end; gap: 6px; max-width: var(--column); margin: 0 auto;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 6px 6px 6px 14px; }
+  #composer:focus-within { border-color: var(--accent); }
+  #input { flex: 1; min-width: 0; max-height: 40dvh; resize: none; overflow-y: auto; background: none;
+    border: 0; outline: 0; padding: 6px 0; }
+  #action { display: inline-flex; align-items: center; justify-content: center; flex: none;
+    width: var(--target); height: var(--target); border: 0; border-radius: 50%;
+    background: var(--accent); color: var(--on-accent); }
+  #hint { max-width: var(--column); margin: 4px auto 0; text-align: center; color: var(--muted); font-size: 12px; }
+  @media (pointer: coarse) { #hint { display: none; } }
+
+  /* Settings */
+  dialog { margin: 0 0 0 auto; height: 100dvh; max-height: none; width: min(380px, 100vw); max-width: 100vw;
+    padding: 16px; background: var(--bg); color: var(--text); border: 0; border-left: 1px solid var(--line); }
+  dialog::backdrop { background: #0005; }
+  .dialog-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  dialog h2 { font-size: 16px; margin: 0; }
+  #settings { display: flex; flex-direction: column; gap: 14px; }
+  #settings label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; font-weight: 500; }
+  #settings small { color: var(--muted); font-weight: 400; font-size: 12px; }
+  #settings input, #settings textarea { width: 100%; padding: 8px 10px; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; resize: vertical; font-weight: 400; }
+  #reset { align-self: flex-start; min-height: var(--target); padding: 0 12px; background: none;
+    border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+  #reset:hover { background: var(--surface-hover); }
 </style>
 </head>
 <body>
+<svg hidden aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+  <symbol id="i-raw" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 13 4 4 10-10"/></symbol>
+  <symbol id="i-retry" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6.3M20 5v6h-6"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM13 7l4 4"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+</svg>
+
 <header>
-  <h1>rli chat</h1>
-  <span id="model">connecting…</span>
-  <button id="new" type="button">New chat</button>
-  <details>
-    <summary>Settings</summary>
-    <div id="settings">
-      <label class="wide">System prompt (empty uses the model's default)
-        <textarea id="system" rows="2"></textarea>
-      </label>
-      <label>Temperature
-        <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7">
-      </label>
-      <label>Max tokens
-        <input id="max-tokens" type="number" min="1" step="1" value="256">
-      </label>
-      <label>Seed (empty is random)
-        <input id="seed" type="number" min="0" step="1">
-      </label>
-      <label class="wide">Stop strings (one per line)
-        <textarea id="stop" rows="2"></textarea>
-      </label>
-    </div>
-  </details>
+  <div class="bar">
+    <h1>rli chat</h1>
+    <span id="model">connecting…</span>
+    <button id="raw" class="tool" type="button" aria-pressed="false" aria-label="Show raw output" title="Show raw output"><svg class="icon" aria-hidden="true"><use href="#i-raw"/></svg></button>
+    <button id="open-settings" class="tool" type="button" aria-label="Settings" title="Settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg></button>
+    <button id="new" class="tool" type="button"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>New chat</button>
+  </div>
+  <div id="session" aria-label="Session token totals">
+    <span title="Prompt tokens evaluated this session, tokens reused from the cache, and evaluation speed"><b>IN</b> <span id="session-in">0 tok · 0 cached</span></span>
+    <span title="Tokens generated this session, and generation speed"><b>OUT</b> <span id="session-out">0 tok</span></span>
+  </div>
 </header>
+
 <main id="scroller">
-  <div id="log" aria-live="polite"><div id="empty">Send a message to start.</div></div>
+  <div id="log" role="log" aria-label="Conversation">
+    <div id="welcome">
+      <h2>What would you like to try?</h2>
+      <div id="starters">
+        <button type="button">Explain how a KV cache speeds up LLM inference.</button>
+        <button type="button">Write a Rust function that reverses a string.</button>
+        <button type="button">Give me three tips for writing clear commit messages.</button>
+        <button type="button">Count from 1 to 20, separated by commas.</button>
+      </div>
+    </div>
+  </div>
+  <button id="jump" type="button" aria-label="Jump to latest" title="Jump to latest" hidden><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg></button>
 </main>
-<form id="composer">
-  <textarea id="input" rows="1" aria-label="Message" placeholder="Message"></textarea>
-  <button id="send" class="primary" type="submit">Send</button>
-  <button id="abort" type="button" disabled>Stop</button>
-</form>
+
+<div id="composer-wrap">
+  <form id="composer">
+    <textarea id="input" rows="1" aria-label="Message" placeholder="Message"></textarea>
+    <button id="action" type="submit" aria-label="Send" title="Send" disabled><svg class="icon" aria-hidden="true"><use id="action-icon" href="#i-send"/></svg></button>
+  </form>
+  <p id="hint">Enter to send · Shift+Enter for a new line</p>
+</div>
+
+<dialog id="settings-dialog" aria-labelledby="settings-title">
+  <div class="dialog-head">
+    <h2 id="settings-title">Settings</h2>
+    <button id="close-settings" class="tool" type="button" aria-label="Close settings"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
+  </div>
+  <form id="settings" method="dialog">
+    <label>System prompt
+      <textarea id="system" rows="3"></textarea>
+      <small>Empty uses the model's default.</small>
+    </label>
+    <label>Temperature
+      <input id="temperature" type="number" min="0" max="2" step="0.1">
+      <small>0 always picks the likeliest token.</small>
+    </label>
+    <label>Max tokens
+      <input id="max-tokens" type="number" min="1" step="1">
+    </label>
+    <label>Seed
+      <input id="seed" type="number" min="0" step="1">
+      <small>Empty is random. Replies can still differ when the prompt is cached.</small>
+    </label>
+    <label>Stop strings
+      <textarea id="stop" rows="2"></textarea>
+      <small>One per line. The reply ends before the first match.</small>
+    </label>
+    <button id="reset" type="button">Restore defaults</button>
+  </form>
+</dialog>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const scroller = $("scroller");
-let history = [];
-let controller = null;
+const log = $("log");
+const welcome = $("welcome");
+const input = $("input");
 
-fetch("/v1/models")
-  .then((r) => r.json())
-  .then((v) => { $("model").textContent = v.data[0].id; })
-  .catch(() => { $("model").textContent = "model unknown"; });
-
-// Model output is untrusted: it only ever goes in through textContent.
-function add(className, text = "") {
-  $("empty")?.remove();
-  const el = document.createElement("div");
-  el.className = className;
-  el.textContent = text;
-  $("log").append(el);
-  return el;
+// Model output is untrusted. It reaches the page only through text nodes and textContent; this
+// file never parses a string as HTML, and the only markup it builds comes from fixed tag names.
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
 }
 
-function follow(update) {
-  const atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
-  update();
-  if (atEnd) scroller.scrollTop = scroller.scrollHeight;
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#i-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+function toolButton(name, label, onClick) {
+  const b = el("button", "tool");
+  b.type = "button";
+  b.title = label;
+  b.setAttribute("aria-label", label);
+  b.append(icon(name));
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+// Settings: this viewer's preferences, so a blocked or empty store just means the defaults.
+const DEFAULTS = { system: "", temperature: "0.7", "max-tokens": "512", seed: "", stop: "" };
+const STORE_KEY = "rli-chat-settings";
+let rawOutput = false;
+
+function loadSettings() {
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(STORE_KEY)) ?? {};
+  } catch { /* unavailable or corrupt: use the defaults */ }
+  for (const [id, value] of Object.entries(DEFAULTS)) $(id).value = saved[id] ?? value;
+  setRaw(saved.raw === true);
+}
+
+function saveSettings() {
+  const values = { raw: rawOutput };
+  for (const id of Object.keys(DEFAULTS)) values[id] = $(id).value;
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(values));
+  } catch { /* unavailable: settings last until the page closes */ }
+}
+
+// Markdown: the small subset models mostly write. Links are left as text, so a reply can't
+// present a misleading link.
+function appendInline(parent, text) {
+  const pattern = /`([^`\n]+)`|\*\*([^*\n]+)\*\*|\*([^*\s][^*\n]*)\*/g;
+  let at = 0;
+  for (const m of text.matchAll(pattern)) {
+    parent.append(text.slice(at, m.index));
+    if (m[1] !== undefined) parent.append(el("code", "", m[1]));
+    else if (m[2] !== undefined) parent.append(el("strong", "", m[2]));
+    else parent.append(el("em", "", m[3]));
+    at = m.index + m[0].length;
+  }
+  parent.append(text.slice(at));
+}
+
+function codeBlock(language, code) {
+  const wrap = el("div", "code");
+  const head = el("div", "code-head", language || "code");
+  head.append(copyButton(() => code, "Copy code"));
+  const pre = el("pre");
+  pre.append(el("code", "", code));
+  wrap.append(head, pre);
+  return wrap;
+}
+
+const FENCE = /^\s*```(.*)$/;
+const HEADING = /^(#{1,6})\s+(.*)$/;
+const RULE = /^\s*([-*_])\1{2,}\s*$/;
+const QUOTE = /^>\s?(.*)$/;
+const ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+function isBlockStart(line) {
+  return FENCE.test(line) || HEADING.test(line) || RULE.test(line) || QUOTE.test(line) || ITEM.test(line);
+}
+
+function renderMarkdown(text) {
+  const out = document.createDocumentFragment();
+  const lines = text.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) {
+      i += 1;
+    } else if ((m = line.match(FENCE))) {
+      const code = [];
+      i += 1;
+      // An unclosed fence runs to the end, which is what a reply still streaming looks like.
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) code.push(lines[i++]);
+      i += 1;
+      out.append(codeBlock(m[1].trim(), code.join("\n")));
+    } else if ((m = line.match(HEADING))) {
+      const h = el(`h${Math.min(m[1].length + 2, 6)}`);
+      appendInline(h, m[2]);
+      out.append(h);
+      i += 1;
+    } else if (RULE.test(line)) {
+      out.append(el("hr"));
+      i += 1;
+    } else if (QUOTE.test(line)) {
+      const quote = el("blockquote");
+      const quoted = [];
+      while (i < lines.length && (m = lines[i].match(QUOTE))) { quoted.push(m[1]); i += 1; }
+      quote.append(renderMarkdown(quoted.join("\n")));
+      out.append(quote);
+    } else if ((m = line.match(ITEM))) {
+      const ordered = /\d/.test(m[2]);
+      const list = el(ordered ? "ol" : "ul");
+      if (ordered) list.start = parseInt(m[2], 10);
+      while (i < lines.length) {
+        const item = lines[i].match(ITEM);
+        if (item && /\d/.test(item[2]) === ordered) {
+          const li = el("li", item[1].length >= 2 ? "nested" : "");
+          appendInline(li, item[3]);
+          list.append(li);
+          i += 1;
+        } else if (!item && lines[i].trim() && /^\s+/.test(lines[i]) && list.lastChild) {
+          list.lastChild.append(" ");
+          appendInline(list.lastChild, lines[i].trim());
+          i += 1;
+        } else if (!lines[i].trim() && (lines[i + 1] ?? "").match(ITEM)) {
+          i += 1;
+        } else {
+          break;
+        }
+      }
+      out.append(list);
+    } else {
+      const para = [];
+      while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) para.push(lines[i++]);
+      const p = el("p");
+      appendInline(p, para.join("\n"));
+      out.append(p);
+    }
+  }
+  return out;
+}
+
+// Splits off a leading <think> block. `closed` is false while the model is still thinking.
+function splitThinking(text) {
+  const open = text.match(/^\s*<think>/);
+  if (!open) return { thought: "", answer: text, closed: true };
+  const rest = text.slice(open[0].length);
+  const end = rest.indexOf("</think>");
+  if (end < 0) return { thought: rest.trim(), answer: "", closed: false };
+  return { thought: rest.slice(0, end).trim(), answer: rest.slice(end + 8).replace(/^\s+/, ""), closed: true };
+}
+
+function renderBody(turn) {
+  const body = turn.body;
+  body.classList.toggle("raw", rawOutput);
+  if (rawOutput) {
+    body.textContent = turn.text;
+    return;
+  }
+  const { thought, answer, closed } = splitThinking(turn.text);
+  const nodes = [];
+  if (thought || !closed) {
+    const details = el("details", "think");
+    details.open = turn.thoughtOpen ?? !closed;
+    const summary = el("summary", "", closed ? "Thought" : "Thinking…");
+    // A click, not "toggle": that also fires when this code opens it, which isn't the reader's choice.
+    summary.addEventListener("click", () => { turn.thoughtOpen = !details.open; });
+    details.append(summary, el("div", "", thought));
+    nodes.push(details);
+  }
+  nodes.push(renderMarkdown(answer));
+  body.replaceChildren(...nodes);
+}
+
+function setRaw(on) {
+  rawOutput = on;
+  const button = $("raw");
+  button.setAttribute("aria-pressed", String(on));
+  for (const turn of turns) if (turn.role === "assistant") renderBody(turn);
+}
+
+// Copy. Clipboard access needs a secure context, which a server on a LAN address isn't.
+async function writeClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch { /* unavailable or refused: use the older route below */ }
+  const area = el("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.append(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
+function copyButton(getText, label) {
+  const b = toolButton("copy", label, async () => {
+    await writeClipboard(getText());
+    b.replaceChildren(icon("check"));
+    b.setAttribute("aria-label", "Copied");
+    b.title = "Copied";
+    setTimeout(() => {
+      b.replaceChildren(icon("copy"));
+      b.setAttribute("aria-label", label);
+      b.title = label;
+    }, 1500);
+  });
+  return b;
+}
+
+// Scrolling: follow new text unless the reader has scrolled up.
+let following = true;
+const nearEnd = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60;
+function updateJump() { $("jump").hidden = following || !turns.length; }
+function toEnd() {
+  following = true;
+  scroller.scrollTop = scroller.scrollHeight;
+  updateJump();
+}
+function afterContent() {
+  if (following) scroller.scrollTop = scroller.scrollHeight;
+  updateJump();
+}
+scroller.addEventListener("scroll", () => {
+  following = nearEnd();
+  updateJump();
+});
+
+// Session totals.
+const session = { evaluated: 0, cached: 0, promptMs: 0, out: 0, outMs: 0, estimated: false };
+const count = (n) => n.toLocaleString("en-US");
+const speed = (n, ms) => {
+  if (!ms) return "";
+  const rate = n / (ms / 1000);
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`;
+};
+
+function renderSession() {
+  const inRate = speed(session.evaluated, session.promptMs);
+  const outRate = speed(session.out, session.outMs);
+  const mark = session.estimated ? "≈" : "";
+  $("session-in").textContent = `${mark}${count(session.evaluated)} tok · ${mark}${count(session.cached)} cached${inRate ? ` · ${inRate}` : ""}`;
+  $("session-out").textContent = `${mark}${count(session.out)} tok${outRate ? ` · ${mark}${outRate}` : ""}`;
+}
+
+function resetSession() {
+  Object.assign(session, { evaluated: 0, cached: 0, promptMs: 0, out: 0, outMs: 0, estimated: false });
+  renderSession();
+}
+
+// The conversation: `turns` is what the model is sent, in order.
+let turns = [];
+let failed = null; // { notice, partial }: the last turn got no usable reply.
+let controller = null;
+let runId = 0;
+
+function addUserTurn(text) {
+  const turn = { role: "user", text, node: el("div", "turn user") };
+  turn.body = el("div", "body", text);
+  turn.footer = el("div", "footer");
+  turn.edit = toolButton("edit", "Edit and resend", () => editLast());
+  turn.footer.append(copyButton(() => turn.text, "Copy message"), turn.edit);
+  turn.node.append(turn.body, turn.footer);
+  log.append(turn.node);
+  turns.push(turn);
+}
+
+function newAssistantTurn() {
+  const turn = { role: "assistant", text: "", node: el("div", "turn") };
+  turn.body = el("div", "body");
+  const typing = el("div", "typing");
+  typing.setAttribute("aria-label", "Generating");
+  typing.append(el("i"), el("i"), el("i"));
+  turn.body.append(typing);
+  turn.node.append(turn.body);
+  log.append(turn.node);
+  return turn;
+}
+
+function addAssistantFooter(turn, stats) {
+  turn.footer = el("div", "footer");
+  turn.regenerate = toolButton("retry", "Regenerate", () => regenerate());
+  turn.footer.append(copyButton(() => turn.text, "Copy reply"), turn.regenerate);
+  if (stats) turn.footer.append(el("span", "stats", stats));
+  turn.node.append(turn.footer);
+}
+
+// Only the newest exchange can be changed, and not while a reply is being written.
+function refreshActions() {
+  const busy = controller !== null;
+  const last = turns[turns.length - 1];
+  for (const turn of turns) {
+    if (turn.edit) turn.edit.hidden = busy || !(turn === last || turn === turns[turns.length - 2]);
+    if (turn.regenerate) turn.regenerate.hidden = busy || turn !== last;
+  }
+}
+
+function setBusy(busy, currentController = null) {
+  controller = busy ? currentController : null;
+  const action = $("action");
+  action.setAttribute("aria-label", busy ? "Stop" : "Send");
+  action.title = busy ? "Stop" : "Send";
+  $("action-icon").setAttribute("href", busy ? "#i-stop" : "#i-send");
+  log.setAttribute("aria-busy", String(busy));
+  updateAction();
+  refreshActions();
+}
+
+function updateAction() {
+  $("action").disabled = controller === null && !input.value.trim();
 }
 
 function requestBody() {
+  const messages = turns.map((t) => ({ role: t.role, content: t.text }));
   const system = $("system").value;
-  const messages = system.trim() ? [{ role: "system", content: system }, ...history] : history;
+  if (system.trim()) messages.unshift({ role: "system", content: system });
   const body = {
     messages,
     stream: true,
+    stream_options: { include_usage: true },
     temperature: Number($("temperature").value),
-    max_tokens: Number($("max-tokens").value),
   };
+  if ($("max-tokens").value !== "") body.max_tokens = Number($("max-tokens").value);
   if ($("seed").value !== "") body.seed = Number($("seed").value);
   const stop = $("stop").value.split("\n").filter((s) => s !== "");
   if (stop.length) body.stop = stop;
@@ -154,105 +584,234 @@ async function readEvents(response, onEvent) {
   }
 }
 
-function describe(stats) {
-  const parts = [`finish: ${stats.finish}`];
-  if (stats.firstAt !== null) {
-    parts.push(`first token ${((stats.firstAt - stats.start) / 1000).toFixed(2)}s`);
-    const seconds = (performance.now() - stats.firstAt) / 1000;
-    // Chunks after the first, over the time since it: chunks are about one token each.
-    if (stats.chunks > 1 && seconds > 0) {
-      parts.push(`≈${((stats.chunks - 1) / seconds).toFixed(1)} tok/s`);
-    }
-  }
-  return parts.join(" · ");
+function showFailure(message, partial) {
+  const notice = el("div", "notice");
+  notice.setAttribute("role", "alert");
+  const retry = el("button", "", "Retry");
+  retry.type = "button";
+  retry.addEventListener("click", () => {
+    clearFailure();
+    generate();
+  });
+  notice.append(el("span", "", message), retry);
+  log.append(notice);
+  failed = { notice, partial };
 }
 
-async function send(text) {
-  history.push({ role: "user", content: text });
-  add("msg user", text);
-  const reply = add("msg assistant");
-  const meta = add("meta");
-  scroller.scrollTop = scroller.scrollHeight;
-  $("send").disabled = true;
-  $("abort").disabled = false;
-  controller = new AbortController();
+function clearFailure() {
+  if (!failed) return;
+  failed.notice.remove();
+  failed.partial?.remove();
+  failed = null;
+}
 
-  const stats = { start: performance.now(), firstAt: null, chunks: 0, finish: "connection ended early" };
-  let finished = false;
+async function generate() {
+  const run = ++runId;
+  const turn = newAssistantTurn();
+  const abort = new AbortController();
+  setBusy(true, abort);
+  toEnd();
+
+  const started = performance.now();
+  let firstAt = null;
+  let lastAt = null;
+  let chunks = 0;
+  let finish = null;
+  let usage = null;
+  let timings = null;
+  let done = false;
+  let frame = 0;
+  const paint = () => {
+    frame = 0;
+    renderBody(turn);
+    afterContent();
+  };
+
+  let failure = null;
+  let stopped = false;
   try {
     const response = await fetch("/v1/chat/completions", {
       method: "POST",
       body: JSON.stringify(requestBody()),
-      signal: controller.signal,
+      signal: abort.signal,
     });
     if (!response.ok) {
       const v = await response.json().catch(() => null);
-      throw new Error(v?.error?.message ?? `HTTP ${response.status}`);
+      throw new Error(v?.error?.message ?? `The server answered ${response.status}.`);
     }
     await readEvents(response, (data) => {
-      if (data === "[DONE]") { finished = true; return; }
-      const choice = JSON.parse(data).choices[0];
-      if (choice.finish_reason) stats.finish = choice.finish_reason;
+      if (run !== runId) return;
+      if (data === "[DONE]") { done = true; return; }
+      const event = JSON.parse(data);
+      if (event.usage) { usage = event.usage; timings = event.timings; }
+      const choice = event.choices[0];
+      if (!choice) return;
+      if (choice.finish_reason) finish = choice.finish_reason;
       const text = choice.delta?.content;
       if (!text) return;
-      stats.firstAt ??= performance.now();
-      stats.chunks += 1;
-      follow(() => { reply.append(text); });
+      lastAt = performance.now();
+      firstAt ??= lastAt;
+      chunks += 1;
+      turn.text += text;
+      // Replies can outpace the screen; re-rendering Markdown once a frame is plenty.
+      frame ||= requestAnimationFrame(paint);
     });
-    meta.textContent = describe(stats);
-    if (!finished) meta.classList.add("error");
+    if (!done) throw new Error("The connection ended before the reply finished.");
   } catch (e) {
-    if (e.name === "AbortError") {
-      stats.finish = "stopped by you";
-      meta.textContent = describe(stats);
-    } else {
-      meta.textContent = `error: ${e.message}`;
-      meta.classList.add("error");
-    }
+    if (e.name === "AbortError") stopped = true;
+    else failure = e.message;
   }
-  if (reply.textContent) {
-    history.push({ role: "assistant", content: reply.textContent });
+  if (frame) cancelAnimationFrame(frame);
+  // New chat took over while this was running: its page is no longer this reply's to change.
+  if (run !== runId) return;
+  renderBody(turn);
+
+  const hasText = turn.text !== "";
+  if (failure || (stopped && !hasText)) {
+    setBusy(false);
+    if (!hasText) turn.node.remove();
+    showFailure(failure ?? "Stopped before any reply arrived.", hasText ? turn.node : null);
   } else {
-    reply.remove();
-    // Nothing came back, so the turn is dropped: the next message mustn't follow it unanswered.
-    history.pop();
+    if (usage && timings) {
+      const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+      session.evaluated += timings.prompt_n;
+      session.cached += cached;
+      session.promptMs += timings.prompt_ms;
+      session.out += usage.completion_tokens;
+      session.outMs += timings.predicted_ms;
+      const parts = [
+        `IN ${count(usage.prompt_tokens)} tok (${count(cached)} cached) · ${speed(timings.prompt_n, timings.prompt_ms)}`,
+        `OUT ${count(usage.completion_tokens)} tok · ${speed(usage.completion_tokens, timings.predicted_ms)}`,
+      ];
+      if (firstAt !== null) parts.push(`first token ${((firstAt - started) / 1000).toFixed(2)}s`);
+      parts.push(`finish: ${finish}`);
+      addAssistantFooter(turn, parts.join(" · "));
+    } else {
+      // A stopped reply closes the connection, so the server can't report it. Text chunks are
+      // about one token each; the prompt's numbers are unknown.
+      const ms = lastAt !== null && firstAt !== null ? lastAt - firstAt : 0;
+      session.out += chunks;
+      session.outMs += ms;
+      session.estimated = true;
+      addAssistantFooter(turn, `OUT ≈${count(chunks)} tok${chunks > 1 && ms ? ` · ≈${speed(chunks - 1, ms)}` : ""} · stopped by you`);
+    }
+    turns.push(turn);
+    renderSession();
+    setBusy(false);
   }
-  controller = null;
-  $("send").disabled = false;
-  $("abort").disabled = true;
-  scroller.scrollTop = scroller.scrollHeight;
-  $("input").focus();
+  afterContent();
+  input.focus();
+}
+
+function send(text) {
+  // A failed exchange is replaced by the new message, so two user turns never run together.
+  if (failed) {
+    clearFailure();
+    const last = turns.pop();
+    last.node.remove();
+  }
+  welcome.remove();
+  addUserTurn(text);
+  generate();
+}
+
+function regenerate() {
+  turns.pop().node.remove();
+  generate();
+}
+
+function editLast() {
+  clearFailure();
+  if (turns[turns.length - 1].role === "assistant") turns.pop().node.remove();
+  const user = turns.pop();
+  user.node.remove();
+  input.value = user.text;
+  autoGrow();
+  updateAction();
+  refreshActions();
+  if (!turns.length) log.append(welcome);
+  input.focus();
+}
+
+function newChat() {
+  runId += 1;
+  controller?.abort();
+  setBusy(false);
+  failed = null;
+  turns = [];
+  log.replaceChildren(welcome);
+  resetSession();
+  following = true;
+  updateJump();
+  input.focus();
+}
+
+function autoGrow() {
+  input.style.height = "auto";
+  input.style.height = `${input.scrollHeight}px`;
+}
+
+function submit() {
+  if (controller) {
+    controller.abort();
+    return;
+  }
+  const text = input.value;
+  if (!text.trim()) return;
+  input.value = "";
+  autoGrow();
+  updateAction();
+  send(text);
 }
 
 $("composer").addEventListener("submit", (e) => {
   e.preventDefault();
-  const text = $("input").value;
-  if (!text.trim() || controller) return;
-  $("input").value = "";
-  send(text);
+  submit();
 });
-
-$("input").addEventListener("keydown", (e) => {
+input.addEventListener("input", () => {
+  autoGrow();
+  updateAction();
+});
+input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
-    $("composer").requestSubmit();
+    // Enter never stops a reply: someone typing the next message shouldn't cancel this one.
+    if (!controller) submit();
   }
 });
-
-$("abort").addEventListener("click", () => controller?.abort());
-
-$("new").addEventListener("click", () => {
-  controller?.abort();
-  history = [];
-  $("log").replaceChildren();
-  const empty = document.createElement("div");
-  empty.id = "empty";
-  empty.textContent = "Send a message to start.";
-  $("log").append(empty);
-  $("input").focus();
+for (const b of $("starters").querySelectorAll("button")) {
+  b.addEventListener("click", () => send(b.textContent));
+}
+$("new").addEventListener("click", newChat);
+$("jump").addEventListener("click", toEnd);
+$("raw").addEventListener("click", () => {
+  setRaw(!rawOutput);
+  saveSettings();
+});
+$("open-settings").addEventListener("click", () => $("settings-dialog").showModal());
+$("close-settings").addEventListener("click", () => $("settings-dialog").close());
+// Clicking the backdrop lands on the dialog element itself; its padding is too small to mistake.
+$("settings-dialog").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) e.currentTarget.close();
+});
+$("settings").addEventListener("input", saveSettings);
+$("settings").addEventListener("submit", (e) => e.preventDefault());
+$("reset").addEventListener("click", () => {
+  for (const [id, value] of Object.entries(DEFAULTS)) $(id).value = value;
+  saveSettings();
 });
 
-$("input").focus();
+fetch("/v1/models")
+  .then((r) => r.json())
+  .then((v) => {
+    $("model").textContent = v.data[0].id;
+    $("model").title = v.data[0].id;
+  })
+  .catch(() => { $("model").textContent = "model unknown"; });
+
+loadSettings();
+renderSession();
+input.focus();
 </script>
 </body>
 </html>
