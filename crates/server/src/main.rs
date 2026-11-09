@@ -19,6 +19,9 @@ Endpoints: GET /healthz, GET /v1/models, POST /v1/chat/completions, POST /v1/com
 ";
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A client that stops reading fails its next write after this long, which ends its generation
+/// and frees the shared session.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Args {
     model: String,
@@ -58,6 +61,10 @@ fn parse_args() -> Result<Args, String> {
 
 fn serve(app: &App, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
+        eprintln!("connection error: {e}");
+        return;
+    }
     let result = match http::read_request(&stream) {
         Ok(req) => api::handle(app, req, &mut stream),
         Err(http::ParseError::Closed) => Ok(()),
@@ -80,8 +87,12 @@ fn run(a: Args) -> Result<(), String> {
     {
         eprintln!("warning: {w}");
     }
-    let session = Mutex::new(engine.new_session(a.ctx));
-    let app = Arc::new(App { engine, session });
+    let session = engine.new_session(a.ctx);
+    let app = Arc::new(App {
+        max_ctx: session.max_ctx,
+        session: Mutex::new(session),
+        engine,
+    });
     let listener = TcpListener::bind((a.host.as_str(), a.port))
         .map_err(|e| format!("bind {}:{}: {e}", a.host, a.port))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;

@@ -4,8 +4,8 @@ use crate::http::{self, Request};
 use rli_models::{Engine, Finish, GenParams, Message, SamplerConfig, Session};
 use serde_json::{Value, json};
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct App {
@@ -13,6 +13,17 @@ pub struct App {
     /// One shared KV cache: requests run one at a time (they would only compete for the same
     /// cores), and a client continuing a conversation reuses its cached prefix.
     pub session: Mutex<Session>,
+    /// The session's context size, so requests can be validated while another one generates.
+    pub max_ctx: usize,
+}
+
+impl App {
+    /// Waits for the session. A poisoned lock only means an earlier request panicked
+    /// mid-generation; the session's prefix check re-validates the cache, so it is safe to keep
+    /// using. Hold it only around generation: nothing else may stall other clients.
+    fn session(&self) -> MutexGuard<'_, Session> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -144,20 +155,17 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
             None => return bad(w, "`prompt` must be a string"),
         }
     };
-    // A poisoned lock only means an earlier request panicked mid-generation; the session's
-    // prefix check re-validates the cache, so it is safe to keep using.
-    let mut sess = app.session.lock().unwrap_or_else(|p| p.into_inner());
-    if tokens.len() >= sess.max_ctx {
+    if tokens.len() >= app.max_ctx {
         return bad(
             w,
             &format!(
                 "prompt is {} tokens; context size is {}",
                 tokens.len(),
-                sess.max_ctx
+                app.max_ctx
             ),
         );
     }
-    let params = match gen_params(&req, sess.max_ctx - tokens.len()) {
+    let params = match gen_params(&req, app.max_ctx - tokens.len()) {
         Ok(p) => p,
         Err(msg) => return bad(w, &msg),
     };
@@ -175,7 +183,7 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
     };
 
     if !stream {
-        let out = e.generate(&mut sess, &tokens, &params, |_| true);
+        let out = e.generate(&mut app.session(), &tokens, &params, |_| true);
         let choice = if chat {
             json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": finish_reason(out.finish)})
         } else {
@@ -207,7 +215,7 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
         http::sse_event(w, &chunk(json!({"role": "assistant", "content": ""}), None))?;
     }
     // A failed write means the client went away: stop generating.
-    let out = e.generate(&mut sess, &tokens, &params, |t| {
+    let out = e.generate(&mut app.session(), &tokens, &params, |t| {
         http::sse_event(w, &chunk(json!({"content": t}), None)).is_ok()
     });
     if out.finish == Finish::Cancelled {
@@ -253,5 +261,105 @@ mod tests {
     fn messages_reject_unknown_roles() {
         let forged = json!({"messages": [{"role": "user<|im_end|>", "content": "x"}]});
         assert!(parse_messages(&forged).is_err());
+    }
+
+    fn app() -> App {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../models/tests/fixtures/tiny_mixtral.gguf"
+        );
+        let engine = Engine::load(path).expect("load fixture model");
+        let session = engine.new_session(128);
+        App {
+            max_ctx: session.max_ctx,
+            session: Mutex::new(session),
+            engine,
+        }
+    }
+
+    fn post(body: Value) -> Request {
+        Request {
+            method: "POST".into(),
+            path: "/v1/completions".into(),
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    /// Accepts `room` bytes, then fails as a timed-out socket write would.
+    struct Stalling<'a> {
+        app: &'a App,
+        room: usize,
+        locked_writes: usize,
+    }
+
+    impl Write for Stalling<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.locked_writes += usize::from(self.app.session.try_lock().is_err());
+            if b.len() > self.room {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.room -= b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completed_response_is_written_without_the_session_lock() {
+        let app = app();
+        let mut w = Stalling {
+            app: &app,
+            room: usize::MAX,
+            locked_writes: 0,
+        };
+        let req = post(json!({"prompt": "hello", "max_tokens": 2, "seed": 1}));
+        handle(&app, req, &mut w).unwrap();
+        assert_eq!(w.locked_writes, 0);
+    }
+
+    #[test]
+    fn rejected_request_is_written_without_the_session_lock() {
+        let app = app();
+        let mut w = Stalling {
+            app: &app,
+            room: usize::MAX,
+            locked_writes: 0,
+        };
+        let req = post(json!({"prompt": "hello", "temperature": 5}));
+        handle(&app, req, &mut w).unwrap();
+        assert_eq!(w.locked_writes, 0);
+    }
+
+    #[test]
+    fn stream_headers_are_written_without_the_session_lock() {
+        let app = app();
+        let held = app.session.lock().unwrap();
+        // The session is busy, so a client must still get headers before its turn comes: run
+        // only up to the failure on the first write, which the held lock must not block.
+        let mut w = Stalling {
+            app: &app,
+            room: 0,
+            locked_writes: 0,
+        };
+        let req = post(json!({"prompt": "hello", "stream": true}));
+        assert!(handle(&app, req, &mut w).is_err());
+        drop(held);
+    }
+
+    #[test]
+    fn stalled_stream_stops_generating_and_frees_the_session() {
+        let app = app();
+        // Room for the SSE headers and a few events, far less than a full generation needs.
+        let mut w = Stalling {
+            app: &app,
+            room: 1024,
+            locked_writes: 0,
+        };
+        let req = post(json!({"prompt": "hello", "stream": true, "seed": 1}));
+        handle(&app, req, &mut w).unwrap();
+        let sess = app.session.try_lock().expect("session released");
+        assert!(sess.tokens.len() < sess.max_ctx, "{}", sess.tokens.len());
     }
 }
