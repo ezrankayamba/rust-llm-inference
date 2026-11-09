@@ -15,7 +15,8 @@ usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] 
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
 
-Endpoints: GET /healthz, GET /v1/models, POST /v1/chat/completions, POST /v1/completions
+Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/completions,
+POST /v1/completions
 ";
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);

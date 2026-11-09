@@ -1,4 +1,5 @@
 //! OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`, `/v1/completions`.
+//! `/` serves a small chat page for trying a model by hand.
 
 use crate::http::{self, Request};
 use rli_models::{Engine, Finish, GenParams, Message, SamplerConfig, Session};
@@ -25,6 +26,8 @@ impl App {
         self.session.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
+
+const CHAT_PAGE: &str = include_str!("chat.html");
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -154,6 +157,7 @@ pub fn handle(
 ) -> std::io::Result<()> {
     let json_ct = "application/json";
     match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => http::respond(w, 200, "text/html; charset=utf-8", CHAT_PAGE.as_bytes()),
         ("GET", "/healthz") => http::respond(w, 200, "text/plain", b"ok"),
         ("GET", "/v1/models") => {
             let body = json!({"object": "list", "data": [{
@@ -163,7 +167,7 @@ pub fn handle(
         }
         ("POST", "/v1/chat/completions") => complete(app, &req.body, true, w, gone),
         ("POST", "/v1/completions") => complete(app, &req.body, false, w, gone),
-        (_, "/healthz" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
+        (_, "/" | "/healthz" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
             http::respond(w, 405, json_ct, &error_body("method not allowed"))
         }
         _ => http::respond(w, 404, json_ct, &error_body("not found")),

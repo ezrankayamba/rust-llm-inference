@@ -254,3 +254,23 @@ fn stop_accepts_null_and_an_empty_list() {
         assert_eq!(st, 200, "{stop}: {body}");
     }
 }
+
+#[test]
+fn root_serves_the_chat_page() {
+    let srv = start();
+    let mut s = TcpStream::connect(&srv.addr).unwrap();
+    write!(s, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("Content-Type: text/html"), "{head}");
+    assert!(body.contains("<title>rli chat</title>"));
+}
+
+#[test]
+fn root_rejects_other_methods() {
+    let srv = start();
+    let (st, _) = request(&srv.addr, "POST", "/", None);
+    assert_eq!(st, 405);
+}

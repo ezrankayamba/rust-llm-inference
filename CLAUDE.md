@@ -84,7 +84,8 @@ Design points that span files:
   keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal
   batched prompts (the matrix units accumulate in a different order); tests that compare logits use it.
   The f16 KV caches (Metal and CPU) move logits by up to ~0.015 against f32 on real models
-  (top-1 unchanged).
+  (top-1 unchanged). These differences are enough to change sampled output: at high temperature, the
+  same seed gives one reply when a prompt is evaluated in full and another when its prefix is cached.
 - **Model files are untrusted.** `rli-gguf` rejects malformed headers, and `Model::load` and
   `Tokenizer::from_gguf` check tensor shapes and metadata against each other, because GPU kernels
   have no bounds checks and a wrong size can allocate without limit. `crates/models/tests/malformed.rs`
@@ -119,7 +120,9 @@ cargo fmt --all
 ```
 
 Run: `rli -m model.gguf -p "prompt"` (without `-p` it starts an interactive chat), or
-`rli-server -m model.gguf --port 8080`. Real models go in `models/`, which is gitignored.
+`rli-server -m model.gguf --port 8080`, which also serves a chat page for manual testing at `/`
+(`crates/server/src/chat.html`, embedded in the binary). Real models go in `models/`, which is
+gitignored.
 
 ## Validation workflow
 

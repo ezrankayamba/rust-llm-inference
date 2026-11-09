@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rli chat</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#fafafa, #16181c);
+    --panel: light-dark(#ffffff, #1f2228);
+    --text: light-dark(#1c1e21, #e6e7e9);
+    --muted: light-dark(#616770, #9aa0a8);
+    --line: light-dark(#d9dbe0, #33373f);
+    --accent: light-dark(#2257c9, #7ba4ff);
+    --on-accent: light-dark(#ffffff, #10131a);
+    --user: light-dark(#e8effc, #26324a);
+    --error: light-dark(#b3261e, #ff8a80);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header, #composer { max-width: 860px; width: 100%; margin: 0 auto; padding: 12px 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  h1 { font-size: 15px; margin: 0; }
+  #model { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; flex: 1; min-width: 120px; }
+  button {
+    font: inherit; padding: 6px 14px; cursor: pointer; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  details { flex-basis: 100%; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  #settings {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px; padding-top: 10px;
+  }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--muted); }
+  label.wide { grid-column: 1 / -1; }
+  input, textarea {
+    font: inherit; color: var(--text); background: var(--panel); width: 100%;
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  textarea { resize: vertical; }
+  main { flex: 1; overflow-y: auto; border-block: 1px solid var(--line); }
+  #log { max-width: 860px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  #empty { color: var(--muted); text-align: center; padding: 32px 0; }
+  .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .user { align-self: flex-end; max-width: 85%; background: var(--user); padding: 8px 12px; border-radius: 10px; }
+  .assistant:empty::before { content: "…"; color: var(--muted); }
+  .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .error { color: var(--error); }
+  #composer { display: flex; gap: 8px; align-items: flex-end; }
+  #input { flex: 1; min-height: 40px; max-height: 40vh; }
+</style>
+</head>
+<body>
+<header>
+  <h1>rli chat</h1>
+  <span id="model">connecting…</span>
+  <button id="new" type="button">New chat</button>
+  <details>
+    <summary>Settings</summary>
+    <div id="settings">
+      <label class="wide">System prompt (empty uses the model's default)
+        <textarea id="system" rows="2"></textarea>
+      </label>
+      <label>Temperature
+        <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7">
+      </label>
+      <label>Max tokens
+        <input id="max-tokens" type="number" min="1" step="1" value="256">
+      </label>
+      <label>Seed (empty is random)
+        <input id="seed" type="number" min="0" step="1">
+      </label>
+      <label class="wide">Stop strings (one per line)
+        <textarea id="stop" rows="2"></textarea>
+      </label>
+    </div>
+  </details>
+</header>
+<main id="scroller">
+  <div id="log" aria-live="polite"><div id="empty">Send a message to start.</div></div>
+</main>
+<form id="composer">
+  <textarea id="input" rows="1" aria-label="Message" placeholder="Message"></textarea>
+  <button id="send" class="primary" type="submit">Send</button>
+  <button id="abort" type="button" disabled>Stop</button>
+</form>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const scroller = $("scroller");
+let history = [];
+let controller = null;
+
+fetch("/v1/models")
+  .then((r) => r.json())
+  .then((v) => { $("model").textContent = v.data[0].id; })
+  .catch(() => { $("model").textContent = "model unknown"; });
+
+// Model output is untrusted: it only ever goes in through textContent.
+function add(className, text = "") {
+  $("empty")?.remove();
+  const el = document.createElement("div");
+  el.className = className;
+  el.textContent = text;
+  $("log").append(el);
+  return el;
+}
+
+function follow(update) {
+  const atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+  update();
+  if (atEnd) scroller.scrollTop = scroller.scrollHeight;
+}
+
+function requestBody() {
+  const system = $("system").value;
+  const messages = system.trim() ? [{ role: "system", content: system }, ...history] : history;
+  const body = {
+    messages,
+    stream: true,
+    temperature: Number($("temperature").value),
+    max_tokens: Number($("max-tokens").value),
+  };
+  if ($("seed").value !== "") body.seed = Number($("seed").value);
+  const stop = $("stop").value.split("\n").filter((s) => s !== "");
+  if (stop.length) body.stop = stop;
+  return body;
+}
+
+// Calls onEvent with each SSE data payload as it arrives.
+async function readEvents(response, onEvent) {
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    buffer += value;
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {
+      const event = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      if (event.startsWith("data: ")) onEvent(event.slice(6));
+    }
+  }
+}
+
+function describe(stats) {
+  const parts = [`finish: ${stats.finish}`];
+  if (stats.firstAt !== null) {
+    parts.push(`first token ${((stats.firstAt - stats.start) / 1000).toFixed(2)}s`);
+    const seconds = (performance.now() - stats.firstAt) / 1000;
+    // Chunks after the first, over the time since it: chunks are about one token each.
+    if (stats.chunks > 1 && seconds > 0) {
+      parts.push(`≈${((stats.chunks - 1) / seconds).toFixed(1)} tok/s`);
+    }
+  }
+  return parts.join(" · ");
+}
+
+async function send(text) {
+  history.push({ role: "user", content: text });
+  add("msg user", text);
+  const reply = add("msg assistant");
+  const meta = add("meta");
+  scroller.scrollTop = scroller.scrollHeight;
+  $("send").disabled = true;
+  $("abort").disabled = false;
+  controller = new AbortController();
+
+  const stats = { start: performance.now(), firstAt: null, chunks: 0, finish: "connection ended early" };
+  let finished = false;
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify(requestBody()),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const v = await response.json().catch(() => null);
+      throw new Error(v?.error?.message ?? `HTTP ${response.status}`);
+    }
+    await readEvents(response, (data) => {
+      if (data === "[DONE]") { finished = true; return; }
+      const choice = JSON.parse(data).choices[0];
+      if (choice.finish_reason) stats.finish = choice.finish_reason;
+      const text = choice.delta?.content;
+      if (!text) return;
+      stats.firstAt ??= performance.now();
+      stats.chunks += 1;
+      follow(() => { reply.append(text); });
+    });
+    meta.textContent = describe(stats);
+    if (!finished) meta.classList.add("error");
+  } catch (e) {
+    if (e.name === "AbortError") {
+      stats.finish = "stopped by you";
+      meta.textContent = describe(stats);
+    } else {
+      meta.textContent = `error: ${e.message}`;
+      meta.classList.add("error");
+    }
+  }
+  if (reply.textContent) {
+    history.push({ role: "assistant", content: reply.textContent });
+  } else {
+    reply.remove();
+    // Nothing came back, so the turn is dropped: the next message mustn't follow it unanswered.
+    history.pop();
+  }
+  controller = null;
+  $("send").disabled = false;
+  $("abort").disabled = true;
+  scroller.scrollTop = scroller.scrollHeight;
+  $("input").focus();
+}
+
+$("composer").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("input").value;
+  if (!text.trim() || controller) return;
+  $("input").value = "";
+  send(text);
+});
+
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $("composer").requestSubmit();
+  }
+});
+
+$("abort").addEventListener("click", () => controller?.abort());
+
+$("new").addEventListener("click", () => {
+  controller?.abort();
+  history = [];
+  $("log").replaceChildren();
+  const empty = document.createElement("div");
+  empty.id = "empty";
+  empty.textContent = "Send a message to start.";
+  $("log").append(empty);
+  $("input").focus();
+});
+
+$("input").focus();
+</script>
+</body>
+</html>
