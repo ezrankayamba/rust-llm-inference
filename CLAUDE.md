@@ -93,9 +93,9 @@ Design points that span files:
   corrupts header fields and requires an error or a clean CPU run, never a panic. New tensors need
   a shape check in `Model::load`.
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
-- **Unverified paths:** the AVX2 kernels (only exercised under Rosetta, which lacks AVX2) and the
-  whole CUDA backend (never run on an NVIDIA GPU; only its weight decoders are checked, on the
-  CPU, by `scripts/cuda_cpu_check`).
+- **Unverified path:** the whole CUDA backend (CI compiles it, but it has never run on an NVIDIA
+  GPU; only its weight decoders are checked, on the CPU, by `scripts/cuda_cpu_check`, which CI
+  doesn't run).
 
 ## Commands
 
@@ -119,6 +119,10 @@ cargo test -p <crate> <test_name>                      # single test
 cargo clippy --workspace --all-targets -- -D warnings  # also with --no-default-features and --features rli-models/cuda
 cargo fmt --all
 ```
+
+CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on PRs: fmt and clippy, plus the tests
+on Linux x86-64 (the only run of the AVX2 `dot`) and macOS arm64 (with Metal). Each job has a
+4-minute timeout, so a change that makes it slower fails rather than creeping up.
 
 Run: `rli -m model.gguf -p "prompt"` (without `-p` it starts an interactive chat), or
 `rli-server -m model.gguf --port 8080`, which also serves a chat page for manual testing at `/`
