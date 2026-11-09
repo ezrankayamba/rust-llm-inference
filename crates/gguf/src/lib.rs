@@ -11,6 +11,7 @@ use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
+const MAX_DIMS: usize = 4;
 
 #[derive(Debug)]
 pub enum Error {
@@ -120,7 +121,37 @@ impl TensorInfo {
         self.dims.iter().product::<u64>() as usize
     }
     pub fn n_bytes(&self) -> Result<usize> {
-        Ok(self.ty()?.row_bytes(self.n_elements()))
+        self.ty()?
+            .checked_row_bytes(self.n_elements())
+            .ok_or_else(|| Error::Format(format!("tensor {}: invalid size", self.name)))
+    }
+
+    /// Checks everything derived from `dims`, so later code can trust them: at least one
+    /// dimension, none empty, whole blocks per row, no overflow. Unknown types pass, since they
+    /// only fail if a model uses them.
+    fn validate_shape(&self) -> Result<()> {
+        let bad = |why: &str| Error::Format(format!("tensor {}: {why}", self.name));
+        if self.dims.is_empty() || self.dims.len() > MAX_DIMS {
+            return Err(bad("needs 1 to 4 dimensions"));
+        }
+        if self.dims.contains(&0) {
+            return Err(bad("has an empty dimension"));
+        }
+        let n = self
+            .dims
+            .iter()
+            .try_fold(1u64, |n, &d| n.checked_mul(d))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| bad("element count overflows"))?;
+        if let Ok(ty) = self.ty() {
+            let row = usize::try_from(self.dims[0]).ok();
+            if row.and_then(|r| ty.checked_row_bytes(r)).is_none()
+                || ty.checked_row_bytes(n).is_none()
+            {
+                return Err(bad("size is not a whole number of blocks or overflows"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -183,6 +214,10 @@ impl<'a> Cursor<'a> {
             8 => Value::String(self.string()?),
             9 => {
                 let elem_ty = self.u32()?;
+                // Models don't use these, and recursing would let a small file overflow the stack.
+                if elem_ty == 9 {
+                    return Err(Error::Format("nested metadata array".into()));
+                }
                 let n = self.len()?;
                 Value::Array((0..n).map(|_| self.value(elem_ty)).collect::<Result<_>>()?)
             }
@@ -215,14 +250,15 @@ impl Gguf {
         let n_tensors = c.len()?;
         let n_kv = c.len()?;
 
-        let mut metadata = HashMap::with_capacity(n_kv);
+        // The counts are unverified, so nothing is allocated from them up front.
+        let mut metadata = HashMap::new();
         for _ in 0..n_kv {
             let key = c.string()?;
             let ty = c.u32()?;
             metadata.insert(key, c.value(ty)?);
         }
 
-        let mut raw = Vec::with_capacity(n_tensors);
+        let mut raw = Vec::new();
         for _ in 0..n_tensors {
             let name = c.string()?;
             let n_dims = c.u32()? as usize;
@@ -241,15 +277,21 @@ impl Gguf {
         };
         let data_start = (c.pos as u64).div_ceil(align) * align;
 
-        let mut tensors = Vec::with_capacity(n_tensors);
-        let mut by_name = HashMap::with_capacity(n_tensors);
+        let mut tensors = Vec::with_capacity(raw.len());
+        let mut by_name = HashMap::with_capacity(raw.len());
         for (name, dims, type_id, rel) in raw {
+            let offset = data_start
+                .checked_add(rel)
+                .filter(|_| rel.is_multiple_of(align))
+                .and_then(|o| usize::try_from(o).ok())
+                .ok_or_else(|| Error::Format(format!("tensor {name}: invalid offset {rel}")))?;
             let info = TensorInfo {
                 name,
                 dims,
                 type_id,
-                offset: (data_start + rel) as usize,
+                offset,
             };
+            info.validate_shape()?;
             // Types we can't decode are allowed in the file; they error only if used.
             if let Ok(n) = info.n_bytes()
                 && info
@@ -262,7 +304,9 @@ impl Gguf {
                     info.name
                 )));
             }
-            by_name.insert(info.name.clone(), tensors.len());
+            if by_name.insert(info.name.clone(), tensors.len()).is_some() {
+                return Err(Error::Format(format!("duplicate tensor {}", info.name)));
+            }
             tensors.push(info);
         }
         Ok(Self {
@@ -386,5 +430,136 @@ mod tests {
         std::fs::write(&path, b"GGUF\x03\0\0\0\x01").unwrap();
         assert!(matches!(Gguf::open(&path), Err(Error::Format(_))));
         std::fs::remove_file(path).unwrap();
+    }
+
+    const F32: u32 = 0;
+    const Q8_0: u32 = GgmlType::Q8_0.id();
+
+    /// A GGUF file from raw parts: `kv` is already encoded, `tensors` are (name, dims, type,
+    /// relative offset), and `data` zero bytes follow the aligned header.
+    fn raw(n_kv: u64, kv: &[u8], tensors: &[(&str, &[u64], u32, u64)], data: usize) -> Vec<u8> {
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
+        b.extend(n_kv.to_le_bytes());
+        b.extend(kv);
+        for (name, dims, ty, rel) in tensors {
+            b.extend((name.len() as u64).to_le_bytes());
+            b.extend(name.as_bytes());
+            b.extend((dims.len() as u32).to_le_bytes());
+            dims.iter().for_each(|d| b.extend(d.to_le_bytes()));
+            b.extend(ty.to_le_bytes());
+            b.extend(rel.to_le_bytes());
+        }
+        b.resize(b.len().div_ceil(32) * 32 + data, 0);
+        b
+    }
+
+    fn assert_malformed(name: &str, bytes: &[u8]) {
+        let path = tmp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+        let r = Gguf::open(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            matches!(r, Err(Error::Format(_))),
+            "{name} was not rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_nested_metadata_arrays() {
+        let mut kv = 1u64.to_le_bytes().to_vec();
+        kv.extend(b"k");
+        kv.extend(9u32.to_le_bytes());
+        // Deep enough to overflow the stack if each level recurses.
+        for _ in 0..500_000 {
+            kv.extend(9u32.to_le_bytes());
+            kv.extend(1u64.to_le_bytes());
+        }
+        kv.extend(0u32.to_le_bytes());
+        kv.extend(0u64.to_le_bytes());
+        assert_malformed("nested", &raw(1, &kv, &[], 0));
+    }
+
+    #[test]
+    fn rejects_elements_not_in_whole_blocks() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[33], Q8_0, 0)];
+        assert_malformed("blocks", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_rows_not_in_whole_blocks() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[16, 2], Q8_0, 0)];
+        assert_malformed("rows", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_tensors_without_dimensions() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[], F32, 0)];
+        assert_malformed("no-dims", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_zero_sized_dimensions() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[0, 4], F32, 0)];
+        assert_malformed("zero-dim", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_too_many_dimensions() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[1, 1, 1, 1, 1], F32, 0)];
+        assert_malformed("many-dims", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_element_counts_that_overflow() {
+        // 3 * this wraps around to 2 elements, which would fit in the file.
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[3, 6_148_914_691_236_517_206], F32, 0)];
+        assert_malformed("elements", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_byte_sizes_that_overflow() {
+        // 4 bytes each wraps around to 0 bytes.
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[1 << 62], F32, 0)];
+        assert_malformed("bytes", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_offsets_that_overflow() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[4], F32, u64::MAX - 31)];
+        assert_malformed("offset", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_unaligned_offsets() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[4], F32, 4)];
+        assert_malformed("unaligned", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names() {
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[4], F32, 0), ("t", &[4], F32, 32)];
+        assert_malformed("duplicate", &raw(0, &[], t, 64));
+    }
+
+    #[test]
+    fn accepts_a_well_formed_raw_file() {
+        let path = tmp_path("raw-ok");
+        let t: &[(&str, &[u64], u32, u64)] = &[("a", &[4], F32, 0), ("b", &[32, 2], Q8_0, 32)];
+        std::fs::write(&path, raw(0, &[], t, 32 + 68)).unwrap();
+        let g = Gguf::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(g.tensor("b").unwrap().n_bytes().unwrap(), 68);
+    }
+
+    #[test]
+    fn unknown_tensor_types_load_and_fail_only_when_used() {
+        let path = tmp_path("unknown-type");
+        let t: &[(&str, &[u64], u32, u64)] = &[("t", &[33], 9999, 0)];
+        std::fs::write(&path, raw(0, &[], t, 64)).unwrap();
+        let g = Gguf::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(g.tensor("t").unwrap().n_bytes().is_err());
     }
 }

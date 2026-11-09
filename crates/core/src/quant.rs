@@ -43,7 +43,7 @@ impl GgmlType {
         })
     }
 
-    pub fn id(self) -> u32 {
+    pub const fn id(self) -> u32 {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
@@ -82,6 +82,14 @@ impl GgmlType {
             Self::Q5_K => 2 + 2 + 12 + 32 + 128,
             Self::Q6_K => 128 + 64 + 16 + 2,
         }
+    }
+
+    /// Bytes for `n` elements, or `None` if `n` isn't a whole number of blocks or the size
+    /// overflows. For sizes read from untrusted files.
+    pub fn checked_row_bytes(self, n: usize) -> Option<usize> {
+        n.is_multiple_of(self.block_size())
+            .then(|| (n / self.block_size()).checked_mul(self.block_bytes()))
+            .flatten()
     }
 
     /// Bytes for `n` elements. `n` must be a multiple of the block size.
