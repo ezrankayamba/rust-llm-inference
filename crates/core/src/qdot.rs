@@ -112,6 +112,22 @@ pub fn dot_rows_q8(ty: GgmlType, row: &[u8], acts: &[Q8Act], out: &mut [f32]) {
             return;
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::has_avx2() {
+        // SAFETY: AVX2, FMA and F16C checked at runtime; sizes are asserted inside.
+        let done = unsafe {
+            match acts.len() {
+                1 => avx2::dot_rows::<1>(ty, row, acts, out),
+                2 => avx2::dot_rows::<2>(ty, row, acts, out),
+                3 => avx2::dot_rows::<3>(ty, row, acts, out),
+                4 => avx2::dot_rows::<4>(ty, row, acts, out),
+                _ => true,
+            }
+        };
+        if done {
+            return;
+        }
+    }
     for (o, a) in out.iter_mut().zip(acts) {
         *o = dot_row_q8_portable(ty, row, a);
     }
@@ -736,6 +752,234 @@ mod neon {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::{Q8Act, QK, scale_min_k4};
+    use crate::quant::{GgmlType, QK_K};
+    use crate::simd::x86::hsum;
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2,f16c")]
+    #[inline]
+    fn le16(b: &[u8], at: usize) -> f32 {
+        let h = u16::from_le_bytes([b[at], b[at + 1]]);
+        _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
+    }
+
+    /// Eight partial sums of `w · x` over 32 lanes, the low four covering lanes 0..16. `maddubs`
+    /// needs one unsigned side, so `w`'s sign moves onto `x`, not the other way round: a Q8_0
+    /// weight can be -128, whose absolute value still reads correctly as an unsigned 128, whereas
+    /// negating it as the signed side would leave -128. `x` is within ±127, so a lane pair
+    /// reaches at most 2 · 128 · 127 = 32512 and the i16 sums can't saturate.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dot32(w: __m256i, x: *const i8) -> __m256i {
+        // SAFETY: the caller guarantees 32 readable values at `x`.
+        let x = unsafe { _mm256_loadu_si256(x.cast()) };
+        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+        _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+    }
+
+    /// [`dot32`] for weights known to be non-negative, which skips moving the sign.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dot32_unsigned(w: __m256i, x: *const i8) -> __m256i {
+        // SAFETY: the caller guarantees 32 readable values at `x`.
+        let x = unsafe { _mm256_loadu_si256(x.cast()) };
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), _mm256_set1_epi16(1))
+    }
+
+    /// Each byte's high nibble, in the low four bits of the byte.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn high_nibbles(v: __m256i) -> __m256i {
+        _mm256_and_si256(_mm256_srli_epi16(v, 4), _mm256_set1_epi8(0xf))
+    }
+
+    /// Sixteen bytes as 32 lanes: the low nibbles, then the high nibbles.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn unpack_nibbles(p: *const u8) -> __m256i {
+        // SAFETY: the caller guarantees 16 readable bytes at `p`.
+        let v = unsafe { _mm_loadu_si128(p.cast()) };
+        let m4 = _mm_set1_epi8(0xf);
+        let lo = _mm_and_si128(v, m4);
+        let hi = _mm_and_si128(_mm_srli_epi16(v, 4), m4);
+        _mm256_set_m128i(hi, lo)
+    }
+
+    /// Lane `i` holds 0x10 if bit `i` of `qh` is set, else 0.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn high_bits(qh: u32) -> __m256i {
+        #[rustfmt::skip]
+        let spread = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        );
+        let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(qh as i32), spread);
+        let set = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bits), bits);
+        _mm256_and_si256(set, _mm256_set1_epi8(0x10))
+    }
+
+    /// Dot products of one encoded row with the activations of `N` tokens, into `out`, unpacking
+    /// each weight block once for all of them. Every token's arithmetic is the same whatever `N`
+    /// is, so a matmul matches per-token matvecs bit for bit. `false` for types without a kernel.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_rows<const N: usize>(
+        ty: GgmlType,
+        row: &[u8],
+        acts: &[Q8Act],
+        out: &mut [f32],
+    ) -> bool {
+        let bb = ty.block_bytes();
+        let n_blocks = row.len() / bb;
+        assert!(acts.len() == N && out.len() == N);
+        for a in acts {
+            assert_eq!(n_blocks * ty.block_size(), a.qs.len());
+        }
+        let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
+        let mut acc = [_mm256_setzero_ps(); N];
+        // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
+        let mut extra = [0f32; N];
+        let add = |acc: __m256, s: __m256i, scale: f32| -> __m256 {
+            _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), _mm256_set1_ps(scale), acc)
+        };
+        // SAFETY (all blocks below): every pointer offset stays inside `row` (n_blocks * bb bytes)
+        // or each token's `qs` (n_blocks * block_size values), as asserted above.
+        unsafe {
+            match ty {
+                GgmlType::Q8_0 => {
+                    for i in 0..n_blocks {
+                        let b = &row[i * bb..];
+                        let w = _mm256_loadu_si256(b.as_ptr().add(2).cast());
+                        let d = le16(b, 0);
+                        for t in 0..N {
+                            let s = dot32(w, xq[t].add(i * QK));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                        }
+                    }
+                }
+                GgmlType::Q4_0 => {
+                    let eight = _mm256_set1_epi8(8);
+                    for i in 0..n_blocks {
+                        let b = &row[i * bb..];
+                        let w = _mm256_sub_epi8(unpack_nibbles(b.as_ptr().add(2)), eight);
+                        let d = le16(b, 0);
+                        for t in 0..N {
+                            let s = dot32(w, xq[t].add(i * QK));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                        }
+                    }
+                }
+                GgmlType::Q5_0 => {
+                    let sixteen = _mm256_set1_epi8(16);
+                    for i in 0..n_blocks {
+                        let b = &row[i * bb..];
+                        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                        let w = _mm256_or_si256(unpack_nibbles(b.as_ptr().add(6)), high_bits(qh));
+                        let w = _mm256_sub_epi8(w, sixteen);
+                        let d = le16(b, 0);
+                        for t in 0..N {
+                            let s = dot32(w, xq[t].add(i * QK));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                        }
+                    }
+                }
+                GgmlType::Q4_K | GgmlType::Q5_K => {
+                    let five = ty == GgmlType::Q5_K;
+                    let ql_at = if five { 48 } else { 16 };
+                    let m4 = _mm256_set1_epi8(0xf);
+                    let sixteen = _mm256_set1_epi8(16);
+                    for i in 0..n_blocks {
+                        let b = &row[i * bb..(i + 1) * bb];
+                        let (d, dmin) = (le16(b, 0), le16(b, 2));
+                        let scales = &b[4..16];
+                        let qh = if five {
+                            _mm256_loadu_si256(b.as_ptr().add(16).cast())
+                        } else {
+                            _mm256_setzero_si256()
+                        };
+                        for g in 0..4 {
+                            let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * g).cast());
+                            for half in 0..2 {
+                                let sub = 2 * g + half;
+                                let mut w = if half == 0 {
+                                    _mm256_and_si256(q, m4)
+                                } else {
+                                    high_nibbles(q)
+                                };
+                                if five {
+                                    let bit = _mm256_set1_epi8(1 << sub);
+                                    let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
+                                    w = _mm256_or_si256(w, _mm256_and_si256(set, sixteen));
+                                }
+                                let xb = i * (QK_K / QK) + sub;
+                                let (sc, m) = scale_min_k4(sub, scales);
+                                let (dsc, dm) = (d * sc, dmin * m);
+                                for t in 0..N {
+                                    let s = dot32_unsigned(w, xq[t].add(xb * QK));
+                                    acc[t] = add(acc[t], s, dsc * acts[t].d[xb]);
+                                    extra[t] -= dm * acts[t].sum[xb];
+                                }
+                            }
+                        }
+                    }
+                }
+                GgmlType::Q6_K => {
+                    let m4 = _mm256_set1_epi8(0xf);
+                    let three = _mm256_set1_epi8(3);
+                    let off = _mm256_set1_epi8(32);
+                    for i in 0..n_blocks {
+                        let b = &row[i * bb..(i + 1) * bb];
+                        let d = le16(b, 208);
+                        let sc = &b[192..208];
+                        let p = b.as_ptr();
+                        for n in 0..2 {
+                            let ql = [
+                                _mm256_loadu_si256(p.add(64 * n).cast()),
+                                _mm256_loadu_si256(p.add(64 * n + 32).cast()),
+                            ];
+                            let qh = _mm256_loadu_si256(p.add(128 + 32 * n).cast());
+                            for k in 0..4 {
+                                let l = ql[k % 2];
+                                let lo = if k < 2 {
+                                    _mm256_and_si256(l, m4)
+                                } else {
+                                    high_nibbles(l)
+                                };
+                                let shift = _mm_cvtsi32_si128(2 * k as i32);
+                                let hi = _mm256_and_si256(_mm256_srl_epi16(qh, shift), three);
+                                let w = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
+                                let w = _mm256_sub_epi8(w, off);
+                                let xb = i * (QK_K / QK) + 4 * n + k;
+                                // Each half's i8 scale goes on in integer arithmetic (exact)
+                                // before the one float multiply; the halves are the two 128-bit
+                                // lanes of the partial sums.
+                                let scale = _mm256_set_m128i(
+                                    _mm_set1_epi32(sc[8 * n + 2 * k + 1] as i8 as i32),
+                                    _mm_set1_epi32(sc[8 * n + 2 * k] as i8 as i32),
+                                );
+                                for t in 0..N {
+                                    let s = dot32(w, xq[t].add(xb * QK));
+                                    let s = _mm256_mullo_epi32(s, scale);
+                                    acc[t] = add(acc[t], s, d * acts[t].d[xb]);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum(acc[t]) + extra[t];
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1088,62 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// With unit scales and integer activations every float sum is exact, so any SIMD kernel must
+    /// equal the portable one bit for bit. Rounding can't hide a wrong integer here.
+    #[test]
+    fn simd_kernels_equal_portable_kernels_exactly_when_sums_are_exact() {
+        let mut rng = Rng::new(21);
+        let n = 256;
+        for ty in INT_TYPES {
+            for _ in 0..50 {
+                let mut row = random_row(ty, n, &mut rng);
+                let offs: &[usize] = match ty {
+                    GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => &[0],
+                    GgmlType::Q6_K => &[208],
+                    _ => &[0, 2],
+                };
+                for blk in row.chunks_exact_mut(ty.block_bytes()) {
+                    for &o in offs {
+                        blk[o..o + 2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+                    }
+                }
+                let x: Vec<f32> = (0..n)
+                    .map(|i| {
+                        if i % QK == 0 {
+                            127.0 // sets the activation block's scale to exactly 1
+                        } else {
+                            (rng.next_u32() % 255) as f32 - 127.0
+                        }
+                    })
+                    .collect();
+                let a = Q8Act::new(&x);
+                assert_eq!(
+                    dot_row_q8(ty, &row, &a),
+                    dot_row_q8_portable(ty, &row, &a),
+                    "{ty:?}"
+                );
+            }
+        }
+    }
+
+    /// The extremes of the widening multiply: -128 weights, which can't be negated in an i8,
+    /// against ±127 activations, the largest products there are.
+    #[test]
+    fn q8_kernel_handles_the_most_negative_weight_without_saturating() {
+        let n = 256;
+        let ty = GgmlType::Q8_0;
+        let mut row = vec![0x80u8; ty.row_bytes(n)];
+        for blk in row.chunks_exact_mut(ty.block_bytes()) {
+            blk[..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        }
+        for (sign, want) in [(127.0, -1.0), (-127.0, 1.0)] {
+            let a = Q8Act::new(&vec![sign; n]);
+            let expected = want * (128 * 127 * n as i32) as f32;
+            assert_eq!(dot_row_q8(ty, &row, &a), expected, "activations {sign}");
+            assert_eq!(dot_row_q8_portable(ty, &row, &a), expected);
         }
     }
 
