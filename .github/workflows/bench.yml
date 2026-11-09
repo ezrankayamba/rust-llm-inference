@@ -6,7 +6,7 @@ on:
     inputs:
       threads:
         description: Comma-separated thread counts
-        default: "1,2"
+        default: "1"
       llama_ref:
         description: llama.cpp tag to compare with
         default: v0.9.0
@@ -34,21 +34,32 @@ jobs:
       - run: |
           cargo build --release --locked -p rli
           cargo build --release --locked -p rli-models --example bench
+      # Both builds in this job, since runner CPUs vary: native is what a user would build there, and
+      # AVX2-only shows how much of the difference is instructions our kernels don't use.
       - name: Build llama.cpp
         run: |
           git clone -q --depth 1 --branch "$LLAMA_REF" https://github.com/ggml-org/llama.cpp.git "$RUNNER_TEMP/llama.cpp"
           cd "$RUNNER_TEMP/llama.cpp"
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
-          cmake --build build -j "$(nproc)" --target llama-bench llama-completion
+          common="-DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF"
+          cmake -B native $common -DGGML_NATIVE=ON
+          cmake -B avx2 $common -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+          for b in native avx2; do
+            cmake --build "$b" -j "$(nproc)" --target llama-bench llama-completion
+          done
       - name: Compare
         run: |
           grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|avx512f|avx512_vnni|avx_vnni|amx_int8)$' | paste -sd' '
           for url in $MODELS; do
             model="$RUNNER_TEMP/$(basename "$url")"
             curl -fsSL --retry 3 -o "$model" "$url"
-            python3 scripts/bench_compare.py --bin-dir target/release \
-              --llama-dir "$RUNNER_TEMP/llama.cpp/build/bin" --model "$model" --threads "$THREADS" \
-              | tee -a "$GITHUB_STEP_SUMMARY"
+            for b in native avx2; do
+              echo "llama.cpp build: $b" | tee -a "$GITHUB_STEP_SUMMARY"
+              python3 scripts/bench_compare.py --bin-dir target/release \
+                --llama-dir "$RUNNER_TEMP/llama.cpp/$b/bin" --model "$model" --threads "$THREADS" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              # The instructions the build really used, in case a flag above was ignored.
+              "$RUNNER_TEMP/llama.cpp/$b/bin/llama-completion" -m "$model" -p hi -n 1 -ngl 0 2>&1 \
+                | grep -m1 'system_info' || true
+            done
             rm "$model"
           done
