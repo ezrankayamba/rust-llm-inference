@@ -7,6 +7,10 @@ on:
       base:
         description: Compare this engine at HEAD with this revision, instead of with llama.cpp
         default: ""
+      profile:
+        description: Profile decode with perf instead (first model only)
+        type: boolean
+        default: false
       threads:
         description: Comma-separated thread counts
         default: "1"
@@ -23,8 +27,34 @@ permissions:
   contents: read
 
 jobs:
+  profile:
+    if: inputs.profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODELS: ${{ inputs.models }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: cargo build --release --locked -p rli-models --example bench
+      - run: sudo apt-get install -qq -y linux-tools-common "linux-tools-$(uname -r)" > /dev/null
+      - name: Profile
+        run: |
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          lscpu | grep 'Model name'
+          url=${MODELS%% *}
+          model="$RUNNER_TEMP/$(basename "$url")"
+          curl -fsSL --retry 3 -o "$model" "$url"
+          target/release/examples/bench "$model" --pp 0 --tg 64 --reps 1 --threads 1
+          perf record -q -o "$RUNNER_TEMP/perf.data" -- \
+            target/release/examples/bench "$model" --pp 0 --tg 256 --reps 2 --threads 1
+          perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
+            | head -25 | cut -c1-160
+          perf stat -e cycles,instructions,cache-misses -- \
+            target/release/examples/bench "$model" --pp 0 --tg 128 --reps 1 --threads 1 2>&1 | tail -12
+
   revisions:
-    if: inputs.base != ''
+    if: inputs.base != '' && !inputs.profile
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -68,7 +98,7 @@ jobs:
           done
 
   compare:
-    if: inputs.base == ''
+    if: inputs.base == '' && !inputs.profile
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
