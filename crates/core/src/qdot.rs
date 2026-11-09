@@ -936,11 +936,11 @@ mod avx2 {
             assert_eq!(n_blocks * ty.block_size(), a.qs.len());
         }
         let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
-        // Read through these rather than `acts[t].d[i]`: this runs per token every 32 weights.
+        // Read through these rather than `acts[t].d[i]`: this runs per token every 32 weights, and
+        // measured faster for every type but Q4_K and Q5_K, which keep the lookup (x86 only).
         let xd: [*const f32; N] = std::array::from_fn(|t| acts[t].d.as_ptr());
-        let xsum: [*const f32; N] = std::array::from_fn(|t| acts[t].sum.as_ptr());
         for a in acts {
-            assert!(a.d.len() == a.qs.len() / QK && a.sum.len() == a.d.len());
+            assert_eq!(a.d.len(), a.qs.len() / QK);
         }
         let mut acc = [_mm256_setzero_ps(); N];
         // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
@@ -1022,8 +1022,8 @@ mod avx2 {
                                 let (dsc, dm) = (d * sc, dmin * m);
                                 for t in 0..N {
                                     let s = dot32_unsigned(w, xq[t].add(xb * QK));
-                                    acc[t] = add(acc[t], s, dsc * *xd[t].add(xb));
-                                    extra[t] -= dm * *xsum[t].add(xb);
+                                    acc[t] = add(acc[t], s, dsc * acts[t].d[xb]);
+                                    extra[t] -= dm * acts[t].sum[xb];
                                 }
                             }
                         }
