@@ -38,7 +38,9 @@ jobs:
       - run: rustup toolchain install
       - name: Build both revisions
         run: |
-          git worktree add -q --detach "$RUNNER_TEMP/base" "$BASE"
+          # A branch name exists here only as origin/<name>.
+          rev=$(git rev-parse -q --verify "$BASE^{commit}" || git rev-parse --verify "origin/$BASE^{commit}")
+          git worktree add -q --detach "$RUNNER_TEMP/base" "$rev"
           for dir in . "$RUNNER_TEMP/base"; do
             (cd "$dir" && cargo build --release --locked -p rli-models --example bench \
               && cargo build --release --locked -p rli-core --example bench_matvec)
