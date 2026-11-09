@@ -59,7 +59,8 @@ impl Config {
 
         let n_embd = g.usize(&key("embedding_length"))?;
         let n_head = g.usize(&key("attention.head_count"))?;
-        let head_dim = opt("attention.key_length").unwrap_or(n_embd / n_head);
+        let head_dim =
+            opt("attention.key_length").unwrap_or(n_embd.checked_div(n_head).unwrap_or(0));
         let n_expert = opt("expert_count").unwrap_or(0);
         let n_ff = match arch {
             Arch::Qwen2Moe | Arch::Qwen3Moe => opt("expert_feed_forward_length")
@@ -67,7 +68,7 @@ impl Config {
                 .ok_or_else(|| Error::Missing(key("expert_feed_forward_length")))?,
             _ => g.usize(&key("feed_forward_length"))?,
         };
-        Ok(Self {
+        let cfg = Self {
             arch,
             n_embd,
             n_layer: g.usize(&key("block_count"))?,
@@ -92,7 +93,56 @@ impl Config {
                 _ => true,
             },
             arch_name,
-        })
+        };
+        cfg.validate(g.tensors.len())?;
+        Ok(cfg)
+    }
+
+    /// Rejects values that would divide by zero or size buffers from nonsense. Tensor shapes are
+    /// checked against these once the tensors are read.
+    fn validate(&self, n_tensors: usize) -> Result<()> {
+        let bad = |why: String| Err(Error::Format(format!("{}: {why}", self.arch_name)));
+        for (name, v) in [
+            ("embedding_length", self.n_embd),
+            ("block_count", self.n_layer),
+            ("attention.head_count", self.n_head),
+            ("attention.head_count_kv", self.n_head_kv),
+            ("head dimension", self.head_dim),
+            ("feed-forward length", self.n_ff),
+            ("context_length", self.n_ctx_train),
+        ] {
+            if v == 0 {
+                return bad(format!("{name} is 0"));
+            }
+        }
+        if self.n_layer > n_tensors {
+            return bad(format!(
+                "{} layers but only {n_tensors} tensors",
+                self.n_layer
+            ));
+        }
+        if !self.n_head.is_multiple_of(self.n_head_kv) {
+            return bad(format!(
+                "{} heads don't divide into {} KV heads",
+                self.n_head, self.n_head_kv
+            ));
+        }
+        if self.n_head.checked_mul(self.head_dim).is_none() {
+            return bad("attention size overflows".into());
+        }
+        if !self.rope_dim.is_multiple_of(2) || self.rope_dim > self.head_dim {
+            return bad(format!(
+                "rope dimension {} doesn't fit head dimension {}",
+                self.rope_dim, self.head_dim
+            ));
+        }
+        if self.n_expert_used > self.n_expert {
+            return bad(format!(
+                "{} experts used of {}",
+                self.n_expert_used, self.n_expert
+            ));
+        }
+        Ok(())
     }
 
     pub fn q_dim(&self) -> usize {

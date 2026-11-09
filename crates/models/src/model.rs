@@ -247,23 +247,71 @@ fn weight(g: &Gguf, name: &str) -> Result<Weight> {
     })
 }
 
+/// An f32 copy of a vector tensor that must have `len` elements. Checked first, so a bad file
+/// can't make this decode a huge tensor.
+fn vector(g: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
+    let t = g
+        .tensor(name)
+        .ok_or_else(|| Error::Missing(format!("tensor {name}")))?;
+    if t.n_elements() != len {
+        return Err(Error::Format(format!(
+            "tensor {name}: {} elements, expected {len}",
+            t.n_elements()
+        )));
+    }
+    g.f32_vec(name)
+}
+
+fn opt_vector(g: &Gguf, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
+    g.tensor(name).map(|_| vector(g, name, len)).transpose()
+}
+
+/// The kernels size their inputs and outputs from the config and the weights from these shapes,
+/// and GPU kernels have no bounds checks, so the two must agree.
+fn check_shape(name: &str, w: &Weight, rows: usize, cols: usize) -> Result<()> {
+    if (w.rows, w.cols) != (rows, cols) {
+        return Err(Error::Format(format!(
+            "tensor {name}: {} x {}, expected {rows} x {cols}",
+            w.rows, w.cols
+        )));
+    }
+    Ok(())
+}
+
+fn check_expert(name: &str, e: &Expert, n_ff: usize, n_embd: usize) -> Result<()> {
+    check_shape(&format!("{name} gate"), &e.gate, n_ff, n_embd)?;
+    check_shape(&format!("{name} up"), &e.up, n_ff, n_embd)?;
+    check_shape(&format!("{name} down"), &e.down, n_embd, n_ff)
+}
+
 /// Splits stacked 3-D expert tensors (`[n_expert][rows][cols]`) into per-expert views.
-fn split_experts(gate: Weight, up: Weight, down: Weight, n_expert: usize) -> Vec<Expert> {
+fn split_experts(gate: Weight, up: Weight, down: Weight, n_expert: usize) -> Result<Vec<Expert>> {
     let (n_ff, n_embd) = (gate.rows / n_expert, down.rows / n_expert);
-    (0..n_expert)
+    if n_ff == 0
+        || n_embd == 0
+        || up.rows != gate.rows
+        || gate.rows != n_ff * n_expert
+        || down.rows != n_embd * n_expert
+    {
+        return Err(Error::Format(format!(
+            "expert tensors of {} and {} rows don't split into {n_expert} experts",
+            gate.rows, down.rows
+        )));
+    }
+    Ok((0..n_expert)
         .map(|e| Expert {
             gate: gate.rows_slice(e * n_ff, n_ff),
             up: up.rows_slice(e * n_ff, n_ff),
             down: down.rows_slice(e * n_embd, n_embd),
         })
-        .collect()
+        .collect())
 }
 
 impl Model {
     pub fn load(gguf: Gguf) -> Result<Self> {
         let cfg = Config::from_gguf(&gguf)?;
         let g = &gguf;
-        let opt_vec = |name: &str| g.tensor(name).map(|_| g.f32_vec(name)).transpose();
+        let (n_embd, q_dim, kv_dim) = (cfg.n_embd, cfg.q_dim(), cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{i}.{s}");
@@ -275,7 +323,7 @@ impl Model {
                         w("ffn_up_exps.weight")?,
                         w("ffn_down_exps.weight")?,
                         cfg.n_expert,
-                    )
+                    )?
                 } else {
                     // Older Mixtral conversions store one tensor per expert.
                     (0..cfg.n_expert)
@@ -288,6 +336,10 @@ impl Model {
                         })
                         .collect::<Result<_>>()?
                 };
+                let experts: Vec<Expert> = experts;
+                for e in &experts {
+                    check_expert(&p("expert"), e, cfg.n_ff, n_embd)?;
+                }
                 let shared = match g.tensor(&p("ffn_gate_inp_shexp.weight")) {
                     Some(_) => Some((
                         w("ffn_gate_inp_shexp.weight")?,
@@ -299,30 +351,48 @@ impl Model {
                     )),
                     None => None,
                 };
+                if let Some((gate_inp, e)) = &shared {
+                    check_shape(&p("shared gate input"), gate_inp, 1, n_embd)?;
+                    check_expert(&p("shared expert"), e, e.gate.rows, n_embd)?;
+                }
+                let router = w("ffn_gate_inp.weight")?;
+                check_shape(&p("router"), &router, cfg.n_expert, n_embd)?;
                 Ffn::Moe {
-                    router: w("ffn_gate_inp.weight")?,
+                    router,
                     experts,
                     shared,
                 }
             } else {
-                Ffn::Dense(Expert {
+                let e = Expert {
                     gate: w("ffn_gate.weight")?,
                     up: w("ffn_up.weight")?,
                     down: w("ffn_down.weight")?,
-                })
+                };
+                check_expert(&p("ffn"), &e, cfg.n_ff, n_embd)?;
+                Ffn::Dense(e)
             };
+            let (wq, wk, wv, wo) = (
+                w("attn_q.weight")?,
+                w("attn_k.weight")?,
+                w("attn_v.weight")?,
+                w("attn_output.weight")?,
+            );
+            check_shape(&p("attn_q"), &wq, q_dim, n_embd)?;
+            check_shape(&p("attn_k"), &wk, kv_dim, n_embd)?;
+            check_shape(&p("attn_v"), &wv, kv_dim, n_embd)?;
+            check_shape(&p("attn_output"), &wo, n_embd, q_dim)?;
             layers.push(Layer {
-                attn_norm: g.f32_vec(&p("attn_norm.weight"))?,
-                wq: w("attn_q.weight")?,
-                wk: w("attn_k.weight")?,
-                wv: w("attn_v.weight")?,
-                wo: w("attn_output.weight")?,
-                bq: opt_vec(&p("attn_q.bias"))?,
-                bk: opt_vec(&p("attn_k.bias"))?,
-                bv: opt_vec(&p("attn_v.bias"))?,
-                q_norm: opt_vec(&p("attn_q_norm.weight"))?,
-                k_norm: opt_vec(&p("attn_k_norm.weight"))?,
-                ffn_norm: g.f32_vec(&p("ffn_norm.weight"))?,
+                attn_norm: vector(g, &p("attn_norm.weight"), n_embd)?,
+                wq,
+                wk,
+                wv,
+                wo,
+                bq: opt_vector(g, &p("attn_q.bias"), q_dim)?,
+                bk: opt_vector(g, &p("attn_k.bias"), kv_dim)?,
+                bv: opt_vector(g, &p("attn_v.bias"), kv_dim)?,
+                q_norm: opt_vector(g, &p("attn_q_norm.weight"), cfg.head_dim)?,
+                k_norm: opt_vector(g, &p("attn_k_norm.weight"), cfg.head_dim)?,
+                ffn_norm: vector(g, &p("ffn_norm.weight"), n_embd)?,
                 ffn,
             });
         }
@@ -332,8 +402,10 @@ impl Model {
         } else {
             embd
         };
-        let output_norm = g.f32_vec("output_norm.weight")?;
-        let rope_freqs = opt_vec("rope_freqs.weight")?;
+        check_shape("token_embd", &embd, embd.rows, n_embd)?;
+        check_shape("output", &output, embd.rows, n_embd)?;
+        let output_norm = vector(g, "output_norm.weight", n_embd)?;
+        let rope_freqs = opt_vector(g, "rope_freqs.weight", cfg.rope_dim / 2)?;
         if cfg.n_expert > 0 && cfg.n_expert_used == 0 {
             return Err(Error::Missing(format!(
                 "{}.expert_used_count",
@@ -383,6 +455,11 @@ impl Model {
             max_ctx,
             accel: None,
         }
+    }
+
+    /// Rows of the embedding matrix, which must match the tokenizer's vocabulary.
+    pub fn n_vocab(&self) -> usize {
+        self.embd.rows
     }
 
     pub(crate) fn mat(&self, w: &Weight) -> QMatrix<'_> {

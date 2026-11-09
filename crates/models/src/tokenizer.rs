@@ -104,7 +104,22 @@ impl Tokenizer {
             .enumerate()
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
-        let opt_id = |key: &str| g.get(key).and_then(Value::as_u64).map(|v| v as u32);
+        if scores.len() != n || types.len() != n {
+            return Err(Error::Format(format!(
+                "{n} tokens but {} scores and {} types",
+                scores.len(),
+                types.len()
+            )));
+        }
+        let opt_id = |key: &str| -> Result<Option<u32>> {
+            match g.get(key).and_then(Value::as_u64) {
+                Some(id) if id < n as u64 => Ok(Some(id as u32)),
+                Some(id) => Err(Error::Format(format!(
+                    "{key} {id} is not in the vocabulary"
+                ))),
+                None => Ok(None),
+            }
+        };
         let opt_bool = |key: &str| g.get(key).and_then(Value::as_bool);
 
         let model = match g.str("tokenizer.ggml.model")? {
@@ -181,8 +196,8 @@ impl Tokenizer {
             scores,
             types,
             specials,
-            bos: opt_id("tokenizer.ggml.bos_token_id"),
-            eos: opt_id("tokenizer.ggml.eos_token_id"),
+            bos: opt_id("tokenizer.ggml.bos_token_id")?,
+            eos: opt_id("tokenizer.ggml.eos_token_id")?,
             add_bos: opt_bool("tokenizer.ggml.add_bos_token").unwrap_or(is_spm),
         })
     }

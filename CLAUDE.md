@@ -85,6 +85,11 @@ Design points that span files:
   batched prompts (the matrix units accumulate in a different order); tests that compare logits use it.
   The f16 KV caches (Metal and CPU) move logits by up to ~0.015 against f32 on real models
   (top-1 unchanged).
+- **Model files are untrusted.** `rli-gguf` rejects malformed headers, and `Model::load` and
+  `Tokenizer::from_gguf` check tensor shapes and metadata against each other, because GPU kernels
+  have no bounds checks and a wrong size can allocate without limit. `crates/models/tests/malformed.rs`
+  corrupts header fields and requires an error or a clean CPU run, never a panic. New tensors need
+  a shape check in `Model::load`.
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
 - **Unverified paths:** the AVX2 kernels (only exercised under Rosetta, which lacks AVX2) and the
   whole CUDA backend (never run on an NVIDIA GPU; only its weight decoders are checked, on the

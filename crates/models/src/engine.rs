@@ -4,7 +4,7 @@ use crate::chat::{ChatTemplate, Message};
 use crate::model::{Model, PROMPT_SLICE, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
-use rli_gguf::{Gguf, Result};
+use rli_gguf::{Error, Gguf, Result};
 use std::path::Path;
 use std::time::Instant;
 
@@ -97,6 +97,13 @@ impl Engine {
         stop.sort_unstable();
         stop.dedup();
         let model = Model::load(gguf)?;
+        if model.n_vocab() != tokenizer.vocab_size() {
+            return Err(Error::Format(format!(
+                "{} tokens but {} embedding rows",
+                tokenizer.vocab_size(),
+                model.n_vocab()
+            )));
+        }
         Ok(Self {
             model,
             tokenizer,
