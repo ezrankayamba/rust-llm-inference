@@ -103,7 +103,10 @@ impl<'a> QMatrix<'a> {
         let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
         let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
             .then(|| xs.par_chunks_exact(cols).map(Q8Act::new).collect());
-        let block = acts.as_deref().and_then(|a| qdot::BlockActs::new(ty, a));
+        let block = acts
+            .as_deref()
+            .filter(|_| n >= qdot::BLOCK_MIN_TOKENS)
+            .and_then(|a| qdot::BlockActs::new(ty, a));
         // Computed as [row][token] so each task owns a contiguous slice, then transposed.
         let mut yt = vec![0.0f32; rows * n];
         yt.par_chunks_mut(ROWS_PER_TASK * n)
