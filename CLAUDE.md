@@ -121,8 +121,9 @@ cargo fmt --all
 ```
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on PRs: fmt and clippy, plus the tests
-on Linux x86-64 (the only run of the AVX2 `dot`) and macOS arm64 (with Metal). Each job has a
-4-minute timeout, so a change that makes it slower fails rather than creeping up.
+on Linux x86-64 (the only run of the AVX2 `dot`). Each job has a 4-minute timeout, so a change that
+makes it slower fails rather than creeping up. There is no macOS job, to avoid its billing: Metal
+and NEON are checked only locally, so run the tests and clippy above before pushing changes to them.
 
 Run: `rli -m model.gguf -p "prompt"` (without `-p` it starts an interactive chat), or
 `rli-server -m model.gguf --port 8080`, which also serves a chat page for manual testing at `/`
