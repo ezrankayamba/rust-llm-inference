@@ -104,23 +104,6 @@ impl<'a> QMatrix<'a> {
         let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
             .then(|| xs.par_chunks_exact(cols).map(Q8Act::new).collect());
         let block = acts.as_deref().and_then(|a| qdot::BlockActs::new(ty, a));
-        // One row against every token; quantized rows go `MAX_TOKENS` tokens per kernel call,
-        // so each weight block is unpacked once per group rather than once per token.
-        let dots = |row: &[u8], o: &mut [f32]| match &acts {
-            Some(a) => {
-                for (oc, ac) in o
-                    .chunks_mut(qdot::MAX_TOKENS)
-                    .zip(a.chunks(qdot::MAX_TOKENS))
-                {
-                    qdot::dot_rows_q8(ty, row, ac, oc);
-                }
-            }
-            None => {
-                for (t, v) in o.iter_mut().enumerate() {
-                    *v = dot_row(ty, row, &xs[t * cols..(t + 1) * cols]);
-                }
-            }
-        };
         // Computed as [row][token] so each task owns a contiguous slice, then transposed.
         let mut yt = vec![0.0f32; rows * n];
         yt.par_chunks_mut(ROWS_PER_TASK * n)
@@ -130,8 +113,23 @@ impl<'a> QMatrix<'a> {
                 if let Some(b) = &block {
                     return qdot::dot_block(ty, rows, rb, b, out);
                 }
-                for (o, row) in out.chunks_exact_mut(n).zip(rows.chunks_exact(rb)) {
-                    dots(row, o);
+                let Some(a) = &acts else {
+                    for (o, row) in out.chunks_exact_mut(n).zip(rows.chunks_exact(rb)) {
+                        for (t, v) in o.iter_mut().enumerate() {
+                            *v = dot_row(ty, row, &xs[t * cols..(t + 1) * cols]);
+                        }
+                    }
+                    return;
+                };
+                // `MAX_TOKENS` tokens per kernel call, so each weight block is unpacked once per
+                // group. Tokens outside rows: a group's activations stay in L1 while it meets
+                // every row, where the other way round each row would cycle through them all.
+                for (g, ac) in a.chunks(qdot::MAX_TOKENS).enumerate() {
+                    let t0 = g * qdot::MAX_TOKENS;
+                    for (r, row) in rows.chunks_exact(rb).enumerate() {
+                        let o = &mut out[r * n + t0..r * n + t0 + ac.len()];
+                        qdot::dot_rows_q8(ty, row, ac, o);
+                    }
                 }
             });
         ys.par_chunks_mut(rows).enumerate().for_each(|(t, y)| {

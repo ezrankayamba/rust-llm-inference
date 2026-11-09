@@ -936,6 +936,12 @@ mod avx2 {
             assert_eq!(n_blocks * ty.block_size(), a.qs.len());
         }
         let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
+        // Read through these rather than `acts[t].d[i]`: this runs per token every 32 weights.
+        let xd: [*const f32; N] = std::array::from_fn(|t| acts[t].d.as_ptr());
+        let xsum: [*const f32; N] = std::array::from_fn(|t| acts[t].sum.as_ptr());
+        for a in acts {
+            assert!(a.d.len() == a.qs.len() / QK && a.sum.len() == a.d.len());
+        }
         let mut acc = [_mm256_setzero_ps(); N];
         // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
         let mut extra = [0f32; N];
@@ -953,7 +959,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
@@ -965,7 +971,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
@@ -979,7 +985,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
+                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
                         }
                     }
                 }
@@ -1016,8 +1022,8 @@ mod avx2 {
                                 let (dsc, dm) = (d * sc, dmin * m);
                                 for t in 0..N {
                                     let s = dot32_unsigned(w, xq[t].add(xb * QK));
-                                    acc[t] = add(acc[t], s, dsc * acts[t].d[xb]);
-                                    extra[t] -= dm * acts[t].sum[xb];
+                                    acc[t] = add(acc[t], s, dsc * *xd[t].add(xb));
+                                    extra[t] -= dm * *xsum[t].add(xb);
                                 }
                             }
                         }
@@ -1060,7 +1066,7 @@ mod avx2 {
                                 for t in 0..N {
                                     let s = dot32(w, xq[t].add(xb * QK));
                                     let s = _mm256_mullo_epi32(s, scale);
-                                    acc[t] = add(acc[t], s, d * acts[t].d[xb]);
+                                    acc[t] = add(acc[t], s, d * *xd[t].add(xb));
                                 }
                             }
                         }
