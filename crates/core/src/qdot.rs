@@ -936,12 +936,6 @@ mod avx2 {
             assert_eq!(n_blocks * ty.block_size(), a.qs.len());
         }
         let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
-        // Read through these rather than `acts[t].d[i]`: this runs per token every 32 weights, and
-        // measured faster for every type but Q4_K and Q5_K, which keep the lookup (x86 only).
-        let xd: [*const f32; N] = std::array::from_fn(|t| acts[t].d.as_ptr());
-        for a in acts {
-            assert_eq!(a.d.len(), a.qs.len() / QK);
-        }
         let mut acc = [_mm256_setzero_ps(); N];
         // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
         let mut extra = [0f32; N];
@@ -959,7 +953,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
                         }
                     }
                 }
@@ -971,7 +965,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
                         }
                     }
                 }
@@ -985,7 +979,7 @@ mod avx2 {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
+                            acc[t] = add(acc[t], s, d * acts[t].d[i]);
                         }
                     }
                 }
@@ -1066,7 +1060,7 @@ mod avx2 {
                                 for t in 0..N {
                                     let s = dot32(w, xq[t].add(xb * QK));
                                     let s = _mm256_mullo_epi32(s, scale);
-                                    acc[t] = add(acc[t], s, d * *xd[t].add(xb));
+                                    acc[t] = add(acc[t], s, d * acts[t].d[xb]);
                                 }
                             }
                         }
