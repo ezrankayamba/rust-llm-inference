@@ -77,7 +77,7 @@ fn main() {
     let backend = m
         .accelerator()
         .map_or("cpu".to_string(), |(n, l)| format!("{n}, {l} layers"));
-    let threads = rayon::current_num_threads();
+    let threads = rli_models::threads();
     println!(
         "model: {} | backend: {backend} | cpu threads: {threads} | precise: {}",
         engine.model_name, m.precise

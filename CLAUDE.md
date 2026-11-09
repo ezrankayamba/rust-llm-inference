@@ -26,7 +26,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 Workspace crates (dependencies flow downward only):
 
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
-  dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel), fast integer kernels over
+  dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel; every forward pass runs inside rli-models' own pool, `pool()` in `lib.rs`, so the calling thread is a worker rather than waiting on one per matvec), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
   fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)

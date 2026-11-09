@@ -503,6 +503,15 @@ impl Model {
         tokens: &[u32],
         want_logits: bool,
     ) -> Option<Vec<f32>> {
+        crate::pool().install(|| self.forward_batch_in_pool(sess, tokens, want_logits))
+    }
+
+    fn forward_batch_in_pool(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        want_logits: bool,
+    ) -> Option<Vec<f32>> {
         let n_embd = self.cfg.n_embd;
         let pos = sess.len();
         if tokens.is_empty() {
