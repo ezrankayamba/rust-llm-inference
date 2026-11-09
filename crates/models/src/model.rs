@@ -176,31 +176,51 @@ impl KvCache {
         }
     }
 
-    /// `out[t] = q · cache[at + t * stride..][..q.len()]`.
-    fn dots(&self, at: usize, stride: usize, q: &[f32], out: &mut [f32]) {
+    /// Rows `t` of the columns `at..at + width` (one KV head), as f32 with their stride:
+    /// borrowed from an f32 cache, converted into `buf` from an f16 one.
+    fn rows<'a>(
+        &'a self,
+        at: usize,
+        stride: usize,
+        width: usize,
+        t: std::ops::Range<usize>,
+        buf: &'a mut Vec<f32>,
+    ) -> (&'a [f32], usize) {
+        let first = at + t.start * stride;
         match self {
-            KvCache::F32(c) => {
-                for (t, o) in out.iter_mut().enumerate() {
-                    *o = simd::dot(q, &c[at + t * stride..][..q.len()]);
-                }
+            KvCache::F32(c) => (&c[first..], stride),
+            KvCache::F16(c) => {
+                buf.resize(t.len() * width, 0.0);
+                simd::f16_rows_to_f32(&c[2 * first..], 2 * stride, width, buf);
+                (&buf[..], width)
             }
-            KvCache::F16(c) => simd::dot_f16_rows(q, &c[2 * at..], 2 * stride, out),
         }
     }
+}
 
-    /// `out = Σ_t w[t] · cache[at + t * stride..][..out.len()]`.
-    fn weighted_sum(&self, at: usize, stride: usize, w: &[f32], out: &mut [f32]) {
-        match self {
-            KvCache::F32(c) => {
-                out.fill(0.0);
-                for (t, &p) in w.iter().enumerate() {
-                    let row = &c[at + t * stride..][..out.len()];
-                    out.iter_mut().zip(row).for_each(|(o, &v)| *o += p * v);
-                }
-            }
-            KvCache::F16(c) => simd::weighted_rows_f16(out, w, &c[2 * at..], 2 * stride),
-        }
+/// Cached positions per step of the CPU attention: one KV head's K and V rows for a block are
+/// converted to f32 once and stay in L2 while every query head that shares them runs.
+const ATT_BLOCK: usize = 256;
+
+/// One online-softmax step for a query head: scales its scores `s` against a block of rows, turns
+/// them into weights, and folds the block's values `v` into `p` = [running max, weight sum,
+/// weighted value sum..].
+fn fold_block(s: &mut [f32], scale: f32, v: &[f32], stride: usize, p: &mut [f32]) {
+    s.iter_mut().for_each(|x| *x *= scale);
+    let m = s.iter().copied().fold(p[0], f32::max);
+    let r = (p[0] - m).exp();
+    let mut sum = 0.0;
+    for x in s.iter_mut() {
+        *x = (*x - m).exp();
+        sum += *x;
     }
+    p[0] = m;
+    p[1] = p[1] * r + sum;
+    let o = &mut p[2..];
+    if r != 1.0 {
+        o.iter_mut().for_each(|x| *x *= r);
+    }
+    simd::weighted_rows(o, s, v, stride);
 }
 
 /// Per-conversation state: KV cache (grown on demand, so memory tracks tokens actually used)
@@ -582,6 +602,7 @@ impl Model {
         let mut v = vec![0.0; n * kv_dim];
         let mut att = vec![0.0; n * q_dim];
         let mut tmp = vec![0.0; n * n_embd];
+        let mut parts = Vec::new();
         let scale = 1.0 / (hd as f32).sqrt();
         let norm_rows = |out: &mut [f32], x: &[f32], w: &[f32]| {
             for (o, r) in out.chunks_exact_mut(n_embd).zip(x.chunks_exact(n_embd)) {
@@ -618,21 +639,57 @@ impl Model {
             sess.k[l].push(&k);
             sess.v[l].push(&v);
 
-            // Causal attention, parallel over (token, head): token i sees positions 0..=pos + i.
+            // Causal attention: token i sees positions 0..=pos + i. Work items are (token, KV
+            // head, span of positions), which run each query head of the KV head's group over
+            // its rows; spans are ATT_BLOCK per token, so decode splits a long context for
+            // threads while prompts split by token. Then each head merges its spans in order.
             let (kc, vc) = (&sess.k[l], &sess.v[l]);
-            att.par_chunks_mut(hd)
-                .zip(q.par_chunks(hd))
+            let span = ATT_BLOCK * n;
+            let spans = (pos + n).div_ceil(span);
+            let (n_kv, part) = (c.n_head_kv, hd + 2);
+            parts.resize(n * n_kv * spans * group * part, 0.0);
+            parts
+                .par_chunks_mut(group * part)
                 .enumerate()
-                .for_each_init(Vec::new, |scores, (j, (out, qh))| {
-                    let (i, h) = (j / c.n_head, j % c.n_head);
-                    let n_pos = pos + i + 1;
-                    let off = (h / group) * hd;
-                    scores.resize(n_pos, 0.0);
-                    kc.dots(off, kv_dim, qh, scores);
-                    scores.iter_mut().for_each(|s| *s *= scale);
-                    ops::softmax(scores);
-                    vc.weighted_sum(off, kv_dim, scores, out);
-                });
+                .for_each_init(
+                    || (Vec::new(), Vec::new(), Vec::new()),
+                    |(kb, vb, sc), (j, item)| {
+                        let (i, kvh, sp) = (j / (n_kv * spans), j / spans % n_kv, j % spans);
+                        let end = (pos + i + 1).min((sp + 1) * span);
+                        let qs = &q[i * q_dim + kvh * group * hd..][..group * hd];
+                        for p in item.chunks_exact_mut(part) {
+                            p[0] = f32::NEG_INFINITY;
+                            p[1..].fill(0.0);
+                        }
+                        for t0 in (sp * span..end).step_by(ATT_BLOCK) {
+                            let t = t0..(t0 + ATT_BLOCK).min(end);
+                            let (ks, k_stride) = kc.rows(kvh * hd, kv_dim, hd, t.clone(), kb);
+                            let (vs, v_stride) = vc.rows(kvh * hd, kv_dim, hd, t.clone(), vb);
+                            sc.resize(t.len(), 0.0);
+                            for (qh, p) in qs.chunks_exact(hd).zip(item.chunks_exact_mut(part)) {
+                                simd::dot_rows(qh, ks, k_stride, sc);
+                                fold_block(sc, scale, vs, v_stride, p);
+                            }
+                        }
+                    },
+                );
+            att.par_chunks_mut(hd).enumerate().for_each(|(j, out)| {
+                let (i, h) = (j / c.n_head, j % c.n_head);
+                let first = ((i * n_kv + h / group) * spans * group + h % group) * part;
+                let span_parts = || parts[first..].chunks(group * part).take(spans);
+                let m = span_parts().fold(f32::NEG_INFINITY, |m, p| m.max(p[0]));
+                out.fill(0.0);
+                let mut l = 0.0;
+                // Spans past token i hold max -inf and weight 0, so they add nothing.
+                for p in span_parts() {
+                    let r = (p[0] - m).exp();
+                    l += r * p[1];
+                    out.iter_mut()
+                        .zip(&p[2..part])
+                        .for_each(|(o, &x)| *o += r * x);
+                }
+                out.iter_mut().for_each(|o| *o /= l);
+            });
             self.matmul(&layer.wo, &att, &mut tmp, n);
             ops::add_assign(xs, &tmp);
 

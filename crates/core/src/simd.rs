@@ -32,6 +32,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     let n = a.len();
@@ -122,36 +123,104 @@ fn widen(
     (lo, hi)
 }
 
-/// `out[t] = x · row_t`, row `t` being `x.len()` little-endian halves at byte `t * stride` of
-/// `rows` (attention's scores against cached keys). Each equals [`dot_f16`] of that row exactly;
-/// one call for all rows saves a dispatch per row that cost more than a 64-128 element dot.
-pub fn dot_f16_rows(x: &[f32], rows: &[u8], stride: usize, out: &mut [f32]) {
+/// `out[t] = x · row_t`, row `t` being `x.len()` values at `t * stride` of `rows` (attention's
+/// scores against cached keys). Each equals [`dot`] of that row exactly; one call for all rows
+/// saves a dispatch per row that cost more than a 64-128 element dot.
+pub fn dot_rows(x: &[f32], rows: &[f32], stride: usize, out: &mut [f32]) {
     if let Some(last) = out.len().checked_sub(1) {
-        assert!(rows.len() >= last * stride + 2 * x.len(), "rows too short");
+        assert!(rows.len() >= last * stride + x.len(), "rows too short");
     }
     let row = |t: usize| {
         // SAFETY: checked above: row `t < out.len()` ends within `rows`.
-        unsafe { rows.get_unchecked(t * stride..t * stride + 2 * x.len()) }
+        unsafe { rows.get_unchecked(t * stride..t * stride + x.len()) }
     };
     #[cfg(target_arch = "aarch64")]
     for (t, o) in out.iter_mut().enumerate() {
-        // SAFETY: NEON is mandatory on aarch64; the row holds `x.len()` halves.
-        *o = unsafe { dot_f16_neon(row(t), x) };
+        // SAFETY: NEON is mandatory on aarch64; the row holds `x.len()` values.
+        *o = unsafe { dot_neon(row(t), x) };
     }
     #[cfg(target_arch = "x86_64")]
     {
         if x86::has_avx2() {
             // SAFETY: CPU support verified at runtime; bounds checked above.
-            unsafe { x86::dot_f16_rows_avx2(x, rows, stride, out) }
+            unsafe { x86::dot_rows_avx2(x, rows, stride, out) }
         } else {
             for (t, o) in out.iter_mut().enumerate() {
-                *o = dot_f16_scalar(row(t), x);
+                *o = dot_scalar(row(t), x);
             }
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     for (t, o) in out.iter_mut().enumerate() {
-        *o = dot_f16_scalar(row(t), x);
+        *o = dot_scalar(row(t), x);
+    }
+}
+
+/// Rows of `width` little-endian halves, row `t` at byte `t * stride` of `rows`, converted to f32
+/// and packed into `out` (`out.len() / width` rows). Exact: every half is an f32.
+pub fn f16_rows_to_f32(rows: &[u8], stride: usize, width: usize, out: &mut [f32]) {
+    if width == 0 {
+        return;
+    }
+    let n = out.len() / width;
+    assert_eq!(out.len(), n * width, "out holds whole rows");
+    if let Some(last) = n.checked_sub(1) {
+        assert!(rows.len() >= last * stride + 2 * width, "rows too short");
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64; bounds checked above.
+        unsafe { f16_rows_to_f32_neon(rows, stride, width, out) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx2() {
+            // SAFETY: CPU support verified at runtime; bounds checked above.
+            unsafe { x86::f16_rows_to_f32_avx2(rows, stride, width, out) }
+        } else {
+            f16_rows_to_f32_scalar(rows, stride, width, out)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        f16_rows_to_f32_scalar(rows, stride, width, out)
+    }
+}
+
+pub fn f16_rows_to_f32_scalar(rows: &[u8], stride: usize, width: usize, out: &mut [f32]) {
+    for (t, o) in out.chunks_exact_mut(width).enumerate() {
+        let r = &rows[t * stride..][..2 * width];
+        for (v, h) in o.iter_mut().zip(r.as_chunks::<2>().0) {
+            *v = crate::half::f16_to_f32(u16::from_le_bytes(*h));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn f16_rows_to_f32_neon(rows: &[u8], stride: usize, width: usize, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let po = out.as_mut_ptr();
+    for t in 0..out.len() / width {
+        // SAFETY: the caller checked that row `t` holds `width` halves and `out` `width` values
+        // for it; `rows` may be only byte-aligned, and the loads are unaligned-safe.
+        unsafe {
+            let (r, o) = (
+                rows.as_ptr().add(t * stride) as *const u16,
+                po.add(t * width),
+            );
+            let mut i = 0;
+            while i + 8 <= width {
+                let (lo, hi) = widen(vld1q_u16(r.add(i)));
+                vst1q_f32(o.add(i), lo);
+                vst1q_f32(o.add(i + 4), hi);
+                i += 8;
+            }
+            while i < width {
+                *o.add(i) = crate::half::f16_to_f32(r.add(i).read_unaligned());
+                i += 1;
+            }
+        }
     }
 }
 
@@ -190,120 +259,62 @@ unsafe fn dot_f16_neon(w: &[u8], x: &[f32]) -> f32 {
     }
 }
 
-/// `y += a * w` with `w` as little-endian IEEE halves (`2 * y.len()` bytes).
-#[inline]
-pub fn axpy_f16(y: &mut [f32], a: f32, w: &[u8]) {
-    assert_eq!(w.len(), 2 * y.len());
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is mandatory on aarch64; lengths checked above.
-        unsafe { axpy_f16_neon(y, a, w) }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if x86::has_avx2() {
-            // SAFETY: CPU support verified at runtime; lengths checked above.
-            unsafe { x86::axpy_f16_avx2(y, a, w) }
-        } else {
-            axpy_f16_scalar(y, a, w)
-        }
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        axpy_f16_scalar(y, a, w)
-    }
-}
-
-pub fn axpy_f16_scalar(y: &mut [f32], a: f32, w: &[u8]) {
-    for (o, h) in y.iter_mut().zip(w.as_chunks::<2>().0) {
-        *o += a * crate::half::f16_to_f32(u16::from_le_bytes(*h));
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn axpy_f16_neon(y: &mut [f32], a: f32, w: &[u8]) {
-    use std::arch::aarch64::*;
-    let n = y.len();
-    let (pw, py) = (w.as_ptr() as *const u16, y.as_mut_ptr());
-    let mut i = 0;
-    // SAFETY: every access stays within `n` elements, which `w` (as halves) and `y` share. `w`
-    // may be only byte-aligned: `vld1q_u16` doesn't require alignment, and the scalar tail
-    // reads unaligned.
-    unsafe {
-        while i + 8 <= n {
-            let (lo, hi) = widen(vld1q_u16(pw.add(i)));
-            vst1q_f32(py.add(i), vfmaq_n_f32(vld1q_f32(py.add(i)), lo, a));
-            vst1q_f32(py.add(i + 4), vfmaq_n_f32(vld1q_f32(py.add(i + 4)), hi, a));
-            i += 8;
-        }
-        while i < n {
-            *py.add(i) += a * crate::half::f16_to_f32(pw.add(i).read_unaligned());
-            i += 1;
-        }
-    }
-}
-
-/// `out = Σ_t w[t] · row_t`, row `t` being `out.len()` little-endian halves at byte `t * stride`
-/// of `rows` (attention's weighted sum of cached values). Bit-identical to zeroing `out` and
-/// calling [`axpy_f16`] per row, but the SIMD paths keep the outputs in registers across all rows
-/// instead of loading and storing them for each one.
-pub fn weighted_rows_f16(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+/// `out += Σ_t w[t] · row_t`, row `t` being `out.len()` values at `t * stride` of `rows`
+/// (attention's weighted sum of cached values). The SIMD paths keep `out` in registers across all
+/// rows instead of loading and storing it for each one.
+pub fn weighted_rows(out: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
     if let Some(last) = w.len().checked_sub(1) {
-        assert!(
-            rows.len() >= last * stride + 2 * out.len(),
-            "rows too short"
-        );
+        assert!(rows.len() >= last * stride + out.len(), "rows too short");
     }
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is mandatory on aarch64; bounds checked above.
-        unsafe { weighted_rows_f16_neon(out, w, rows, stride) }
+        unsafe { weighted_rows_neon(out, w, rows, stride) }
     }
     #[cfg(target_arch = "x86_64")]
     {
         if x86::has_avx2() {
             // SAFETY: CPU support verified at runtime; bounds checked above.
-            unsafe { x86::weighted_rows_f16_avx2(out, w, rows, stride) }
+            unsafe { x86::weighted_rows_avx2(out, w, rows, stride) }
         } else {
-            weighted_rows_f16_scalar(out, w, rows, stride)
+            weighted_rows_scalar(out, w, rows, stride)
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        weighted_rows_f16_scalar(out, w, rows, stride)
+        weighted_rows_scalar(out, w, rows, stride)
     }
 }
 
-pub fn weighted_rows_f16_scalar(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
-    out.fill(0.0);
+pub fn weighted_rows_scalar(out: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
+    let n = out.len();
     for (t, &a) in w.iter().enumerate() {
-        axpy_f16_scalar(out, a, &rows[t * stride..t * stride + 2 * out.len()]);
+        for (o, &v) in out.iter_mut().zip(&rows[t * stride..][..n]) {
+            *o += a * v;
+        }
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn weighted_rows_f16_neon(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+unsafe fn weighted_rows_neon(out: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
     use std::arch::aarch64::*;
     /// Columns `c..c + 4 * N` over every row, accumulated in `N` registers.
     #[inline(always)]
     unsafe fn cols<const N: usize>(
         out: *mut f32,
         w: &[f32],
-        rows: *const u8,
+        rows: *const f32,
         stride: usize,
         c: usize,
     ) {
         // SAFETY: the caller checked that every row holds these columns.
         unsafe {
-            let mut acc = [vdupq_n_f32(0.0); N];
+            let mut acc: [float32x4_t; N] = std::array::from_fn(|j| vld1q_f32(out.add(c + 4 * j)));
             for (t, &a) in w.iter().enumerate() {
-                let r = rows.add(t * stride + 2 * c) as *const u16;
-                for j in 0..N / 2 {
-                    let (lo, hi) = widen(vld1q_u16(r.add(8 * j)));
-                    acc[2 * j] = vfmaq_n_f32(acc[2 * j], lo, a);
-                    acc[2 * j + 1] = vfmaq_n_f32(acc[2 * j + 1], hi, a);
+                let r = rows.add(t * stride + c);
+                for (j, slot) in acc.iter_mut().enumerate() {
+                    *slot = vfmaq_n_f32(*slot, vld1q_f32(r.add(4 * j)), a);
                 }
             }
             for (j, v) in acc.iter().enumerate() {
@@ -314,23 +325,20 @@ unsafe fn weighted_rows_f16_neon(out: &mut [f32], w: &[f32], rows: &[u8], stride
     let n = out.len();
     let (po, pr) = (out.as_mut_ptr(), rows.as_ptr());
     let mut c = 0;
-    // SAFETY: `weighted_rows_f16` checked the bounds; `rows` may be only byte-aligned, and the
-    // loads are unaligned-safe.
+    // SAFETY: `weighted_rows` checked the bounds.
     unsafe {
         while c + 32 <= n {
             cols::<8>(po, w, pr, stride, c);
             c += 32;
         }
-        while c + 8 <= n {
-            cols::<2>(po, w, pr, stride, c);
-            c += 8;
+        while c + 4 <= n {
+            cols::<1>(po, w, pr, stride, c);
+            c += 4;
         }
         for i in c..n {
-            let mut s = 0.0;
+            let mut s = *po.add(i);
             for (t, &a) in w.iter().enumerate() {
-                s += a * crate::half::f16_to_f32(
-                    (pr.add(t * stride + 2 * i) as *const u16).read_unaligned(),
-                );
+                s += a * *pr.add(t * stride + i);
             }
             *po.add(i) = s;
         }
@@ -361,6 +369,7 @@ pub(crate) mod x86 {
     }
 
     #[target_feature(enable = "avx2,fma")]
+    #[inline]
     pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
         let n = a.len();
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
@@ -424,55 +433,57 @@ pub(crate) mod x86 {
         }
     }
 
-    /// [`super::dot_f16_rows`], with the per-row dot inlined.
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn dot_f16_rows_avx2(x: &[f32], rows: &[u8], stride: usize, out: &mut [f32]) {
+    /// [`super::dot_rows`], with the per-row dot inlined.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_rows_avx2(x: &[f32], rows: &[f32], stride: usize, out: &mut [f32]) {
         for (t, o) in out.iter_mut().enumerate() {
             // SAFETY: the caller checked that row `t` ends within `rows`.
-            *o = unsafe {
-                dot_f16_avx2(rows.get_unchecked(t * stride..t * stride + 2 * x.len()), x)
-            };
+            *o = unsafe { dot_avx2(rows.get_unchecked(t * stride..t * stride + x.len()), x) };
         }
     }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn axpy_f16_avx2(y: &mut [f32], a: f32, w: &[u8]) {
-        let n = y.len();
-        let (pw, py) = (w.as_ptr() as *const u16, y.as_mut_ptr());
-        let va = _mm256_set1_ps(a);
-        let mut i = 0;
-        // SAFETY: every access stays within `n` elements, which `w` (as halves) and `y` share.
-        unsafe {
-            while i + 8 <= n {
-                let v = _mm256_fmadd_ps(load_halves(pw.add(i)), va, _mm256_loadu_ps(py.add(i)));
-                _mm256_storeu_ps(py.add(i), v);
-                i += 8;
-            }
-            while i < n {
-                *py.add(i) += a * crate::half::f16_to_f32(pw.add(i).read_unaligned());
-                i += 1;
+    #[target_feature(enable = "avx2,f16c")]
+    pub unsafe fn f16_rows_to_f32_avx2(rows: &[u8], stride: usize, width: usize, out: &mut [f32]) {
+        let po = out.as_mut_ptr();
+        for t in 0..out.len() / width {
+            // SAFETY: the caller checked that row `t` holds `width` halves and `out` `width`
+            // values for it.
+            unsafe {
+                let (r, o) = (
+                    rows.as_ptr().add(t * stride) as *const u16,
+                    po.add(t * width),
+                );
+                let mut i = 0;
+                while i + 8 <= width {
+                    _mm256_storeu_ps(o.add(i), load_halves(r.add(i)));
+                    i += 8;
+                }
+                while i < width {
+                    *o.add(i) = crate::half::f16_to_f32(r.add(i).read_unaligned());
+                    i += 1;
+                }
             }
         }
     }
 
     /// Columns `c..c + 8 * N` over every row, accumulated in `N` registers.
-    #[target_feature(enable = "avx2,fma,f16c")]
+    #[target_feature(enable = "avx2,fma")]
     #[inline]
     unsafe fn weighted_cols<const N: usize>(
         out: *mut f32,
         w: &[f32],
-        rows: *const u8,
+        rows: *const f32,
         stride: usize,
         c: usize,
     ) {
         // SAFETY: the caller checked that every row holds these columns.
         unsafe {
-            let mut acc = [_mm256_setzero_ps(); N];
+            let mut acc: [__m256; N] = std::array::from_fn(|j| _mm256_loadu_ps(out.add(c + 8 * j)));
             for (t, &a) in w.iter().enumerate() {
-                let r = rows.add(t * stride + 2 * c) as *const u16;
+                let r = rows.add(t * stride + c);
                 let va = _mm256_set1_ps(a);
                 for (j, slot) in acc.iter_mut().enumerate() {
-                    *slot = _mm256_fmadd_ps(load_halves(r.add(8 * j)), va, *slot);
+                    *slot = _mm256_fmadd_ps(_mm256_loadu_ps(r.add(8 * j)), va, *slot);
                 }
             }
             for (j, v) in acc.iter().enumerate() {
@@ -481,12 +492,12 @@ pub(crate) mod x86 {
         }
     }
 
-    #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn weighted_rows_f16_avx2(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn weighted_rows_avx2(out: &mut [f32], w: &[f32], rows: &[f32], stride: usize) {
         let n = out.len();
         let (po, pr) = (out.as_mut_ptr(), rows.as_ptr());
         let mut c = 0;
-        // SAFETY: `weighted_rows_f16` checked the bounds.
+        // SAFETY: `weighted_rows` checked the bounds.
         unsafe {
             while c + 64 <= n {
                 weighted_cols::<8>(po, w, pr, stride, c);
@@ -497,11 +508,9 @@ pub(crate) mod x86 {
                 c += 8;
             }
             for i in c..n {
-                let mut s = 0.0;
+                let mut s = *po.add(i);
                 for (t, &a) in w.iter().enumerate() {
-                    s += a * crate::half::f16_to_f32(
-                        (pr.add(t * stride + 2 * i) as *const u16).read_unaligned(),
-                    );
+                    s += a * *pr.add(t * stride + i);
                 }
                 *po.add(i) = s;
             }
@@ -534,80 +543,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn axpy_f16_matches_scalar_for_all_tail_lengths() {
-        let mut rng = Rng::new(9);
-        for n in (0..40).chain([128, 1000]) {
-            let w: Vec<u8> = rng
-                .vec(n)
-                .iter()
-                .flat_map(|&v| crate::half::f32_to_f16(v).to_le_bytes())
-                .collect();
-            let y0 = rng.vec(n);
-            let (mut fast, mut slow) = (y0.clone(), y0);
-            axpy_f16(&mut fast, 0.37, &w);
-            axpy_f16_scalar(&mut slow, 0.37, &w);
-            for (f, s) in fast.iter().zip(&slow) {
-                assert!((f - s).abs() <= 1e-6 * (1.0 + s.abs()), "n={n} {f} vs {s}");
-            }
-        }
-    }
+    /// Rows padded apart, as K/V heads are inside a cache row.
+    const SIZES: [(usize, usize); 8] = [
+        (0, 3),
+        (5, 0),
+        (7, 4),
+        (8, 9),
+        (40, 33),
+        (64, 300),
+        (128, 17),
+        (70, 5),
+    ];
 
     #[test]
-    fn dot_f16_rows_equals_per_row_dot_exactly() {
+    fn f16_rows_to_f32_is_exact() {
         let mut rng = Rng::new(12);
-        for (n, rows) in [
-            (0, 3),
-            (5, 0),
-            (7, 4),
-            (16, 9),
-            (64, 300),
-            (128, 17),
-            (70, 5),
-        ] {
-            let stride = 2 * n + 6; // rows padded apart, as K/V heads are inside a cache row
+        for (n, rows) in SIZES {
+            let stride = 2 * n + 6;
             let bytes: Vec<u8> = rng
                 .vec(rows * stride / 2 + n)
                 .iter()
                 .flat_map(|&v| crate::half::f32_to_f16(v).to_le_bytes())
                 .collect();
+            let mut got = vec![1.0; rows * n];
+            f16_rows_to_f32(&bytes, stride, n, &mut got);
+            let mut want = vec![0.0; rows * n];
+            if n > 0 {
+                f16_rows_to_f32_scalar(&bytes, stride, n, &mut want);
+            }
+            assert_eq!(got, want, "n={n} rows={rows}");
+        }
+    }
+
+    #[test]
+    fn dot_rows_equals_per_row_dot_exactly() {
+        let mut rng = Rng::new(13);
+        for (n, rows) in SIZES {
+            let stride = n + 3;
+            let m = rng.vec(rows * stride + n);
             let x = rng.vec(n);
             let mut got = vec![1.0; rows];
-            dot_f16_rows(&x, &bytes, stride, &mut got);
+            dot_rows(&x, &m, stride, &mut got);
             let want: Vec<f32> = (0..rows)
-                .map(|t| dot_f16(&bytes[t * stride..t * stride + 2 * n], &x))
+                .map(|t| dot(&m[t * stride..t * stride + n], &x))
                 .collect();
             assert_eq!(got, want, "n={n} rows={rows}");
         }
     }
 
     #[test]
-    fn weighted_rows_f16_equals_per_row_axpy_exactly() {
+    fn weighted_rows_adds_to_out_and_matches_scalar() {
         let mut rng = Rng::new(11);
-        for (n, rows) in [
-            (0, 3),
-            (5, 0),
-            (7, 4),
-            (8, 9),
-            (40, 33),
-            (64, 300),
-            (128, 17),
-            (70, 5),
-        ] {
-            let stride = 2 * n + 6; // rows padded apart, as K/V heads are inside a cache row
-            let bytes: Vec<u8> = rng
-                .vec(rows * stride / 2 + n)
-                .iter()
-                .flat_map(|&v| crate::half::f32_to_f16(v).to_le_bytes())
-                .collect();
+        for (n, rows) in SIZES {
+            let stride = n + 3;
+            let m = rng.vec(rows * stride + n);
             let w = rng.vec(rows);
-            let mut got = vec![1.0; n];
-            weighted_rows_f16(&mut got, &w, &bytes, stride);
-            let mut want = vec![0.0; n];
-            for (t, &a) in w.iter().enumerate() {
-                axpy_f16(&mut want, a, &bytes[t * stride..t * stride + 2 * n]);
+            let start = rng.vec(n);
+            let (mut got, mut want) = (start.clone(), start);
+            weighted_rows(&mut got, &w, &m, stride);
+            weighted_rows_scalar(&mut want, &w, &m, stride);
+            for (g, s) in got.iter().zip(&want) {
+                assert!((g - s).abs() <= 1e-4 * (1.0 + s.abs()), "n={n} {g} vs {s}");
             }
-            assert_eq!(got, want, "n={n} rows={rows}");
         }
     }
 
