@@ -42,7 +42,8 @@ Workspace crates (dependencies flow downward only):
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
-  mutex; a client disconnect cancels generation.
+  mutex held only during generation. A client disconnect or a 30 s write stall cancels generation;
+  `Engine::generate` polls between 256-token prompt slices and before each token.
 
 Design points that span files:
 

@@ -66,7 +66,7 @@ fn serve(app: &App, mut stream: TcpStream) {
         return;
     }
     let result = match http::read_request(&stream) {
-        Ok(req) => api::handle(app, req, &mut stream),
+        Ok(req) => api::handle(app, req, &mut &stream, || http::peer_gone(&stream)),
         Err(http::ParseError::Closed) => Ok(()),
         Err(http::ParseError::TooLarge) => {
             http::respond(&mut stream, 413, "text/plain", b"request too large")

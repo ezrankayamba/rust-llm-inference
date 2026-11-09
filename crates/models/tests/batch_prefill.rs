@@ -10,7 +10,8 @@ use rli_core::quant::{quantize_q4_0, quantize_q8_0};
 use rli_gguf::Gguf;
 use rli_gguf::Value;
 use rli_gguf::writer::Writer;
-use rli_models::Model;
+use rli_models::{Engine, Finish, GenParams, Model, SamplerConfig};
+use std::cell::Cell;
 
 const D: usize = 128;
 const FF: usize = 192;
@@ -46,6 +47,11 @@ fn write_model(arch: &str, heads: usize, kv_heads: usize, moe: bool, path: &std:
     let kv = kv_heads * hd;
     let mut w = Writer::new();
     let key = |k: &str| format!("{arch}.{k}");
+    let tokens = (0..VOCAB)
+        .map(|i| Value::String(format!("t{i} ")))
+        .collect();
+    w.kv("tokenizer.ggml.model", Value::String("llama".into()))
+        .kv("tokenizer.ggml.tokens", Value::Array(tokens));
     w.kv("general.architecture", Value::String(arch.into()))
         .kv(&key("block_count"), Value::U32(LAYERS as u32))
         .kv(&key("context_length"), Value::U32(1024))
@@ -354,5 +360,120 @@ fn weights_split_across_metal_buffers_give_identical_logits() {
                 "{arch}, batched={batched}"
             );
         }
+    }
+}
+
+fn engine(gpu_layers: usize) -> Engine {
+    let mut e = Engine::load(model_path("llama", 4, 4, false)).expect("load");
+    e.model.precise = true;
+    rli_models::backend::attach(&mut e.model, gpu_layers).expect("attach");
+    e
+}
+
+/// CPU, plus Metal when built in: whole model and partial offload.
+fn gpu_layer_counts() -> Vec<usize> {
+    if rli_models::backend::HAS_GPU {
+        vec![0, LAYERS, 1]
+    } else {
+        vec![0]
+    }
+}
+
+fn greedy(max_tokens: usize) -> GenParams {
+    GenParams {
+        max_tokens,
+        sampler: SamplerConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed: 0,
+        },
+    }
+}
+
+/// An `is_cancelled` that answers false `n` times, then true.
+fn cancel_after(n: usize) -> impl Fn() -> bool {
+    let polls = Cell::new(0);
+    move || {
+        polls.set(polls.get() + 1);
+        polls.get() > n
+    }
+}
+
+#[test]
+fn generate_slices_prompts_without_changing_logits() {
+    let prompt = prompt();
+    for gpu_layers in gpu_layer_counts() {
+        let e = engine(gpu_layers);
+        let mut s = e.new_session(512);
+        e.generate(&mut s, &prompt, &greedy(0), || false, |_| true);
+        let sliced = e.model.forward(&mut s, 7, true).expect("logits");
+        let (_, whole) = run(&e.model, &prompt, true);
+        let d = max_diff(&sliced, &whole);
+        assert!(d < 1e-4, "gpu_layers={gpu_layers}: max diff {d}");
+    }
+}
+
+#[test]
+fn generate_cancelled_before_starting_keeps_the_cached_prefix() {
+    for gpu_layers in gpu_layer_counts() {
+        let e = engine(gpu_layers);
+        let mut s = e.new_session(512);
+        e.generate(&mut s, &[1, 2, 3, 4], &greedy(2), || false, |_| true);
+        let cached = s.tokens.clone();
+        let out = e.generate(&mut s, &[9, 9], &greedy(2), || true, |_| true);
+        assert_eq!(out.finish, Finish::Cancelled);
+        assert_eq!(s.tokens, cached, "gpu_layers={gpu_layers}");
+    }
+}
+
+#[test]
+fn generate_cancelled_between_prompt_slices_keeps_the_finished_slice() {
+    let prompt = prompt();
+    for gpu_layers in gpu_layer_counts() {
+        let e = engine(gpu_layers);
+        let mut s = e.new_session(512);
+        let out = e.generate(&mut s, &prompt, &greedy(4), cancel_after(1), |_| true);
+        assert_eq!(out.finish, Finish::Cancelled);
+        assert_eq!(out.completion_tokens, 0);
+        assert_eq!(s.tokens, prompt[..256], "gpu_layers={gpu_layers}");
+    }
+}
+
+#[test]
+fn generate_retried_after_cancelling_matches_an_uninterrupted_run() {
+    let prompt = prompt();
+    for gpu_layers in gpu_layer_counts() {
+        let e = engine(gpu_layers);
+        let mut straight = e.new_session(512);
+        let want = e.generate(&mut straight, &prompt, &greedy(4), || false, |_| true);
+
+        let mut s = e.new_session(512);
+        e.generate(&mut s, &prompt, &greedy(4), cancel_after(1), |_| true);
+        let got = e.generate(&mut s, &prompt, &greedy(4), || false, |_| true);
+
+        assert_eq!(got.prompt_evaluated, PROMPT - 256);
+        assert_eq!(got.text, want.text, "gpu_layers={gpu_layers}");
+        assert_eq!(s.tokens, straight.tokens);
+        let a = e.model.forward(&mut s, 7, true).expect("logits");
+        let b = e.model.forward(&mut straight, 7, true).expect("logits");
+        let d = max_diff(&a, &b);
+        assert!(d < 1e-4, "gpu_layers={gpu_layers}: max diff {d}");
+    }
+}
+
+#[test]
+fn generate_cancelled_while_decoding_keeps_the_generated_tokens() {
+    let prompt = prompt();
+    for gpu_layers in gpu_layer_counts() {
+        let e = engine(gpu_layers);
+        let mut s = e.new_session(512);
+        // Polls: before starting, at the prompt's second slice, then once per token.
+        let out = e.generate(&mut s, &prompt, &greedy(50), cancel_after(2 + 3), |_| true);
+        assert_eq!(out.finish, Finish::Cancelled);
+        assert_eq!(out.completion_tokens, 3);
+        assert_eq!(s.len(), PROMPT + 3, "gpu_layers={gpu_layers}");
     }
 }

@@ -115,12 +115,18 @@ fn run(a: Args) -> Result<(), String> {
     let mut messages: Vec<Message> = a.system.iter().map(|s| Message::new("system", s)).collect();
     let stdout = std::io::stdout();
     let generate = |tokens: &[u32], sess: &mut _| {
-        let out = engine.generate(sess, tokens, &a.params, |t| {
-            let mut o = stdout.lock();
-            let _ = o.write_all(t.as_bytes());
-            let _ = o.flush();
-            true
-        });
+        let out = engine.generate(
+            sess,
+            tokens,
+            &a.params,
+            || false,
+            |t| {
+                let mut o = stdout.lock();
+                let _ = o.write_all(t.as_bytes());
+                let _ = o.flush();
+                true
+            },
+        );
         println!();
         eprintln!(
             "[{} prompt tokens ({} evaluated) in {:.2}s = {:.1} tok/s | {} generated in {:.2}s = {:.1} tok/s | {:?}]",

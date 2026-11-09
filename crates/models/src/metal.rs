@@ -34,6 +34,7 @@ struct GpuLayer {
 
 /// Most prompt tokens processed per GPU pass; bounds the batch scratch buffers.
 const BATCH_CHUNK: usize = 256;
+const _: () = assert!(crate::model::PROMPT_SLICE.is_multiple_of(BATCH_CHUNK));
 /// Positions a session's GPU KV cache holds at first; it doubles as needed, up to `max_ctx`.
 const KV_INITIAL: usize = 256;
 

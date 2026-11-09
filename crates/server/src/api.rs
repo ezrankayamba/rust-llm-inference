@@ -118,7 +118,13 @@ fn finish_reason(f: Finish) -> &'static str {
     }
 }
 
-pub fn handle(app: &App, req: Request, w: &mut impl Write) -> std::io::Result<()> {
+/// `gone` reports that the client has disconnected, which cancels its generation.
+pub fn handle(
+    app: &App,
+    req: Request,
+    w: &mut impl Write,
+    gone: impl Fn() -> bool,
+) -> std::io::Result<()> {
     let json_ct = "application/json";
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/healthz") => http::respond(w, 200, "text/plain", b"ok"),
@@ -128,8 +134,8 @@ pub fn handle(app: &App, req: Request, w: &mut impl Write) -> std::io::Result<()
             }]});
             http::respond(w, 200, json_ct, body.to_string().as_bytes())
         }
-        ("POST", "/v1/chat/completions") => complete(app, &req.body, true, w),
-        ("POST", "/v1/completions") => complete(app, &req.body, false, w),
+        ("POST", "/v1/chat/completions") => complete(app, &req.body, true, w, gone),
+        ("POST", "/v1/completions") => complete(app, &req.body, false, w, gone),
         (_, "/healthz" | "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
             http::respond(w, 405, json_ct, &error_body("method not allowed"))
         }
@@ -137,7 +143,13 @@ pub fn handle(app: &App, req: Request, w: &mut impl Write) -> std::io::Result<()
     }
 }
 
-fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::Result<()> {
+fn complete(
+    app: &App,
+    body: &[u8],
+    chat: bool,
+    w: &mut impl Write,
+    gone: impl Fn() -> bool,
+) -> std::io::Result<()> {
     let bad = |w: &mut _, msg: &str| http::respond(w, 400, "application/json", &error_body(msg));
     let req: Value = match serde_json::from_slice(body) {
         Ok(v @ Value::Object(_)) => v,
@@ -183,7 +195,10 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
     };
 
     if !stream {
-        let out = e.generate(&mut app.session(), &tokens, &params, |_| true);
+        let out = e.generate(&mut app.session(), &tokens, &params, gone, |_| true);
+        if out.finish == Finish::Cancelled {
+            return Ok(());
+        }
         let choice = if chat {
             json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": finish_reason(out.finish)})
         } else {
@@ -215,7 +230,7 @@ fn complete(app: &App, body: &[u8], chat: bool, w: &mut impl Write) -> std::io::
         http::sse_event(w, &chunk(json!({"role": "assistant", "content": ""}), None))?;
     }
     // A failed write means the client went away: stop generating.
-    let out = e.generate(&mut app.session(), &tokens, &params, |t| {
+    let out = e.generate(&mut app.session(), &tokens, &params, gone, |t| {
         http::sse_event(w, &chunk(json!({"content": t}), None)).is_ok()
     });
     if out.finish == Finish::Cancelled {
@@ -315,7 +330,7 @@ mod tests {
             locked_writes: 0,
         };
         let req = post(json!({"prompt": "hello", "max_tokens": 2, "seed": 1}));
-        handle(&app, req, &mut w).unwrap();
+        handle(&app, req, &mut w, || false).unwrap();
         assert_eq!(w.locked_writes, 0);
     }
 
@@ -328,7 +343,7 @@ mod tests {
             locked_writes: 0,
         };
         let req = post(json!({"prompt": "hello", "temperature": 5}));
-        handle(&app, req, &mut w).unwrap();
+        handle(&app, req, &mut w, || false).unwrap();
         assert_eq!(w.locked_writes, 0);
     }
 
@@ -344,7 +359,7 @@ mod tests {
             locked_writes: 0,
         };
         let req = post(json!({"prompt": "hello", "stream": true}));
-        assert!(handle(&app, req, &mut w).is_err());
+        assert!(handle(&app, req, &mut w, || false).is_err());
         drop(held);
     }
 
@@ -358,8 +373,18 @@ mod tests {
             locked_writes: 0,
         };
         let req = post(json!({"prompt": "hello", "stream": true, "seed": 1}));
-        handle(&app, req, &mut w).unwrap();
+        handle(&app, req, &mut w, || false).unwrap();
         let sess = app.session.try_lock().expect("session released");
         assert!(sess.tokens.len() < sess.max_ctx, "{}", sess.tokens.len());
+    }
+
+    #[test]
+    fn disconnected_client_gets_no_response_and_no_generation() {
+        let app = app();
+        let mut w = Vec::new();
+        let req = post(json!({"prompt": "hello", "seed": 1}));
+        handle(&app, req, &mut w, || true).unwrap();
+        assert!(w.is_empty());
+        assert!(app.session.try_lock().unwrap().tokens.is_empty());
     }
 }

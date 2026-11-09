@@ -2,6 +2,7 @@
 //! (`Connection: close`), `Content-Length` bodies only.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -74,6 +75,22 @@ pub fn read_request(stream: impl Read) -> Result<Request, ParseError> {
     Ok(Request { method, path, body })
 }
 
+/// Whether the client has closed the connection (or half-closed it, which looks the same).
+/// Toggles the socket's non-blocking flag, which clones share too, so only call this from the
+/// thread that writes to the socket.
+pub fn peer_gone(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let peeked = stream.peek(&mut [0]);
+    let restored = stream.set_nonblocking(false);
+    match peeked {
+        Ok(n) => n == 0,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => restored.is_err(),
+        Err(_) => true,
+    }
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -119,6 +136,34 @@ mod tests {
             (r.method.as_str(), r.path.as_str(), r.body.as_slice()),
             ("POST", "/v1/chat/completions", &b"abcd"[..])
         );
+    }
+
+    #[test]
+    fn peer_gone_turns_true_only_after_the_client_closes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(!peer_gone(&server));
+        drop(client);
+        // The FIN arrives asynchronously, even on loopback.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !peer_gone(&server) {
+            assert!(std::time::Instant::now() < deadline, "close not seen");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn peer_gone_leaves_the_socket_blocking() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        peer_gone(&server);
+        client.write_all(b"x").unwrap();
+        let mut b = [0];
+        // A socket left non-blocking could fail this read with WouldBlock.
+        server.read_exact(&mut b).unwrap();
+        assert_eq!(b, *b"x");
     }
 
     #[test]

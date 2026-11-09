@@ -1,7 +1,7 @@
 //! Model + tokenizer + chat template, and the token generation loop shared by the CLI and server.
 
 use crate::chat::{ChatTemplate, Message};
-use crate::model::{Model, Session};
+use crate::model::{Model, PROMPT_SLICE, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use rli_gguf::{Gguf, Result};
@@ -28,7 +28,7 @@ pub enum Finish {
     Stop,
     /// `max_tokens` or the context limit was reached.
     Length,
-    /// The token callback asked to stop.
+    /// `is_cancelled` or the token callback asked to stop.
     Cancelled,
 }
 
@@ -114,13 +114,29 @@ impl Engine {
     ///
     /// If the session already holds a prefix of `prompt`, that prefix's KV cache is reused.
     /// `on_text` receives decoded text as it becomes valid UTF-8 and returns `false` to cancel.
+    /// `is_cancelled` is polled before any work, between prompt slices and before each token, so
+    /// a caller that has lost interest doesn't need text to arrive to stop. Cancelling leaves the
+    /// session consistent: a retry reuses what was evaluated.
     pub fn generate(
         &self,
         sess: &mut Session,
         prompt: &[u32],
         params: &GenParams,
+        is_cancelled: impl Fn() -> bool,
         mut on_text: impl FnMut(&str) -> bool,
     ) -> GenOutput {
+        // Before truncating: a request cancelled while queued must not evict the cached prefix.
+        if is_cancelled() {
+            return GenOutput {
+                text: String::new(),
+                prompt_tokens: prompt.len(),
+                prompt_evaluated: 0,
+                completion_tokens: 0,
+                finish: Finish::Cancelled,
+                prefill_secs: 0.0,
+                decode_secs: 0.0,
+            };
+        }
         let kv_dim = self.model.cfg.kv_dim();
         let common = sess
             .tokens
@@ -146,10 +162,22 @@ impl Engine {
         }
 
         let t0 = Instant::now();
-        let mut logits = self
-            .model
-            .forward_batch(sess, &prompt[keep..], true)
-            .expect("logits requested");
+        let to_eval = &prompt[keep..];
+        let mut evaluated = 0;
+        let mut last = None;
+        for slice in to_eval.chunks(PROMPT_SLICE) {
+            if evaluated > 0 && is_cancelled() {
+                out.prompt_evaluated = evaluated;
+                out.finish = Finish::Cancelled;
+                out.prefill_secs = t0.elapsed().as_secs_f64();
+                return out;
+            }
+            evaluated += slice.len();
+            last = self
+                .model
+                .forward_batch(sess, slice, evaluated == to_eval.len());
+        }
+        let mut logits = last.expect("logits requested");
         out.prefill_secs = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
@@ -158,6 +186,10 @@ impl Engine {
         loop {
             if out.completion_tokens >= params.max_tokens || sess.len() >= sess.max_ctx {
                 out.finish = Finish::Length;
+                break;
+            }
+            if is_cancelled() {
+                out.finish = Finish::Cancelled;
                 break;
             }
             let next = sampler.sample(&mut logits, &sess.tokens);

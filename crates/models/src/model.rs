@@ -11,6 +11,10 @@ use std::any::Any;
 /// Prompt tokens per CPU pass: amortizes weight reads while keeping scratch buffers (and the
 /// quantized activations each weight block is multiplied against) cache-sized.
 const CPU_CHUNK: usize = 64;
+/// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls. A multiple
+/// of every backend's chunk size, so slicing a prompt moves no chunk boundaries.
+pub const PROMPT_SLICE: usize = 256;
+const _: () = assert!(PROMPT_SLICE.is_multiple_of(CPU_CHUNK));
 
 /// A weight matrix identified by its location in the mapped file, so CPU kernels and
 /// accelerator backends address the same bytes without copies.
