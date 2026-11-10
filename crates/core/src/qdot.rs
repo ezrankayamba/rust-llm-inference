@@ -907,19 +907,11 @@ mod avx2 {
         _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
     }
 
-    /// [`dot32`] with each 16-bit pair sum multiplied by `scale`'s matching lane, in the same
-    /// `madd` (exact: a pair is at most 2 · 128 · 127, and a scale fits in an i8).
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn dot32_scaled(w: __m256i, x: *const i8, scale: __m256i) -> __m256i {
-        // SAFETY: the caller guarantees 32 readable values at `x`.
-        let x = unsafe { _mm256_loadu_si256(x.cast()) };
-        let pairs = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
-        _mm256_madd_epi16(pairs, scale)
-    }
-
-    /// [`dot_rows`] for Q4_K (`FIVE` false) and Q5_K, with each super-block's scales and mins
-    /// decoded once rather than per 32 weights.
+    /// [`dot_rows`] for Q4_K (`FIVE` false) and Q5_K. A super-block's eight sub-blocks go into
+    /// four partial sums that don't wait on each other, and only their total joins the running
+    /// sum, so the loop isn't held to one multiply-add latency per 32 weights. The 6-bit scales
+    /// go on in integer arithmetic (exact) as the `madd` multiplier, and the mins are one vector
+    /// multiply-add per super-block.
     #[target_feature(enable = "avx2,fma,f16c")]
     #[inline]
     unsafe fn k_rows<const N: usize, const FIVE: bool>(
@@ -928,7 +920,7 @@ mod avx2 {
         xd: [*const f32; N],
         xs: [*const f32; N],
         acc: &mut [__m256; N],
-        extra: &mut [f32; N],
+        extra: &mut [__m256; N],
     ) {
         let bb = if FIVE { 176 } else { 144 };
         let ql_at = if FIVE { 48 } else { 16 };
@@ -937,22 +929,24 @@ mod avx2 {
         // SAFETY: per `dot_rows`, whose block count bounds every token's activations.
         unsafe {
             for (i, b) in row.chunks_exact(bb).enumerate() {
-                // Each sub-block's d·scale and dmin·min, all eight at once.
                 let (sc, mn) = scales_mins_k4(&b[4..16]);
-                let times = |bytes: u64, f: f32| {
-                    let v =
-                        _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(bytes as i64)));
-                    let mut out = [0f32; 8];
-                    _mm256_storeu_ps(out.as_mut_ptr(), _mm256_mul_ps(v, _mm256_set1_ps(f)));
-                    out
-                };
-                let (dsc, dm) = (times(sc, le16(b, 0)), times(mn, le16(b, 2)));
+                // The eight scales as 16-bit lanes, in both halves for the shuffles below.
+                let sc =
+                    _mm256_broadcastsi128_si256(_mm_cvtepu8_epi16(_mm_cvtsi64_si128(sc as i64)));
+                let mn = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(mn as i64)));
+                let dmin = _mm256_mul_ps(mn, _mm256_set1_ps(le16(b, 2)));
+                let d = _mm256_set1_ps(le16(b, 0));
+                let xb = i * (QK_K / QK);
+                for t in 0..N {
+                    extra[t] = _mm256_fnmadd_ps(dmin, _mm256_loadu_ps(xs[t].add(xb)), extra[t]);
+                }
                 let qh = if FIVE {
                     _mm256_loadu_si256(b.as_ptr().add(16).cast())
                 } else {
                     _mm256_setzero_si256()
                 };
-                for g in 0..4 {
+                let mut part = [[_mm256_setzero_ps(); N]; 4];
+                for (g, part) in part.iter_mut().enumerate() {
                     let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * g).cast());
                     for half in 0..2 {
                         let sub = 2 * g + half;
@@ -962,30 +956,35 @@ mod avx2 {
                             high_nibbles(q)
                         };
                         if FIVE {
-                            let bit = _mm256_set1_epi8(1 << sub);
-                            let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
-                            w = _mm256_or_si256(w, _mm256_and_si256(set, sixteen));
+                            // Bit `sub` of each byte, moved to bit 4. The 16-bit shifts carry
+                            // a neighbouring byte's bits in, which the mask drops.
+                            let bit = if sub <= 4 {
+                                _mm256_sll_epi16(qh, _mm_cvtsi32_si128(4 - sub as i32))
+                            } else {
+                                _mm256_srl_epi16(qh, _mm_cvtsi32_si128(sub as i32 - 4))
+                            };
+                            w = _mm256_or_si256(w, _mm256_and_si256(bit, sixteen));
                         }
-                        let xb = i * (QK_K / QK) + sub;
+                        // This sub-block's scale in every 16-bit lane.
+                        let pick = _mm256_set1_epi16((((2 * sub + 1) << 8) | (2 * sub)) as i16);
+                        let scale = _mm256_shuffle_epi8(sc, pick);
                         for t in 0..N {
-                            let s = dot32_unsigned(w, xq[t].add(xb * QK));
-                            let scale = _mm256_set1_ps(dsc[sub] * *xd[t].add(xb));
-                            acc[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, acc[t]);
-                            extra[t] -= dm[sub] * *xs[t].add(xb);
+                            let x = _mm256_loadu_si256(xq[t].add((xb + sub) * QK).cast());
+                            let s = _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), scale);
+                            let xd = _mm256_broadcast_ss(&*xd[t].add(xb + sub));
+                            part[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), xd, part[t]);
                         }
                     }
                 }
+                for t in 0..N {
+                    let sum = _mm256_add_ps(
+                        _mm256_add_ps(part[0][t], part[1][t]),
+                        _mm256_add_ps(part[2][t], part[3][t]),
+                    );
+                    acc[t] = _mm256_fmadd_ps(sum, d, acc[t]);
+                }
             }
         }
-    }
-
-    /// [`dot32`] for weights known to be non-negative, which skips moving the sign.
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn dot32_unsigned(w: __m256i, x: *const i8) -> __m256i {
-        // SAFETY: the caller guarantees 32 readable values at `x`.
-        let x = unsafe { _mm256_loadu_si256(x.cast()) };
-        _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), _mm256_set1_epi16(1))
     }
 
     /// Each byte's high nibble, in the low four bits of the byte.
@@ -1047,60 +1046,102 @@ mod avx2 {
             assert!(a.d.len() * QK == a.qs.len() && a.sum.len() == a.d.len());
         }
         let mut acc = [_mm256_setzero_ps(); N];
-        // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
-        let mut extra = [0f32; N];
-        let add = |acc: __m256, s: __m256i, scale: f32| -> __m256 {
-            _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), _mm256_set1_ps(scale), acc)
-        };
-        let blocks = row.chunks_exact(bb).enumerate();
+        // The K-quant mins' terms, kept apart from the weights' sums.
+        let mut extra = [_mm256_setzero_ps(); N];
         // SAFETY (all blocks below): every pointer offset stays inside the current block of `row`
         // or each token's activations (n_blocks * block_size values and n_blocks * block_size / 32
         // scales and sums), as asserted above.
         unsafe {
+            // The 32-weight formats, whose blocks start with their f16 scale: `$weights` decodes
+            // a block's weights, as stored values that stand for themselves minus `$off`. Four
+            // running sums take the blocks in turn, so a block's multiply-add doesn't wait for
+            // the one before it (a single sum held the loop to one multiply-add latency per
+            // block). Four blocks' scales are converted together: one f16 at a time compiles to
+            // an insert into a register an earlier sum last wrote, which chains the sums again.
+            // With an offset, the weights stay unsigned for `maddubs` and the offset comes off
+            // through the activations' sums, which saves moving each block's signs.
+            macro_rules! blocks32 {
+                ($off:literal, $weights:expr) => {{
+                    let weights = $weights;
+                    let mut acc4 = [[_mm256_setzero_ps(); 4]; N];
+                    let mut sums = [_mm_setzero_ps(); N];
+                    let ones = _mm256_set1_epi16(1);
+                    let h = |b: *const u8| b.cast::<u16>().read_unaligned().to_le() as u64;
+                    for i in (0..n_blocks / 4).map(|i| 4 * i) {
+                        let b = row.as_ptr().add(i * bb);
+                        let d = h(b)
+                            | h(b.add(bb)) << 16
+                            | h(b.add(2 * bb)) << 32
+                            | h(b.add(3 * bb)) << 48;
+                        let d = _mm_cvtph_ps(_mm_cvtsi64_si128(d as i64));
+                        let mut scales = [_mm256_setzero_ps(); N];
+                        for t in 0..N {
+                            let s = _mm_mul_ps(d, _mm_loadu_ps(xd[t].add(i)));
+                            scales[t] = _mm256_castps128_ps256(s);
+                            if $off != 0 {
+                                sums[t] = _mm_fmadd_ps(d, _mm_loadu_ps(xs[t].add(i)), sums[t]);
+                            }
+                        }
+                        for k in 0..4 {
+                            let w: __m256i = weights(b.add(k * bb + 2));
+                            let lane = _mm256_set1_epi32(k as i32);
+                            for t in 0..N {
+                                let x = xq[t].add((i + k) * QK);
+                                let s = if $off != 0 {
+                                    let x = _mm256_loadu_si256(x.cast());
+                                    _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), ones)
+                                } else {
+                                    dot32(w, x)
+                                };
+                                let scale = _mm256_permutevar8x32_ps(scales[t], lane);
+                                acc4[t][k] =
+                                    _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, acc4[t][k]);
+                            }
+                        }
+                    }
+                    for i in n_blocks / 4 * 4..n_blocks {
+                        let b = row.as_ptr().add(i * bb);
+                        let w: __m256i = weights(b.add(2));
+                        let w = _mm256_sub_epi8(w, _mm256_set1_epi8($off));
+                        let d = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi64_si128(h(b) as i64)));
+                        for t in 0..N {
+                            let s = dot32(w, xq[t].add(i * QK));
+                            let scale = _mm256_set1_ps(d * *xd[t].add(i));
+                            acc4[t][0] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), scale, acc4[t][0]);
+                        }
+                    }
+                    for t in 0..N {
+                        let a = acc4[t];
+                        acc[t] =
+                            _mm256_add_ps(_mm256_add_ps(a[0], a[1]), _mm256_add_ps(a[2], a[3]));
+                        let off = _mm_mul_ps(sums[t], _mm_set1_ps(-($off as f32)));
+                        extra[t] = _mm256_zextps128_ps256(off);
+                    }
+                }};
+            }
             match ty {
-                GgmlType::Q8_0 => {
-                    for (i, b) in blocks {
-                        let w = _mm256_loadu_si256(b.as_ptr().add(2).cast());
-                        let d = le16(b, 0);
-                        for t in 0..N {
-                            let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
-                        }
-                    }
-                }
-                GgmlType::Q4_0 => {
-                    let eight = _mm256_set1_epi8(8);
-                    for (i, b) in blocks {
-                        let w = _mm256_sub_epi8(unpack_nibbles(b.as_ptr().add(2)), eight);
-                        let d = le16(b, 0);
-                        for t in 0..N {
-                            let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
-                        }
-                    }
-                }
-                GgmlType::Q5_0 => {
-                    let sixteen = _mm256_set1_epi8(16);
-                    for (i, b) in blocks {
-                        let qh = b.as_ptr().add(2).cast::<u32>().read_unaligned().to_le();
-                        let w = _mm256_or_si256(unpack_nibbles(b.as_ptr().add(6)), high_bits(qh));
-                        let w = _mm256_sub_epi8(w, sixteen);
-                        let d = le16(b, 0);
-                        for t in 0..N {
-                            let s = dot32(w, xq[t].add(i * QK));
-                            acc[t] = add(acc[t], s, d * *xd[t].add(i));
-                        }
-                    }
-                }
+                GgmlType::Q8_0 => blocks32!(0, |q: *const u8| _mm256_loadu_si256(q.cast())),
+                GgmlType::Q4_0 => blocks32!(8, |q: *const u8| unpack_nibbles(q)),
+                GgmlType::Q5_0 => blocks32!(16, |q: *const u8| {
+                    let qh = q.cast::<u32>().read_unaligned().to_le();
+                    _mm256_or_si256(unpack_nibbles(q.add(4)), high_bits(qh))
+                }),
                 GgmlType::Q4_K => k_rows::<N, false>(row, xq, xd, xs, &mut acc, &mut extra),
                 GgmlType::Q5_K => k_rows::<N, true>(row, xq, xd, xs, &mut acc, &mut extra),
                 GgmlType::Q6_K => {
                     let m4 = _mm256_set1_epi8(0xf);
                     let three = _mm256_set1_epi8(3);
                     let off = _mm256_set1_epi8(32);
-                    for (i, b) in blocks {
-                        let d = le16(b, 208);
+                    // The 16 scales with the even ones first, so that as 16-bit lanes each
+                    // half of the register holds one half-block's scale of every pair.
+                    let split = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+                    for (i, b) in row.chunks_exact(bb).enumerate() {
+                        let d = _mm256_set1_ps(le16(b, 208));
                         let p = b.as_ptr();
+                        let sc = _mm_shuffle_epi8(_mm_loadu_si128(p.add(192).cast()), split);
+                        let sc = _mm256_cvtepi8_epi16(sc);
+                        // Four partial sums per super-block, as in `k_rows`.
+                        let mut part = [[_mm256_setzero_ps(); 4]; N];
                         for n in 0..2 {
                             let ql = [
                                 _mm256_loadu_si256(p.add(64 * n).cast()),
@@ -1117,21 +1158,34 @@ mod avx2 {
                                 let shift = _mm_cvtsi32_si128(2 * k as i32);
                                 let hi = _mm256_and_si256(_mm256_srl_epi16(qh, shift), three);
                                 let w = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
-                                let w = _mm256_sub_epi8(w, off);
-                                let xb = i * (QK_K / QK) + 4 * n + k;
+                                let j = 4 * n + k;
+                                let xb = i * (QK_K / QK) + j;
                                 // Each half's i8 scale goes on in integer arithmetic (exact)
                                 // before the one float multiply, as the `madd` multiplier: the
                                 // halves are the two 128-bit lanes of the partial sums.
-                                let sc = p.add(192 + 8 * n + 2 * k).cast::<i8>();
-                                let scale = _mm256_set_m128i(
-                                    _mm_set1_epi16(*sc.add(1) as i16),
-                                    _mm_set1_epi16(*sc as i16),
-                                );
+                                let pick = _mm256_set1_epi16((((2 * j + 1) << 8) | (2 * j)) as i16);
+                                let scale = _mm256_shuffle_epi8(sc, pick);
                                 for t in 0..N {
-                                    let s = dot32_scaled(w, xq[t].add(xb * QK), scale);
-                                    acc[t] = add(acc[t], s, d * *xd[t].add(xb));
+                                    // Weights are stored plus 32 and `maddubs` wants them
+                                    // unsigned, so the 32 comes off as its own product: pair
+                                    // sums reach 2 · 63 · 127 and 2 · 32 · 127, inside an i16.
+                                    let x = _mm256_loadu_si256(xq[t].add(xb * QK).cast());
+                                    let pairs = _mm256_sub_epi16(
+                                        _mm256_maddubs_epi16(w, x),
+                                        _mm256_maddubs_epi16(off, x),
+                                    );
+                                    let s = _mm256_madd_epi16(pairs, scale);
+                                    let xd = _mm256_broadcast_ss(&*xd[t].add(xb));
+                                    part[t][k] =
+                                        _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), xd, part[t][k]);
                                 }
                             }
+                        }
+                        for t in 0..N {
+                            let p = part[t];
+                            let sum =
+                                _mm256_add_ps(_mm256_add_ps(p[0], p[1]), _mm256_add_ps(p[2], p[3]));
+                            acc[t] = _mm256_fmadd_ps(sum, d, acc[t]);
                         }
                     }
                 }
@@ -1139,7 +1193,7 @@ mod avx2 {
             }
         }
         for t in 0..N {
-            out[t] = hsum(acc[t]) + extra[t];
+            out[t] = hsum(_mm256_add_ps(acc[t], extra[t]));
         }
         true
     }
