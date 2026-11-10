@@ -10,6 +10,15 @@ use crate::quant::{GgmlType, QK_K};
 
 const QK: usize = 32;
 
+/// Activation blocks per group that shares a base scale: a K-quant super-block's worth.
+const GROUP: usize = QK_K / QK;
+
+/// A block's scale is its group's largest block scale times a whole number of this many parts.
+/// A block much quieter than its group's loudest gets a slightly coarser scale than its own
+/// (at most 2% coarser at a fifth of the loudest, up to 2x below 1/255 of it), where its error
+/// is far below the loud block's anyway.
+const RATIO_MAX: f32 = 255.0;
+
 /// Activations quantized to Q8 in blocks of 32.
 #[derive(Clone)]
 pub struct Q8Act {
@@ -31,22 +40,31 @@ impl Q8Act {
             sum: Vec::with_capacity(n),
             qs: vec![0; x.len()],
         };
-        for (blk, qs) in x
-            .as_chunks::<QK>()
-            .0
-            .iter()
-            .zip(a.qs.as_chunks_mut::<QK>().0.iter_mut())
-        {
-            let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let d = amax / 127.0;
-            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-            let mut s = 0i32;
-            for (q, &v) in qs.iter_mut().zip(blk) {
-                *q = (v * id).round() as i8;
-                s += *q as i32;
+        let amax = |v: &[f32]| v.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let groups = x.chunks(QK * GROUP).zip(a.qs.chunks_mut(QK * GROUP));
+        for (xg, qg) in groups {
+            let base = amax(xg) / 127.0;
+            for (blk, qs) in xg.chunks_exact(QK).zip(qg.chunks_exact_mut(QK)) {
+                // The smallest ratio whose scale still covers the block's largest value.
+                let exact = amax(blk) / 127.0;
+                let mut r = if base != 0.0 {
+                    (exact / base * RATIO_MAX).ceil().clamp(1.0, RATIO_MAX)
+                } else {
+                    1.0
+                };
+                if base * (r / RATIO_MAX) < exact && r < RATIO_MAX {
+                    r += 1.0;
+                }
+                let d = base * (r / RATIO_MAX);
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let mut s = 0i32;
+                for (q, &v) in qs.iter_mut().zip(blk) {
+                    *q = (v * id).round() as i8;
+                    s += *q as i32;
+                }
+                a.d.push(d);
+                a.sum.push(d * s as f32);
             }
-            a.d.push(d);
-            a.sum.push(d * s as f32);
         }
         a
     }
