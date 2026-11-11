@@ -34,7 +34,9 @@ Workspace crates (dependencies flow downward only):
   all 8 rows (weights stay in the mapping; no repacked copy), or 16 rows with `vpdpbusd` where the CPU
   has AVX-512 VNNI, which must match the AVX2 kernel bit for bit. Either way batched int8 results differ from
   per-token ones by float rounding. The AVX2 one-row kernel, most of x86 decode time, keeps a K-quant
-  super-block in i32 and spreads the 32-weight formats over four sums, so no sum waits on the last), and ops (RMSNorm, RoPE, softmax, SwiGLU).
+  super-block in i32 and spreads the 32-weight formats over four sums, so no sum waits on the last; on Intel CPUs
+  only, its caller prefetches the bytes 1152 ahead of each row, which was worth 1.7x in decode there and
+  cost up to 18% on AMD), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and

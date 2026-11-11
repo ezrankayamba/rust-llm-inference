@@ -3,6 +3,43 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-11: prefetching rows on Intel (decode), one thread
+
+`Benchmark` workflow with `base=main` on the PR #7 branch (run 43075955195), Intel Xeon 6975P-C.
+
+| Model | Decode before tok/s | Decode after tok/s | Prompt tok/s |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 9.2 | 15.8 | 69 (unchanged) |
+| Qwen2.5-0.5B Q4_K_M | 17.6 | 30.8 | 145 (unchanged) |
+
+This answers the open question in the next section. Decode reads every weight once per token, and
+on Intel runners the one-row kernel slowed down once the weights no longer fit in cache. Scratch
+branch `intel-probe` (deleted) ran `bench_matvec` with 400000 rows instead of 5632 (run 43064994879,
+Xeon 6975P-C against run 43064986231, EPYC 9V74):
+
+| Format | Xeon, 5632 rows GB/s | Xeon, 400000 rows GB/s | EPYC, 5632 rows GB/s | EPYC, 400000 rows GB/s |
+|---|---:|---:|---:|---:|
+| Q8_0 | 23.2 | 11.8 | 30.7 | 30.6 |
+| Q4_K | 17.1 | 5.5 | 20.3 | 18.9 |
+| Q6_K | 18.4 | 11.9 | 21.4 | 21.7 |
+
+llama.cpp (native build) was slow on the same Xeon: Llama-3.2-1B decode 11.5 tok/s against rli's
+8.7, where on the EPYC 9V74 it was 30.3 against 25.0. Why the Xeon's own prefetching does not keep
+up was not investigated.
+
+The fix asks for the bytes 1152 ahead of each row before the row kernel runs, on Intel CPUs only.
+Distances tried on Xeon 6973P-C and 6975P-C (runs 43070276411, 43070287058, 43073436141,
+43073570890), Llama-3.2-1B decode tok/s: off 8.5, 1152 bytes 14.8, 2304 14.7, 4608 10.2, 9216 11.9,
+18432 12.1; starting at the next row instead 14.1. With two threads on the runner's one core,
+Llama-3.2-1B went 15.8 -> 16.4 and Qwen2.5-0.5B 27.6 -> 32.4.
+
+The same prefetch made AMD slower, so it is off there: EPYC 9V74 decode 25.0 -> 20.3 at 1152 bytes
+(run 43068339866), EPYC 9V45 33.9 -> 32.3, EPYC 7763 17.1 -> 16.3. With the vendor check, six
+`base=main` runs on those three CPUs showed no change.
+
+Not measured: Intel generations before Granite Rapids (the Xeon 8370C and 8573C runners showed the
+same slow decode, 10-11 tok/s, but no run with the prefetch landed on them), and the NEON kernel.
+
 ## 2026-11-11: AVX-512 VNNI block kernel (prompts), one thread
 
 `Benchmark` workflow with `base=main` on eebd36d (run 42961812565), AMD EPYC 9V74.
@@ -32,7 +69,7 @@ measured.
 Open question from run 43050974549: on the Xeon Platinum 8573C, Llama-3.2-1B decoded at 10.1 tok/s
 against about 25 on the EPYC 9V74, while prompts ran at 60 tok/s against 52 (AVX2 kernel on both).
 The Q4_K matvec was only 1.4x slower (0.445 ms against 0.322), so the row kernel alone does not
-explain it. Cause unknown.
+explain it. Answered above: the weights do not fit in cache during decode.
 
 ## 2026-11-11: x86 CPU against llama.cpp, one thread
 
