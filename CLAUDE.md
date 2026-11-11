@@ -32,7 +32,8 @@ Workspace crates (dependencies flow downward only):
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
   decode 8 weight rows at a time into an interleaved panel in L1, so one broadcast activation load serves
   all 8 rows (weights stay in the mapping; no repacked copy). Either way batched int8 results differ from
-  per-token ones by float rounding), and ops (RMSNorm, RoPE, softmax, SwiGLU).
+  per-token ones by float rounding. The AVX2 one-row kernel, most of x86 decode time, keeps a K-quant
+  super-block in i32 and spreads the 32-weight formats over four sums, so no sum waits on the last), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and
@@ -170,4 +171,5 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
   comparison of int8 kernels, and it doesn't carry over to x86.
 
 Performance-sensitive changes to kernels or the hot path need before/after benchmark numbers. Debug
-builds are not representative, so always measure with `--release`.
+builds are not representative, so always measure with `--release`. Record results worth keeping in
+`docs/benchmarks.md`, with the run or command that produced them.
