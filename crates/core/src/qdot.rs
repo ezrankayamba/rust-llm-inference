@@ -1319,6 +1319,7 @@ mod avx2 {
     /// [`HALVES`], u8 for [`OFFSET`]), with its float scale `d`, its offset `m`, and the
     /// integer scales of its two halves.
     #[target_feature(enable = "avx2,f16c")]
+    #[inline]
     unsafe fn decode(ty: GgmlType, row: &[u8], j: usize) -> (__m256i, f32, f32, [i16; 2]) {
         let bb = ty.block_bytes();
         let m4 = _mm256_set1_epi8(0xf);
@@ -1390,6 +1391,27 @@ mod avx2 {
         }
     }
 
+    /// Four rows of eight i32 turned on their side: vector `k` of the result holds lane `k` of
+    /// the four rows in its low half and lane `k + 4` of them in its high half.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn transpose4(r: [__m256i; 4]) -> [__m256i; 4] {
+        let (t0, t1) = (
+            _mm256_unpacklo_epi32(r[0], r[1]),
+            _mm256_unpackhi_epi32(r[0], r[1]),
+        );
+        let (t2, t3) = (
+            _mm256_unpacklo_epi32(r[2], r[3]),
+            _mm256_unpackhi_epi32(r[2], r[3]),
+        );
+        [
+            _mm256_unpacklo_epi64(t0, t2),
+            _mm256_unpackhi_epi64(t0, t2),
+            _mm256_unpacklo_epi64(t1, t3),
+            _mm256_unpackhi_epi64(t1, t3),
+        ]
+    }
+
     /// Chunks of eight rows decoded and interleaved, so that one 4-byte group of a token's
     /// activations, broadcast, meets the matching group of all eight rows: vector `8c + k` holds,
     /// in its i32 lane `r`, weights `4k..4k + 4` of chunk `c` of row `r`.
@@ -1410,28 +1432,30 @@ mod avx2 {
             self.m.clear();
             self.hs.clear();
             for j in chunks {
-                let mut lanes = [[0i32; 8]; 8];
+                let mut w = [_mm256_setzero_si256(); 8];
                 let (mut d, mut m, mut hs) = ([0f32; 8], [0f32; 8], [[0i16; 16]; 2]);
                 for (r, row) in rows.iter().enumerate() {
                     // SAFETY: `j` is a chunk of the row, per the caller.
-                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
-                    let mut bytes = [0i32; 8];
-                    // SAFETY: 32 writable bytes.
-                    unsafe { _mm256_storeu_si256(bytes.as_mut_ptr().cast(), w) };
-                    for (k, v) in bytes.into_iter().enumerate() {
-                        lanes[k][r] = v;
-                    }
+                    let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                    w[r] = rw;
                     (d[r], m[r]) = (rd, rm);
                     for h in 0..2 {
                         hs[h][2 * r] = rh[h];
                         hs[h][2 * r + 1] = rh[h];
                     }
                 }
+                // Rows to lanes in registers: writing each 4-byte group to memory and loading
+                // the vectors back was a quarter of prompt time.
+                let (lo, hi) = (
+                    transpose4([w[0], w[1], w[2], w[3]]),
+                    transpose4([w[4], w[5], w[6], w[7]]),
+                );
+                self.w
+                    .extend((0..4).map(|k| _mm256_permute2x128_si256(lo[k], hi[k], 0x20)));
+                self.w
+                    .extend((0..4).map(|k| _mm256_permute2x128_si256(lo[k], hi[k], 0x31)));
                 // SAFETY: each source holds 32 bytes.
                 unsafe {
-                    for l in &lanes {
-                        self.w.push(_mm256_loadu_si256(l.as_ptr().cast()));
-                    }
                     self.d.push(_mm256_loadu_ps(d.as_ptr()));
                     self.m.push(_mm256_loadu_ps(m.as_ptr()));
                     self.hs
@@ -1624,29 +1648,33 @@ mod avx2 {
             };
             let flip = _mm256_set1_epi8(flip);
             for j in chunks {
-                let mut lanes = [[0i32; 16]; 8];
+                let mut w = [_mm256_setzero_si256(); 16];
                 let (mut d, mut m, mut hs) = ([0f32; 16], [0f32; 16], [[0i32; 16]; 2]);
                 for (r, row) in rows.iter().enumerate() {
                     // SAFETY: `j` is a chunk of the row, per the caller.
-                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
-                    let mut bytes = [0i32; 8];
-                    // SAFETY: 32 writable bytes.
-                    unsafe {
-                        _mm256_storeu_si256(bytes.as_mut_ptr().cast(), _mm256_xor_si256(w, flip))
-                    };
-                    for (k, v) in bytes.into_iter().enumerate() {
-                        lanes[k][r] = v;
-                    }
+                    let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                    w[r] = _mm256_xor_si256(rw, flip);
                     (d[r], m[r]) = (rd, rm);
                     for h in 0..2 {
                         hs[h][r] = rh[h] as i32;
                     }
                 }
+                // Rows to lanes in registers, as in `Panel::fill`: each group of four rows on
+                // its side, then the groups' halves side by side.
+                let g: [[__m256i; 4]; 4] = std::array::from_fn(|g| {
+                    transpose4([w[4 * g], w[4 * g + 1], w[4 * g + 2], w[4 * g + 3]])
+                });
+                let pair =
+                    |a: __m256i, b: __m256i| _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1);
+                let mut cols = [_mm512_setzero_si512(); 8];
+                for k in 0..4 {
+                    let (ab, cd) = (pair(g[0][k], g[1][k]), pair(g[2][k], g[3][k]));
+                    cols[k] = _mm512_shuffle_i32x4(ab, cd, 0x88);
+                    cols[k + 4] = _mm512_shuffle_i32x4(ab, cd, 0xdd);
+                }
+                self.w.extend_from_slice(&cols);
                 // SAFETY: each source holds 64 bytes.
                 unsafe {
-                    for l in &lanes {
-                        self.w.push(_mm512_loadu_si512(l.as_ptr().cast()));
-                    }
                     self.d.push(_mm512_loadu_ps(d.as_ptr()));
                     self.m.push(_mm512_loadu_ps(m.as_ptr()));
                     self.hs

@@ -11,6 +11,9 @@ on:
         description: Profile decode with perf instead (first model only)
         type: boolean
         default: false
+      profile_run:
+        description: With profile, the bench arguments to profile
+        default: "--pp 0 --tg 256 --reps 2"
       threads:
         description: Comma-separated thread counts
         default: "1"
@@ -36,6 +39,7 @@ jobs:
     timeout-minutes: 20
     env:
       MODELS: ${{ inputs.models }}
+      PROFILE_RUN: ${{ inputs.profile_run }}
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -50,7 +54,7 @@ jobs:
           curl -fsSL --retry 3 -o "$model" "$url"
           target/release/examples/bench "$model" --pp 0 --tg 64 --reps 1 --threads 1
           perf record -q -o "$RUNNER_TEMP/perf.data" -- \
-            target/release/examples/bench "$model" --pp 0 --tg 256 --reps 2 --threads 1
+            target/release/examples/bench "$model" $PROFILE_RUN --threads 1
           perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
             | head -25 | cut -c1-160
           perf stat -e cycles,instructions,cache-misses -- \
