@@ -49,19 +49,18 @@ impl Q8Act {
             sum: Vec::with_capacity(n),
             qs: vec![0; x.len()],
         };
-        let amax = |v: &[f32]| v.iter().fold(0f32, |m, v| m.max(v.abs()));
         let groups = x.chunks(QK * GROUP).zip(a.qs.chunks_mut(QK * GROUP));
         for (xg, qg) in groups {
-            let base = amax(xg) / 127.0;
+            // Each block's own scale, found once: the group's base is the largest of them.
+            let blocks = xg.as_chunks::<QK>().0;
+            let mut exact = [0f32; GROUP];
+            for (e, blk) in exact.iter_mut().zip(blocks) {
+                *e = blk.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+            }
+            let base = exact.iter().fold(0f32, |m, &e| m.max(e));
             a.unit.push(base / RATIO_MAX);
-            for (blk, qs) in xg
-                .as_chunks::<QK>()
-                .0
-                .iter()
-                .zip(qg.as_chunks_mut::<QK>().0)
-            {
+            for ((blk, qs), exact) in blocks.iter().zip(qg.as_chunks_mut::<QK>().0).zip(exact) {
                 // The smallest ratio whose scale still covers the block's largest value.
-                let exact = amax(blk) / 127.0;
                 let mut r = if base != 0.0 {
                     (exact / base * RATIO_MAX).ceil().clamp(1.0, RATIO_MAX)
                 } else {
