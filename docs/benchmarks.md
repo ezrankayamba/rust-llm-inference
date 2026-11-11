@@ -3,6 +3,37 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-11: AVX-512 VNNI block kernel (prompts), one thread
+
+`Benchmark` workflow with `base=main` on eebd36d (run 42961812565), AMD EPYC 9V74.
+
+| Model | Prompt before tok/s | Prompt after tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 51.9 | 67.1 | 25.2 (unchanged) |
+| Qwen2.5-0.5B Q4_K_M | 119.4 | 142.6 | 40.6 -> 41.1 |
+
+64-token matmul (`bench_matvec`, 5632 x 2048): Q8_0 15.2 -> 8.9 ms, Q4_0 12.3 -> 9.2, Q5_0 12.3 ->
+9.0, Q4_K 12.6 -> 9.2, Q5_K 12.3 -> 9.3, Q6_K 16.1 -> 9.8.
+
+The kernel takes 16 rows per panel and uses `vpdpbusd`; CPUs without AVX-512 VNNI keep the AVX2
+kernel. `llvm-mca -mcpu=znver4` put its inner loop at 2.2-2.5x the AVX2 one per row; the measured
+matmul gain was 1.3-1.7x.
+
+A perf profile of a 256-token prompt after the change (Llama-3.2-1B, run 43050339226, EPYC 9V74,
+`profile=true`, `profile_run="--pp 256 --tg 0 --reps 6"`, with the fill and inner loop kept out of
+line): inner loop 39%, panel fill 24%, block decode 13%, `Q8Act::new` and `roundf` 7%.
+
+Transposing the panel's rows in registers instead of through memory (PR #6, not merged) did not
+recover the fill's share: Xeon Platinum 8573C prompt +1% and +4% (run 43050974549); a slower EPYC
+9V74 instance -4% and 0%, with the Q4_K matmul 5% slower (run 43052040901). The fill is where a
+matmul first reads its weights, so its share is probably memory, not the interleaving. Not
+measured.
+
+Open question from run 43050974549: on the Xeon Platinum 8573C, Llama-3.2-1B decoded at 10.1 tok/s
+against about 25 on the EPYC 9V74, while prompts ran at 60 tok/s against 52 (AVX2 kernel on both).
+The Q4_K matvec was only 1.4x slower (0.445 ms against 0.322), so the row kernel alone does not
+explain it. Cause unknown.
+
 ## 2026-11-11: x86 CPU against llama.cpp, one thread
 
 `Benchmark` workflow on `main` at 679b213 (run 42957871229), AMD EPYC 9V45 (AVX-512), llama.cpp

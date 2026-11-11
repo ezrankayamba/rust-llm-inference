@@ -31,7 +31,8 @@ Workspace crates (dependencies flow downward only):
   fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
   decode 8 weight rows at a time into an interleaved panel in L1, so one broadcast activation load serves
-  all 8 rows (weights stay in the mapping; no repacked copy). Either way batched int8 results differ from
+  all 8 rows (weights stay in the mapping; no repacked copy), or 16 rows with `vpdpbusd` where the CPU
+  has AVX-512 VNNI, which must match the AVX2 kernel bit for bit. Either way batched int8 results differ from
   per-token ones by float rounding. The AVX2 one-row kernel, most of x86 decode time, keeps a K-quant
   super-block in i32 and spreads the 32-weight formats over four sums, so no sum waits on the last), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
