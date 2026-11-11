@@ -152,6 +152,9 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
   within ±0.3%; Qwen3-30B-A3B (MoE) KL mean 0.004-0.015, max ~1.0, as int8 noise flips expert choices.
   One activation scale per 256 values for K-quants (llama.cpp's Q8_K) raised KL 1.4-6x and cut top-1
   agreement by 1-3 points, so we keep one per 32.
+  Each block's scale is its 256-value group's largest block scale times r/256 (`Q8Act`), which lets the
+  AVX2 K-quant row kernels multiply by r as an integer and convert to float once per super-block; against
+  free per-32 scales that moved KL mean by x0.8-1.25 and top-1 agreement by under 1 point (2026-11-11).
 - Fixtures: `scripts/gen_quant_fixture.py` (dequant reference) and `scripts/make_tiny_moe.py`
   (tiny MoE GGUFs plus their reference logits, used by `crates/models/tests/moe_reference.rs`).
 - Throughput: `cargo run --release -p rli-models --features metal --example bench -- <model> [--pp 512] [--tg 128] [--depth D] [--reps 3] [--gpu-layers N]`
