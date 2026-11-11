@@ -161,6 +161,9 @@ pub fn dot_rows_q8(ty: GgmlType, row: &[u8], acts: &[Q8Act], out: &mut [f32]) {
     }
     #[cfg(target_arch = "x86_64")]
     if crate::simd::x86::has_avx2() {
+        if crate::simd::x86::prefetch_rows() {
+            avx2::prefetch_ahead(row);
+        }
         // SAFETY: AVX2, FMA and F16C checked at runtime; sizes are asserted inside.
         let done = unsafe {
             match acts.len() {
@@ -1064,6 +1067,23 @@ mod avx2 {
         let bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(qh as i32), spread);
         let set = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bits), bits);
         _mm256_and_si256(set, _mm256_set1_epi8(0x10))
+    }
+
+    /// How far ahead of a row's start [`prefetch_ahead`] begins. The best of 1152 to 18432 bytes,
+    /// and of starting at the next row instead, on Xeon 6973P-C and 6975P-C.
+    const PREFETCH_BYTES: usize = 1152;
+
+    /// Asks for the `row.len()` bytes that start `PREFETCH_BYTES` after `row` does: weights the
+    /// kernel reaches soon, in this row or the rows after it. Decode reads every weight once per
+    /// token, and without this an Intel core read them at a third of the speed it manages in
+    /// cache. May name addresses past the matrix, which a prefetch ignores.
+    #[inline]
+    pub fn prefetch_ahead(row: &[u8]) {
+        for off in (0..row.len()).step_by(64) {
+            let p = row.as_ptr().wrapping_add(PREFETCH_BYTES + off);
+            // SAFETY: a prefetch never faults, whatever the address; SSE is in the x86-64 baseline.
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.cast()) };
+        }
     }
 
     /// Dot products of one encoded row with the activations of `N` tokens, into `out`, unpacking

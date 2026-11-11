@@ -362,6 +362,18 @@ pub(crate) mod x86 {
         })
     }
 
+    /// Whether rows should be prefetched ahead of the one-row kernel: Intel CPUs only. Measured
+    /// on Xeon 6973P-C and 6975P-C (Granite Rapids), where decode over weights larger than the
+    /// cache ran 1.7-1.8x faster with it; on EPYC 9V74 and 9V45 (Zen 4) it was 3-18% slower.
+    pub fn prefetch_rows() -> bool {
+        static INTEL: OnceLock<bool> = OnceLock::new();
+        *INTEL.get_or_init(|| {
+            let id = __cpuid(0);
+            // "GenuineIntel", in the order the registers hold it.
+            (id.ebx, id.edx, id.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e)
+        })
+    }
+
     #[target_feature(enable = "avx2")]
     #[inline]
     pub fn hsum(v: __m256) -> f32 {
