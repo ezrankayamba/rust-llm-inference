@@ -352,6 +352,16 @@ pub(crate) mod x86 {
         })
     }
 
+    /// AVX-512 with VNNI's `vpdpbusd`, on top of [`has_avx2`] (Ice Lake and Zen 4 onwards).
+    pub fn has_avx512_vnni() -> bool {
+        static HAS: OnceLock<bool> = OnceLock::new();
+        *HAS.get_or_init(|| {
+            has_avx2()
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512vnni")
+        })
+    }
+
     #[target_feature(enable = "avx2")]
     #[inline]
     pub fn hsum(v: __m256) -> f32 {

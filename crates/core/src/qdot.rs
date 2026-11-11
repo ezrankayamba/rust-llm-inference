@@ -1261,6 +1261,9 @@ mod avx2 {
         qs: Vec<i8>,
         d: Vec<f32>,
         sum: Vec<f32>,
+        /// For the AVX-512 kernel (empty without it): 128 times the sum of each half chunk's
+        /// 16 values, which is what biasing signed weights by 128 adds to a half's products.
+        bias: Vec<i32>,
     }
 
     impl BlockActs {
@@ -1276,12 +1279,20 @@ mod avx2 {
                 qs: Vec::with_capacity(acts.len() * n_chunks * QK),
                 d: Vec::with_capacity(acts.len() * n_chunks),
                 sum: Vec::with_capacity(acts.len() * n_chunks),
+                bias: Vec::new(),
             };
             for a in acts {
                 assert!(a.d.len() == n_chunks && a.qs.len() == n_chunks * QK);
                 b.qs.extend_from_slice(&a.qs);
                 b.d.extend_from_slice(&a.d);
                 b.sum.extend_from_slice(&a.sum);
+            }
+            if crate::simd::x86::has_avx512_vnni() && kind(ty) != Some(OFFSET) {
+                let halves = b.qs.as_chunks::<{ QK / 2 }>().0;
+                b.bias = halves
+                    .iter()
+                    .map(|h| 128 * h.iter().map(|&q| q as i32).sum::<i32>())
+                    .collect();
             }
             Some(b)
         }
@@ -1498,10 +1509,29 @@ mod avx2 {
     /// in L1 while every token passes over it.
     const PANEL_CHUNKS: usize = 32;
 
-    /// [`super::dot_block`]: rows in eights (the last row repeated to fill the final one) and
-    /// tokens in fours.
+    /// [`super::dot_block`], on the widest kernel the CPU has.
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_block(
+        ty: GgmlType,
+        rows: &[u8],
+        rb: usize,
+        acts: &BlockActs,
+        out: &mut [f32],
+    ) {
+        // SAFETY: the caller's guarantees, plus the AVX-512 check for that kernel.
+        unsafe {
+            if crate::simd::x86::has_avx512_vnni() {
+                dot_block16(ty, rows, rb, acts, out)
+            } else {
+                dot_block8(ty, rows, rb, acts, out)
+            }
+        }
+    }
+
+    /// The AVX2 block kernel: rows in eights (the last row repeated to fill the final one) and
+    /// tokens in fours.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub(super) unsafe fn dot_block8(
         ty: GgmlType,
         rows: &[u8],
         rb: usize,
@@ -1561,6 +1591,205 @@ mod avx2 {
                 let mut lanes = [0f32; 8];
                 // SAFETY: 8 writable floats.
                 unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), _mm256_add_ps(acc[t], ex[t])) };
+                for (r, &v) in lanes.iter().enumerate().take(n_rows - r0) {
+                    out[(r0 + r) * nt + t] = v;
+                }
+            }
+        }
+    }
+
+    /// [`Panel`] for sixteen rows: vector `8c + k` holds, in its i32 lane `r`, weights
+    /// `4k..4k + 4` of chunk `c` of row `r`. Signed weights are stored plus 128, as the unsigned
+    /// bytes `vpdpbusd` takes.
+    struct Panel16 {
+        w: Vec<__m512i>,
+        d: Vec<__m512>,
+        m: Vec<__m512>,
+        /// Per chunk and half, each row's integer scale as an i32.
+        hs: Vec<[__m512i; 2]>,
+    }
+
+    impl Panel16 {
+        #[target_feature(enable = "avx512f,avx2,f16c")]
+        unsafe fn fill(&mut self, ty: GgmlType, rows: [&[u8]; 16], chunks: std::ops::Range<usize>) {
+            self.w.clear();
+            self.d.clear();
+            self.m.clear();
+            self.hs.clear();
+            // Adding 128 to a signed byte flips its top bit.
+            let flip = if kind(ty) == Some(OFFSET) {
+                0
+            } else {
+                0x80u8 as i8
+            };
+            let flip = _mm256_set1_epi8(flip);
+            for j in chunks {
+                let mut lanes = [[0i32; 16]; 8];
+                let (mut d, mut m, mut hs) = ([0f32; 16], [0f32; 16], [[0i32; 16]; 2]);
+                for (r, row) in rows.iter().enumerate() {
+                    // SAFETY: `j` is a chunk of the row, per the caller.
+                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                    let mut bytes = [0i32; 8];
+                    // SAFETY: 32 writable bytes.
+                    unsafe {
+                        _mm256_storeu_si256(bytes.as_mut_ptr().cast(), _mm256_xor_si256(w, flip))
+                    };
+                    for (k, v) in bytes.into_iter().enumerate() {
+                        lanes[k][r] = v;
+                    }
+                    (d[r], m[r]) = (rd, rm);
+                    for h in 0..2 {
+                        hs[h][r] = rh[h] as i32;
+                    }
+                }
+                // SAFETY: each source holds 64 bytes.
+                unsafe {
+                    for l in &lanes {
+                        self.w.push(_mm512_loadu_si512(l.as_ptr().cast()));
+                    }
+                    self.d.push(_mm512_loadu_ps(d.as_ptr()));
+                    self.m.push(_mm512_loadu_ps(m.as_ptr()));
+                    self.hs
+                        .push(hs.map(|h| _mm512_loadu_si512(h.as_ptr().cast())));
+                }
+            }
+        }
+    }
+
+    /// [`run`] over a [`Panel16`]. `vpdpbusd` multiplies four unsigned bytes by four signed
+    /// ones and adds the products to an i32 in one step, where AVX2 takes `maddubs`, `madd` and
+    /// an add. Signed weights come biased by 128, and each half chunk's sum gives back 128
+    /// times its activations' sum ([`BlockActs::bias`]), the same for every row. The integer
+    /// sums are the ones [`run`] gets and the float steps are the same in the same order, so
+    /// the two kernels agree bit for bit.
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run16<const K: u8, const NT: usize>(
+        p: &Panel16,
+        j0: usize,
+        n: usize,
+        acts: &BlockActs,
+        t0: usize,
+        acc: &mut [__m512],
+        ex: &mut [__m512],
+    ) {
+        let nc = acts.n_chunks;
+        let zero = _mm512_setzero_si512();
+        let mut a: [__m512; NT] = std::array::from_fn(|i| acc[t0 + i]);
+        let mut e: [__m512; NT] = std::array::from_fn(|i| ex[t0 + i]);
+        // SAFETY: tokens `t0..t0 + NT` and chunks `j0..j0 + n` are inside `acts`, and the panel
+        // holds `n` chunks, per the caller.
+        unsafe {
+            let x: [*const i8; NT] =
+                std::array::from_fn(|i| acts.qs.as_ptr().add(((t0 + i) * nc + j0) * QK));
+            for c in 0..n {
+                let mut isum = [zero; NT];
+                // A half is 16 weights: Q6_K's integer scale goes on each half's sum.
+                for h in 0..2 {
+                    let mut half = [zero; NT];
+                    for k in 4 * h..4 * h + 4 {
+                        let w = *p.w.get_unchecked(8 * c + k);
+                        for i in 0..NT {
+                            let g = x[i].add(c * QK + 4 * k).cast::<i32>().read_unaligned();
+                            half[i] = _mm512_dpbusd_epi32(half[i], w, _mm512_set1_epi32(g));
+                        }
+                    }
+                    for i in 0..NT {
+                        let mut v = half[i];
+                        if K != OFFSET {
+                            let at = 2 * ((t0 + i) * nc + j0 + c) + h;
+                            v = _mm512_sub_epi32(
+                                v,
+                                _mm512_set1_epi32(*acts.bias.get_unchecked(at)),
+                            );
+                        }
+                        if K == HALVES {
+                            v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
+                        }
+                        isum[i] = _mm512_add_epi32(isum[i], v);
+                    }
+                }
+                let at = |i: usize| (t0 + i) * nc + j0 + c;
+                for i in 0..NT {
+                    let xd = _mm512_set1_ps(*acts.d.get_unchecked(at(i)));
+                    let scale = _mm512_mul_ps(*p.d.get_unchecked(c), xd);
+                    a[i] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(isum[i]), scale, a[i]);
+                    if K == OFFSET {
+                        let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at(i)));
+                        e[i] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, e[i]);
+                    }
+                }
+            }
+        }
+        acc[t0..t0 + NT].copy_from_slice(&a);
+        ex[t0..t0 + NT].copy_from_slice(&e);
+    }
+
+    /// The AVX-512 VNNI block kernel: [`dot_block8`] with rows in sixteens.
+    #[target_feature(enable = "avx512f,avx512vnni,avx2,fma,f16c")]
+    pub(super) unsafe fn dot_block16(
+        ty: GgmlType,
+        rows: &[u8],
+        rb: usize,
+        acts: &BlockActs,
+        out: &mut [f32],
+    ) {
+        let k = kind(ty).expect("checked by BlockActs::new");
+        let (n_rows, nt, nc) = (rows.len() / rb, acts.n_tokens, acts.n_chunks);
+        assert!(n_rows > 0 && out.len() == n_rows * nt && rows.len() == n_rows * rb);
+        assert_eq!(rb / ty.block_bytes() * ty.block_size(), nc * QK);
+        assert!(k == OFFSET || acts.bias.len() == 2 * nt * nc);
+        let mut panel = Panel16 {
+            w: Vec::with_capacity(8 * PANEL_CHUNKS),
+            d: Vec::with_capacity(PANEL_CHUNKS),
+            m: Vec::with_capacity(PANEL_CHUNKS),
+            hs: Vec::with_capacity(PANEL_CHUNKS),
+        };
+        let mut acc = vec![_mm512_setzero_ps(); nt];
+        let mut ex = vec![_mm512_setzero_ps(); nt];
+        for r0 in (0..n_rows).step_by(16) {
+            let sixteen: [&[u8]; 16] = std::array::from_fn(|r| {
+                let r = (r0 + r).min(n_rows - 1);
+                &rows[r * rb..(r + 1) * rb]
+            });
+            acc.fill(_mm512_setzero_ps());
+            ex.fill(_mm512_setzero_ps());
+            for j0 in (0..nc).step_by(PANEL_CHUNKS) {
+                let n = PANEL_CHUNKS.min(nc - j0);
+                // SAFETY: chunks `j0..j0 + n` are in every row (sizes asserted above), and the
+                // token ranges below are inside `acts`.
+                unsafe {
+                    panel.fill(ty, sixteen, j0..j0 + n);
+                    let mut t = 0;
+                    macro_rules! go {
+                        ($nt:literal) => {
+                            match k {
+                                SIGNED => {
+                                    run16::<SIGNED, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                OFFSET => {
+                                    run16::<OFFSET, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                _ => {
+                                    run16::<HALVES, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                            }
+                        };
+                    }
+                    while t + 4 <= nt {
+                        go!(4);
+                        t += 4;
+                    }
+                    while t < nt {
+                        go!(1);
+                        t += 1;
+                    }
+                }
+            }
+            for t in 0..nt {
+                let mut lanes = [0f32; 16];
+                // SAFETY: 16 writable floats.
+                unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), _mm512_add_ps(acc[t], ex[t])) };
                 for (r, &v) in lanes.iter().enumerate().take(n_rows - r0) {
                     out[(r0 + r) * nt + t] = v;
                 }
@@ -1707,6 +1936,38 @@ mod tests {
                         "{ty:?} row {r} token {t}: {got} vs {exact}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The AVX-512 block kernel does the AVX2 one's arithmetic sixteen rows at a time, so they
+    /// must agree bit for bit, whatever the row count leaves in the last group.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_block_kernel_equals_avx2_block_kernel_exactly() {
+        if !crate::simd::x86::has_avx512_vnni() {
+            eprintln!("skipped: no AVX-512 VNNI on this CPU");
+            return;
+        }
+        let mut rng = Rng::new(31);
+        let (n, n_tok) = (512, 11);
+        for ty in INT_TYPES {
+            let acts: Vec<Q8Act> = (0..n_tok).map(|_| Q8Act::new(&rng.vec(n))).collect();
+            let Some(block) = BlockActs::new(ty, &acts) else {
+                continue;
+            };
+            let rb = ty.row_bytes(n);
+            for n_rows in [1, 13, 16, 17, 35] {
+                let rows: Vec<u8> = (0..n_rows)
+                    .flat_map(|_| random_row(ty, n, &mut rng))
+                    .collect();
+                let (mut wide, mut narrow) = (vec![0.0; n_rows * n_tok], vec![0.0; n_rows * n_tok]);
+                // SAFETY: AVX-512 VNNI checked above, AVX2 by `BlockActs::new`.
+                unsafe {
+                    super::avx2::dot_block16(ty, &rows, rb, &block, &mut wide);
+                    super::avx2::dot_block8(ty, &rows, rb, &block, &mut narrow);
+                }
+                assert_eq!(wide, narrow, "{ty:?} with {n_rows} rows");
             }
         }
     }
