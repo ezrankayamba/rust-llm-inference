@@ -74,7 +74,7 @@ Design points that span files:
   chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
   `attention_merge`), so decode speed holds up at long context.
   head_dim not a multiple of 32 or above 256 falls back to one token at a time.
-- **CPU prompts are batched too**, in chunks of 64 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
+- **CPU prompts are batched too**, in chunks of 128 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
   route each row, then run each used expert once over the rows that picked it.
