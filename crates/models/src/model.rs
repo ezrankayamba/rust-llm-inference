@@ -8,9 +8,10 @@ use rli_core::{GgmlType, QMatrix, simd};
 use rli_gguf::{Error, Gguf, Result};
 use std::any::Any;
 
-/// Prompt tokens per CPU pass: amortizes weight reads while keeping scratch buffers (and the
-/// quantized activations each weight block is multiplied against) cache-sized.
-const CPU_CHUNK: usize = 64;
+/// Prompt tokens per CPU pass. The x86 block kernels decode each group of weight rows once per
+/// pass, which cost about as much as multiplying them by 64 tokens: 128 made prompts 21-24% faster
+/// than 64 there (no change on NEON), and 256 gained 2-6% on one model and lost as much on another.
+const CPU_CHUNK: usize = 128;
 /// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls. A multiple
 /// of every backend's chunk size, so slicing a prompt moves no chunk boundaries.
 pub const PROMPT_SLICE: usize = 256;
