@@ -3,6 +3,53 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-12: x86 CPU against llama.cpp after the 128-token chunk, one thread
+
+`Benchmark` workflow on `main` at f8057bd, llama.cpp v0.9.0 built natively. Prompt 256 tokens,
+decode 64, 3 reps. One run per CPU, so compare within a row only.
+
+| CPU (run) | Model | rli prompt | llama.cpp prompt | rli decode | llama.cpp decode |
+|---|---|---:|---:|---:|---:|
+| EPYC 7763, AVX2 only (43277552926) | Qwen2.5-0.5B | 99.4 | 77.7 | 28.8 | 28.3 |
+| | Llama-3.2-1B | 42.7 | 48.1 | 17.1 | 16.5 |
+| EPYC 9V74 (43277586143) | Qwen2.5-0.5B | 171.8 | 140.8 | 40.3 | 36.3 |
+| | Llama-3.2-1B | 82.1 | 79.4 | 24.5 | 30.1 |
+| EPYC 9V45 (43277578138) | Qwen2.5-0.5B | 259.0 | 186.4 | 55.6 | 55.9 |
+| | Llama-3.2-1B | 132.0 | 137.7 | 33.2 | 36.4 |
+| Xeon 6975P-C (43277570337) | Qwen2.5-0.5B | 158.4 | 130.6 | 29.8 | 19.7 |
+| | Llama-3.2-1B | 77.9 | 143.0 | 15.2 | 11.4 |
+
+All tok/s. Peak anonymous memory: rli 67-93 MiB, llama.cpp 101-882 MiB.
+
+Where rli is still behind: Llama-3.2-1B prompts on the Xeon (1.8x), on the EPYC 7763 (11%) and on
+the EPYC 9V45 (4%), and Llama-3.2-1B decode on the two Zen 4 CPUs (9-19%). Not investigated: what
+llama.cpp's native build does on the Xeon that its AVX2 build (60.4 tok/s there) does not.
+
+## 2026-11-12: CPU prompts in chunks of 128 tokens
+
+`CPU_CHUNK` 64 -> 128 (PR #8). `Benchmark` with `base=main` on scratch branches, one thread, prompt
+of 256 tokens; decode did not change.
+
+| CPU (run) | Chunk | Llama-3.2-1B prompt tok/s | Qwen2.5-0.5B prompt tok/s |
+|---|---|---:|---:|
+| EPYC 9V74 (43274603182) | 64 -> 128 | 65.8 -> 81.5 | 140.5 -> 171.3 |
+| EPYC 9V45 (43274641028) | 64 -> 256 | 100.5 -> 127.4 | 206.7 -> 237.0 |
+| Xeon 8573C (43274633974) | 64 -> 256 | 68.0 -> 88.4 | 141.2 -> 163.9 |
+| Xeon 6975P-C (43274648611) | 64 -> 256 | 66.5 -> 81.4 | 139.1 -> 145.8 |
+| EPYC 9V74 (43275713291) | 128 -> 256 | 82.2 -> 84.7 | 173.0 -> 166.3 |
+| Xeon 6975P-C (43275721192) | 128 -> 256 | 76.8 -> 81.7 | 154.2 -> 151.2 |
+| EPYC 7763 (43275729603) | 128 -> 256 | 41.9 -> 43.7 | 96.7 -> 96.2 |
+| EPYC 9V45 (43275744600) | 128 -> 256 | 135.7 -> 140.0 | 279.2 -> 263.3 |
+
+The x86 block kernels decode each group of weight rows once per chunk, which the profile below put
+at 37% of prompt time, so more tokens per chunk spread it thinner. 256 helped one model and hurt
+the other, so 128. On the Apple M4 (NEON), prompts were the same at 64, 128 and 256 (Llama-3.2-1B
+45.6, 46.4, 46.0 tok/s on one thread), and peak memory for a 256-token prompt rose by 1.6 MB.
+
+Ruled out on the way: matmul speed does not depend on the matrix shape (`bench_matvec` at 8192 x
+2048, 2048 x 8192 and 2048 x 2048 stayed within 10% of 5632 x 2048 in GOP/s on four CPUs), apart
+from a fixed cost per call that shows on small matrices (512 x 2048: about 30% lower).
+
 ## 2026-11-11: prefetching rows on Intel (decode), one thread
 
 `Benchmark` workflow with `base=main` on the PR #7 branch (run 43075955195), Intel Xeon 6975P-C.
