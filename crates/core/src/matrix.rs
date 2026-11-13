@@ -70,23 +70,20 @@ impl<'a> QMatrix<'a> {
         let rb = self.row_bytes();
         let ty = self.ty;
         let act = (!precise && qdot::supports(ty)).then(|| Q8Act::new(x));
-        let dot = |row: &[u8]| match &act {
-            Some(a) => qdot::dot_row_q8(ty, row, a),
-            None => dot_row(ty, row, x),
+        let dot = |ys: &mut [f32], rows: &[u8]| match &act {
+            Some(a) => qdot::matvec_q8(ty, rows, rb, a, ys),
+            None => {
+                for (out, row) in ys.iter_mut().zip(rows.chunks_exact(rb)) {
+                    *out = dot_row(ty, row, x);
+                }
+            }
         };
         if self.rows * self.cols < PARALLEL_MIN_ELEMS {
-            for (out, row) in y.iter_mut().zip(self.data.chunks_exact(rb)) {
-                *out = dot(row);
-            }
-            return;
+            return dot(y, self.data);
         }
         y.par_chunks_mut(ROWS_PER_TASK)
             .zip(self.data.par_chunks(rb * ROWS_PER_TASK))
-            .for_each(|(ys, rows)| {
-                for (out, row) in ys.iter_mut().zip(rows.chunks_exact(rb)) {
-                    *out = dot(row);
-                }
-            });
+            .for_each(|(ys, rows)| dot(ys, rows));
     }
 
     /// `Y = X W^T` for `n` tokens: `xs` is `n x cols` and `ys` is `n x rows`, row-major. Each
