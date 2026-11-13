@@ -22,8 +22,10 @@ decode 64, 3 reps. One run per CPU, so compare within a row only.
 All tok/s. Peak anonymous memory: rli 67-93 MiB, llama.cpp 101-882 MiB.
 
 Where rli is still behind: Llama-3.2-1B prompts on the Xeon (1.8x), on the EPYC 7763 (11%) and on
-the EPYC 9V45 (4%), and Llama-3.2-1B decode on the two Zen 4 CPUs (9-19%). Not investigated: what
-llama.cpp's native build does on the Xeon that its AVX2 build (60.4 tok/s there) does not.
+the EPYC 9V45 (4%), and Llama-3.2-1B decode on the two Zen 4 CPUs (9-19%). On the Xeon,
+llama.cpp's native build reports `AMX_INT8 = 1` and runs matmuls on AMX tiles
+(`ggml/src/ggml-cpu/amx/mmq.cpp`: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, weights repacked at
+load, hence its 882 MiB); its AVX2 build manages 60.4 tok/s there. rli has no AMX kernel.
 
 ## 2026-11-12: CPU prompts in chunks of 128 tokens
 
