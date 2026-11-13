@@ -74,10 +74,10 @@ def measure(cmd):
     return wall, usage.ru_maxrss * rss_unit() / 2**20, anon
 
 
-def ours_throughput(a, t):
+def ours_throughput(a, t, extra=()):
     out = subprocess.run(
         [f"{a.bin_dir}/examples/bench", a.model, "--pp", str(a.pp), "--tg", str(a.tg),
-         "--reps", str(a.reps), "--threads", str(t)],
+         "--reps", str(a.reps), "--threads", str(t), *extra],
         check=True, capture_output=True, text=True,
     ).stdout
     pp = re.search(rf"pp{a.pp}:\s*([\d.]+)", out)
@@ -97,9 +97,13 @@ def llama_throughput(a, t):
     return pp["avg_ts"], tg["avg_ts"]
 
 
-def ours_run(a, t, n):
+def ours_run(a, t, n, extra=()):
     return [f"{a.bin_dir}/rli", "-m", a.model, "-p", PROMPT, "--raw", "-n", str(n), "-c", str(CTX),
-            "--temp", "0", "--gpu-layers", "0", "-t", str(t)]
+            "--temp", "0", "--gpu-layers", "0", "-t", str(t), *extra]
+
+
+def with_repack(f):
+    return lambda *args: f(*args, extra=["--repack"])
 
 
 def llama_run(a, t, n):
@@ -147,8 +151,11 @@ def main():
           "| Peak anon MiB |")
     print("|---|---|---:|---:|---:|---:|---:|")
     for t in (int(x) for x in a.threads.split(",")):
-        for name, tp, run in [("rli", ours_throughput, ours_run),
-                              ("llama.cpp", llama_throughput, llama_run)]:
+        engines = [("rli", ours_throughput, ours_run),
+                   ("llama.cpp", llama_throughput, llama_run)]
+        if platform.machine() in ("x86_64", "AMD64"):  # the flag does nothing elsewhere
+            engines.insert(1, ("rli --repack", with_repack(ours_throughput), with_repack(ours_run)))
+        for name, tp, run in engines:
             pp, tg = tp(a, t)
             first, rss, anon = cold(run, a, t)
             print(f"| {t} | {name} | {pp:.1f} | {tg:.1f} | {first:.2f} | {rss:.0f} "
