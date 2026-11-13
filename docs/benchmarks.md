@@ -3,6 +3,50 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-13: decode on Zen 4 against llama.cpp's
+
+Two changes to the AVX2 row kernel, `Benchmark` with `base=main`, one thread, decode tok/s (prompts
+unchanged in both):
+
+| Change (run) | CPU | Llama-3.2-1B | Qwen2.5-0.5B |
+|---|---|---:|---:|
+| Kernel set up once per 16 rows, PR #9 (43367028654) | EPYC 9V74 | 24.7 -> 24.8 | 40.3 -> 42.2 |
+| (43367061182) | EPYC 9V45 | 32.7 -> 34.1 | 57.8 -> 61.4 |
+| (43367038062) | EPYC 7763 | 17.0 -> 17.5 | 29.5 -> 31.3 |
+| (43367042601) | Xeon 8573C | 12.6 -> 12.9 | 24.9 -> 25.3 |
+| f16 scale loaded with `vmovd`, PR #10 (43472418497) | EPYC 9V74 | 24.9 -> 26.0 | 43.2 -> 43.5 |
+| (43472451322) | EPYC 9V45 | 32.4 -> 33.0 | 56.6 -> 57.6 |
+| (43472427574) | EPYC 7763 | 17.8 -> 18.1 | 32.3 -> 32.6 |
+| (43472435357) | Xeon 6975P-C | 15.7 -> 16.1 | 31.4 -> 31.4 |
+
+What the measurements behind them showed (scratch branches, deleted):
+
+- A row cost a fixed 11-14 ns on the EPYC 9V74 on top of about 5.2 ns per 256 Q4_K weights, 7.8
+  for Q6_K and 6.9 for Q8_0 (run 43363411780). In RAM instead of cache the per-weight cost rose 8%.
+- `perf annotate` of decode on the EPYC 9V74 (run 43471675407): the Q6_K loop took 42% of the
+  kernel's samples for 33% of Llama-3.2-1B's weights, and a third of that sat on a `vpinsrw` the
+  compiler made of the scale's load and the three instructions after it. Hence PR #10.
+- llama.cpp's own decode profile on the same machine (run 43470015824): 53% in
+  `ggml_gemv_q4_K_8x8_q8_K` and 31% in `ggml_vec_dot_q6_K_q8_K`. The first runs on a copy of the
+  Q4_K weights interleaved eight rows at a time, made at load (`repack_q4_K_to_q4_K_8_bl`), which
+  is most of its 553 MiB against rli's 91. Per weight it spent about 20% less than rli on Q4_K and
+  about 27% less on Q6_K, by these shares and the tok/s of the comparison below.
+- `llvm-mca -mcpu=znver4` put the Q4_K loop at 18 cycles per 256 weights, which is what the EPYC
+  measured, with the four vector pipes as the limit.
+
+Tried and dropped, no gain:
+
+- VNNI `vpdpwssd` in the Q4_K loop (256-bit): 3% in the loop on the EPYC 9V74, 0-4% slower on the
+  EPYC 9V45, 7-13% faster in cache on the Xeon 6975P-C (runs 43367018119, 43366525353, 43366520289).
+- Decoding the Q4_K scales in 8 fewer instructions per super-block: no change on four CPUs (runs
+  43468821016 to 43468864401).
+- Working the multipliers out one super-block ahead: more instructions and slower in `llvm-mca`;
+  not run.
+
+Left: Llama-3.2-1B decode on the EPYC 9V74 is at about 26 tok/s against llama.cpp's 30. An idea
+not tried: Q6_K's offset of 32 costs a second `maddubs` per 32 weights, which could come from the
+activations once per matvec.
+
 ## 2026-11-12: x86 CPU against llama.cpp after the 128-token chunk, one thread
 
 `Benchmark` workflow on `main` at f8057bd, llama.cpp v0.9.0 built natively. Prompt 256 tokens,
