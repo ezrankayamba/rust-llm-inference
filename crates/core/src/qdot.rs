@@ -934,14 +934,22 @@ mod avx2 {
     #[target_feature(enable = "avx2,f16c")]
     #[inline]
     fn le16(b: &[u8], at: usize) -> f32 {
-        // Loading four bytes (only the low two are converted) writes the whole register. A 16-bit
-        // value compiles to an insert into whatever the register last held, chaining every
-        // block's conversion onto the previous block's.
-        let v = match b.get(at..at + 4) {
-            Some(w) => _mm_cvtsi32_si128(i32::from_le_bytes([w[0], w[1], w[2], w[3]])),
-            None => _mm_set1_epi16(u16::from_le_bytes([b[at], b[at + 1]]) as i16),
-        };
-        _mm_cvtss_f32(_mm_cvtph_ps(v))
+        let v = u16::from_le_bytes([b[at], b[at + 1]]) as u32;
+        let x: __m128i;
+        // A move written out, because the compiler turns every way of loading 16 bits into a
+        // vector register (a wider load included) into an insert into whatever that register
+        // last held, and the conversion then waits for it. On Zen 4 that wait was the hottest
+        // spot of the Q6_K loop.
+        // SAFETY: a register-to-register move; AVX is checked by the callers' callers.
+        unsafe {
+            std::arch::asm!(
+                "vmovd {x}, {v:e}",
+                v = in(reg) v,
+                x = lateout(xmm_reg) x,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        _mm_cvtss_f32(_mm_cvtph_ps(x))
     }
 
     /// Eight partial sums of `w · x` over 32 lanes, the low four covering lanes 0..16. `maddubs`
