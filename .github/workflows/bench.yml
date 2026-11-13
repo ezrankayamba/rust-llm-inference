@@ -138,11 +138,7 @@ jobs:
           for url in $MODELS; do
             model="$RUNNER_TEMP/$(basename "$url")"
             curl -fsSL --retry 3 -o "$model" "$url"
-            for extra in "" --repack; do
-              echo "== text $extra"
-              target/release/rli -m "$model" -p "Explain how a CPU cache works." -n 48 --temp 0 --gpu-layers 0 -t 1 $extra 2>&1 | tail -6
-            done
-            for b in native; do
+            for b in native avx2; do
               echo "llama.cpp build: $b" | tee -a "$GITHUB_STEP_SUMMARY"
               python3 scripts/bench_compare.py --bin-dir target/release \
                 --llama-dir "$RUNNER_TEMP/llama.cpp/$b/bin" --model "$model" --threads "$THREADS" \
