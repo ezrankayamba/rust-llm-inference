@@ -3,6 +3,37 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-13: `--repack`, an 8-row copy of Q4_K weights for x86 decode
+
+`Benchmark` on the PR #11 branch (llama.cpp v0.9.0, native build), one thread, Llama-3.2-1B Q4_K_M.
+The flag copies the Q4_K weights (457 MiB here) at load into groups of eight interleaved rows that
+a dedicated AVX2 kernel reads for one-token matvecs; prompts still read the mapping.
+
+| CPU (run) | Engine | Prompt tok/s | Decode tok/s | First token s | Peak RSS MiB | Peak anon MiB |
+|---|---|---:|---:|---:|---:|---:|
+| EPYC 9V74 (43485095711) | rli | 81.1 | 25.4 | 2.97 | 864 | 91 |
+| | rli --repack | 80.8 | 30.1 | 3.26 | 1322 | 549 |
+| | llama.cpp | 78.4 | 29.9 | 3.67 | 1331 | 553 |
+| EPYC 9V45 (43485123307) | rli | 125.8 | 33.7 | 1.97 | 864 | 91 |
+| | rli --repack | 127.5 | 36.1 | 2.21 | 1322 | 549 |
+| | llama.cpp | 138.9 | 36.6 | 2.31 | 1331 | 553 |
+| EPYC 7763 (43485102243) | rli | 42.0 | 17.4 | 5.21 | 866 | 93 |
+| | rli --repack | 42.3 | 18.9 | 5.68 | 1319 | 550 |
+| | llama.cpp | 47.9 | 17.1 | 5.61 | 1330 | 553 |
+| Xeon 8573C (43485115112) | rli | 68.6 | 12.6 | 3.35 | 864 | 91 |
+| | rli --repack | 68.2 | 12.6 | 3.62 | 1322 | 549 |
+| | llama.cpp | 70.3 | 10.3 | 4.23 | 1331 | 553 |
+
+- Decode gains 18% on Zen 4, 7% on Zen 5, 3-9% on Zen 3 (two more EPYC 7763 runs: 15.6 -> 16.7 and
+  17.5 -> 18.0) and nothing on the Xeon, for 458 MiB of memory and 0.25-0.5 s at load.
+- Qwen2.5-0.5B Q4_K_M has only 28 MiB of Q4_K weights (the rest is Q5_0 and Q6_K), so it moved by
+  under 2% either way.
+- Greedy text was the same with and without the flag on both models (48 tokens, EPYC 9V74 and the
+  Xeon), though results differ by float rounding and can diverge on a near-tie.
+- Tried just before it and dropped: Q6_K's offset term precomputed per token instead of a second
+  multiply per 32 weights. `llvm-mca` predicted 6% for the loop; Llama-3.2-1B decode on the EPYC
+  9V74 went 25.5 -> 24.4 in both runs (43482959603, 43482996129) and was level elsewhere.
+
 ## 2026-11-13: decode on Zen 4 against llama.cpp's
 
 Two changes to the AVX2 row kernel, `Benchmark` with `base=main`, one thread, decode tok/s (prompts

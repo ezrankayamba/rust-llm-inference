@@ -86,6 +86,25 @@ impl<'a> QMatrix<'a> {
             .for_each(|(ys, rows)| dot(ys, rows));
     }
 
+    /// [`QMatrix::matvec`] reading `packed`, this matrix's [`qdot::pack_rows`] copy, for all but
+    /// the rows after its last full group.
+    pub fn matvec_packed(&self, packed: &[u8], x: &[f32], y: &mut [f32]) {
+        assert_eq!(x.len(), self.cols);
+        assert_eq!(y.len(), self.rows);
+        let (rb, cols) = (self.row_bytes(), self.cols);
+        let act = Q8Act::new(x);
+        let full = self.rows - self.rows % qdot::PACK_ROWS;
+        let (y, tail) = y.split_at_mut(full);
+        qdot::matvec_q8(self.ty, &self.data[full * rb..], rb, &act, tail);
+        let groups = ROWS_PER_TASK / qdot::PACK_ROWS;
+        if self.rows * cols < PARALLEL_MIN_ELEMS {
+            return qdot::matvec_packed(packed, cols, &act, y);
+        }
+        y.par_chunks_mut(groups * qdot::PACK_ROWS)
+            .zip(packed.par_chunks(groups * qdot::pack_bytes(cols)))
+            .for_each(|(ys, p)| qdot::matvec_packed(p, cols, &act, ys));
+    }
+
     /// `Y = X W^T` for `n` tokens: `xs` is `n x cols` and `ys` is `n x rows`, row-major. Each
     /// parallel task takes a block of weight rows and runs it against every token while those
     /// rows are in cache, so the weights are read from memory once per call, not once per token.
@@ -159,6 +178,30 @@ mod tests {
         let a = Q8Act::new(&x);
         for (r, &got) in y.iter().enumerate() {
             assert_eq!(got, qdot::dot_row_q8(GgmlType::Q8_0, m.row(r), &a));
+        }
+    }
+
+    #[test]
+    fn packed_matvec_matches_matvec_including_rows_past_the_last_group() {
+        let mut rng = Rng::new(9);
+        let (ty, rows, cols) = (GgmlType::Q4_K, 301, 256); // parallel path, 5 rows left over
+        let mut data: Vec<u8> = (0..rows * ty.row_bytes(cols))
+            .map(|_| rng.next_u32() as u8)
+            .collect();
+        for block in data.as_chunks_mut::<144>().0 {
+            let d = crate::half::f32_to_f16(0.01).to_le_bytes();
+            block[..4].copy_from_slice(&[d[0], d[1], d[0], d[1]]);
+        }
+        let m = QMatrix::new(ty, rows, cols, &data);
+        let packed = qdot::pack_rows(&data, m.row_bytes());
+        let x = rng.vec(cols);
+        let (mut want, mut got) = (vec![0.0; rows], vec![0.0; rows]);
+        m.matvec(&x, &mut want);
+        m.matvec_packed(&packed, &x, &mut got);
+        // A row's terms reach about 0.01 * 63 * 15 * |x| each and largely cancel.
+        let scale = 0.01 * 63.0 * 15.0 * x.iter().map(|v| v.abs()).sum::<f32>();
+        for (r, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() <= 1e-5 * scale, "row {r}: {g} vs {w}");
         }
     }
 

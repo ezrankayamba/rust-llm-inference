@@ -21,6 +21,8 @@ usage: rli -m <model.gguf> [options]
       --seed <n>
       --gpu-layers <n>      layers to run on the GPU (default: all, if this build has a
                             GPU backend; 0 = CPU only)
+      --repack              copy Q4_K weights into a layout x86 decodes faster from; costs
+                            about their size in extra memory
   -t, --threads <n>         CPU threads (default: one per logical core)
       --info               print model metadata and exit
 ";
@@ -33,6 +35,7 @@ struct Args {
     ctx: usize,
     info: bool,
     gpu_layers: Option<usize>,
+    repack: bool,
     params: GenParams,
 }
 
@@ -47,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
         ctx: 4096,
         info: false,
         gpu_layers: None,
+        repack: false,
         params: GenParams {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
@@ -80,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
             "--repeat-penalty" => s.repeat_penalty = num(&flag, it.next())?,
             "--seed" => s.seed = num(&flag, it.next())?,
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
+            "--repack" => a.repack = true,
             "-t" | "--threads" => rli_models::set_threads(num(&flag, it.next())?)?,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -116,6 +121,12 @@ fn run(a: Args) -> Result<(), String> {
         .map_err(|e| e.to_string())?
     {
         eprintln!("warning: {w}");
+    }
+    if a.repack {
+        match engine.model.repack() {
+            0 => eprintln!("warning: --repack does nothing here: it needs Q4_K weights and AVX2"),
+            n => eprintln!("repacked:  {} MiB of weights copied", n >> 20),
+        }
     }
     if !a.raw
         && let Some(w) = &engine.template_warning

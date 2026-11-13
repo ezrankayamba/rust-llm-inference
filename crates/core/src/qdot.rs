@@ -117,7 +117,6 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
 
 /// All eight 6-bit scales and mins of a Q4_K/Q5_K super-block from its 12 packed bytes, the
 /// same values [`scale_min_k4`] gives one at a time, as a little-endian u64 of bytes each.
-#[cfg(any(test, target_arch = "x86_64"))]
 #[inline]
 fn scales_mins_k4(q: &[u8]) -> (u64, u64) {
     let u = |i: usize| u32::from_le_bytes([q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]]);
@@ -924,9 +923,118 @@ pub fn matvec_q8(ty: GgmlType, rows: &[u8], rb: usize, act: &Q8Act, out: &mut [f
     }
 }
 
+/// Rows per group of a [`pack_rows`] copy.
+pub const PACK_ROWS: usize = 8;
+
+/// Bytes of one super-block of [`PACK_ROWS`] packed Q4_K rows: their f16 scales (16 bytes) and
+/// min scales (16), each sub-block's eight 6-bit scales as bytes (64) and mins (64), then the
+/// 4-bit weights (1024): for each pair of sub-blocks, the rows' 4 bytes for weights 0..4, then
+/// for 4..8 and so on, the pair's first sub-block in the low nibbles as in the file.
+const PACK_BLOCK: usize = 160 + PACK_ROWS * (QK_K / 2);
+const PACK_SCALES: usize = 32;
+const PACK_MINS: usize = 96;
+const PACK_QS: usize = 160;
+
+/// Whether a matrix of `ty` gains from a [`pack_rows`] copy on this CPU: Q4_K with AVX2. The
+/// portable [`matvec_packed`] is slower than the row kernels.
+pub fn packs(ty: GgmlType) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return ty == GgmlType::Q4_K && crate::simd::x86::has_avx2();
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = ty;
+        false
+    }
+}
+
+/// Bytes of a [`pack_rows`] copy of [`PACK_ROWS`] rows of `cols` weights.
+pub fn pack_bytes(cols: usize) -> usize {
+    cols / QK_K * PACK_BLOCK
+}
+
+/// A copy of Q4_K `rows` (`rb` bytes each) with every [`PACK_ROWS`] of them interleaved, so that
+/// [`matvec_packed`] loads the same four weights of all of them at once and multiplies them by
+/// four activations it loaded once. Rows left over after the last full group aren't copied. It
+/// takes 2.8% more memory than the rows it copies, on top of them.
+pub fn pack_rows(rows: &[u8], rb: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let bb = GgmlType::Q4_K.block_bytes();
+    assert!(rb > 0 && rb.is_multiple_of(bb) && rows.len().is_multiple_of(rb));
+    let gb = rb / bb * PACK_BLOCK;
+    let mut out = vec![0u8; rows.len() / rb / PACK_ROWS * gb];
+    out.par_chunks_mut(gb)
+        .zip(rows.par_chunks(rb * PACK_ROWS))
+        .for_each(|(out, group)| {
+            for (i, o) in out.as_chunks_mut::<PACK_BLOCK>().0.iter_mut().enumerate() {
+                for r in 0..PACK_ROWS {
+                    let b = &group[r * rb + i * bb..][..bb];
+                    o[2 * r..2 * r + 2].copy_from_slice(&b[0..2]);
+                    o[16 + 2 * r..16 + 2 * r + 2].copy_from_slice(&b[2..4]);
+                    let (sc, mn) = scales_mins_k4(&b[4..16]);
+                    for sub in 0..GROUP {
+                        o[PACK_SCALES + PACK_ROWS * sub + r] = (sc >> (8 * sub)) as u8;
+                        o[PACK_MINS + PACK_ROWS * sub + r] = (mn >> (8 * sub)) as u8;
+                    }
+                    for (c, q) in b[16..].as_chunks::<4>().0.iter().enumerate() {
+                        o[PACK_QS + 4 * (PACK_ROWS * c + r)..][..4].copy_from_slice(q);
+                    }
+                }
+            }
+        });
+    out
+}
+
+/// [`matvec_q8`] over a [`pack_rows`] copy of rows of `cols` weights: one result per packed row.
+/// A result differs from the row kernel's by float rounding, as the sums are grouped differently.
+pub fn matvec_packed(packed: &[u8], cols: usize, act: &Q8Act, out: &mut [f32]) {
+    let gb = pack_bytes(cols);
+    assert!(
+        cols.is_multiple_of(QK_K) && act.qs.len() == cols && out.len().is_multiple_of(PACK_ROWS)
+    );
+    assert!(packed.len() == gb * (out.len() / PACK_ROWS));
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::x86::has_avx2() {
+        let pf = crate::simd::x86::prefetch_rows();
+        // SAFETY: AVX2, FMA and F16C checked at runtime; sizes are asserted above and inside.
+        return unsafe { avx2::packed_k4(packed, gb, act, out, pf) };
+    }
+    for (group, out) in packed
+        .chunks_exact(gb.max(1))
+        .zip(out.as_chunks_mut::<PACK_ROWS>().0)
+    {
+        *out = packed_portable(group, act);
+    }
+}
+
+fn packed_portable(group: &[u8], a: &Q8Act) -> [f32; PACK_ROWS] {
+    let mut out = [0.0; PACK_ROWS];
+    for (i, b) in group.as_chunks::<PACK_BLOCK>().0.iter().enumerate() {
+        for (r, out) in out.iter_mut().enumerate() {
+            let (d, dmin) = (le16(b, 2 * r), le16(b, 16 + 2 * r));
+            for sub in 0..GROUP {
+                let blk = i * GROUP + sub;
+                let x = &a.qs[blk * QK..(blk + 1) * QK];
+                let mut s = 0i32;
+                for (k, x) in x.as_chunks::<4>().0.iter().enumerate() {
+                    let q = &b[PACK_QS + 4 * (PACK_ROWS * (8 * (sub / 2) + k) + r)..][..4];
+                    for (q, &x) in q.iter().zip(x) {
+                        let w = if sub % 2 == 0 { q & 0xf } else { q >> 4 };
+                        s += w as i32 * x as i32;
+                    }
+                }
+                let scale = b[PACK_SCALES + PACK_ROWS * sub + r] as f32;
+                let min = b[PACK_MINS + PACK_ROWS * sub + r] as f32;
+                *out += d * scale * a.d[blk] * s as f32 - dmin * min * a.sum[blk];
+            }
+        }
+    }
+    out
+}
+
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{GROUP, Q8Act, QK, scale_min_k4, scales_mins_k4};
+    use super::{GROUP, PACK_BLOCK, PACK_MINS, PACK_QS, PACK_ROWS, PACK_SCALES};
+    use super::{Q8Act, QK, scale_min_k4, scales_mins_k4};
     use crate::quant::{GgmlType, QK_K};
     use crate::simd::x86::hsum;
     use std::arch::x86_64::*;
@@ -1106,6 +1214,82 @@ mod avx2 {
             let p = row.as_ptr().wrapping_add(PREFETCH_BYTES + off);
             // SAFETY: a prefetch never faults, whatever the address; SSE is in the x86-64 baseline.
             unsafe { _mm_prefetch::<_MM_HINT_T0>(p.cast()) };
+        }
+    }
+
+    /// [`super::matvec_packed`]: groups of `gb` bytes, eight results each. Four activations are
+    /// broadcast against the eight rows' matching weights, so a row's products land in its own
+    /// 32-bit lane as two 16-bit sums. Those take a sub-block's eight steps without saturating
+    /// (8 · 2 · 15 · 127 = 30480), then `madd` puts on the sub-block's scale times the
+    /// activations' ratio. Two sub-blocks' sums fit an i32 (2 · 2 · 30480 · 63 · 256 = 1.97e9),
+    /// a whole super-block's wouldn't, so they go to float a pair at a time.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn packed_k4(
+        packed: &[u8],
+        gb: usize,
+        act: &Q8Act,
+        out: &mut [f32],
+        prefetch: bool,
+    ) {
+        let nb = gb / PACK_BLOCK;
+        assert!(gb > 0 && gb.is_multiple_of(PACK_BLOCK) && out.len().is_multiple_of(PACK_ROWS));
+        assert!(packed.len() == gb * (out.len() / PACK_ROWS));
+        assert!(act.qs.len() == nb * QK_K && act.d.len() == nb * GROUP);
+        assert!(act.sum.len() == nb * GROUP && act.ratio.len() == nb * GROUP);
+        assert!(act.unit.len() == nb);
+        let (xq, xr) = (act.qs.as_ptr(), act.ratio.as_ptr());
+        let (xu, xs) = (act.unit.as_ptr(), act.sum.as_ptr());
+        let m4 = _mm256_set1_epi8(0xf);
+        for (group, out) in packed
+            .chunks_exact(gb)
+            .zip(out.as_chunks_mut::<PACK_ROWS>().0)
+        {
+            if prefetch {
+                prefetch_ahead(group);
+            }
+            let mut acc = _mm256_setzero_ps();
+            let mut extra = _mm256_setzero_ps();
+            // SAFETY: every offset stays inside the group's current block of `PACK_BLOCK` bytes or
+            // the activations' `nb` groups, as asserted above.
+            unsafe {
+                for i in 0..nb {
+                    let p = group.as_ptr().add(i * PACK_BLOCK);
+                    let xb = i * GROUP;
+                    let d = _mm256_cvtph_ps(_mm_loadu_si128(p.cast()));
+                    let dmin = _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast()));
+                    let scale = _mm256_mul_ps(d, _mm256_set1_ps(*xu.add(i)));
+                    let mut mins = _mm256_setzero_ps();
+                    for g in 0..GROUP / 2 {
+                        let x = xq.add((xb + 2 * g) * QK);
+                        let mut pairs = [_mm256_setzero_si256(); 2];
+                        for k in 0..8 {
+                            let q = _mm256_loadu_si256(p.add(PACK_QS + 32 * (8 * g + k)).cast());
+                            let w = [_mm256_and_si256(q, m4), high_nibbles(q)];
+                            for half in 0..2 {
+                                let x4 = x.add(half * QK + 4 * k).cast::<i32>().read_unaligned();
+                                let s = _mm256_maddubs_epi16(w[half], _mm256_set1_epi32(x4));
+                                pairs[half] = _mm256_add_epi16(pairs[half], s);
+                            }
+                        }
+                        let mut sum = _mm256_setzero_si256();
+                        for (half, pairs) in pairs.into_iter().enumerate() {
+                            let sub = 2 * g + half;
+                            let at = PACK_ROWS * sub;
+                            let sc = _mm_loadl_epi64(p.add(PACK_SCALES + at).cast());
+                            let ratio = _mm256_set1_epi32(*xr.add(xb + sub) as i32);
+                            let m = _mm256_mullo_epi16(_mm256_cvtepu8_epi32(sc), ratio);
+                            let m = _mm256_or_si256(m, _mm256_slli_epi32::<16>(m));
+                            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(pairs, m));
+                            let mn = _mm_loadl_epi64(p.add(PACK_MINS + at).cast());
+                            let mn = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(mn));
+                            mins = _mm256_fmadd_ps(mn, _mm256_set1_ps(*xs.add(xb + sub)), mins);
+                        }
+                        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum), scale, acc);
+                    }
+                    extra = _mm256_fnmadd_ps(dmin, mins, extra);
+                }
+                _mm256_storeu_ps(out.as_mut_ptr(), _mm256_add_ps(acc, extra));
+            }
         }
     }
 
@@ -2128,6 +2312,60 @@ mod tests {
                 assert_eq!(block_dot(ty, &row, &a), Some(expected));
             }
             assert_eq!(dot_row_q8_portable(ty, &row, &a), expected);
+        }
+    }
+
+    #[test]
+    fn packed_rows_match_row_dots_within_float_rounding() {
+        let mut rng = Rng::new(17);
+        let (ty, cols, rows) = (GgmlType::Q4_K, 768, 2 * PACK_ROWS + 3);
+        let rb = ty.row_bytes(cols);
+        let data: Vec<u8> = (0..rows)
+            .flat_map(|_| random_row(ty, cols, &mut rng))
+            .collect();
+        let packed = pack_rows(&data, rb);
+        assert_eq!(packed.len(), 2 * pack_bytes(cols));
+        let a = Q8Act::new(&rng.vec(cols));
+        let mut got = [0.0; 2 * PACK_ROWS];
+        matvec_packed(&packed, cols, &a, &mut got);
+        for (r, (row, got)) in data.chunks_exact(rb).zip(got).enumerate() {
+            let want = dot_row_q8_portable(ty, row, &a);
+            let gb = pack_bytes(cols);
+            let portable = packed_portable(&packed[r / PACK_ROWS * gb..][..gb], &a);
+            let mut w = vec![0.0; cols];
+            dequantize_row(ty, row, &mut w);
+            let scale: f32 = w
+                .iter()
+                .zip(&a.qs)
+                .enumerate()
+                .map(|(i, (w, &q))| (w * q as f32 * a.d[i / QK]).abs())
+                .sum();
+            for got in [got, portable[r % PACK_ROWS]] {
+                assert!(
+                    (got - want).abs() <= 1e-5 * (1.0 + scale),
+                    "row {r}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Weights, scales and activations at the extremes that the packed kernel's 16- and 32-bit
+    /// sums have to hold.
+    #[test]
+    fn packed_kernel_holds_the_largest_sums() {
+        let cols = 512;
+        let mut row = vec![0xffu8; GgmlType::Q4_K.row_bytes(cols)];
+        for b in row.as_chunks_mut::<144>().0 {
+            b[0..2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+            b[2..4].copy_from_slice(&f32_to_f16(0.0).to_le_bytes());
+        }
+        let data = row.repeat(PACK_ROWS);
+        let a = Q8Act::new(&vec![1.0; cols]);
+        let mut got = [0.0; PACK_ROWS];
+        matvec_packed(&pack_rows(&data, row.len()), cols, &a, &mut got);
+        let want = 15.0 * 63.0 * cols as f32;
+        for got in got {
+            assert!((got - want).abs() <= 1e-5 * want, "{got} vs {want}");
         }
     }
 

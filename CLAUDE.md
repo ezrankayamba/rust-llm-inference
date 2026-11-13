@@ -36,7 +36,10 @@ Workspace crates (dependencies flow downward only):
   per-token ones by float rounding. The AVX2 one-row kernel, most of x86 decode time, keeps a K-quant
   super-block in i32 and spreads the 32-weight formats over four sums, so no sum waits on the last; on Intel CPUs
   only, its caller prefetches the bytes 1152 ahead of each row, which was worth 1.7x in decode there and
-  cost up to 18% on AMD), and ops (RMSNorm, RoPE, softmax, SwiGLU).
+  cost up to 18% on AMD. `--repack` (`Model::repack`, off by default) copies the CPU layers' Q4_K
+  weights into groups of 8 interleaved rows (`pack_rows`) that `matvec_packed` reads for one-token
+  matvecs: +18% decode on Zen 4 for about the Q4_K weights' size in anonymous memory, nothing on
+  Intel; prompts and `precise` still read the mapping), and ops (RMSNorm, RoPE, softmax, SwiGLU).
   GPU primitives live here too: `metal.rs` + `metal.metal` (feature `metal`) and `cuda.rs` +
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and

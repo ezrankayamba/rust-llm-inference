@@ -4,9 +4,10 @@ use crate::config::Config;
 use rayon::prelude::*;
 use rli_core::half::f32_to_f16;
 use rli_core::ops::{self, Rope};
-use rli_core::{GgmlType, QMatrix, simd};
+use rli_core::{GgmlType, QMatrix, qdot, simd};
 use rli_gguf::{Error, Gguf, Result};
 use std::any::Any;
+use std::collections::HashMap;
 
 /// Prompt tokens per CPU pass. The x86 block kernels decode each group of weight rows once per
 /// pass, which cost about as much as multiplying them by 64 tokens: 128 made prompts 21-24% faster
@@ -135,6 +136,8 @@ pub struct Model {
     pub(crate) layers: Vec<Layer>,
     /// Keep activations in f32 for CPU matvecs (slow; used to validate against references).
     pub precise: bool,
+    /// Interleaved copies of weights ([`Model::repack`]), by file offset and row count.
+    packed: HashMap<(usize, usize), Vec<u8>>,
 }
 
 /// One layer's cached keys or values for the CPU layers: f16 (half the memory), or f32 when the
@@ -427,6 +430,7 @@ impl Model {
             layers,
             accel: None,
             precise: false,
+            packed: HashMap::new(),
         })
     }
 
@@ -476,11 +480,53 @@ impl Model {
         )
     }
 
+    /// Copies the weights of the layers that run on the CPU into the layout the CPU's decode
+    /// kernel reads fastest, where it has one (Q4_K on x86 with AVX2), and returns the bytes
+    /// taken: slightly more than those weights' own size, in memory that can't be paged back
+    /// to the file. One token at a time then reads the copies; prompts and `precise` still read
+    /// the mapping. Call it after attaching an accelerator.
+    pub fn repack(&mut self) -> usize {
+        let mut ws = vec![self.output];
+        for layer in &self.layers[self.accelerator().map_or(0, |(_, n)| n)..] {
+            ws.extend([layer.wq, layer.wk, layer.wv, layer.wo]);
+            let expert = |e: &Expert| [e.gate, e.up, e.down];
+            match &layer.ffn {
+                Ffn::Dense(e) => ws.extend(expert(e)),
+                Ffn::Moe {
+                    router,
+                    experts,
+                    shared,
+                } => {
+                    ws.push(*router);
+                    ws.extend(experts.iter().flat_map(expert));
+                    if let Some((gate, e)) = shared {
+                        ws.push(*gate);
+                        ws.extend(expert(e));
+                    }
+                }
+            }
+        }
+        for w in ws {
+            if qdot::packs(w.ty) && w.rows >= qdot::PACK_ROWS {
+                let m = self.mat(&w);
+                let packed = crate::pool().install(|| qdot::pack_rows(m.data, m.row_bytes()));
+                self.packed.insert((w.offset, w.rows), packed);
+            }
+        }
+        self.packed.values().map(Vec::len).sum()
+    }
+
     fn matvec(&self, w: &Weight, x: &[f32], y: &mut [f32]) {
-        self.mat(w).matvec_with(x, y, self.precise);
+        match self.packed.get(&(w.offset, w.rows)) {
+            Some(p) if !self.precise => self.mat(w).matvec_packed(p, x, y),
+            _ => self.mat(w).matvec_with(x, y, self.precise),
+        }
     }
 
     fn matmul(&self, w: &Weight, xs: &[f32], ys: &mut [f32], n: usize) {
+        if n == 1 {
+            return self.matvec(w, xs, ys);
+        }
         self.mat(w).matmul_with(xs, ys, n, self.precise);
     }
 
