@@ -203,14 +203,14 @@ dependencies = [
 
 [[package]]
 name = "rli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rli-models",
 ]
 
 [[package]]
 name = "rli-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cudarc",
  "objc2",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "rli-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
  "rli-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "rli-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "rli-core",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "rli-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rli-models",
  "serde_json",
