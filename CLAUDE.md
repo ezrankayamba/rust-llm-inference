@@ -137,8 +137,13 @@ Design points that span files:
   for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose
   result feeds int8 matrices quantize it on the way out (`quant_block` in `rmsnorm`, `swiglu`,
   `attention`), the int8 matvec can add into the residual stream, `rope` takes queries and keys
-  together and a token's gate and up are one launch (`matvec_q_pair`): 12 launches a dense layer,
-  was 20. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
+  together and a token's gate and up are one launch (`matvec_q_pair`; the `mvq_*_pair` kernels
+  take a grid two deep, and are separate because their three extra parameters made the plain
+  ones 2-5% slower): 12 launches a dense layer, was 20. A Qwen3 MoE layer takes 14: its chosen
+  experts' gate and up stacks are one launch too (decode only; 1.5% slower over a prompt chunk),
+  `norm_rope` does the per-head query and key norms with the rotation, and an f32/f16 matvec of
+  up to 256 rows (the router) gets a block of 8 warps per row. That took Qwen3-30B-A3B decode
+  from 155 to 178 tok/s, past llama.cpp's 171.5. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
   `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
   so the queueing code is the same either way; a pass whose launches differ is captured anew,
   and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Stacked MoE experts run
@@ -154,8 +159,10 @@ Design points that span files:
   latency, which was most of the loading time with so few warps per multiprocessor
   (65536 / registers / 32 fit). Don't carry that over: the same reordering made the decode
   matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
-  llama.cpp's CUDA backend was 1.9-2.6x faster on dense prompts, 12x on Qwen3-30B-A3B's and
-  2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
+  Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
+  is ahead on Mistral-7B and Qwen3-30B-A3B and 4% behind on Llama-3.2-1B; decode at 2048
+  positions is 8-25% behind, and prompts 1.7x (Llama-3.2-1B), 2.3x (Mistral-7B) and 5.2x
+  (Qwen3-30B-A3B) behind.
 - **CUDA kernels wait on memory per read.** A thread that reads values in a loop and uses each
   at once waits out the latency every time round, so a small kernel wants a thread per value
   (`rmsnorm` with 256 threads for a 2048-wide row cost twice a trivial launch). `RLI_CUDA_PROF=1`

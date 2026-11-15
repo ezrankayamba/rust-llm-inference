@@ -25,6 +25,7 @@ fn main() {
         (GgmlType::Q4_K, 256, 256),
         (GgmlType::Q8_0, 4096, 4096),
         (GgmlType::F16, 4096, 4096),
+        (GgmlType::F32, 128, 2048),
     ] {
         let bytes = ty.row_bytes(cols) * rows;
         let count = (mem.len() / bytes).min(4096);

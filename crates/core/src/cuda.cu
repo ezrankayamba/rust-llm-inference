@@ -116,15 +116,41 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
                                 const uint* ids, ulong id_stride, uint x_stride,               \
                                 uint x_div, uint y_stride) {                                   \
-    uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
-    uint lane = threadIdx.x % 32;                                                              \
+    /* A block of 128 threads takes 4 rows, a warp each. One of 256 takes a single row, its */ \
+    /* 8 warps every 8th step of it: a small matrix (a MoE router) is all memory latency,   */ \
+    /* and that leaves each warp fewer rounds of reads.                                     */ \
+    __shared__ float red[8];                                                                   \
+    uint warp = threadIdx.x / 32, lane = threadIdx.x % 32;                                     \
+    bool wide = blockDim.x > ROWS_PER_BLOCK * 32;                                              \
+    uint row = wide ? blockIdx.x : blockIdx.x * ROWS_PER_BLOCK + warp;                         \
+    uint c0 = wide ? warp : 0, step = wide ? 8 : 1, steps = cols / 32;                         \
     if (row >= rows) return;                                                                   \
     uint e = blockIdx.y;                                                                       \
     const uchar* r = w + w_off + (ulong)ids[e] * id_stride + (ulong)row * row_bytes;           \
     const float* xs = x + x_off + (ulong)(e / x_div) * x_stride + lane;                        \
     float acc = 0;                                                                             \
-    for (uint c = 0; c < cols / 32; c++) acc += WT(r, c, lane) * xs[c * 32];                   \
+    /* 8 steps' reads are issued before the first is used: used at once, each makes the   */   \
+    /* warp wait out the memory latency.                                                   */   \
+    for (uint c = c0; c < steps; c += 8 * step) {                                              \
+        float wv[8], xv[8];                                                                    \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < 8; j++) {                                                         \
+            uint cj = min(c + j * step, steps - 1);                                            \
+            wv[j] = WT(r, cj, lane);                                                           \
+            xv[j] = xs[cj * 32];                                                               \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < 8; j++)                                                           \
+            if (c + j * step < steps) acc += wv[j] * xv[j];                                    \
+    }                                                                                          \
     acc = warp_sum(acc);                                                                       \
+    if (wide) {                                                                                \
+        if (lane == 0) red[warp] = acc;                                                        \
+        __syncthreads();                                                                       \
+        acc = 0;                                                                               \
+        for (uint i = 0; i < 8; i++) acc += red[i];                                            \
+        if (warp) return;                                                                      \
+    }                                                                                          \
     if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
 }
 
@@ -551,16 +577,27 @@ __device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float
 }
 
 // Grid rows, ids and strides as in MATVEC; x_stride counts values of x. With `add`, the result
-// is added to y.
-#define MATVEC_Q(NAME, STEP, SB_BYTES, NSB)                                                    \
+// is added to y. The *_pair kernels take a grid two deep, whose second layer runs a matrix (or
+// stack) of the same shape z_stride bytes after the first over the same x, into y2: a token's
+// gate and up in one launch. They are separate kernels because the three parameters alone
+// made the plain ones 2-5% slower.
+#define MVQ_PAIR_ARGS , float* y2, ulong y2_off, ulong z_stride
+#define MVQ_PAIR_PICK                                                                          \
+    if (blockIdx.z) {                                                                          \
+        w_off += z_stride;                                                                     \
+        y = y2;                                                                                \
+        y_off = y2_off;                                                                        \
+    }
+#define MATVEC_Q(NAME, STEP, SB_BYTES, NSB, ARGS, PICK)                                        \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, const float* xd,   \
                                 const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
                                 uint row_bytes, const uint* ids, ulong id_stride,              \
-                                uint x_stride, uint x_div, uint y_stride, uint add) {          \
+                                uint x_stride, uint x_div, uint y_stride, uint add ARGS) {     \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     if (row >= rows) return;                                                                   \
     uint e = blockIdx.y, n_sb = cols / 256;                                                    \
+    PICK                                                                                       \
     const uchar* r = w + w_off + (ulong)ids[e] * id_stride + (ulong)row * row_bytes;           \
     ulong xo = (ulong)(e / x_div) * x_stride;                                                  \
     const int* q = xq + xo / 4;                                                                \
@@ -575,8 +612,10 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, cons
 }
 
 #ifndef RLI_MMA
-MATVEC_Q(mvq_q4_k, mvq_q4_k_step, 144, 4)
-MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4)
+MATVEC_Q(mvq_q4_k, mvq_q4_k_step, 144, 4, , )
+MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4, , )
+MATVEC_Q(mvq_q4_k_pair, mvq_q4_k_step, 144, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
+MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
 #endif
 
 #ifdef RLI_MMA
@@ -880,6 +919,47 @@ extern "C" __global__ void rope(float* x, ulong x_off, const float* ff, uint has
     hd[b] = x0 * s + x1 * c;
 }
 
+// rmsnorm over each head (weights wq for x's heads, wk for x2's), then rope: Qwen3 normalizes
+// its queries and keys, and this saves a token two launches a layer. One block per head, a
+// thread per value: head_dim threads, a multiple of 32.
+extern "C" __global__ void norm_rope(float* x, ulong x_off, const float* wq, const float* ff,
+                                     uint has_ff, uint n_heads, uint head_dim, uint rope_dim,
+                                     uint pos, float theta, uint neox, uint heads_per_tok,
+                                     float* x2, ulong x2_off, const float* wk,
+                                     uint heads_per_tok2, float eps) {
+    __shared__ float red[32];
+    __shared__ float val[1024];
+    uint hh = blockIdx.x, i = threadIdx.x, half_dim = rope_dim / 2;
+    const float* wn = wq;
+    if (hh >= n_heads) {
+        hh -= n_heads;
+        x = x2;
+        x_off = x2_off;
+        heads_per_tok = heads_per_tok2;
+        wn = wk;
+    }
+    float* hd = x + x_off + (ulong)hh * head_dim;
+    float v = hd[i], wv = wn[i];
+    float s = block_sum(v * v, red);
+    v = v * rsqrtf(s / (float)head_dim + eps) * wv;
+    val[i] = v;
+    __syncthreads();
+    if (i >= rope_dim) {
+        hd[i] = v;
+        return;
+    }
+    // This value's pair, its other half, and whether this is the first of the two.
+    uint j = neox ? i % half_dim : i / 2;
+    bool first = neox ? i < half_dim : !(i & 1);
+    uint other = neox ? (first ? i + half_dim : i - half_dim) : i ^ 1;
+    float freq = powf(theta, -2.0f * (float)j / (float)rope_dim);
+    if (has_ff) freq /= ff[j];
+    float sn, c;
+    sincosf((float)(pos + hh / heads_per_tok) * freq, &sn, &c);
+    float o = val[other];
+    hd[i] = first ? v * c - o * sn : o * sn + v * c;
+}
+
 __device__ inline uint warp_min_u(uint v) {
     for (int o = 16; o > 0; o >>= 1) {
         uint u = __shfl_xor_sync(0xffffffff, v, o);
@@ -893,16 +973,23 @@ __device__ inline uint warp_min_u(uint v) {
 // weights, the last its sigmoid gate. Takes up to 2048 experts (64 per lane).
 extern "C" __global__ void moe_topk(const float* logits, const float* shared_gate, uint* ids,
                                     float* w, uint n_expert, uint k, uint norm, uint shared) {
+    // The logits and the chosen weights are kept in shared memory: every pass over device
+    // memory would wait out its latency once per read.
+    __shared__ float lg[2048];
+    __shared__ float wk[2048];
     uint lane = threadIdx.x, tok = blockIdx.x;
     logits += (ulong)tok * n_expert;
     shared_gate += tok;
     ids += (ulong)tok * k;
     w += (ulong)tok * (k + shared);
     float mx = NEG_INF;
-    for (uint e = lane; e < n_expert; e += 32) mx = fmaxf(mx, logits[e]);
+    for (uint e = lane; e < n_expert; e += 32) {
+        lg[e] = logits[e];
+        mx = fmaxf(mx, lg[e]);
+    }
     mx = warp_max(mx);
     float sum = 0;
-    for (uint e = lane; e < n_expert; e += 32) sum += expf(logits[e] - mx);
+    for (uint e = lane; e < n_expert; e += 32) sum += expf(lg[e] - mx);
     sum = warp_sum(sum);
     ulong taken = 0;
     float chosen = 0;
@@ -910,8 +997,8 @@ extern "C" __global__ void moe_topk(const float* logits, const float* shared_gat
         float bv = NEG_INF;
         uint be = 0xffffffffu;
         for (uint e = lane, j = 0; e < n_expert; e += 32, j++) {
-            if (!((taken >> j) & 1) && logits[e] > bv) {
-                bv = logits[e];
+            if (!((taken >> j) & 1) && lg[e] > bv) {
+                bv = lg[e];
                 be = e;
             }
         }
@@ -922,13 +1009,12 @@ extern "C" __global__ void moe_topk(const float* logits, const float* shared_gat
         chosen += wi;
         if (lane == 0) {
             ids[i] = win < n_expert ? win : 0;  // no winner (NaN logits): stay inside the stack
-            w[i] = wi;
+            wk[i] = wi;
         }
     }
-    if (lane == 0) {
-        if (norm) for (uint i = 0; i < k; i++) w[i] /= chosen;
-        if (shared) w[k] = 1.0f / (1.0f + expf(-shared_gate[0]));
-    }
+    __syncwarp();
+    for (uint i = lane; i < k; i += 32) w[i] = norm ? wk[i] / chosen : wk[i];
+    if (lane == 0 && shared) w[k] = 1.0f / (1.0f + expf(-shared_gate[0]));
 }
 
 // Row t of x (n_tok rows of n) += sum over r < m of w[t * w_stride + r] * src row t * m + r:

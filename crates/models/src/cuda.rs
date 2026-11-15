@@ -255,10 +255,19 @@ fn moe(
     if !quantized && wants_q(b, &[&e.gate, &e.up], int8) {
         b.quantize(xb, n * n_embd, &s.xq);
     }
-    for (m, stride, out) in [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)] {
+    // In decode, stacks of one type and stride run as one launch. Over a prompt chunk that was
+    // 1.5% slower than two.
+    let paired = n < MMQ_MIN_TOKENS
+        && e.gate.ty == e.up.ty
+        && gate_stride == up_stride
+        && wants_q(b, &[&e.gate, &e.up], int8);
+    let stacks = [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)];
+    for (m, stride, out) in &stacks[..2 - paired as usize] {
+        let (m, stride, out) = (*m, *stride, *out);
         let (ty, at) = (m.ty, m.offset);
         if wants_q(b, &[m], int8) {
             let xq = &s.xq;
+            let second = paired.then_some((e.up.offset, up));
             b.matvec_q_id(
                 ty,
                 ff,
@@ -274,6 +283,7 @@ fn moe(
                 ff,
                 n * k,
                 false,
+                second,
             );
         } else {
             b.matvec_id(
@@ -313,6 +323,7 @@ fn moe(
             n_embd,
             n * k,
             false,
+            None,
         );
     } else {
         b.swiglu(gate, up, n * k * ff, None);
@@ -402,13 +413,20 @@ impl Cuda {
                         b.add_bias(t, bias, n * len);
                     }
                 }
-                if let Some(w) = &g.q_norm {
-                    b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, eps, None);
+                match (&g.q_norm, &g.k_norm) {
+                    (Some(wq), Some(wk)) if Batch::has_norm_rope(hd) => {
+                        b.norm_rope(At(&s.q, 0), k_at, wq, wk, eps, &rope);
+                    }
+                    (wq, wk) => {
+                        if let Some(w) = wq {
+                            b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, eps, None);
+                        }
+                        if let Some(w) = wk {
+                            b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None);
+                        }
+                        b.rope(At(&s.q, 0), k_at, &rope);
+                    }
                 }
-                if let Some(w) = &g.k_norm {
-                    b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None);
-                }
-                b.rope(At(&s.q, 0), k_at, &rope);
                 let p = AttnParams {
                     n_head: c.n_head as u32,
                     n_kv: c.n_head_kv as u32,

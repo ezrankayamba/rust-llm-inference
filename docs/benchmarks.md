@@ -3,6 +3,44 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: Qwen3-30B-A3B decode on CUDA: 17 launches a layer to 14
+
+The profile (`RLI_CUDA_PROF=1`) put a decoded Qwen3 token at 17 launches a layer, 816 a token,
+which at 2.9 us a replayed launch is 2.3 ms of its 6.4 ms. Same A100, Q4_K_M, 48 layers
+offloaded, `bench --pp 512 --tg 128 --reps 3` and `--pp 0 --tg 128 --depth 2048`, the build at
+ab28911 and the new one run alternately, twice each; tok/s.
+
+| Model | Measure | ab28911 | Now | llama.cpp |
+|---|---|---:|---:|---:|
+| Qwen3-30B-A3B | tg128 | 155.1-156.2 | 178.1-178.6 | 171.5 |
+| Qwen3-30B-A3B | tg128 at depth 2048 | 121.4-124.1 | 134.8-137.6 | 166.4 |
+| Qwen3-30B-A3B | pp512 | 802.2-813.3 | 802.5-804.2 | 4241.7 |
+| Mistral-7B | tg128 | 165.8-167.4 | 164.1-165.1 | 155.4 |
+| Llama-3.2-1B | tg128 | 500.4-505.4 | 501.1-506.4 | 524.4 |
+
+What changed, with decode measured after each step against 153-157 for ab28911:
+
+- **Router matvec** (f32, 128 x 2048), 160-165 tok/s. A warp per row read one value per lane
+  and used it, 64 times over. Issuing 8 steps' reads before using any took the launch from 19.7
+  to 19.1 us in the profile (floor about 11.5); a block of 8 warps per row, each taking every
+  8th step, took it to 12.3 (`bench_cuda`: 11.6 -> 5.2 us). f32/f16 matrices of up to 256 rows
+  take the wide shape. `moe_topk` now copies its logits to shared memory once: 17.3 -> 16.1 us.
+- **`norm_rope`**, 167-174 tok/s: Qwen3's per-head RMSNorm of queries and keys and the rotation
+  were three launches and are one. No change to prompts.
+- **Gate and up of the chosen experts as one launch**, 175-178 tok/s: `mvq_*_pair` takes a
+  grid two deep. Prompt chunks keep two launches: one was 1.5% slower there (794-801 against
+  807-813 tok/s).
+
+One thing that cost more than it looked: giving the plain int8 matvec kernels the pair's three
+extra parameters and a branch on `blockIdx.z` made them 2-5% slower per launch (Q4_K over a
+prompt chunk 1457-1520 -> 1556-1562 us), which was 3.5% of Qwen3 prompts. The pair is a second
+instantiation of the macro instead.
+
+Checks: the GPU tests, with and without `RLI_CUDA_NO_MMA=1`; Qwen3 `dump_logits --precise` on
+CUDA against the CPU (`--gpu-layers=0`), batched and `--per-token`: 1.0e-5 and 1.3e-5, so
+`norm_rope` and the wide matvec agree with an independent path; int8 against f32 unchanged
+(0.30 batched, 0.26 per token on Qwen3).
+
 ## 2026-11-15: reading before storing in the other CUDA kernels (not merged)
 
 The section below found that the tensor-core kernels' tile loads were waiting out one memory

@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("cuda.cu");
 const MATVEC_ROWS_PER_BLOCK: usize = 4;
+/// f32/f16 matvecs of at most this many rows run a block per row (see `MATVEC` in cuda.cu).
+const MATVEC_WIDE_ROWS: usize = 256;
 const REDUCE_THREADS: u32 = 1024;
 /// Threads per attention block, which is also the largest head_dim the kernel takes.
 pub const ATTN_THREADS: u32 = 1024;
@@ -59,13 +61,14 @@ pub const MMQ_MIN_TOKENS: usize = 8;
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
 const MMA_REGS: usize = 96;
-const OTHER_KERNELS: [&str; 14] = [
+const OTHER_KERNELS: [&str; 15] = [
     "quant_x",
     "rmsnorm",
     "axpy",
     "add_bias",
     "swiglu",
     "rope",
+    "norm_rope",
     "attention",
     "attention_part",
     "attention_merge",
@@ -160,16 +163,14 @@ pub struct Gpu {
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     mmq: Vec<(GgmlType, CudaFunction)>,
-    /// The int8 matvecs (`mvq_*`) of the same types.
-    mvq: Vec<(GgmlType, CudaFunction)>,
+    /// The int8 matvecs of the same types: `mvq_*`, and `mvq_*_pair` for two matrices.
+    mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
     zero_id: GpuIds,
-    /// 0 and 1: the ids of [`Batch::matvec_q_pair`]'s two matrices.
-    pair_ids: GpuIds,
     /// Stands in for the quantized output of a kernel that isn't asked for one.
     no_q: GpuQ,
     name: String,
@@ -242,7 +243,10 @@ impl Gpu {
         };
         let mvq = MMQ_KERNELS
             .iter()
-            .map(|&(t, n)| Ok((t, func(&n.replace("mmq", "mvq"))?)))
+            .map(|&(t, n)| {
+                let n = n.replace("mmq", "mvq");
+                Ok((t, func(&n)?, func(&format!("{n}_pair"))?))
+            })
             .collect::<Result<_, String>>()?;
         let other = OTHER_KERNELS
             .iter()
@@ -295,10 +299,6 @@ impl Gpu {
                 .alloc_zeros(MMQ_MIN_TOKENS)
                 .map_err(err("allocate"))?,
         );
-        let mut pair_ids = GpuIds(stream.alloc_zeros(2).map_err(err("allocate"))?);
-        stream
-            .memcpy_htod(&[0u32, 1], &mut pair_ids.0)
-            .map_err(err("upload"))?;
         let no_q = GpuQ {
             q: stream.alloc_zeros(8).map_err(err("allocate"))?,
             d: stream.alloc_zeros(1).map_err(err("allocate"))?,
@@ -315,7 +315,6 @@ impl Gpu {
             mma,
             other,
             zero_id,
-            pair_ids,
             no_q,
             name,
         })
@@ -689,7 +688,7 @@ impl Gpu {
             format!("f32 {t:?}")
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul {t:?}")
-        } else if let Some((t, _)) = self.mvq.iter().find(|(_, g)| eq(g)) {
+        } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
             format!("int8 matvec {t:?}")
         } else {
             "?".into()
@@ -891,7 +890,7 @@ impl<'a> Batch<'a> {
         if n_tok < MMQ_MIN_TOKENS {
             let zero = &self.gpu.zero_id;
             return self.matvec_q_id(
-                ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok, add,
+                ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok, add, None,
             );
         }
         assert!(!add, "the int8 matmul kernels don't accumulate");
@@ -949,6 +948,7 @@ impl<'a> Batch<'a> {
         y_stride: usize,
         n: usize,
         add: bool,
+        second: Option<(usize, At<'_>)>,
     ) {
         assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n > 0 && x_div > 0);
         assert!(
@@ -961,9 +961,16 @@ impl<'a> Batch<'a> {
         let row_bytes = ty.row_bytes(cols);
         let span = (n_stack - 1) * stride + rows * row_bytes;
         let w_off = self.gpu.device_offset(offset, span) as u64;
+        // The kernel adds the second stack's distance to the offset, modulo 2^64.
+        let second = second.map(|(offset2, y2)| {
+            assert!(self.gpu.has_int8(ty, cols, offset2));
+            assert!(y2.1 + (n - 1) * y_stride + rows <= y2.0.len());
+            let w2 = self.gpu.device_offset(offset2, span) as u64;
+            (w2.wrapping_sub(w_off), y2)
+        });
         let (id_stride, xs, xd) = (stride as u64, x_stride as u32, x_div as u32);
         self.launch_mvq(
-            ty, rows, cols, w_off, id_stride, ids, xq, xs, xd, y, y_stride, n, add,
+            ty, rows, cols, w_off, id_stride, ids, xq, xs, xd, y, y_stride, n, add, second,
         );
     }
 
@@ -978,26 +985,24 @@ impl<'a> Batch<'a> {
         xq: &GpuQ,
         y: At<'_>,
     ) {
-        assert!(offsets.iter().all(|&o| self.gpu.has_int8(ty, cols, o)) && rows > 0);
-        assert!(xq.q.len() * 4 >= cols && y.1 + 2 * rows <= y.0.len());
-        let len = rows * ty.row_bytes(cols);
-        let [a, b] = offsets.map(|o| self.gpu.device_offset(o, len) as u64);
-        // The kernel adds id * stride to the first matrix's offset, modulo 2^64.
-        let ids = &self.gpu.pair_ids;
-        self.launch_mvq(
+        let (zero, y2) = (&self.gpu.zero_id, At(y.0, y.1 + rows));
+        let [a, b] = offsets;
+        self.matvec_q_id(
             ty,
             rows,
             cols,
             a,
-            b.wrapping_sub(a),
-            ids,
-            xq,
             0,
+            1,
+            zero,
+            xq,
+            cols,
             1,
             y,
             rows,
-            2,
+            1,
             false,
+            Some((b, y2)),
         );
     }
 
@@ -1017,16 +1022,19 @@ impl<'a> Batch<'a> {
         y_stride: usize,
         n: usize,
         add: bool,
+        second: Option<(u64, At<'_>)>,
     ) {
-        let f = &self
+        let (_, one, pair) = self
             .gpu
             .mvq
             .iter()
-            .find(|(t, _)| *t == ty)
-            .expect("checked by has_matmul_q")
-            .1;
+            .find(|(t, ..)| *t == ty)
+            .expect("checked by has_matmul_q");
+        let f = if second.is_some() { pair } else { one };
         let (y_off, rb) = (y.1 as u64, ty.row_bytes(cols) as u32);
         let (rows_u, cols_u, ys, add) = (rows as u32, cols as u32, y_stride as u32, add as u32);
+        let (z_stride, y2) = second.unwrap_or((0, y));
+        let y2_off = y2.1 as u64;
         let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
@@ -1044,14 +1052,16 @@ impl<'a> Batch<'a> {
             .arg(&xd)
             .arg(&ys)
             .arg(&add);
-        self.launch(
-            a,
-            grid2(
-                rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
-                n,
-                (MATVEC_ROWS_PER_BLOCK * 32) as u32,
-            ),
+        if second.is_some() {
+            a.arg(&y2.0.0).arg(&y2_off).arg(&z_stride);
+        }
+        let mut cfg = grid2(
+            rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
+            n,
+            (MATVEC_ROWS_PER_BLOCK * 32) as u32,
         );
+        cfg.grid_dim.2 = 1 + second.is_some() as u32;
+        self.launch(a, cfg);
     }
 
     /// `n` matvecs in one launch, over matrices of a stack of `n_stack` that lie `stride` bytes
@@ -1102,14 +1112,18 @@ impl<'a> Batch<'a> {
             .arg(&xs)
             .arg(&xd)
             .arg(&ys);
-        self.launch(
-            a,
+        // A small f32 matrix (a MoE router) gets a block of 8 warps per row: see MATVEC.
+        let wide = matches!(ty, GgmlType::F32 | GgmlType::F16) && rows <= MATVEC_WIDE_ROWS;
+        let cfg = if wide {
+            grid2(rows, n, 256)
+        } else {
             grid2(
                 rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
                 n,
                 (MATVEC_ROWS_PER_BLOCK * 32) as u32,
-            ),
-        );
+            )
+        };
+        self.launch(a, cfg);
     }
 
     /// The kernel (matmul or matvec), device offset and row size of a matrix at byte `offset`
@@ -1332,6 +1346,58 @@ impl<'a> Batch<'a> {
             .arg(&per_tok2);
         let n = (heads + heads2) * r.rope_dim / 2;
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+    }
+
+    /// Whether [`Batch::norm_rope`] takes heads of `head_dim`.
+    pub fn has_norm_rope(head_dim: usize) -> bool {
+        head_dim.is_multiple_of(32) && head_dim <= 1024
+    }
+
+    /// RMSNorm over each head (weights `wq` for the heads at `x`, `wk` for those at `x2`), then
+    /// [`Batch::rope`], as one launch.
+    pub fn norm_rope(
+        &mut self,
+        x: At<'_>,
+        x2: At<'_>,
+        wq: &GpuBuf,
+        wk: &GpuBuf,
+        eps: f32,
+        r: &RopeArgs<'_>,
+    ) {
+        let (heads, heads2) = (r.n_tok * r.n_heads, r.n_tok * r.n_heads2);
+        assert!(Self::has_norm_rope(r.head_dim) && r.rope_dim <= r.head_dim);
+        assert!(wq.len() >= r.head_dim && wk.len() >= r.head_dim);
+        assert!(x.1 + heads * r.head_dim <= x.0.len());
+        assert!(x2.1 + heads2 * r.head_dim <= x2.0.len());
+        let (x_off, x2_off) = (x.1 as u64, x2.1 as u64);
+        let ff = r.freq_factors.unwrap_or(x.0);
+        let has_ff = r.freq_factors.is_some() as u32;
+        let (nh, hd, rd, pos) = (
+            heads as u32,
+            r.head_dim as u32,
+            r.rope_dim as u32,
+            r.pos as u32,
+        );
+        let (neox, per_tok, per_tok2) = (r.neox as u32, r.n_heads as u32, r.n_heads2 as u32);
+        let mut l = self.call(self.gpu.other("norm_rope"));
+        l.arg(&x.0.0)
+            .arg(&x_off)
+            .arg(&wq.0)
+            .arg(&ff.0)
+            .arg(&has_ff)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&rd)
+            .arg(&pos)
+            .arg(&r.theta)
+            .arg(&neox)
+            .arg(&per_tok)
+            .arg(&x2.0.0)
+            .arg(&x2_off)
+            .arg(&wk.0)
+            .arg(&per_tok2)
+            .arg(&eps);
+        self.launch(l, grid(heads + heads2, hd));
     }
 
     /// f32s of `scores` scratch [`Batch::attention`] needs for one token at `max_ctx`.
