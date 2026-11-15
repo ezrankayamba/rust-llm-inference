@@ -71,8 +71,8 @@ fn main() {
                 b.matmul_q(ty, rows, cols, i * bytes, &xq, At(&y, 0), 1, false);
             }
         };
-        let graph = gpu.capture(queue);
-        let best = |f: &dyn Fn()| {
+        let mut graph = None;
+        let best = |f: &mut dyn FnMut()| {
             f();
             (0..5)
                 .map(|_| {
@@ -84,13 +84,13 @@ fn main() {
                 / count as f64
                 * 1e6
         };
-        let direct = best(&|| {
+        let direct = best(&mut || {
             let mut b = gpu.batch();
             queue(&mut b);
             b.finish();
         });
-        let replayed = best(&|| {
-            gpu.replay(&graph);
+        let replayed = best(&mut || {
+            gpu.run_graph(&mut graph, queue);
             gpu.sync();
         });
         println!("launches {rows}x{cols}: direct {direct:.2} us, graph {replayed:.2} us");

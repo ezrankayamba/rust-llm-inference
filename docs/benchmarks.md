@@ -26,6 +26,33 @@ warps and has others to run while one waits; the tensor-core kernels at 128 x 12
 For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
 for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
 
+## 2026-11-15: decode replayed as a CUDA graph, and MoE experts in int8
+
+Same A100 instance. One token's launches are captured into a CUDA graph the first time and
+replayed after that (`Gpu::run_graph`): every launch still goes through `Batch`, which compares
+its kernel, grid and arguments with the graph's launch of the same index and updates the node if
+they differ (the KV write offsets, the RoPE position and the attention length: 4 nodes a
+layer), then one `cuGraphLaunch` runs them. Launches that no longer match (the attention kernel
+changes at 128 positions, a prompt may not want logits) capture a new graph. Replaying costs 2.8
+microseconds a launch against 4.0 queued (`bench_cuda`, 256x256 matvecs), and the CPU thread no
+longer paces the GPU. Layers routed on the CPU read back mid-pass and are not replayed.
+
+MoE experts stored as a stack now run the int8 matvec (`matvec_q_id`) for their gate, up and
+down matrices, in decode and in prompt chunks; they were the last f32 matvecs on the hot path.
+
+Before is caf0996, `bench --gpu-layers N --reps 5` (3 at depth), Q4_K_M, tok/s:
+
+| Model | tg128 before | graph | and int8 experts | tg128 at 2048 before | after | pp512 before | after | llama.cpp tg128 / at 2048 / pp512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 437.8 | 453.2 | 467.2 | 353.8 | 380.5 | 7295.6 ± 896.3 | 7663.5 ± 1409.9 | 524.4 / 522.4 / 14500.7 |
+| Mistral-7B | 143.5 | 147.8 | 149.3 | 121.9 | 126.8 | 1881.4 | 1885.3 | 155.4 / 150.9 / 4911.9 |
+| Qwen3-30B-A3B (MoE) | 114.9 | 122.3 | 144.5 | 96.9 | 116.7 | 357.8 | 743.5 | 171.5 / 166.4 / 4241.7 |
+
+The dense models' last column of tg128 is a second run of the graph build (nothing in the expert
+change touches them); the host was quieter for it. pp4: 743.7, 189.2, 182.2. Int8 logits against
+f32 on Qwen3-30B-A3B, max difference: 0.483 batched, 0.451 through decode (0.461 / 0.267 with
+f32 experts), top-1 the same; the dense models' are unchanged. `--precise` is unchanged.
+
 ## 2026-11-15: fewer launches per decoded token on CUDA, and a Q6_K matvec of wide reads
 
 Same A100 instance. A launch costs about 4 microseconds however little it does (a 256x256
@@ -62,9 +89,8 @@ Int8 logits against f32, max difference on the 36-word prompt, batched / through
 Llama-3.2-1B 0.148 / 0.145, Mistral-7B 0.107 / 0.121, Qwen3-30B-A3B 0.461 / 0.267; top-1 the
 same. `--precise` is unchanged (decode against batched: 7.2e-6, 1.7e-5, 6.7e-6).
 
-A captured CUDA graph replays the same launches for 2.8 microseconds each where queueing them
-takes 4.0 (`bench_cuda`, "launches"; `Gpu::capture` / `Gpu::replay`); decode does not use it yet.
-The device stream is now one of our own, since the default stream cannot be captured.
+The device stream is now one of our own, since the default stream cannot be captured into a
+graph (the section above).
 
 ## 2026-11-15: decode attention split over the context on CUDA
 

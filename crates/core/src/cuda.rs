@@ -9,8 +9,8 @@
 
 use crate::quant::GgmlType;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchArgs, LaunchConfig,
-    PushKernelArg, sys,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchArgs,
+    LaunchConfig, PushKernelArg, sys,
 };
 use std::sync::Arc;
 
@@ -388,7 +388,10 @@ impl Gpu {
     }
 
     pub fn batch(&self) -> Batch<'_> {
-        Batch { gpu: self }
+        Batch {
+            gpu: self,
+            mode: Mode::Queue,
+        }
     }
 
     fn other(&self, name: &str) -> &CudaFunction {
@@ -429,15 +432,86 @@ impl Gpu {
     }
 }
 
-/// Launches recorded by [`Gpu::capture`], replayed in order by [`Gpu::replay`].
+/// Most arguments a kernel takes.
+const MAX_ARGS: usize = 24;
+
+/// A kernel argument as the bytes the driver copies: a device pointer or a scalar.
+trait ArgBits {
+    fn bits(&self, stream: &CudaStream) -> (u64, u8);
+}
+impl ArgBits for u32 {
+    fn bits(&self, _: &CudaStream) -> (u64, u8) {
+        (*self as u64, 4)
+    }
+}
+impl ArgBits for f32 {
+    fn bits(&self, _: &CudaStream) -> (u64, u8) {
+        (self.to_bits() as u64, 4)
+    }
+}
+impl ArgBits for u64 {
+    fn bits(&self, _: &CudaStream) -> (u64, u8) {
+        (*self, 8)
+    }
+}
+impl<T> ArgBits for CudaSlice<T> {
+    fn bits(&self, stream: &CudaStream) -> (u64, u8) {
+        (self.device_ptr(stream).0, 8)
+    }
+}
+
+/// One launch: its kernel, grid and arguments.
+#[derive(Clone, Copy, PartialEq)]
+struct Rec {
+    func: *const CudaFunction,
+    /// Grid x and y, and threads per block.
+    dims: [u32; 3],
+    bits: [u64; MAX_ARGS],
+    sizes: [u8; MAX_ARGS],
+    n: usize,
+}
+
+/// A launch being put together: the arguments as cudarc takes them, where it will be the one
+/// to launch, and as bits to compare with a graph's.
+struct Call<'a> {
+    stream: &'a CudaStream,
+    args: Option<LaunchArgs<'a>>,
+    rec: Rec,
+}
+
+impl<'a> Call<'a> {
+    fn arg<T: ArgBits>(&mut self, v: &'a T) -> &mut Self
+    where
+        LaunchArgs<'a>: PushKernelArg<&'a T>,
+    {
+        let (bits, size) = v.bits(self.stream);
+        (self.rec.bits[self.rec.n], self.rec.sizes[self.rec.n]) = (bits, size);
+        self.rec.n += 1;
+        if let Some(a) = &mut self.args {
+            a.arg(v);
+        }
+        self
+    }
+}
+
+/// A token's launches as a CUDA graph ([`Gpu::run_graph`]): replaying it costs less per launch
+/// than queueing each (2.8 against 4.0 microseconds on an A100) and takes one driver call.
 pub struct Graph {
     graph: sys::CUgraph,
     exec: sys::CUgraphExec,
+    /// Per launch, in order: its node, the node's parameters and what was last launched.
+    nodes: Vec<sys::CUgraphNode>,
+    params: Vec<sys::CUDA_KERNEL_NODE_PARAMS>,
+    recs: Vec<Rec>,
 }
+
+// SAFETY: the handles are only used through `Gpu::run_graph`, on the context's stream; the
+// pointers inside `params` are rewritten before each use.
+unsafe impl Send for Graph {}
 
 impl Drop for Graph {
     fn drop(&mut self) {
-        // SAFETY: both handles came from `Gpu::capture` and are not used again.
+        // SAFETY: both handles came from `Gpu::run_graph` and are not used again.
         unsafe {
             sys::cuGraphExecDestroy(self.exec);
             sys::cuGraphDestroy(self.graph);
@@ -445,34 +519,125 @@ impl Drop for Graph {
     }
 }
 
+impl Graph {
+    /// Makes launch `i` of the graph `rec` (same kernel, new grid or arguments).
+    fn set(&mut self, i: usize, rec: Rec) {
+        self.recs[i] = rec;
+        let rec = &self.recs[i];
+        let mut ptrs = [std::ptr::null_mut(); MAX_ARGS];
+        for (p, b) in ptrs.iter_mut().zip(&rec.bits) {
+            *p = b as *const u64 as *mut std::ffi::c_void;
+        }
+        let p = &mut self.params[i];
+        (p.gridDimX, p.gridDimY, p.blockDimX) = (rec.dims[0], rec.dims[1], rec.dims[2]);
+        p.kernelParams = ptrs.as_mut_ptr();
+        // SAFETY: the node belongs to this graph; the driver copies the arguments (each 4 or
+        // 8 bytes, the low bytes of its u64) before returning.
+        unsafe { sys::cuGraphExecKernelNodeSetParams_v2(self.exec, self.nodes[i], p) }
+            .result()
+            .expect("CUDA graph update failed");
+    }
+}
+
 impl Gpu {
-    /// Records the launches `f` queues instead of running them.
-    pub fn capture(&self, f: impl FnOnce(&mut Batch<'_>)) -> Graph {
+    /// Queues the launches `f` makes, as a graph kept in `slot`: captured on the first call and
+    /// replayed after that, with the launches whose grid or arguments changed updated first.
+    /// When `f` makes other launches than the graph holds, it is captured again, so `f` may
+    /// run twice and must do nothing but queue launches.
+    pub fn run_graph(&self, slot: &mut Option<Graph>, f: impl Fn(&mut Batch<'_>)) {
         let stream = self.stream.cu_stream();
+        if let Some(g) = slot {
+            let mut b = Batch {
+                gpu: self,
+                mode: Mode::Replay(g, 0),
+            };
+            f(&mut b);
+            let Mode::Replay(g, next) = b.mode else {
+                unreachable!()
+            };
+            if next == g.recs.len() {
+                // SAFETY: the graph is live and was captured on this stream.
+                unsafe { sys::cuGraphLaunch(g.exec, stream) }
+                    .result()
+                    .expect("CUDA graph launch failed");
+                return;
+            }
+            *slot = None;
+        }
         let (mut graph, mut exec) = (std::ptr::null_mut(), std::ptr::null_mut());
-        // SAFETY: the stream is live; capture is ended before the handles are used.
+        // SAFETY: the stream is live, and capture ends before the graph is used.
         unsafe {
             sys::cuStreamBeginCapture_v2(
                 stream,
                 sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
             )
-            .result()
-            .expect("CUDA capture failed");
-            f(&mut self.batch());
+        }
+        .result()
+        .expect("CUDA capture failed");
+        let mut b = Batch {
+            gpu: self,
+            mode: Mode::Capture(Vec::new()),
+        };
+        f(&mut b);
+        let Mode::Capture(recs) = b.mode else {
+            unreachable!()
+        };
+        let mut n = recs.len();
+        let mut nodes = vec![std::ptr::null_mut(); n];
+        // SAFETY: `nodes` has room for the `n` it is told of; the handles outlive their uses.
+        let params: Vec<sys::CUDA_KERNEL_NODE_PARAMS> = unsafe {
             sys::cuStreamEndCapture(stream, &mut graph)
                 .result()
                 .expect("CUDA capture failed");
             sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0)
                 .result()
                 .expect("CUDA graph failed");
+            sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut n)
+                .result()
+                .expect("CUDA graph nodes");
+            nodes
+                .iter()
+                .map(|&node| {
+                    let mut p = std::mem::zeroed();
+                    sys::cuGraphKernelNodeGetParams_v2(node, &mut p)
+                        .result()
+                        .expect("CUDA graph node");
+                    p
+                })
+                .collect()
+        };
+        // Updates address nodes by launch order, so the nodes must come back in that order.
+        assert_eq!(
+            n,
+            recs.len(),
+            "CUDA graph has other nodes than were launched"
+        );
+        for (p, r) in params.iter().zip(&recs) {
+            assert_eq!(
+                [p.gridDimX, p.gridDimY, p.blockDimX],
+                r.dims,
+                "CUDA graph node order"
+            );
+            for i in 0..r.n {
+                // SAFETY: the node holds `r.n` arguments of these sizes.
+                let have = unsafe {
+                    let a = *p.kernelParams.add(i) as *const u8;
+                    let mut v = [0u8; 8];
+                    std::ptr::copy_nonoverlapping(a, v.as_mut_ptr(), r.sizes[i] as usize);
+                    u64::from_le_bytes(v)
+                };
+                assert_eq!(have, r.bits[i], "CUDA graph node order");
+            }
         }
-        Graph { graph, exec }
-    }
-
-    /// Queues the recorded launches.
-    pub fn replay(&self, g: &Graph) {
-        // SAFETY: the handles are live until `g` drops.
-        unsafe { sys::cuGraphLaunch(g.exec, self.stream.cu_stream()) }
+        let g = slot.insert(Graph {
+            graph,
+            exec,
+            nodes,
+            params,
+            recs,
+        });
+        // SAFETY: as above.
+        unsafe { sys::cuGraphLaunch(g.exec, stream) }
             .result()
             .expect("CUDA graph launch failed");
     }
@@ -480,6 +645,64 @@ impl Gpu {
     /// Waits for all queued work.
     pub fn sync(&self) {
         self.stream.synchronize().expect("CUDA command failed");
+    }
+}
+
+/// Where a [`Batch`]'s launches go.
+enum Mode<'a> {
+    /// To the stream.
+    Queue,
+    /// To the stream, which is capturing them, and into the list.
+    Capture(Vec<Rec>),
+    /// Nowhere: each is compared with the graph's launch of that index, which is updated if
+    /// it differs. The index stops advancing at a launch the graph can't become.
+    Replay(&'a mut Graph, usize),
+}
+
+impl<'a> Batch<'a> {
+    fn call<'c>(&self, func: &'c CudaFunction) -> Call<'c>
+    where
+        'a: 'c,
+    {
+        let gpu: &'a Gpu = self.gpu;
+        Call {
+            stream: &gpu.stream,
+            args: (!matches!(self.mode, Mode::Replay(..))).then(|| gpu.stream.launch_builder(func)),
+            rec: Rec {
+                func,
+                dims: [0; 3],
+                bits: [0; MAX_ARGS],
+                sizes: [0; MAX_ARGS],
+                n: 0,
+            },
+        }
+    }
+
+    fn launch(&mut self, mut call: Call<'_>, cfg: LaunchConfig) {
+        call.rec.dims = [cfg.grid_dim.0, cfg.grid_dim.1, cfg.block_dim.0];
+        if let Some(args) = &mut call.args {
+            // SAFETY: each caller passes exactly the parameters of the kernel's signature in
+            // cuda.cu, with buffer bounds asserted or sized by construction.
+            unsafe { args.launch(cfg) }.expect("CUDA launch failed");
+        }
+        match &mut self.mode {
+            Mode::Queue => {}
+            Mode::Capture(recs) => recs.push(call.rec),
+            Mode::Replay(g, next) => {
+                let Some(have) = g.recs.get(*next) else {
+                    *next = usize::MAX;
+                    return;
+                };
+                if *have != call.rec {
+                    if have.func != call.rec.func || have.sizes != call.rec.sizes {
+                        *next = usize::MAX;
+                        return;
+                    }
+                    g.set(*next, call.rec);
+                }
+                *next += 1;
+            }
+        }
     }
 }
 
@@ -495,18 +718,13 @@ fn grid2(x: usize, y: usize, threads: u32) -> LaunchConfig {
     }
 }
 
-fn launch(mut args: LaunchArgs<'_>, cfg: LaunchConfig) {
-    // SAFETY: each caller passes exactly the parameters of the kernel's signature in cuda.cu,
-    // with buffer bounds asserted or sized by construction.
-    unsafe { args.launch(cfg) }.expect("CUDA launch failed");
-}
-
 /// Queued GPU work on the device stream; kernels run in order. [`Batch::finish`] waits.
 pub struct Batch<'a> {
     gpu: &'a Gpu,
+    mode: Mode<'a>,
 }
 
-impl Batch<'_> {
+impl<'a> Batch<'a> {
     /// [`Gpu::has_int8`] of the batch's device.
     pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
         self.gpu.has_int8(ty, cols, offset)
@@ -550,7 +768,7 @@ impl Batch<'_> {
         );
         let (x_off, y_off) = (x.1 as u64, y.1 as u64);
         let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
-        let mut a = self.gpu.stream.launch_builder(f);
+        let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
             .arg(&x.0.0)
@@ -561,7 +779,7 @@ impl Batch<'_> {
             .arg(&cols_u)
             .arg(&row_bytes)
             .arg(&nt);
-        launch(
+        self.launch(
             a,
             grid2(
                 rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
@@ -576,14 +794,14 @@ impl Batch<'_> {
         assert!(n.is_multiple_of(32) && x.1 + n <= x.0.len());
         assert!(out.q.len() * 4 >= n && out.d.len() * 32 >= n && out.s.len() * 16 >= n);
         let (x_off, blocks) = (x.1 as u64, (n / 32) as u32);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("quant_x"));
+        let mut l = self.call(self.gpu.other("quant_x"));
         l.arg(&x.0.0)
             .arg(&x_off)
             .arg(&out.q)
             .arg(&out.d)
             .arg(&out.s)
             .arg(&blocks);
-        launch(l, grid((n / 32).div_ceil(8), 256));
+        self.launch(l, grid((n / 32).div_ceil(8), 256));
     }
 
     /// [`Batch::matmul`] over activations quantized by [`Batch::quantize`] (`n_tok` rows of
@@ -622,7 +840,7 @@ impl Batch<'_> {
             .1;
         let (y_off, rb) = (y.1 as u64, row_bytes as u32);
         let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
-        let mut a = self.gpu.stream.launch_builder(f);
+        let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
             .arg(&xq.q)
@@ -643,7 +861,7 @@ impl Batch<'_> {
         } else {
             grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256)
         };
-        launch(a, cfg);
+        self.launch(a, cfg);
     }
 
     /// [`Batch::matvec_id`] over activations quantized by [`Batch::quantize`], for the matrices
@@ -743,7 +961,7 @@ impl Batch<'_> {
             .1;
         let (y_off, rb) = (y.1 as u64, ty.row_bytes(cols) as u32);
         let (rows_u, cols_u, ys, add) = (rows as u32, cols as u32, y_stride as u32, add as u32);
-        let mut a = self.gpu.stream.launch_builder(f);
+        let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
             .arg(&xq.q)
@@ -760,7 +978,7 @@ impl Batch<'_> {
             .arg(&xd)
             .arg(&ys)
             .arg(&add);
-        launch(
+        self.launch(
             a,
             grid2(
                 rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
@@ -803,7 +1021,7 @@ impl Batch<'_> {
         let (x_off, y_off, id_stride) = (x.1 as u64, y.1 as u64, stride as u64);
         let (rows_u, cols_u) = (rows as u32, cols as u32);
         let (xs, xd, ys) = (x_stride as u32, x_div as u32, y_stride as u32);
-        let mut a = self.gpu.stream.launch_builder(f);
+        let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
             .arg(&x.0.0)
@@ -818,7 +1036,7 @@ impl Batch<'_> {
             .arg(&xs)
             .arg(&xd)
             .arg(&ys);
-        launch(
+        self.launch(
             a,
             grid2(
                 rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
@@ -838,15 +1056,15 @@ impl Batch<'_> {
         offset: usize,
         span: usize,
         matmul: bool,
-    ) -> (&CudaFunction, u64, u32) {
+    ) -> (&'a CudaFunction, u64, u32) {
+        let gpu: &'a Gpu = self.gpu;
         assert!(
             rows > 0 && cols.is_multiple_of(32),
             "matvec cols must be a multiple of 32"
         );
         let row_bytes = ty.row_bytes(cols);
-        let w_off = self.gpu.device_offset(offset, span) as u64;
-        let (_, mv, mm) = self
-            .gpu
+        let w_off = gpu.device_offset(offset, span) as u64;
+        let (_, mv, mm) = gpu
             .matvec
             .iter()
             .find(|(t, ..)| *t == ty)
@@ -875,7 +1093,7 @@ impl Batch<'_> {
         assert!(n_tok * n_expert <= logits.len() && n_tok <= shared_gate.len());
         assert!(ids.0.len() >= n_tok * k && w.len() >= n_tok * (k + usize::from(shared)));
         let (ne, k_u, norm_u, shared_u) = (n_expert as u32, k as u32, norm as u32, shared as u32);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("moe_topk"));
+        let mut l = self.call(self.gpu.other("moe_topk"));
         l.arg(&logits.0)
             .arg(&shared_gate.0)
             .arg(&ids.0)
@@ -884,7 +1102,7 @@ impl Batch<'_> {
             .arg(&k_u)
             .arg(&norm_u)
             .arg(&shared_u);
-        launch(l, grid(n_tok, 32));
+        self.launch(l, grid(n_tok, 32));
     }
 
     /// For each of `n_tok` tokens `t`: row `t` of `x` `+= sum over r < m of
@@ -905,10 +1123,7 @@ impl Batch<'_> {
         assert!(w.1 + (n_tok - 1) * w_stride + m <= w.0.len());
         let (x_off, src_off, w_off) = (x.1 as u64, src.1 as u64, w.1 as u64);
         let (ws, n_u, m_u, nt) = (w_stride as u32, n as u32, m as u32, n_tok as u32);
-        let mut l = self
-            .gpu
-            .stream
-            .launch_builder(self.gpu.other("moe_combine"));
+        let mut l = self.call(self.gpu.other("moe_combine"));
         l.arg(&x.0.0)
             .arg(&x_off)
             .arg(&src.0.0)
@@ -920,7 +1135,7 @@ impl Batch<'_> {
             .arg(&m_u)
             .arg(&nt);
         let len = n * n_tok;
-        launch(l, grid(len.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+        self.launch(l, grid(len.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
@@ -938,7 +1153,7 @@ impl Batch<'_> {
         assert!(x.1 + rows * n <= x.0.len() && out.1 + rows * n <= out.0.len());
         let (x_off, o_off, n_u) = (x.1 as u64, out.1 as u64, n as u32);
         let (q, quant) = self.quant_out(quant, rows * n, n);
-        let mut a = self.gpu.stream.launch_builder(self.gpu.other("rmsnorm"));
+        let mut a = self.call(self.gpu.other("rmsnorm"));
         a.arg(&x.0.0)
             .arg(&x_off)
             .arg(&out.0.0)
@@ -950,31 +1165,35 @@ impl Batch<'_> {
             .arg(&q.d)
             .arg(&q.s)
             .arg(&quant);
-        launch(a, grid(rows, REDUCE_THREADS));
+        self.launch(a, grid(rows, REDUCE_THREADS));
     }
 
     /// The buffers and flag a kernel takes for quantizing its `n` results (rows of `row`, a
     /// multiple of 32) on the way out, as [`Batch::quantize`] would.
-    fn quant_out<'a>(&'a self, q: Option<&'a GpuQ>, n: usize, row: usize) -> (&'a GpuQ, u32) {
+    fn quant_out<'c>(&self, q: Option<&'c GpuQ>, n: usize, row: usize) -> (&'c GpuQ, u32)
+    where
+        'a: 'c,
+    {
+        let gpu: &'a Gpu = self.gpu;
         if let Some(q) = q {
             assert!(row.is_multiple_of(32));
             assert!(q.q.len() * 4 >= n && q.d.len() * 32 >= n && q.s.len() * 16 >= n);
         }
-        (q.unwrap_or(&self.gpu.no_q), q.is_some() as u32)
+        (q.unwrap_or(&gpu.no_q), q.is_some() as u32)
     }
 
     /// `a += alpha * b`
     pub fn axpy(&mut self, a: At<'_>, b: At<'_>, alpha: f32, n: usize) {
         assert!(a.1 + n <= a.0.len() && b.1 + n <= b.0.len());
         let (a_off, b_off, n_u) = (a.1 as u64, b.1 as u64, n as u32);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("axpy"));
+        let mut l = self.call(self.gpu.other("axpy"));
         l.arg(&a.0.0)
             .arg(&a_off)
             .arg(&b.0.0)
             .arg(&b_off)
             .arg(&n_u)
             .arg(&alpha);
-        launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// `a += b`
@@ -987,9 +1206,9 @@ impl Batch<'_> {
         let m = bias.len();
         assert!(a.1 + n <= a.0.len() && n.is_multiple_of(m));
         let (a_off, n_u, m_u) = (a.1 as u64, n as u32, m as u32);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("add_bias"));
+        let mut l = self.call(self.gpu.other("add_bias"));
         l.arg(&a.0.0).arg(&a_off).arg(&bias.0).arg(&n_u).arg(&m_u);
-        launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// `gate = silu(gate) * up`, quantized into `quant` as well when given.
@@ -997,7 +1216,7 @@ impl Batch<'_> {
         assert!(gate.1 + n <= gate.0.len() && up.1 + n <= up.0.len());
         let (g_off, u_off, n_u) = (gate.1 as u64, up.1 as u64, n as u32);
         let (q, quant) = self.quant_out(quant, n, n);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("swiglu"));
+        let mut l = self.call(self.gpu.other("swiglu"));
         l.arg(&gate.0.0)
             .arg(&g_off)
             .arg(&up.0.0)
@@ -1007,7 +1226,7 @@ impl Batch<'_> {
             .arg(&q.d)
             .arg(&q.s)
             .arg(&quant);
-        launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// Rotates the heads at `x`, and those at `x2` (`r.n_heads2` per token) in the same launch.
@@ -1026,7 +1245,7 @@ impl Batch<'_> {
             r.pos as u32,
         );
         let (neox, per_tok) = (r.neox as u32, r.n_heads as u32);
-        let mut l = self.gpu.stream.launch_builder(self.gpu.other("rope"));
+        let mut l = self.call(self.gpu.other("rope"));
         l.arg(&x.0.0)
             .arg(&x_off)
             .arg(&ff.0)
@@ -1043,7 +1262,7 @@ impl Batch<'_> {
             .arg(&nh2)
             .arg(&per_tok2);
         let n = (heads + heads2) * r.rope_dim / 2;
-        launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// f32s of `scores` scratch [`Batch::attention`] needs for one token at `max_ctx`.
@@ -1066,10 +1285,7 @@ impl Batch<'_> {
     ) {
         let n_parts = (p.n_pos as usize).div_ceil(ATTN_PART);
         assert!(scores.len() >= (p.n_head * (p.head_dim + 2)) as usize * n_parts);
-        let mut l = self
-            .gpu
-            .stream
-            .launch_builder(self.gpu.other("attention_part"));
+        let mut l = self.call(self.gpu.other("attention_part"));
         l.arg(&q.0)
             .arg(&k.0)
             .arg(&v.0)
@@ -1080,12 +1296,9 @@ impl Batch<'_> {
             .arg(&p.n_pos)
             .arg(&p.kv_dim)
             .arg(&p.scale);
-        launch(l, grid2(p.n_kv as usize, n_parts, ATTN_PART_THREADS));
+        self.launch(l, grid2(p.n_kv as usize, n_parts, ATTN_PART_THREADS));
         let n_parts = n_parts as u32;
-        let mut l = self
-            .gpu
-            .stream
-            .launch_builder(self.gpu.other("attention_merge"));
+        let mut l = self.call(self.gpu.other("attention_merge"));
         let (xq, quant) =
             self.quant_out(quant, (p.n_head * p.head_dim) as usize, p.head_dim as usize);
         l.arg(&scores.0)
@@ -1096,7 +1309,7 @@ impl Batch<'_> {
             .arg(&xq.d)
             .arg(&xq.s)
             .arg(&quant);
-        launch(l, grid(p.n_head as usize, ATTN_PART_THREADS));
+        self.launch(l, grid(p.n_head as usize, ATTN_PART_THREADS));
     }
 
     /// Causal attention for `p.n_tok` query tokens over the cached positions. `q`, `k`, `v` and
@@ -1133,7 +1346,7 @@ impl Batch<'_> {
             return self.attention_decode(q, k, v, out, scores, p, quant);
         }
         for tok0 in (0..p.n_tok).step_by(per_launch) {
-            let mut l = self.gpu.stream.launch_builder(self.gpu.other("attention"));
+            let mut l = self.call(self.gpu.other("attention"));
             l.arg(&q.0)
                 .arg(&k.0)
                 .arg(&v.0)
@@ -1152,7 +1365,7 @@ impl Batch<'_> {
                 .arg(&xq.s)
                 .arg(&quant_u);
             let n = per_launch.min((p.n_tok - tok0) as usize);
-            launch(l, grid2(p.n_head as usize, n, ATTN_THREADS));
+            self.launch(l, grid2(p.n_head as usize, n, ATTN_THREADS));
         }
     }
 

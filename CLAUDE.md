@@ -136,7 +136,11 @@ Design points that span files:
   result feeds int8 matrices quantize it on the way out (`quant_block` in `rmsnorm`, `swiglu`,
   `attention`), the int8 matvec can add into the residual stream, `rope` takes queries and keys
   together and a token's gate and up are one launch (`matvec_q_pair`): 12 launches a dense layer,
-  was 20. Other weight types and MoE experts stay f32. `dp4a` has no header
+  was 20. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
+  `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
+  so the queueing code is the same either way; a pass whose launches differ is captured anew,
+  and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Stacked MoE experts run
+  the int8 matvec too (`matvec_q_id`); other weight types stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,
