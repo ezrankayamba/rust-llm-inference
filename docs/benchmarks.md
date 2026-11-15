@@ -3,6 +3,64 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: int8 tensor-core prompt matmul on CUDA
+
+Same A100 instance as the next three sections. On compute capability 8.0 and up, `mma_q4_k` and
+`mma_q6_k` replace the `dp4a` kernels of the next section: one `mma.sync` (inline PTX)
+multiplies 16 weight rows by 8 tokens over 32 columns (Q4_K) or 16 (Q6_K) for a whole warp. A
+block takes 64 rows and 128 tokens, 128 columns at a time; they are a second compile of
+`cuda.cu`, capped at 96 registers per thread. `bench --gpu-layers N --reps 5`, Q4_K_M, tok/s;
+"dp4a" is the same build with `RLI_CUDA_NO_MMA=1`.
+
+| Model | pp512 dp4a | pp512 tensor cores | tg128 dp4a | tg128 tensor cores | llama.cpp pp512 |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 5119.4 ± 559.7 | 7511.1 ± 1637.1 | 276.9 | 280.9 | 14500.7 |
+| Mistral-7B | 968.9 | 1895.2 | 72.7 | 73.4 | 4911.9 |
+| Qwen3-30B-A3B (MoE) | 347.5 | 356.8 | 97.0 | 95.0 | 4241.7 |
+
+llama.cpp is now 1.9x, 2.6x and 11.9x ahead on prompts. Short prompts gain too (5 reps, tensor
+cores / dp4a): Mistral-7B pp8 160.0 / 109.6, pp32 543.1 / 402.5, pp128 1491.7 / 901.7;
+Llama-3.2-1B pp8 463.7 / 290.9, pp32 1467.0 / 1077.6, pp128 3663.6 / 3169.9. The second compile
+adds 0.5-0.8 s to attaching (2.07 s -> 2.6-2.9 s for a one-token run of Llama-3.2-1B).
+
+Last-token logits of a 99-token prompt against the GPU's f32 (`--precise`) run: Llama-3.2-1B
+max 0.173, mean 0.030, KL 3.6e-4; Mistral-7B 0.126, 0.022, 4.0e-4; Qwen3-30B-A3B 0.600, 0.105,
+4.2e-3; top-1 the same in each. The integer sums are exact, but the result is not bit-equal to
+the dp4a kernels' (float sums in another order), and with int8 activations that moves logits by
+as much as the int8 rounding itself (0.126 between the two on Mistral-7B). Other checks: the
+workspace tests with `--features rli-models/cuda`, among them a new one comparing `matmul_q`
+with the f32 matmul on random Q4_K and Q6_K weights (run with and without `RLI_CUDA_NO_MMA`);
+Llama-3.2-1B `--precise` against `ref_forward.py`, 421 tokens, 3.8e-5 batched and 3.3e-5 per
+token.
+
+How it got there, Mistral-7B pp512 (3 reps), each step measured by compiling parts of the
+kernel out. With the kernel returning at once the prompt ran at 6200-6800 tok/s, so everything
+outside these matmuls is about 0.16 ms a token.
+
+| Step | tok/s |
+|---|---:|
+| `dp4a` kernel (next section) | 961 |
+| `mma.sync` in the same loop, 16 columns a step, 32 rows x 64 tokens | 1282 |
+| 32 columns a step for Q4_K (one scale per 32 weights) | 1349 |
+| 128 x 128 tiles, weights of a warp's 16 rows held in registers, 8 warps | 784 |
+| the same with the loops that load tiles unrolled | 937 |
+| tile loads read everything into registers, then store | 1598 |
+| 64 x 128 tiles, at most 96 registers per thread | 1885 |
+
+- The multiplies were never the limit: with the `mma.sync` replaced by an xor the time did not
+  change, and 32 columns a step in place of 16 gained 5%.
+- Loading tiles was. A warp that reads global memory and stores the value before the next read
+  waits out one memory latency per row: loading alone took 0.69 ms a token at 128 x 128, 0.18
+  once all of a thread's reads were issued before its first store. The other CUDA kernels here
+  still read and use one value at a time, which may be why every one of them moved weights at
+  75-115 GB/s; not tested on them.
+- Registers set how many warps a multiprocessor holds (65536 / registers / 32). Left alone the
+  compiler used 128-255 a thread for these kernels; a 96 cap gave 1611 -> 1885 at 64 x 128
+  (72-104 all within 1%), and the same cap applied to the whole file took f32 (`--precise`)
+  prompts from 227.6 to 177.6, hence the separate compile. 16 warps a block would not launch.
+- No gain: converting the sums to float with an integer add and a float add in place of
+  `(float)` (identical speed and results).
+
 ## 2026-11-15: int8 prompt matmul on CUDA (`dp4a`)
 
 Same A100 instance as the next two sections. Prompt chunks of 8+ tokens now quantize activations

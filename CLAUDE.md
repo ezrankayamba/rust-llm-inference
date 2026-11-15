@@ -125,12 +125,23 @@ Design points that span files:
   over 64 tokens per block; 3.4-4.4x on dense prompts, logits within ~0.16 of f32 (0.6 on
   Qwen3-30B-A3B). Other weight types, MoE experts and decode stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
-  llama.cpp's CUDA backend, which uses int8 tensor-core instructions, was 3-12x faster on
-  prompts and 2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
+  On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
+  keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,
+  128 columns at a time, a warp's 16 rows of weights held in registers. They are a second
+  compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 96 registers per thread,
+  which lets a multiprocessor hold more warps but slows the f32 matmuls. About 2x `dp4a` on
+  Mistral-7B prompts; not bit-equal to it. Two things measured there apply to any CUDA
+  kernel: issue all of a thread's global reads before its first store (a read followed by a
+  store waits out the memory latency, which was most of the tile-loading time), and check
+  registers per thread, since 65536 / registers / 32 warps fit a multiprocessor.
+  llama.cpp's CUDA backend was 1.9-2.6x faster on dense prompts, 12x on Qwen3-30B-A3B's and
+  2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
   the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
   against `ref_forward.py` both batched and with `--per-token` (the decode kernels).
-  `scripts/cuda_cpu_check` checks the weight decoders on the CPU; CI doesn't run it. It first ran
+  `scripts/cuda_cpu_check` checks the weight decoders on the CPU; CI doesn't run it. The tensor-core
+  kernels decode inline, so only the GPU test `matmul_q_matches_f32_matmul` (rli-core, run it
+  with and without `RLI_CUDA_NO_MMA=1`) covers them. It first ran
   on 2026-11-15, on a rented A100; `libnvrtc` had to be put on the library path there
   (`LD_LIBRARY_PATH=/opt/conda/lib` on a PyTorch image).
 

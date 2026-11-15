@@ -38,6 +38,10 @@ const MMQ_KERNELS: [(GgmlType, &str); 2] =
     [(GgmlType::Q4_K, "mmq_q4_k"), (GgmlType::Q6_K, "mmq_q6_k")];
 /// Tokens per block of the int8 matmul kernels (`MQ_T` in cuda.cu).
 const MMQ_TILE: usize = 64;
+/// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
+/// warps in cuda.cu), and their compile's cap on registers per thread.
+const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
+const MMA_REGS: usize = 96;
 const OTHER_KERNELS: [&str; 9] = [
     "quant_x",
     "rmsnorm",
@@ -132,6 +136,8 @@ pub struct Gpu {
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     mmq: Vec<(GgmlType, CudaFunction)>,
+    /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
+    mma: bool,
     other: Vec<(&'static str, CudaFunction)>,
     /// One zero: the expert id of a plain matvec.
     zero_id: GpuIds,
@@ -166,10 +172,39 @@ impl Gpu {
             .iter()
             .map(|&(t, n)| Ok((t, func(n)?, func(&n.replace("matvec", "matmul"))?)))
             .collect::<Result<_, String>>()?;
-        let mmq = MMQ_KERNELS
-            .iter()
-            .map(|&(t, n)| Ok((t, func(n)?)))
-            .collect::<Result<_, String>>()?;
+        // From compute capability 8.0 (Ampere) the tensor-core kernels replace the dp4a ones.
+        // They are a second compile of the same source: fewer registers per thread let a
+        // multiprocessor hold more of their warps, and the same cap slows the f32 matmuls.
+        // RLI_CUDA_NO_MMA keeps the dp4a kernels, to check them on a newer GPU.
+        let mma = std::env::var_os("RLI_CUDA_NO_MMA").is_none()
+            && ctx
+                .compute_capability()
+                .map_err(err("compute capability"))?
+                .0
+                >= 8;
+        let mmq = if mma {
+            let opts = cudarc::nvrtc::CompileOptions {
+                arch: Some("compute_80"),
+                options: vec!["-DRLI_MMA".into()],
+                maxrregcount: Some(MMA_REGS),
+                ..Default::default()
+            };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
+                .map_err(|e| format!("CUDA tensor-core kernel compile failed: {e:?}"))?;
+            let module = ctx.load_module(ptx).map_err(err("load CUDA module"))?;
+            MMQ_KERNELS
+                .iter()
+                .map(|&(t, n)| {
+                    let n = n.replace("mmq", "mma");
+                    Ok((t, module.load_function(&n).map_err(err(&n))?))
+                })
+                .collect::<Result<_, String>>()?
+        } else {
+            MMQ_KERNELS
+                .iter()
+                .map(|&(t, n)| Ok((t, func(n)?)))
+                .collect::<Result<_, String>>()?
+        };
         let other = OTHER_KERNELS
             .iter()
             .map(|&n| Ok((n, func(n)?)))
@@ -224,6 +259,7 @@ impl Gpu {
             placed,
             matvec,
             mmq,
+            mma,
             other,
             zero_id,
             name,
@@ -472,7 +508,16 @@ impl Batch<'_> {
             .arg(&cols_u)
             .arg(&rb)
             .arg(&nt);
-        launch(a, grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256));
+        let cfg = if self.gpu.mma {
+            grid2(
+                rows.div_ceil(MMA_TILE.0),
+                n_tok.div_ceil(MMA_TILE.1),
+                MMA_TILE.2,
+            )
+        } else {
+            grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256)
+        };
+        launch(a, cfg);
     }
 
     /// `n` matvecs in one launch, over matrices of a stack of `n_stack` that lie `stride` bytes
@@ -756,5 +801,59 @@ impl Batch<'_> {
     /// Waits for all queued work.
     pub fn finish(self) {
         self.gpu.stream.synchronize().expect("CUDA command failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The int8 matmul against the f32 one over the same random weights: they differ only by
+    /// the rounding of activations to int8. The sizes leave a row tile and a token tile partly
+    /// filled. Needs an NVIDIA GPU, so CI doesn't run it; `RLI_CUDA_NO_MMA=1` checks the dp4a
+    /// kernels on a GPU that would use the tensor-core ones.
+    #[test]
+    fn matmul_q_matches_f32_matmul() {
+        let (rows, cols, n) = (200, 512, 137);
+        for (ty, scales_at) in [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])] {
+            let mut seed = 1u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let mut w: Vec<u8> = (0..rows * ty.row_bytes(cols))
+                .map(|_| next() as u8)
+                .collect();
+            for block in w.chunks_exact_mut(ty.block_bytes()) {
+                for &i in scales_at {
+                    block[i + 1] = 0x24 | (block[i + 1] & 3); // an f16 in [2^-6, 2^-5)
+                }
+            }
+            let x: Vec<f32> = (0..n * cols)
+                .map(|_| next() as f32 / 8388608.0 - 1.0)
+                .collect();
+
+            let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            let (xb, xq) = (gpu.upload(&x), gpu.alloc_q(n * cols));
+            let (y_f32, y_q) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
+            let mut b = gpu.batch();
+            b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
+            b.quantize(At(&xb, 0), n * cols, &xq);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&y_q, 0), n);
+            b.finish();
+            let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+            gpu.read(&y_f32, &mut want);
+            gpu.read(&y_q, &mut got);
+
+            let rms = |v: &mut dyn Iterator<Item = f32>| {
+                (v.map(|a| (a * a) as f64).sum::<f64>() / (n * rows) as f64).sqrt()
+            };
+            let err = rms(&mut got.iter().zip(&want).map(|(a, b)| a - b));
+            let size = rms(&mut want.iter().copied());
+            assert!(
+                err < 0.01 * size,
+                "{ty:?}: rms error {err} against rms {size}"
+            );
+        }
     }
 }

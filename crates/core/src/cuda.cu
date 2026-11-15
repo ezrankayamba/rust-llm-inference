@@ -13,8 +13,7 @@ typedef unsigned long long ulong;
 #define NEG_INF __uint_as_float(0xff800000u)
 
 // Little-endian IEEE half at p (any alignment) to f32.
-__device__ inline float h(const uchar* p) {
-    uint b = (uint)p[0] | ((uint)p[1] << 8);
+__device__ inline float h_bits(uint b) {
     uint sign = (b & 0x8000u) << 16, e = (b >> 10) & 31, m = b & 1023;
     if (e == 0) {
         float f = (float)m * 5.9604645e-8f;  // subnormal: m * 2^-24
@@ -22,6 +21,10 @@ __device__ inline float h(const uchar* p) {
     }
     uint bits = e == 31 ? (sign | 0x7f800000u | (m << 13)) : (sign | ((e + 112) << 23) | (m << 13));
     return __uint_as_float(bits);
+}
+
+__device__ inline float h(const uchar* p) {
+    return h_bits((uint)p[0] | ((uint)p[1] << 8));
 }
 
 __device__ inline float warp_sum(float v) {
@@ -125,8 +128,11 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
     if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
 }
 
+// The tensor-core compile (RLI_MMA, see MATMUL_MMA) builds only its own kernels.
+#ifndef RLI_MMA
 MATVEC(matvec_f32, wt_f32)
 MATVEC(matvec_f16, wt_f16)
+#endif
 
 // Two bytes at p (even address) as a little-endian u16.
 __device__ inline uint u16(const uchar* p) {
@@ -245,12 +251,14 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
     if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
 }
 
+#ifndef RLI_MMA
 MATVEC_SB(matvec_q4_0, sb_q4_0, 8 * 18, wt_q4_0)
 MATVEC_SB(matvec_q5_0, sb_q5_0, 8 * 22, wt_q5_0)
 MATVEC_SB(matvec_q8_0, sb_q8_0, 8 * 34, wt_q8_0)
 MATVEC_SB(matvec_q4_k, sb_q4_k, 144, wt_q4_k)
 MATVEC_SB(matvec_q5_k, sb_q5_k, 176, wt_q5_k)
 MATVEC_SB(matvec_q6_k, sb_q6_k, 210, wt_q6_k)
+#endif
 
 // Y = X W^T for n_tok tokens: x is n_tok rows of cols, y is n_tok rows of `rows`. Grid: x over
 // groups of ROWS_PER_BLOCK weight rows, y over tiles of TILE tokens. A warp decodes each weight
@@ -282,6 +290,7 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
     }                                                                                          \
 }
 
+#ifndef RLI_MMA
 MATMUL(matmul_f32, wt_f32)
 MATMUL(matmul_f16, wt_f16)
 MATMUL(matmul_q4_0, wt_q4_0)
@@ -290,6 +299,7 @@ MATMUL(matmul_q8_0, wt_q8_0)
 MATMUL(matmul_q4_k, wt_q4_k)
 MATMUL(matmul_q5_k, wt_q5_k)
 MATMUL(matmul_q6_k, wt_q6_k)
+#endif
 
 // ---- Int8 matmul: activations quantized to int8, 4 products per dp4a ----
 //
@@ -424,8 +434,220 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
     }                                                                                          \
 }
 
+#ifndef RLI_MMA
 MATMUL_Q(mmq_q4_k, mq_load_q4_k, 144)
 MATMUL_Q(mmq_q6_k, mq_load_q6_k, 210)
+#endif
+
+#ifdef RLI_MMA
+// The same product on int8 tensor cores (compute capability 8.0 and up; this part is compiled
+// separately, for that and with a cap on registers). One instruction multiplies 16 weight rows
+// by 8 tokens over 16 or 32 columns for a whole warp: lane 4i + j gives the 4 weights of rows
+// i and i + 8 at columns 4j..4j+3 (and 16 + 4j.. for 32 columns) and the same columns of token
+// i, and receives the sums of rows i and i + 8 with tokens 2j and 2j + 1.
+//
+// A block takes MA_R rows and MA_T tokens, 128 columns at a time. Warp w owns 16 rows
+// (w % MA_RG), keeps their weights and scales in registers, and runs them against every
+// (MA_NW / MA_RG)-th octet of tokens. Rows and tokens lie MA_S words apart in shared memory so
+// a warp's loads fall in different banks. On an A100 the multiplies are a small part of the
+// time: what set the shape was reading the tiles (larger is better) against registers per
+// thread, which limit how many warps a multiprocessor holds (smaller is better).
+#define MA_R 64
+#define MA_T 128
+#define MA_NW 8
+#define MA_S 36
+#define MA_RG (MA_R / 16)
+#define MA_NO (MA_T / 8 / (MA_NW / MA_RG))
+
+// c += a b^T over 16 columns or 32.
+__device__ inline void mma16_s8(int a0, int a1, int b, int* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                 "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b));
+}
+
+__device__ inline void mma32_s8(int a0, int a1, int a2, int a3, int b0, int b1, int* c) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Tile loading reads everything it needs from global memory into registers before it stores
+// anything: a warp waits for a read only when it uses the result, so the reads of all its rows
+// are in flight together. With a store after each read they took one memory latency per row.
+#define MA_ROWP(R) (w + sb_off + (ulong)(row0 + (R) < rows ? row0 + (R) : rows - 1) * row_bytes)
+
+// Q6_K: 4 weights of quarter k of a half super-block, from their low nibbles (in ql, already
+// the right 4 bytes) and high bit pairs, as int8.
+__device__ inline uint ma_word_q6_k(uint ql, uint qh, uint k) {
+    uint v = ((ql >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu) | (((qh >> (2 * k)) & 0x03030303u) << 4);
+    // Each byte is 0..63; subtract 32 from each without borrowing across bytes.
+    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+
+// K32: one scale per 32 weights (Q4_K, with an offset wm), so a step covers 32 columns and a
+// row's half super-block takes 16 lanes; otherwise 16 columns and 32 lanes (Q6_K, no offset).
+// Weights are ws * q - wm.
+#define MATMUL_MMA(NAME, SB_BYTES, K32)                                                        \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, const float* xd,  \
+                                const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
+                                uint row_bytes, uint n_tok) {                                  \
+    const uint NG = K32 ? 4 : 8, NP = MA_R / MA_NW / (K32 ? 2 : 1), NT = MA_T / MA_NW;         \
+    __shared__ uint wq[MA_R * MA_S];                                                           \
+    __shared__ uint tq[MA_T * MA_S];                                                           \
+    __shared__ float ws[MA_R * (K32 ? 4 : 8)];                                                 \
+    __shared__ float wm[K32 ? MA_R * 4 : 1];                                                   \
+    __shared__ float td[MA_T * 4];                                                             \
+    __shared__ float ts[K32 ? MA_T * 4 : 1];                                                   \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint gi = lane / 4, gj = lane % 4;                                                         \
+    uint row0 = blockIdx.x * MA_R, t0 = blockIdx.y * MA_T;                                     \
+    uint last = n_tok - 1 - t0;                                                                \
+    uint ra = 16 * (warp % MA_RG) + gi, ow = warp / MA_RG;                                     \
+    float acc[4 * MA_NO];                                                                      \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < 4 * MA_NO; j++) acc[j] = 0;                                           \
+    for (uint kh = 0; kh < cols / 128; kh++) {                                                 \
+        ulong sb_off = w_off + (ulong)(kh / 2) * SB_BYTES;                                     \
+        uint hf = kh % 2;                                                                      \
+        uint v0[16], v1[16], v2[16], v3[16];                                                   \
+        if (K32) {                                                                             \
+            uint l = lane % 16, rl = 2 * warp + lane / 16;                                     \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NP; p++)                                                      \
+                v0[p] = u32e(MA_ROWP(rl + p * 2 * MA_NW) + 16 + 64 * hf + 4 * l);              \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NP; p++) {                                                    \
+                uint* wr = wq + (rl + p * 2 * MA_NW) * MA_S + 16 * (l / 8) + l % 8;            \
+                wr[0] = v0[p] & 0x0F0F0F0Fu; /* low nibbles: sub-block 2 (l / 8) */            \
+                wr[8] = (v0[p] >> 4) & 0x0F0F0F0Fu;                                            \
+            }                                                                                  \
+            if (l < 4) {                                                                       \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < NP; p++) {                                                \
+                    const uchar* b = MA_ROWP(rl + p * 2 * MA_NW);                              \
+                    v0[p] = u32e(b);                                                           \
+                    v1[p] = u32e(b + 4);                                                       \
+                    v2[p] = u32e(b + 8);                                                       \
+                    v3[p] = u32e(b + 12);                                                      \
+                }                                                                              \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < NP; p++) {                                                \
+                    /* Sub-block 4 hf + l: bytes l, 4 + l and 8 + l of the 12 scale bytes. */  \
+                    uint b0 = (v1[p] >> 8 * l) & 255, b1 = (v2[p] >> 8 * l) & 255;             \
+                    uint b2 = (v3[p] >> 8 * l) & 255;                                          \
+                    uint sc = hf ? (b2 & 0xF) | ((b0 >> 6) << 4) : b0 & 63;                    \
+                    uint mn = hf ? (b2 >> 4) | ((b1 >> 6) << 4) : b1 & 63;                     \
+                    uint r = rl + p * 2 * MA_NW;                                               \
+                    ws[r * 4 + l] = h_bits(v0[p] & 0xFFFF) * (float)sc;                        \
+                    wm[K32 ? r * 4 + l : 0] = h_bits(v0[p] >> 16) * (float)mn;                 \
+                }                                                                              \
+            }                                                                                  \
+        } else {                                                                               \
+            uint k = lane / 8, i = 4 * (lane % 8);                                             \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NP; p++) {                                                    \
+                const uchar* b = MA_ROWP(warp + p * MA_NW);                                    \
+                v0[p] = u32e(b + 64 * hf + 32 * (k % 2) + i);                                  \
+                v1[p] = u32e(b + 128 + 32 * hf + i);                                           \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NP; p++)                                                      \
+                wq[(warp + p * MA_NW) * MA_S + lane] = ma_word_q6_k(v0[p], v1[p], k);          \
+            if (lane < 8) {                                                                    \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < NP; p++) {                                                \
+                    const uchar* b = MA_ROWP(warp + p * MA_NW);                                \
+                    v0[p] = u16(b + 208);                                                      \
+                    v1[p] = (uint)(int)((const signed char*)b)[192 + 8 * hf + lane];           \
+                }                                                                              \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < NP; p++)                                                  \
+                    ws[(warp + p * MA_NW) * 8 + lane] = h_bits(v0[p]) * (float)(int)v1[p];     \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < NT; p++) {                                                        \
+            uint t = warp + p * MA_NW;                                                         \
+            v0[p] = xq[(ulong)(t0 + (t < last ? t : last)) * (cols / 4) + kh * 32 + lane];     \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < NT; p++) tq[(warp + p * MA_NW) * MA_S + lane] = v0[p];            \
+        if (lane < 4) {                                                                        \
+            float f0[16], f1[16], f2[16];                                                      \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NT; p++) {                                                    \
+                uint t = warp + p * MA_NW;                                                     \
+                ulong tok = t0 + (t < last ? t : last);                                        \
+                f0[p] = xd[tok * (cols / 32) + kh * 4 + lane];                                 \
+                f1[p] = K32 ? xs[tok * (cols / 16) + kh * 8 + 2 * lane] : 0;                   \
+                f2[p] = K32 ? xs[tok * (cols / 16) + kh * 8 + 2 * lane + 1] : 0;               \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < NT; p++) {                                                    \
+                uint t = warp + p * MA_NW;                                                     \
+                td[t * 4 + lane] = f0[p];                                                      \
+                if (K32) ts[t * 4 + lane] = f1[p] + f2[p];                                     \
+            }                                                                                  \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+        {                                                                                      \
+        int a[8][4];                                                                           \
+        float sa[8], sb[8], ma[8], mb[8];                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint g = 0; g < NG; g++) {                                                        \
+            const uint* ap = wq + ra * MA_S + (K32 ? 8 : 4) * g + gj;                          \
+            a[g][0] = ap[0];                                                                   \
+            a[g][1] = ap[8 * MA_S];                                                            \
+            a[g][2] = K32 ? ap[4] : 0;                                                         \
+            a[g][3] = K32 ? ap[8 * MA_S + 4] : 0;                                              \
+            sa[g] = ws[ra * NG + g];                                                           \
+            sb[g] = ws[(ra + 8) * NG + g];                                                     \
+            ma[g] = K32 ? wm[ra * NG + g] : 0;                                                 \
+            mb[g] = K32 ? wm[(ra + 8) * NG + g] : 0;                                           \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint o = 0; o < MA_NO; o++) {                                                     \
+            uint tb = (o * (MA_NW / MA_RG) + ow) * 8, ta = tb + 2 * gj;                        \
+            if (tb > last) continue;                                                           \
+            _Pragma("unroll")                                                                  \
+            for (uint g = 0; g < NG; g++) {                                                    \
+                const uint* bp = tq + (tb + gi) * MA_S + (K32 ? 8 : 4) * g + gj;               \
+                uint di = K32 ? g : g / 2;                                                     \
+                float d0 = td[ta * 4 + di], d1 = td[(ta + 1) * 4 + di];                        \
+                int c[4] = {0, 0, 0, 0};                                                       \
+                if (K32) mma32_s8(a[g][0], a[g][1], a[g][2], a[g][3], bp[0], bp[4], c);        \
+                else mma16_s8(a[g][0], a[g][1], bp[0], c);                                     \
+                acc[4 * o] += sa[g] * d0 * (float)c[0];                                        \
+                acc[4 * o + 1] += sa[g] * d1 * (float)c[1];                                    \
+                acc[4 * o + 2] += sb[g] * d0 * (float)c[2];                                    \
+                acc[4 * o + 3] += sb[g] * d1 * (float)c[3];                                    \
+                if (K32) {                                                                     \
+                    float s0 = ts[ta * 4 + g], s1 = ts[(ta + 1) * 4 + g];                      \
+                    acc[4 * o] -= ma[g] * s0;                                                  \
+                    acc[4 * o + 1] -= ma[g] * s1;                                              \
+                    acc[4 * o + 2] -= mb[g] * s0;                                              \
+                    acc[4 * o + 3] -= mb[g] * s1;                                              \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+    }                                                                                          \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < 4 * MA_NO; j++) {                                                     \
+        uint t = (j / 4 * (MA_NW / MA_RG) + ow) * 8 + 2 * gj + j % 2;                          \
+        uint row = row0 + ra + 8 * (j / 2 % 2);                                                \
+        if (t <= last && row < rows) y[y_off + (ulong)(t0 + t) * rows + row] = acc[j];         \
+    }                                                                                          \
+}
+
+MATMUL_MMA(mma_q4_k, 144, 1)
+MATMUL_MMA(mma_q6_k, 210, 0)
+
+#else  // the rest of the file is not part of the tensor-core compile
 
 // Block-wide reductions for blockDim.x <= 1024 (a multiple of 32).
 __device__ inline float block_sum(float v, float* red) {
@@ -624,3 +846,4 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
         oh[d] = o / sum;
     }
 }
+#endif  // RLI_MMA
