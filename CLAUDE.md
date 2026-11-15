@@ -130,10 +130,11 @@ Design points that span files:
   128 columns at a time, a warp's 16 rows of weights held in registers. They are a second
   compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 96 registers per thread,
   which lets a multiprocessor hold more warps but slows the f32 matmuls. About 2x `dp4a` on
-  Mistral-7B prompts; not bit-equal to it. Two things measured there apply to any CUDA
-  kernel: issue all of a thread's global reads before its first store (a read followed by a
-  store waits out the memory latency, which was most of the tile-loading time), and check
-  registers per thread, since 65536 / registers / 32 warps fit a multiprocessor.
+  Mistral-7B prompts; not bit-equal to it. Their tile loads issue all of a thread's
+  global reads before its first store: a read followed by a store waits out the memory
+  latency, which was most of the loading time with so few warps per multiprocessor
+  (65536 / registers / 32 fit). Don't carry that over: the same reordering made the decode
+  matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
   llama.cpp's CUDA backend was 1.9-2.6x faster on dense prompts, 12x on Qwen3-30B-A3B's and
   2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:

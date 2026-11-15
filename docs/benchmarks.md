@@ -3,6 +3,29 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: reading before storing in the other CUDA kernels (not merged)
+
+The section below found that the tensor-core kernels' tile loads were waiting out one memory
+latency per row, and guessed the other CUDA kernels might be held back the same way. Three
+tries on the same A100 say they are not; none was kept. `bench --reps 3`, Q4_K_M, tok/s.
+
+| Kernel, change | Measure | Before | After |
+|---|---|---:|---:|
+| Q4_K decode matvec: all reads of 1 / 2 / 4 / 8 super-blocks, then the arithmetic | Llama-3.2-1B tg128 | 276.4 | 259.8 / 268.2 / 269.7 / 248.0 |
+| | Mistral-7B tg128 | 73.6 | 67.6 / 68.7 / 68.2 / 60.1 |
+| | Qwen3-30B-A3B tg128 | 96.2 | 91.3 / 92.0 / 89.8 / 83.5 |
+| f32 matmul: a tile's 32 values of x read before the multiplies | Mistral-7B pp512 `--precise` | 227.6 | 163.4 |
+| | Llama-3.2-1B pp512 `--precise` | not rerun (1537.1 at 95d536b) | 1270.3 |
+| `dp4a` matmul (`RLI_CUDA_NO_MMA=1`): a block's tokens read before they are stored | Mistral-7B pp512 | 968.9 | 818.4 |
+| | Llama-3.2-1B pp512 | 5119.4 ± 559.7 | 4804.9 ± 131.4 |
+
+The decode variant's logits still matched `ref_forward.py` (6.7e-6, `--per-token`), and the
+`dp4a` one passed `matmul_q_matches_f32_matmul`. Why these lose was not investigated. The
+decode matvecs run 4 warps a block at 32-40 registers a thread, so a multiprocessor holds many
+warps and has others to run while one waits; the tensor-core kernels at 128 x 128 held 8.
+For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
+for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
+
 ## 2026-11-15: int8 tensor-core prompt matmul on CUDA
 
 Same A100 instance as the next three sections. On compute capability 8.0 and up, `mma_q4_k` and
@@ -51,9 +74,8 @@ outside these matmuls is about 0.16 ms a token.
   change, and 32 columns a step in place of 16 gained 5%.
 - Loading tiles was. A warp that reads global memory and stores the value before the next read
   waits out one memory latency per row: loading alone took 0.69 ms a token at 128 x 128, 0.18
-  once all of a thread's reads were issued before its first store. The other CUDA kernels here
-  still read and use one value at a time, which may be why every one of them moved weights at
-  75-115 GB/s; not tested on them.
+  once all of a thread's reads were issued before its first store. The same change made the
+  other CUDA kernels slower (section above).
 - Registers set how many warps a multiprocessor holds (65536 / registers / 32). Left alone the
   compiler used 128-255 a thread for these kernels; a 96 cap gave 1611 -> 1885 at 64 x 128
   (72-104 all within 1%), and the same cap applied to the whole file took f32 (`--precise`)
