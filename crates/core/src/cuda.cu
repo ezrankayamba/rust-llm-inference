@@ -327,6 +327,46 @@ MATMUL(matmul_q5_k, wt_q5_k)
 MATMUL(matmul_q6_k, wt_q6_k)
 #endif
 
+// ---- f16 GEMM for long prompts: weights dequantized to f16 once per matmul ----
+//
+// The int8 tensor-core matmul spends most of its time scaling each 32-column product by its
+// two block scales. Weights and activations as f16 need none of that: a matmul over 64 tokens
+// or more dequantizes its matrix into scratch (`dequant_*`) and multiplies it by the
+// activations (`to_f16`) on f16 tensor cores (`gemm_f16`, in the tensor-core compile).
+
+__device__ inline unsigned short f2h(float f) {
+    unsigned short r;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(r) : "f"(f));
+    return r;
+}
+
+#ifndef RLI_MMA
+extern "C" __global__ void to_f16(const float* x, ulong x_off, unsigned short* out, uint n) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = f2h(x[x_off + i]);
+}
+
+// A warp per 32 weights of a row.
+#define DEQUANT(NAME, WT)                                                                      \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, unsigned short* out, uint rows, uint cols, \
+                                uint row_bytes) {                                              \
+    uint lane = threadIdx.x % 32;                                                              \
+    ulong chunk = (ulong)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;                    \
+    uint row = (uint)(chunk / (cols / 32)), c = (uint)(chunk % (cols / 32));                   \
+    if (row >= rows) return;                                                                   \
+    float v = WT(w + w_off + (ulong)row * row_bytes, c, lane);                                 \
+    out[(ulong)row * cols + c * 32 + lane] = f2h(v);                                           \
+}
+
+DEQUANT(dequant_f32, wt_f32)
+DEQUANT(dequant_f16, wt_f16)
+DEQUANT(dequant_q4_0, wt_q4_0)
+DEQUANT(dequant_q5_0, wt_q5_0)
+DEQUANT(dequant_q8_0, wt_q8_0)
+DEQUANT(dequant_q5_k, wt_q5_k)
+DEQUANT(dequant_q6_k, wt_q6_k)
+#endif
+
 // ---- Int8 matmul: activations quantized to int8, 4 products per dp4a ----
 //
 // Y = X W^T for n_tok tokens over activations quantized by quant_x. A block of 8 warps takes 32
@@ -576,6 +616,53 @@ __device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float
     return h_bits((uint)sc[2] & 0xFFFF) * (fa * dx[0] * (float)sa + fb * dx[2] * (float)sb);
 }
 
+#ifndef RLI_MMA
+// Scale and minimum of sub-block i, from the 12 scale bytes in words 1..3 of a Q4_K
+// super-block's first 16 bytes.
+__device__ inline void q4_k_scale(const U128& hd, uint i, float* sc, float* mn) {
+    uint l = i % 4;
+    uint b0 = (hd.v[1] >> 8 * l) & 255, b1 = (hd.v[2] >> 8 * l) & 255;
+    uint b2 = (hd.v[3] >> 8 * l) & 255;
+    *sc = h_bits(hd.v[0] & 0xFFFF) * (float)(i < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4));
+    *mn = h_bits(hd.v[0] >> 16) * (float)(i < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4));
+}
+
+// Q4_K written out as f16, in 16-byte reads and stores (the row must lie at a multiple of 16
+// bytes; `dequant_q4_k_any` below takes any). A warp takes 4 super-blocks of a row; lane
+// 8u + j reads 16 bytes of super-block u, which hold weights 16 (j % 2).. of sub-blocks
+// j & ~1 (low nibbles) and j | 1 (high).
+extern "C" __global__ void dequant_q4_k(const uchar* w, ulong w_off, unsigned short* out,
+                                        uint rows, uint cols, uint row_bytes) {
+    uint lane = threadIdx.x % 32, u = lane / 8, j = lane % 8;
+    uint steps = (cols / 256 + 3) / 4;
+    ulong chunk = (ulong)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    uint row = (uint)(chunk / steps), sb = 4 * (uint)(chunk % steps) + u;
+    if (row >= rows || sb >= cols / 256) return;
+    const uchar* b = w + w_off + (ulong)row * row_bytes + (ulong)sb * 144;
+    U128 hd = *(const U128*)b;
+    U128 q = *(const U128*)(b + 16 + 16 * j);
+    float sa, ma, sc, mc;
+    q4_k_scale(hd, j & ~1u, &sa, &ma);
+    q4_k_scale(hd, j | 1u, &sc, &mc);
+    U128 lo[2], hi[2];
+    #pragma unroll
+    for (uint k = 0; k < 8; k++) {
+        // Two weights a word: bytes 2k and 2k + 1 of the 16.
+        uint by = (q.v[k / 2] >> 16 * (k % 2)) & 0xFFFF;
+        uint a0 = f2h(sa * (float)(by & 15) - ma), a1 = f2h(sa * (float)((by >> 8) & 15) - ma);
+        uint c0 = f2h(sc * (float)((by >> 4) & 15) - mc), c1 = f2h(sc * (float)(by >> 12) - mc);
+        lo[k / 4].v[k % 4] = a0 | (a1 << 16);
+        hi[k / 4].v[k % 4] = c0 | (c1 << 16);
+    }
+    U128* o = (U128*)(out + (ulong)row * cols + sb * 256 + 32 * (j & ~1u) + 16 * (j % 2));
+    o[0] = lo[0];
+    o[1] = lo[1];
+    o[4] = hi[0];
+    o[5] = hi[1];
+}
+DEQUANT(dequant_q4_k_any, wt_q4_k)
+#endif
+
 // Grid rows, ids and strides as in MATVEC; x_stride counts values of x. With `add`, the result
 // is added to y. The *_pair kernels take a grid two deep, whose second layer runs a matrix (or
 // stack) of the same shape z_stride bytes after the first over the same x, into y2: a token's
@@ -817,6 +904,97 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
 
 MATMUL_MMA(mma_q4_k, 144, 1)
 MATMUL_MMA(mma_q6_k, 210, 0)
+
+// c += a b^T over 16 columns of f16: lane 4i + j gives columns 2j, 2j + 1 and 8 + 2j, 9 + 2j
+// of rows i and i + 8 and of token i, and receives the sums of rows i and i + 8 with tokens
+// 2j and 2j + 1.
+__device__ inline void mma16_f16(const uint* a, uint b0, uint b1, float* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// y = W x for n_tok tokens, W and x in f16 (rows of cols, a multiple of GE_K). A block of NW
+// warps takes R rows and T tokens, GE_K columns at a time through shared memory; a warp owns
+// 16 rows, holds their weights in registers and runs them against 8 octets of tokens. Rows
+// and tokens lie GE_S words apart so a warp's loads fall in different banks. Tiles are copied
+// 16 bytes at a time, every read issued before the first store (see MATMUL_MMA): thread i
+// takes words 4 (i % 8).. of rows and tokens i / 8 + 4 NW p.
+//
+// More tokens per block means fewer reads of the weights, but a matrix of few rows then has
+// too few blocks to occupy the GPU, which costs more: the caller picks. Blocks of 128 rows,
+// 32 rows or 256 tokens were all slower on an A100 (docs/benchmarks.md).
+#define GE_K 64
+#define GE_S 36
+struct __attribute__((aligned(16))) V128 {
+    uint v[4];
+};
+#define GEMM_F16(NAME, R, T, NW)                                                               \
+extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong y_off,         \
+                                uint rows, uint cols, uint n_tok) {                            \
+    const uint NWG = NW / (R / 16), NO = T / 8 / NWG;                                          \
+    __shared__ uint wt[R * GE_S];                                                              \
+    __shared__ uint xt[T * GE_S];                                                              \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint gi = lane / 4, gj = lane % 4;                                                         \
+    uint row0 = blockIdx.x * R, t0 = blockIdx.y * T;                                           \
+    uint last = n_tok - 1 - t0, kw = cols / 2;                                                 \
+    uint ra = 16 * (warp % (R / 16)) + gi, ow = warp / (R / 16);                               \
+    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);                                     \
+    float c[8][4];                                                                             \
+    _Pragma("unroll")                                                                          \
+    for (uint o = 0; o < NO; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;                   \
+    for (uint ks = 0; ks < cols / GE_K; ks++) {                                                \
+        V128 v[4];                                                                             \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < R / (4 * NW); p++) {                                              \
+            uint r = row0 + tr + 4 * NW * p;                                                   \
+            v[p] = *(const V128*)(wh + (ulong)(r < rows ? r : rows - 1) * kw + ks * (GE_K / 2) + tw); \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < R / (4 * NW); p++)                                                \
+            *(V128*)(wt + (tr + 4 * NW * p) * GE_S + tw) = v[p];                               \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < T / (4 * NW); p++) {                                              \
+            uint t = tr + 4 * NW * p;                                                          \
+            v[p] = *(const V128*)(xh + (ulong)(t0 + (t < last ? t : last)) * kw + ks * (GE_K / 2) + tw); \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < T / (4 * NW); p++)                                                \
+            *(V128*)(xt + (tr + 4 * NW * p) * GE_S + tw) = v[p];                               \
+        __syncthreads();                                                                       \
+        uint a[GE_K / 16][4];                                                                  \
+        _Pragma("unroll")                                                                      \
+        for (uint k = 0; k < GE_K / 16; k++) {                                                 \
+            const uint* ap = wt + ra * GE_S + 8 * k + gj;                                      \
+            a[k][0] = ap[0];                                                                   \
+            a[k][1] = ap[8 * GE_S];                                                            \
+            a[k][2] = ap[4];                                                                   \
+            a[k][3] = ap[8 * GE_S + 4];                                                        \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint o = 0; o < NO; o++) {                                                        \
+            uint tb = (NWG * o + ow) * 8;                                                      \
+            if (tb > last) continue;                                                           \
+            _Pragma("unroll")                                                                  \
+            for (uint k = 0; k < GE_K / 16; k++) {                                             \
+                const uint* bp = xt + (tb + gi) * GE_S + 8 * k + gj;                           \
+                mma16_f16(a[k], bp[0], bp[4], c[o]);                                           \
+            }                                                                                  \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+    }                                                                                          \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < 4 * NO; j++) {                                                        \
+        uint t = (NWG * (j / 4) + ow) * 8 + 2 * gj + j % 2;                                    \
+        uint row = row0 + ra + 8 * (j / 2 % 2);                                                \
+        if (t <= last && row < rows) y[y_off + (ulong)(t0 + t) * rows + row] = c[j / 4][j % 4]; \
+    }                                                                                          \
+}
+
+GEMM_F16(gemm_f16_64x64, 64, 64, 8)
+GEMM_F16(gemm_f16_64x128, 64, 128, 8)
 
 #else  // the rest of the file is not part of the tensor-core compile
 

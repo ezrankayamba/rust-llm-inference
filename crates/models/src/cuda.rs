@@ -8,10 +8,10 @@
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::cuda::{
-    ATTN_THREADS, At, AttnParams, Batch, Gpu, GpuBuf, GpuIds, GpuQ, Graph, MMQ_MIN_TOKENS,
-    MOE_MAX_EXPERTS, RopeArgs,
+    ATTN_THREADS, At, AttnParams, Batch, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf, GpuIds, GpuQ,
+    Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
 };
-use rli_core::ops;
+use rli_core::{GgmlType, ops};
 use std::any::Any;
 use std::sync::Mutex;
 
@@ -50,14 +50,25 @@ struct Scratch {
     route_w: GpuBuf,
     /// A matmul's input, quantized to int8.
     xq: GpuQ,
+    /// For the f16 GEMM of long prompts: a matmul's input, and its matrix written out.
+    xh: GpuHalf,
+    wh: GpuHalf,
     logits: GpuBuf,
 }
 
 impl Scratch {
-    fn new(gpu: &Gpu, c: &crate::config::Config, max_ff: usize, logits: usize, n: usize) -> Self {
+    /// `max_ff`: the widest feed-forward activation; `max_w`: the most weights in a matrix.
+    fn new(
+        gpu: &Gpu,
+        c: &crate::config::Config,
+        (max_ff, max_w): (usize, usize),
+        logits: usize,
+        n: usize,
+    ) -> Self {
         // An MoE token holds its k chosen experts' activations side by side; their outputs are
         // followed by the shared expert's, one row per token.
         let k = c.n_expert_used;
+        let gemm = n >= GEMM_MIN_TOKENS;
         Self {
             x: gpu.alloc(n * c.n_embd),
             xb: gpu.alloc(n * c.n_embd),
@@ -72,6 +83,12 @@ impl Scratch {
             route_ids: gpu.alloc_ids(n * k),
             route_w: gpu.alloc(n * (k + 1)),
             xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)),
+            xh: gpu.alloc_half(if gemm {
+                n * c.n_embd.max(c.q_dim()).max(max_ff)
+            } else {
+                0
+            }),
+            wh: gpu.alloc_half(if gemm { max_w } else { 0 }),
             logits: gpu.alloc(logits),
         }
     }
@@ -96,7 +113,8 @@ struct Cuda {
     covers_all: bool,
     /// No offloaded layer is routed on the CPU, so prompts can run as batches.
     batchable: bool,
-    max_ff: usize,
+    /// The widest feed-forward activation and the largest matrix, for [`Scratch::new`].
+    sizes: (usize, usize),
     kv_dim: usize,
     n_head: usize,
     head_dim: usize,
@@ -145,6 +163,17 @@ fn mm_each(
     int8: bool,
     quantized: bool,
 ) {
+    // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
+    // are. F32 and F16 weights are the reference path and keep f32 activations.
+    let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
+    if int8 && !ws.iter().any(float) && b.has_gemm(ws[0].cols, n) {
+        b.to_f16(x, n * ws[0].cols, &s.xh);
+        for (w, &y) in ws.iter().zip(ys) {
+            b.dequant(w.ty, w.rows, w.cols, w.offset, &s.wh);
+            b.gemm(w.rows, w.cols, &s.wh, &s.xh, y, n);
+        }
+        return;
+    }
     if !quantized && wants_q(b, ws, int8) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
@@ -591,7 +620,7 @@ impl Accelerator for Cuda {
             } else {
                 0
             };
-            Scratch::new(&self.gpu, &model.cfg, self.max_ff, logits, BATCH_CHUNK)
+            Scratch::new(&self.gpu, &model.cfg, self.sizes, logits, BATCH_CHUNK)
         });
         let n_chunks = xs.len().div_ceil(BATCH_CHUNK * n_embd);
         let mut done = false;
@@ -669,7 +698,19 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         })
         .collect();
     let logits = if covers_all { model.output.rows } else { 0 };
-    let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1);
+    // The largest matrix a prompt's GEMM writes out as f16.
+    let max_w = model.layers[..n]
+        .iter()
+        .flat_map(|l| {
+            let e = experts_of(&l.ffn).into_iter();
+            [&l.wq, &l.wk, &l.wv, &l.wo]
+                .into_iter()
+                .chain(e.flat_map(|e| [&e.gate, &e.up, &e.down]))
+        })
+        .map(|w| w.rows * w.cols)
+        .max()
+        .unwrap_or(0);
+    let scratch = Scratch::new(&gpu, &c, (max_ff, max_w), logits, 1);
     let batchable = model.layers[..n]
         .iter()
         .zip(&gpu_layers)
@@ -680,7 +721,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         layers: gpu_layers,
         covers_all,
         batchable,
-        max_ff,
+        sizes: (max_ff, max_w),
         kv_dim: c.kv_dim(),
         n_head: c.n_head,
         head_dim: c.head_dim,

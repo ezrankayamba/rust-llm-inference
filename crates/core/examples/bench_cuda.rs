@@ -63,6 +63,61 @@ fn main() {
         };
         println!("{ty:?} {rows}x{cols}: f32 {}{q}", time(false));
     }
+    // The f16 GEMM of long prompts: writing a matrix out as f16, and multiplying it by 256
+    // tokens. Random activations, so the products are ordinary numbers.
+    {
+        let n_tok = 256;
+        let mut seed = 5u32;
+        let xs: Vec<f32> = (0..n_tok * 14336)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / 8388608.0 - 1.0
+            })
+            .collect();
+        let xf = gpu.upload(&xs);
+        let (wh, xh) = (gpu.alloc_half(14336 * 4096), gpu.alloc_half(n_tok * 14336));
+        let yb = gpu.alloc(n_tok * 14336);
+        let mut b = gpu.batch();
+        b.to_f16(At(&xf, 0), n_tok * 14336, &xh);
+        b.finish();
+        for (ty, rows, cols) in [
+            (GgmlType::Q4_K, 4096, 4096),
+            (GgmlType::Q4_K, 14336, 4096),
+            (GgmlType::Q4_K, 4096, 14336),
+            (GgmlType::Q6_K, 4096, 4096),
+        ] {
+            let bytes = ty.row_bytes(cols) * rows;
+            let count = (mem.len() / bytes).min(16);
+            let time = |dequant: bool, gemm: bool| {
+                let run = || {
+                    let mut b = gpu.batch();
+                    for i in 0..count {
+                        if dequant {
+                            b.dequant(ty, rows, cols, i * bytes, &wh);
+                        }
+                        if gemm {
+                            b.gemm(rows, cols, &wh, &xh, At(&yb, 0), n_tok);
+                        }
+                    }
+                    b.finish();
+                };
+                run();
+                let best = (0..5)
+                    .map(|_| {
+                        let t = Instant::now();
+                        run();
+                        t.elapsed().as_secs_f64()
+                    })
+                    .fold(f64::MAX, f64::min);
+                best / count as f64 * 1e6
+            };
+            let (d, g) = (time(true, false), time(false, true));
+            let tflops = 2.0 * (rows * cols * n_tok) as f64 / g / 1e6;
+            println!(
+                "gemm {ty:?} {rows}x{cols} x {n_tok} tokens: dequant {d:7.1} us, gemm {g:7.1} us ({tflops:.0} TFLOPS)"
+            );
+        }
+    }
     // Launch cost: small matvecs queued one by one, and replayed as a captured graph.
     for (rows, cols) in [(256, 256), (2048, 2048), (4096, 4096)] {
         let ty = GgmlType::Q4_K;

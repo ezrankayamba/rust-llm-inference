@@ -3,6 +3,62 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: long CUDA prompts through an f16 tensor-core GEMM
+
+llama.cpp's CUDA backend writes a quantized matrix out as f16 and multiplies it with cuBLAS for
+batches of 64+ tokens. Prompt chunks of 64+ tokens (`GEMM_MIN_TOKENS`) now do the same with our
+own kernels: `to_f16` converts the activations once per matmul input, `dequant_*` writes the
+matrix to an f16 scratch buffer, and `gemm_f16_*` multiplies them with `mma.sync` m16n8k16
+(f16 inputs, f32 sums). Same A100, Q4_K_M, all layers offloaded, `bench --pp 512 --tg 128
+--reps 3`, each build twice (Llama: `--reps 10`, three times, as its 50 ms prompt is noisy);
+tok/s. The baseline is ab28911.
+
+| Model | pp512 before | pp512 now | llama.cpp |
+|---|---:|---:|---:|
+| Llama-3.2-1B | 9426-9807 | 12069-12598 | 14500.7 |
+| Mistral-7B | 2160-2166 | 2716-2722 | 4911.9 |
+| Qwen3-30B-A3B | 811-812 | 828-831 | 4241.7 |
+
+So prompts are still behind: 1.2x, 1.8x and 5.1x. Qwen3 barely moved because 81% of its prompt
+time is the experts, which still run as one int8 matvec per (token, expert) pair.
+
+Logits of a 357-444 token prompt against `--precise` (max difference; top-1 unchanged): Llama
+0.164 -> 0.064, Mistral 0.393 -> 0.070, Qwen3 1.017 -> 1.055 (its experts are still int8).
+F32 and F16 weights keep the f32 matmul: on them the GEMM's f16 activations are the only
+rounding there is (0.0026 on the tiny test model, where batched and per-token otherwise agree
+to 1e-3).
+
+`bench_cuda`, one matrix against 256 tokens:
+
+| Matrix | dequant us | GEMM us | GEMM TFLOPS |
+|---|---:|---:|---:|
+| Q4_K 4096x4096 | 45.8 | 120.5 | 71 |
+| Q4_K 14336x4096 | 146.0 | 352.1 | 85 |
+| Q4_K 4096x14336 | 148.2 | 436.0 | 69 |
+| Q6_K 4096x4096 | 125.9 | 121.8 | 71 |
+
+What was tried on the way:
+
+- **The int8 tensor-core matmul is bound by instruction count.** On Mistral pp512 (234 ms),
+  removing parts in turn: the float scaling after each `mma` is about 49% of the time, tile
+  loads 25%, the `mma` itself 5%. Register cap, tile shape and software pipelining each moved
+  it by 6% or less. An f16 GEMM has no per-block scaling, which is why it wins.
+- **Tile shapes.** Blocks of 64 rows x 64 tokens and 64 x 128 are kept; the larger one is used
+  when the matmul still fills 256 blocks (`GEMM_BLOCKS_MIN`). 128x128, 64x256, 32x64, 64x32,
+  32x128 and 32x32 were slower; 128x256 needs more than 48 KB of shared memory.
+- **Tile copies** were half of the GEMM's time one value at a time; they now move 16 bytes
+  per thread and step.
+- **Q4_K dequantizer**: a lane takes a sub-block in 16-byte reads, as the int8 matvec does.
+  The other types use a one-weight-per-lane decoder, which is why Q6_K above takes 2.7x as
+  long as Q4_K; a wide Q6_K one is not written yet.
+- **Register cap** of the second compile: 96 -> 80 (it now holds the GEMM too).
+- **Kernel profile mode misleads here**: ablations timed with `RLI_CUDA_PROF=1` gave
+  contradictory results for the GEMM; the numbers above are from `bench_cuda`.
+
+Running the tests several at once also turned up a race: graph capture was in global mode, so
+an allocation on another thread's `Gpu` failed while a capture was open
+(`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). Capture is thread-local now.
+
 ## 2026-11-15: the CPU's share of a decoded token on CUDA
 
 Timing the phases of a token showed the GPU idle for about 480 us of Llama-3.2-1B's 2.0 ms and

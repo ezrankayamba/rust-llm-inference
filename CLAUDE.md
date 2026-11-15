@@ -152,16 +152,25 @@ Design points that span files:
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,
   128 columns at a time, a warp's 16 rows of weights held in registers. They are a second
-  compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 96 registers per thread,
+  compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 80 registers per thread,
   which lets a multiprocessor hold more warps but slows the f32 matmuls. About 2x `dp4a` on
   Mistral-7B prompts; not bit-equal to it. Their tile loads issue all of a thread's
   global reads before its first store: a read followed by a store waits out the memory
   latency, which was most of the loading time with so few warps per multiprocessor
   (65536 / registers / 32 fit). Don't carry that over: the same reordering made the decode
   matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
+  Prompt chunks of 64+ tokens (`GEMM_MIN_TOKENS`) skip all of that for dense matrices, as
+  llama.cpp does with cuBLAS: `to_f16` converts a matmul's input, `dequant_*` writes the matrix
+  out as f16 into a scratch buffer the size of the largest one (`Scratch::wh`), and
+  `gemm_f16_64x64` / `_64x128` multiply them with f16 `mma.sync` and f32 sums (the second
+  compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
+  under `precise`, not for F32/F16 weights (they keep f32 activations), not for MoE experts.
+  Only Q4_K has a wide dequantizer; the int8 matmuls remain for chunks of 8-63 tokens.
+  Graph capture is thread-local: in global mode another thread's allocation fails while it
+  is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
   is 10-16% ahead on all three models; decode at 2048 positions is 6-11% behind, and prompts
-  1.7x (Llama-3.2-1B), 2.3x (Mistral-7B) and 5.2x (Qwen3-30B-A3B) behind.
+  1.2x (Llama-3.2-1B), 1.8x (Mistral-7B) and 5.1x (Qwen3-30B-A3B) behind.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

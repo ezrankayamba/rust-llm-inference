@@ -62,7 +62,15 @@ pub const MMQ_MIN_TOKENS: usize = 8;
 /// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
-const MMA_REGS: usize = 96;
+const MMA_REGS: usize = 80;
+/// Rows, tokens and threads of a block of the f16 GEMM's kernels, and the columns they take
+/// at a time (`GE_K` in cuda.cu).
+const GEMM_TILES: [(usize, usize, u32); 2] = [(64, 64, 256), (64, 128, 256)];
+const GEMM_COLS: usize = 64;
+/// Fewest blocks the GEMM's larger tile is used for.
+const GEMM_BLOCKS_MIN: usize = 256;
+/// Fewest tokens the f16 GEMM is used for.
+pub const GEMM_MIN_TOKENS: usize = 64;
 const OTHER_KERNELS: [&str; 15] = [
     "quant_x",
     "rmsnorm",
@@ -101,6 +109,9 @@ impl GpuBuf {
         self.0.len() == 0
     }
 }
+
+/// A device f16 buffer: what [`Batch::gemm`] multiplies.
+pub struct GpuHalf(CudaSlice<u16>);
 
 /// A device u32 buffer: the expert ids [`Batch::moe_topk`] chooses.
 pub struct GpuIds(CudaSlice<u32>);
@@ -171,6 +182,13 @@ pub struct Gpu {
     mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
+    /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
+    /// and the f16 tensor-core product of the two, where the GPU has one.
+    dequant: Vec<(GgmlType, CudaFunction)>,
+    /// `dequant`'s Q4_K kernel needs the matrix at a multiple of 16 bytes; this one doesn't.
+    dequant_q4_k_any: CudaFunction,
+    to_f16: CudaFunction,
+    gemm: Option<Vec<CudaFunction>>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -222,6 +240,7 @@ impl Gpu {
                 .map_err(err("compute capability"))?
                 .0
                 >= 8;
+        let mut gemm = None;
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -232,6 +251,15 @@ impl Gpu {
             let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
                 .map_err(|e| format!("CUDA tensor-core kernel compile failed: {e:?}"))?;
             let module = ctx.load_module(ptx).map_err(err("load CUDA module"))?;
+            gemm = Some(
+                GEMM_TILES
+                    .iter()
+                    .map(|(r, t, _)| {
+                        let n = format!("gemm_f16_{r}x{t}");
+                        module.load_function(&n).map_err(err(&n))
+                    })
+                    .collect::<Result<_, String>>()?,
+            );
             MMQ_KERNELS
                 .iter()
                 .map(|&(t, n)| {
@@ -252,6 +280,12 @@ impl Gpu {
                 Ok((t, func(&n)?, func(&format!("{n}_pair"))?))
             })
             .collect::<Result<_, String>>()?;
+        let dequant = MATVEC_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, func(&n.replace("matvec", "dequant"))?)))
+            .collect::<Result<_, String>>()?;
+        let to_f16 = func("to_f16")?;
+        let dequant_q4_k_any = func("dequant_q4_k_any")?;
         let other = OTHER_KERNELS
             .iter()
             .map(|&n| Ok((n, func(n)?)))
@@ -318,6 +352,10 @@ impl Gpu {
             mmq,
             mvq,
             mma,
+            dequant,
+            dequant_q4_k_any,
+            to_f16,
+            gemm,
             other,
             zero_id,
             no_q,
@@ -352,6 +390,14 @@ impl Gpu {
     /// device, which the matvecs' 16-byte reads assume (GGUF aligns tensors to 32).
     pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
         Self::has_matmul_q(ty, cols) && self.device_offset(offset, 1).is_multiple_of(16)
+    }
+
+    pub fn alloc_half(&self, n: usize) -> GpuHalf {
+        GpuHalf(
+            self.stream
+                .alloc_zeros(n.max(1))
+                .expect("CUDA buffer allocation failed"),
+        )
     }
 
     /// Room for `n` quantized activations (a multiple of 32).
@@ -598,7 +644,7 @@ impl Gpu {
         unsafe {
             sys::cuStreamBeginCapture_v2(
                 stream,
-                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
         }
         .result()
@@ -712,6 +758,14 @@ impl Gpu {
             n.to_string()
         } else if let Some((t, ..)) = self.matvec.iter().find(|(_, a, b)| eq(a) || eq(b)) {
             format!("f32 {t:?}")
+        } else if eq(&self.dequant_q4_k_any) {
+            "dequant Q4_K (unaligned)".into()
+        } else if let Some((t, _)) = self.dequant.iter().find(|(_, g)| eq(g)) {
+            format!("dequant {t:?}")
+        } else if eq(&self.to_f16) {
+            "to_f16".into()
+        } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
+            format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul {t:?}")
         } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
@@ -878,6 +932,85 @@ impl<'a> Batch<'a> {
                 (MATVEC_ROWS_PER_BLOCK * 32) as u32,
             ),
         );
+    }
+
+    /// Whether [`Batch::gemm`] takes `n_tok` tokens over a matrix of `cols` columns: it pays
+    /// for writing the matrix out as f16 from [`GEMM_MIN_TOKENS`].
+    pub fn has_gemm(&self, cols: usize, n_tok: usize) -> bool {
+        self.gpu.gemm.is_some() && cols.is_multiple_of(GEMM_COLS) && n_tok >= GEMM_MIN_TOKENS
+    }
+
+    /// The `n` values at `x` as f16 in `out`.
+    pub fn to_f16(&mut self, x: At<'_>, n: usize, out: &GpuHalf) {
+        assert!(x.1 + n <= x.0.len() && n <= out.0.len());
+        let (x_off, n_u) = (x.1 as u64, n as u32);
+        let mut l = self.call(&self.gpu.to_f16);
+        l.arg(&x.0.0).arg(&x_off).arg(&out.0).arg(&n_u);
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+    }
+
+    /// Writes the `rows x cols` matrix of `ty` at byte `offset` of the model file out as f16
+    /// into `wh`, for [`Batch::gemm`].
+    pub fn dequant(&mut self, ty: GgmlType, rows: usize, cols: usize, offset: usize, wh: &GpuHalf) {
+        assert!(cols.is_multiple_of(32) && wh.0.len() >= rows * cols);
+        let gpu: &'a Gpu = self.gpu;
+        let row_bytes = ty.row_bytes(cols);
+        let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+        let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
+        let (_, f) = gpu
+            .dequant
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("a kernel per supported type");
+        // The wide Q4_K kernel takes a warp per 4 super-blocks, the others one per 32 weights.
+        let wide = ty == GgmlType::Q4_K && w_off.is_multiple_of(16);
+        let (f, warps) = match (ty, wide) {
+            (GgmlType::Q4_K, true) => (f, rows * (cols / 256).div_ceil(4)),
+            (GgmlType::Q4_K, false) => (&gpu.dequant_q4_k_any, rows * cols / 32),
+            _ => (f, rows * cols / 32),
+        };
+        let mut l = self.call(f);
+        l.arg(&gpu.weights)
+            .arg(&w_off)
+            .arg(&wh.0)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb);
+        self.launch(l, grid(warps.div_ceil(8), 256));
+    }
+
+    /// [`Batch::matmul`] on f16 tensor cores, where [`Batch::has_gemm`]: the matrix as
+    /// [`Batch::dequant`] left it in `wh`, by the `n_tok` rows of `cols` that
+    /// [`Batch::to_f16`] left in `xh`. The result differs from the f32 matmul's by the
+    /// rounding of weights and activations to f16.
+    pub fn gemm(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        wh: &GpuHalf,
+        xh: &GpuHalf,
+        y: At<'_>,
+        n_tok: usize,
+    ) {
+        assert!(self.has_gemm(cols, n_tok) && rows > 0);
+        assert!(wh.0.len() >= rows * cols && xh.0.len() >= n_tok * cols);
+        assert!(y.1 + n_tok * rows <= y.0.len());
+        let gpu: &'a Gpu = self.gpu;
+        let (rows_u, cols_u) = (rows as u32, cols as u32);
+        let (y_off, nt) = (y.1 as u64, n_tok as u32);
+        // The larger tile once it still leaves a few blocks per multiprocessor.
+        let (lr, lt, _) = GEMM_TILES[1];
+        let i = (rows.div_ceil(lr) * n_tok.div_ceil(lt) >= GEMM_BLOCKS_MIN) as usize;
+        let (tr, tt, threads) = GEMM_TILES[i];
+        let mut l = self.call(&gpu.gemm.as_ref().expect("checked by has_gemm")[i]);
+        l.arg(&wh.0)
+            .arg(&xh.0)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&nt);
+        self.launch(l, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt), threads));
     }
 
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
@@ -1645,6 +1778,82 @@ mod tests {
                 err < 0.01 * size,
                 "{ty:?}, {n} tokens: rms error {err} against rms {size}"
             );
+        }
+    }
+
+    /// The f16 GEMM against the f32 matmul over the same random weights of every type: they
+    /// differ by the rounding of weights and activations to f16. The sizes leave a row tile
+    /// and a token tile partly filled. Needs an NVIDIA GPU with f16 tensor cores.
+    #[test]
+    fn gemm_matches_f32_matmul() {
+        for (ty, _) in MATVEC_KERNELS {
+            for (rows, cols, n) in [(200, 512, 137), (64, 1280, 64), (17, 256, 300)] {
+                let mut seed = 3u32;
+                let mut next = move || {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    seed >> 8
+                };
+                let mut w: Vec<u8> = (0..rows * ty.row_bytes(cols))
+                    .map(|_| next() as u8)
+                    .collect();
+                // Floats in the weights (f32, f16 and the blocks' scales) must be finite and
+                // of one size: every other byte pair becomes an f16 in [2^-6, 2^-5), and f32
+                // weights are written whole.
+                match ty {
+                    GgmlType::F32 => {
+                        for c in w.as_chunks_mut::<4>().0 {
+                            let v = next() as f32 / 8388608.0 - 1.0;
+                            c.copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    GgmlType::F16 => w
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .for_each(|c| c[1] = 0x24 | (c[1] & 0x83)),
+                    GgmlType::Q4_K | GgmlType::Q5_K => {
+                        for b in w.chunks_exact_mut(ty.block_bytes()) {
+                            (b[1], b[3]) = (0x24 | (b[1] & 3), 0x24 | (b[3] & 3));
+                        }
+                    }
+                    GgmlType::Q6_K => w
+                        .as_chunks_mut::<210>()
+                        .0
+                        .iter_mut()
+                        .for_each(|b| b[209] = 0x24 | (b[209] & 3)),
+                    _ => {
+                        for b in w.chunks_exact_mut(ty.block_bytes()) {
+                            b[1] = 0x24 | (b[1] & 3);
+                        }
+                    }
+                }
+                let x: Vec<f32> = (0..n * cols)
+                    .map(|_| next() as f32 / 8388608.0 - 1.0)
+                    .collect();
+                let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+                let xb = gpu.upload(&x);
+                let (wh, xh) = (gpu.alloc_half(rows * cols), gpu.alloc_half(n * cols));
+                let (y_f32, y_h) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
+                let mut b = gpu.batch();
+                assert!(b.has_gemm(cols, n), "no f16 tensor cores");
+                b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
+                b.to_f16(At(&xb, 0), n * cols, &xh);
+                b.dequant(ty, rows, cols, 0, &wh);
+                b.gemm(rows, cols, &wh, &xh, At(&y_h, 0), n);
+                b.finish();
+                let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+                gpu.read(&y_f32, &mut want);
+                gpu.read(&y_h, &mut got);
+                let rms = |v: &mut dyn Iterator<Item = f32>| {
+                    (v.map(|a| (a * a) as f64).sum::<f64>() / (n * rows) as f64).sqrt()
+                };
+                let err = rms(&mut got.iter().zip(&want).map(|(a, b)| a - b));
+                let size = rms(&mut want.iter().copied());
+                assert!(
+                    err < 1e-3 * size,
+                    "{ty:?} {rows}x{cols}, {n} tokens: rms error {err} against rms {size}"
+                );
+            }
         }
     }
 
