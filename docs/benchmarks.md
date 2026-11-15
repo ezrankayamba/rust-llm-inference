@@ -3,6 +3,50 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: the CPU's share of a decoded token on CUDA
+
+Timing the phases of a token showed the GPU idle for about 480 us of Llama-3.2-1B's 2.0 ms and
+700 us of Qwen3-30B-A3B's 5.9 ms: 66 / 220 us re-queueing the graph, 100-190 us downloading the
+logits, and 300-380 us outside the backend. Same A100, Q4_K_M, all layers offloaded,
+`bench --pp 512 --tg 128 --reps 3` and `--pp 0 --tg 128 --depth 2048`, each build twice; tok/s.
+The baseline is ab28911, so the Qwen3 rows include the section below.
+
+| Model | Measure | ab28911 | Now | llama.cpp |
+|---|---|---:|---:|---:|
+| Llama-3.2-1B | tg128 | 503.6-521.6 | 607.7-608.3 | 524.4 |
+| Llama-3.2-1B | tg128 at depth 2048 | 404.5-409.6 | 476.1-476.4 | 522.4 |
+| Mistral-7B | tg128 | 164.5-165.9 | 171.5-172.4 | 155.4 |
+| Mistral-7B | tg128 at depth 2048 | 137.7-139.9 | 141.8-141.9 | 150.9 |
+| Qwen3-30B-A3B | tg128 | 154.2-158.6 | 194.3-197.2 | 171.5 |
+| Qwen3-30B-A3B | tg128 at depth 2048 | 124.3-125.5 | 147.6-147.7 | 166.4 |
+
+Prompts did not change (7754-9358 / 2175-2191 / 809-813 against 7657-7725 / 2161-2174 /
+804-812).
+
+- **No pool hand-off for an all-GPU pass** (`Model::forward_batch`). `pool().install` wakes a
+  worker and blocks the caller once per token, for a pass that has no CPU work.
+- **`argmax`** carried the index through a fold, which is not vectorized: about 100 us over
+  128k logits. It now takes 16 running maxima, then finds the first position of the largest.
+  Those two took the time outside the backend from 300 to 60 us (Llama 503 -> 557 tok/s,
+  Qwen3 171 -> 180, 256-token runs).
+- **Logits through page-locked memory** (`Gpu::read`, from 16k floats up), and the hidden
+  state is not downloaded when the logits are: Llama 557 -> 571, Qwen3 180 -> 184.5.
+
+What is left of the CPU's share is the graph replay: 49 us a token on Llama and 178 us on
+Qwen3, of which updating the 4 nodes a layer whose arguments follow the position is 22 and
+67 us (0.35 us each) and the launch call 6-12 us. Not changed.
+
+Two things measured on the way and not acted on: capping registers for the main compile
+(`maxrregcount` 32-56) moved the int8 matvecs by less than their run-to-run spread, and that
+spread is large for Q6_K in `bench_cuda` (128256 x 2048, the output matrix: 196-305 us from
+identical runs with identical device addresses), so its numbers there are not to be read
+singly.
+
+Checks: tests locally (150) and on the A100 (144, plus `read_returns_the_buffer_at_any_length`,
+added because the first version of the page-locked download copied the buffer's length rather
+than the request's and failed after a prompt); `dump_logits` int8 against f32 and `--precise`
+batched against `--per-token` unchanged on all three models, from fresh output files.
+
 ## 2026-11-15: Qwen3-30B-A3B decode on CUDA: 17 launches a layer to 14
 
 The profile (`RLI_CUDA_PROF=1`) put a decoded Qwen3 token at 17 launches a layer, 816 a token,

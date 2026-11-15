@@ -580,6 +580,15 @@ impl Model {
         tokens: &[u32],
         want_logits: bool,
     ) -> Option<Vec<f32>> {
+        // A pass that runs wholly on the accelerator has nothing for the pool to do, and
+        // handing it over costs a thread wake-up per token.
+        if self
+            .accel
+            .as_ref()
+            .is_some_and(|a| a.layers() == self.layers.len())
+        {
+            return self.forward_batch_in_pool(sess, tokens, want_logits);
+        }
         crate::pool().install(|| self.forward_batch_in_pool(sess, tokens, want_logits))
     }
 

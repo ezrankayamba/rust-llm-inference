@@ -26,7 +26,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 Workspace crates (dependencies flow downward only):
 
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
-  dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel; every forward pass runs inside rli-models' own pool, `pool()` in `lib.rs`, so the calling thread is a worker rather than waiting on one per matvec), fast integer kernels over
+  dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel; every forward pass with CPU layers runs inside rli-models' own pool, `pool()` in `lib.rs`, so the calling thread is a worker rather than waiting on one per matvec), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
   fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
@@ -160,9 +160,12 @@ Design points that span files:
   (65536 / registers / 32 fit). Don't carry that over: the same reordering made the decode
   matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
-  is ahead on Mistral-7B and Qwen3-30B-A3B and 4% behind on Llama-3.2-1B; decode at 2048
-  positions is 8-25% behind, and prompts 1.7x (Llama-3.2-1B), 2.3x (Mistral-7B) and 5.2x
-  (Qwen3-30B-A3B) behind.
+  is 10-16% ahead on all three models; decode at 2048 positions is 6-11% behind, and prompts
+  1.7x (Llama-3.2-1B), 2.3x (Mistral-7B) and 5.2x (Qwen3-30B-A3B) behind.
+- **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
+  token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
+  token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through
+  page-locked memory. Time the phases before the kernels.
 - **CUDA kernels wait on memory per read.** A thread that reads values in a loop and uses each
   at once waits out the latency every time round, so a small kernel wants a thread per value
   (`rmsnorm` with 256 threads for a 2048-wide row cost twice a trivial launch). `RLI_CUDA_PROF=1`

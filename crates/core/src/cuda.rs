@@ -10,7 +10,7 @@
 use crate::quant::GgmlType;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchArgs,
-    LaunchConfig, PushKernelArg, sys,
+    LaunchConfig, PinnedHostSlice, PushKernelArg, sys,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,6 +20,8 @@ const MATVEC_ROWS_PER_BLOCK: usize = 4;
 /// f32/f16 matvecs of at most this many rows run a block per row (see `MATVEC` in cuda.cu).
 const MATVEC_WIDE_ROWS: usize = 256;
 const REDUCE_THREADS: u32 = 1024;
+/// Downloads of at least this many f32s go through page-locked memory.
+const PINNED_MIN: usize = 1 << 14;
 /// Threads per attention block, which is also the largest head_dim the kernel takes.
 pub const ATTN_THREADS: u32 = 1024;
 /// The decode attention kernel's cached positions per block, threads per block, most query
@@ -158,6 +160,8 @@ struct Placed {
 
 pub struct Gpu {
     stream: Arc<CudaStream>,
+    /// Page-locked host memory that large downloads land in, and its length.
+    pinned: Mutex<Option<(PinnedHostSlice<f32>, usize)>>,
     weights: CudaSlice<u8>,
     placed: Vec<Placed>,
     /// Per weight type: the matvec kernel and the matmul one.
@@ -307,6 +311,7 @@ impl Gpu {
         let name = format!("cuda ({})", ctx.name().map_err(err("device name"))?);
         Ok(Self {
             stream,
+            pinned: Mutex::new(None),
             weights,
             placed,
             matvec,
@@ -384,10 +389,31 @@ impl Gpu {
 
     /// Copies the start of `src` into `out`, waiting for queued work.
     pub fn read(&self, src: &GpuBuf, out: &mut [f32]) {
+        let src = src.0.slice(..out.len());
+        if out.len() < PINNED_MIN {
+            self.stream
+                .memcpy_dtoh(&src, out)
+                .expect("CUDA download failed");
+            self.stream.synchronize().expect("CUDA sync failed");
+            return;
+        }
+        // A vocabulary of logits per token: into pageable memory the driver copies it in
+        // stages (144 us for 128k floats on an A100), so it goes through a page-locked buffer.
+        let mut pinned = self.pinned.lock().unwrap_or_else(|p| p.into_inner());
+        if pinned.as_ref().is_none_or(|p| p.1 < out.len()) {
+            // SAFETY: f32 has no invalid bit patterns, and the buffer is written before read.
+            let host = unsafe { self.stream.context().alloc_pinned_with_flags(out.len(), 0) }
+                .expect("allocate page-locked memory");
+            *pinned = Some((host, out.len()));
+        }
+        let (host, _) = pinned.as_mut().expect("allocated above");
+        // Exactly the source's length: the copy takes its size from the destination.
+        let host = &mut host.as_mut_slice().expect("CUDA sync failed")[..out.len()];
         self.stream
-            .memcpy_dtoh(&src.0.slice(..out.len()), out)
+            .memcpy_dtoh(&src, host)
             .expect("CUDA download failed");
         self.stream.synchronize().expect("CUDA sync failed");
+        out.copy_from_slice(host);
     }
 
     pub fn batch(&self) -> Batch<'_> {
@@ -1619,6 +1645,26 @@ mod tests {
                 err < 0.01 * size,
                 "{ty:?}, {n} tokens: rms error {err} against rms {size}"
             );
+        }
+    }
+
+    /// Large downloads go through a page-locked buffer that is kept: a shorter one after a
+    /// longer one must copy only its own length. Needs an NVIDIA GPU, so CI doesn't run it.
+    #[test]
+    fn read_returns_the_buffer_at_any_length() {
+        let gpu = Gpu::new(&[0; 256], &[(0, 256)]).expect("CUDA device");
+        let data: Vec<f32> = (0..3 * PINNED_MIN).map(|i| i as f32).collect();
+        let buf = gpu.upload(&data);
+        for len in [
+            3 * PINNED_MIN,
+            PINNED_MIN,
+            PINNED_MIN - 1,
+            2 * PINNED_MIN + 5,
+            7,
+        ] {
+            let mut out = vec![-1.0; len];
+            gpu.read(&buf, &mut out);
+            assert_eq!(out, data[..len], "len {len}");
         }
     }
 

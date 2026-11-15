@@ -130,18 +130,44 @@ impl Sampler {
 }
 
 pub fn argmax(x: &[f32]) -> u32 {
-    x.iter()
-        .enumerate()
-        .fold(
-            (0, f32::NEG_INFINITY),
-            |b, (i, &v)| if v > b.1 { (i, v) } else { b },
-        )
-        .0 as u32
+    // The largest value first, 16 running maxima at a time (which the compiler vectorizes; a
+    // fold that carries the index doesn't, and cost 100 us over a 128k vocabulary), then
+    // where it first occurs.
+    let mut best = [f32::NEG_INFINITY; 16];
+    let (chunks, rest) = x.as_chunks::<16>();
+    for c in chunks {
+        for (b, &v) in best.iter_mut().zip(c) {
+            if v > *b {
+                *b = v;
+            }
+        }
+    }
+    let max = best
+        .iter()
+        .chain(rest)
+        .fold(f32::NEG_INFINITY, |m, &v| if v > m { v } else { m });
+    x.iter().position(|&v| v == max).unwrap_or(0) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argmax_is_the_first_largest_value_at_any_length() {
+        for len in [1, 15, 16, 17, 40, 1000] {
+            for at in [0, len / 2, len - 1] {
+                let mut x: Vec<f32> = (0..len).map(|i| -(i as f32) - 1.0).collect();
+                x[at] = 5.0;
+                assert_eq!(argmax(&x), at as u32, "len {len}");
+                x[len - 1] = 5.0; // a tie goes to the first
+                assert_eq!(argmax(&x), at as u32, "len {len}");
+                x[0] = f32::NAN;
+                assert_eq!(argmax(&x), if at == 0 { len as u32 - 1 } else { at as u32 });
+            }
+        }
+        assert_eq!(argmax(&[]), 0);
+    }
 
     #[test]
     fn zero_temperature_is_greedy() {

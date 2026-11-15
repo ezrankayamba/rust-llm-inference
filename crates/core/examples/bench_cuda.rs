@@ -11,7 +11,7 @@ fn main() {
     // on the values.
     let mem = vec![0u8; 1 << 30];
     let gpu = Gpu::new(&mem, &[(0, mem.len())]).expect("CUDA device");
-    let (x, y) = (gpu.alloc(14336), gpu.alloc(14336));
+    let (x, y) = (gpu.alloc(14336), gpu.alloc(131072));
     let xq = gpu.alloc_q(14336);
     println!("{}", gpu.name());
     for (ty, rows, cols) in [
@@ -20,6 +20,7 @@ fn main() {
         (GgmlType::Q4_K, 4096, 14336),
         (GgmlType::Q6_K, 4096, 4096),
         (GgmlType::Q6_K, 4096, 14336),
+        (GgmlType::Q6_K, 128256, 2048),
         (GgmlType::Q4_K, 2048, 2048),
         (GgmlType::Q4_K, 512, 2048),
         (GgmlType::Q4_K, 256, 256),
