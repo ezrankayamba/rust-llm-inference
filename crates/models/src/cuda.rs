@@ -17,8 +17,6 @@ use std::sync::Mutex;
 /// Prompt tokens per batched pass.
 const BATCH_CHUNK: usize = 256;
 const _: () = assert!(crate::model::PROMPT_SLICE.is_multiple_of(BATCH_CHUNK));
-/// Fewest prompt tokens in a pass for the int8 matmuls; under it the f32 ones run.
-const MMQ_MIN_TOKENS: usize = 8;
 /// Most f32s of attention scores scratch a session allocates for batched prompts (128 MB). A
 /// chunk whose scores need more runs its attention a few tokens at a time.
 const SCORE_BUDGET: usize = 1 << 25;
@@ -71,11 +69,7 @@ impl Scratch {
             shared_gate: gpu.alloc(n),
             route_ids: gpu.alloc_ids(n * k),
             route_w: gpu.alloc(n * (k + 1)),
-            xq: gpu.alloc_q(if n < MMQ_MIN_TOKENS {
-                0
-            } else {
-                n * c.n_embd.max(c.q_dim()).max(max_ff)
-            }),
+            xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(max_ff)),
             logits: gpu.alloc(logits),
         }
     }
@@ -137,12 +131,12 @@ fn mm_each(
     n: usize,
     int8: bool,
 ) {
-    let q = |w: &Weight| int8 && Gpu::has_matmul_q(w.ty, w.cols);
-    if ws.iter().any(|w| q(w)) {
+    let q = |b: &Batch<'_>, w: &Weight| int8 && b.has_int8(w.ty, w.cols, w.offset);
+    if ws.iter().any(|w| q(b, w)) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
     for (w, &y) in ws.iter().zip(ys) {
-        if q(w) {
+        if q(b, w) {
             b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n);
         } else {
             mm(b, w, x, y, n);
@@ -258,8 +252,9 @@ impl Cuda {
         );
         self.gpu.write(&mut s.x, xs);
         let s = &*s;
-        // Prompts multiply in int8, as the CPU does; `precise` keeps every product in f32.
-        let int8 = n >= MMQ_MIN_TOKENS && !model.precise;
+        // Matrices with an int8 kernel multiply in int8, as the CPU does; `precise` keeps every
+        // product in f32.
+        let int8 = !model.precise;
 
         let x_at = At(&s.x, 0);
         let rope = |n_heads| RopeArgs {

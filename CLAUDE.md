@@ -123,7 +123,11 @@ Design points that span files:
   `quant_x` quantizes a matmul's input once (one scale per 32 values), and `mmq_q4_k` /
   `mmq_q6_k` decode a 32-row, 256-column weight tile to int8 in shared memory and run `dp4a`
   over 64 tokens per block; 3.4-4.4x on dense prompts, logits within ~0.16 of f32 (0.6 on
-  Qwen3-30B-A3B). Other weight types, MoE experts and decode stay f32. `dp4a` has no header
+  Qwen3-30B-A3B). Decode and shorter chunks run the same matrices as int8 matvecs (`mvq_q4_k`,
+  `mvq_q6_k`): a Q4_K lane takes one sub-block in four aligned 16-byte reads, since the number
+  of separate loads per step, not the arithmetic, was what the f32 matvec spent its time on
+  (Mistral-7B decode 72 -> 129 tok/s). Those reads need the tensor at a multiple of 16 bytes in
+  VRAM (`Gpu::has_int8`), else f32 runs. Other weight types and MoE experts stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,

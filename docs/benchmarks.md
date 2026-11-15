@@ -26,6 +26,52 @@ warps and has others to run while one waits; the tensor-core kernels at 128 x 12
 For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
 for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
 
+## 2026-11-15: int8 decode matvec on CUDA
+
+Same A100 instance. Decode, and prompts of under 8 tokens, now run Q4_K and Q6_K matrices over
+int8 activations too (`mvq_q4_k`, `mvq_q6_k`; `--precise` keeps f32): `quant_x` as for the prompt
+matmuls, then `dp4a`. A Q4_K lane takes one 32-weight sub-block, 4 super-blocks per warp step, in
+four 16-byte reads: the block's 16-byte header (both f16 scales and all 12 scale bytes, so no lane
+waits on another's), its 16 bytes of weights, and two 16-byte halves of activations. Q6_K lanes
+take 16 weights of one of 2 super-blocks. Before is 0948384, `bench --gpu-layers N --reps 5`
+(3 at depth), Q4_K_M, tok/s:
+
+| Model | tg128 before | after | tg128 at 2048 before | after | pp4 before | after | pp512 before | after | llama.cpp tg128 / at 2048 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 262.3 | 339.1 | 142.9 | 198.1 | 139.8 | 596.4 | 7214.8 ± 1320.0 | 6991.5 ± 1351.3 | 524.4 / 522.4 |
+| Mistral-7B | 72.4 | 129.4 | 50.4 | 70.8 | 32.1 | 173.1 | 1876.4 | 1863.2 | 155.4 / 150.9 |
+| Qwen3-30B-A3B (MoE) | 93.6 | 106.9 | 51.1 | 54.4 | 86.6 | 144.6 | 353.5 | 353.5 | 171.5 / 166.4 |
+
+llama.cpp is still 1.2-1.6x ahead on decode and 2.1-3.1x at 2048 tokens of context. Qwen3's
+experts are still f32 (`matvec_id`). Short prompts gain most because the f32 matmul charged a
+whole 32-token tile for 4 tokens.
+
+One matvec (`-p rli-core --example bench_cuda`, back-to-back launches over 1 GB of weights,
+microseconds, f32 -> int8): Q4_K 4096x4096 53.3 -> 18.0 (524 GB/s of weights), 14336x4096
+143.7 -> 41.8, 4096x14336 166.3 -> 44.8; Q6_K 4096x4096 44.8 -> 35.9. A 256x256 matvec costs
+3.7, which is the launch itself. The CPU spends about 3 microseconds queueing each launch,
+2.1 ms a token on Mistral-7B, overlapping the GPU's 5.3 ms.
+
+Logits against the GPU's f32 run, a 36-word prompt, max difference (top-1 the same in all):
+Llama-3.2-1B 0.147 batched, 0.151 through decode; Mistral-7B 0.104, 0.105; Qwen3-30B-A3B 0.418,
+0.201. With `--precise`, against `ref_forward.py`: Llama-3.2-1B 4.3e-6 batched and 4.0e-6 per
+token, Mistral-7B 3.8e-6 and 3.3e-6.
+
+What it took, Mistral-7B tg128 (73 with f32):
+
+- The f32 kernel's layout (`sb_*`: 8 weights a lane, 256 a step) with `dp4a` in place of the
+  float products: 77. Llama-3.2-1B lost 14% and
+  Qwen3 7%, so integer arithmetic was not the cost.
+- One lane decoding a sub-block's scale and sharing it by shuffle: 80.5. Issuing the next step's
+  reads before using this step's: 83.
+- A lane per sub-block, so each lane reads its own scale bytes: 96-101.
+- The same with every read 16 bytes wide and aligned, 4 reads a lane instead of about 12 of 1-4
+  bytes: 129. The count of separate loads per step was the cost. This needs the tensor at a
+  multiple of 16 bytes in VRAM (`Gpu::has_int8`; GGUF aligns to 32), else f32 runs.
+- Not kept: 2 or 8 rows per block instead of 4, and capping registers at 40 for all kernels,
+  were within noise or slower on whole models, though the cap alone took the Q6_K matvec from
+  36 to 23 microseconds.
+
 ## 2026-11-15: int8 tensor-core prompt matmul on CUDA
 
 Same A100 instance as the next three sections. On compute capability 8.0 and up, `mma_q4_k` and

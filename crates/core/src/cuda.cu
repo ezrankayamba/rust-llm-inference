@@ -439,6 +439,102 @@ MATMUL_Q(mmq_q4_k, mq_load_q4_k, 144)
 MATMUL_Q(mmq_q6_k, mq_load_q6_k, 210)
 #endif
 
+// ---- Int8 matvec: one token (or one matrix of a stack per grid row) over quant_x's output ----
+//
+// A warp takes one weight row, several super-blocks a step, and each lane a whole sub-block:
+// it decodes that sub-block's scale, chains its weights through dp4a into one integer and
+// converts once. `left` is the number of super-blocks left in the row.
+
+// 4 weights of quarter k of a half Q6_K super-block, from their low nibbles (in ql, already
+// the right 4 bytes) and high bit pairs, as int8.
+__device__ inline uint word_q6_k(uint ql, uint qh, uint k) {
+    uint v = ((ql >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu) | (((qh >> (2 * k)) & 0x03030303u) << 4);
+    // Each byte is 0..63; subtract 32 from each without borrowing across bytes.
+    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+
+// 16 bytes at a 16-byte boundary, as one read.
+struct __attribute__((aligned(16))) U128 {
+    uint v[4];
+};
+
+// Q4_K, 4 super-blocks a step, in four 16-byte reads a lane (the row must lie at a multiple of
+// 16 bytes): the super-block's scales, 16 bytes of nibbles and the 16 activations under each
+// half of them. Lane 8u + j of super-block u decodes sub-block j's scale; its 16 bytes are
+// weights 16 (j % 2).. of sub-blocks j & ~1 (low nibbles) and j | 1 (high), so it also needs
+// the scale its neighbour decoded.
+__device__ inline float mvq_q4_k_step(const uchar* r, const int* xq, const float* xd,
+                                      const float* xs, uint left, uint lane) {
+    uint u = lane / 8, j = lane % 8, hf = j % 2, l = j % 4;
+    float f = 0, mins = 0;
+    int s0 = 0, s1 = 0;
+    if (u < left) {
+        const uchar* b = r + u * 144;
+        U128 hd = *(const U128*)b;
+        U128 q = *(const U128*)(b + 16 + 16 * j);
+        U128 x0 = *(const U128*)(xq + 64 * u + 16 * (j / 2) + 4 * hf);
+        U128 x1 = *(const U128*)(xq + 64 * u + 16 * (j / 2) + 8 + 4 * hf);
+        _Pragma("unroll")
+        for (uint k = 0; k < 4; k++) {
+            s0 = dp4a(q.v[k] & 0x0F0F0F0Fu, x0.v[k], s0);
+            s1 = dp4a((q.v[k] >> 4) & 0x0F0F0F0Fu, x1.v[k], s1);
+        }
+        // Scale bytes l, 4 + l and 8 + l of the 12 that follow d and dmin.
+        uint b0 = (hd.v[1] >> 8 * l) & 255, b1 = (hd.v[2] >> 8 * l) & 255;
+        uint b2 = (hd.v[3] >> 8 * l) & 255;
+        uint sc = j < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
+        uint mn = j < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+        f = h_bits(hd.v[0] & 0xFFFF) * (float)sc * xd[8 * u + j];
+        mins = h_bits(hd.v[0] >> 16) * (float)mn * (xs[16 * u + 2 * j] + xs[16 * u + 2 * j + 1]);
+    }
+    float fo = __shfl_xor_sync(0xffffffff, f, 1);
+    return (hf ? fo : f) * (float)s0 + (hf ? f : fo) * (float)s1 - mins;
+}
+
+// Q6_K, 2 super-blocks a step: lane 16u + g takes the 16 weights g of super-block u.
+__device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float* xd,
+                                      const float* xs, uint left, uint lane) {
+    uint u = lane / 16, g = lane % 16;
+    if (u >= left) return 0;
+    uint n = g / 8, k = g % 8 / 2;  // half n, quarter k of it, which 16 of its 32: g % 2
+    const uchar* b = r + u * 210;
+    const uchar* lp = b + 64 * n + 32 * (k % 2) + 16 * (g % 2);
+    const uchar* hp = b + 128 + 32 * n + 16 * (g % 2);
+    const int* xp = xq + 64 * u + 4 * g;
+    int s = 0;
+    _Pragma("unroll")
+    for (uint t = 0; t < 4; t++)
+        s = dp4a(word_q6_k(u32e(lp + 4 * t), u32e(hp + 4 * t), k), xp[t], s);
+    return h(b + 208) * (float)((const signed char*)b)[192 + g] * xd[8 * u + g / 2] * (float)s;
+}
+
+// Grid rows, ids and strides as in MATVEC; x_stride counts values of x.
+#define MATVEC_Q(NAME, STEP, SB_BYTES, NSB)                                                    \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, const float* xd,   \
+                                const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
+                                uint row_bytes, const uint* ids, ulong id_stride,              \
+                                uint x_stride, uint x_div, uint y_stride) {                    \
+    uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
+    uint lane = threadIdx.x % 32;                                                              \
+    if (row >= rows) return;                                                                   \
+    uint e = blockIdx.y, n_sb = cols / 256;                                                    \
+    const uchar* r = w + w_off + (ulong)ids[e] * id_stride + (ulong)row * row_bytes;           \
+    ulong xo = (ulong)(e / x_div) * x_stride;                                                  \
+    const int* q = xq + xo / 4;                                                                \
+    const float* d = xd + xo / 32;                                                             \
+    const float* s = xs + xo / 16;                                                             \
+    float acc = 0;                                                                             \
+    for (uint c = 0; c < n_sb; c += NSB)                                                       \
+        acc += STEP(r + c * SB_BYTES, q + 64 * c, d + 8 * c, s + 16 * c, n_sb - c, lane);      \
+    acc = warp_sum(acc);                                                                       \
+    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
+}
+
+#ifndef RLI_MMA
+MATVEC_Q(mvq_q4_k, mvq_q4_k_step, 144, 4)
+MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 2)
+#endif
+
 #ifdef RLI_MMA
 // The same product on int8 tensor cores (compute capability 8.0 and up; this part is compiled
 // separately, for that and with a cap on registers). One instruction multiplies 16 weight rows
@@ -478,14 +574,6 @@ __device__ inline void mma32_s8(int a0, int a1, int a2, int a3, int b0, int b1, 
 // anything: a warp waits for a read only when it uses the result, so the reads of all its rows
 // are in flight together. With a store after each read they took one memory latency per row.
 #define MA_ROWP(R) (w + sb_off + (ulong)(row0 + (R) < rows ? row0 + (R) : rows - 1) * row_bytes)
-
-// Q6_K: 4 weights of quarter k of a half super-block, from their low nibbles (in ql, already
-// the right 4 bytes) and high bit pairs, as int8.
-__device__ inline uint ma_word_q6_k(uint ql, uint qh, uint k) {
-    uint v = ((ql >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu) | (((qh >> (2 * k)) & 0x03030303u) << 4);
-    // Each byte is 0..63; subtract 32 from each without borrowing across bytes.
-    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
-}
 
 // K32: one scale per 32 weights (Q4_K, with an offset wm), so a step covers 32 columns and a
 // row's half super-block takes 16 lanes; otherwise 16 columns and 32 lanes (Q6_K, no offset).
@@ -555,7 +643,7 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
             }                                                                                  \
             _Pragma("unroll")                                                                  \
             for (uint p = 0; p < NP; p++)                                                      \
-                wq[(warp + p * MA_NW) * MA_S + lane] = ma_word_q6_k(v0[p], v1[p], k);          \
+                wq[(warp + p * MA_NW) * MA_S + lane] = word_q6_k(v0[p], v1[p], k);          \
             if (lane < 8) {                                                                    \
                 _Pragma("unroll")                                                              \
                 for (uint p = 0; p < NP; p++) {                                                \

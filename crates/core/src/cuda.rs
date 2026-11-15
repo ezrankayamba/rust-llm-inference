@@ -38,6 +38,8 @@ const MMQ_KERNELS: [(GgmlType, &str); 2] =
     [(GgmlType::Q4_K, "mmq_q4_k"), (GgmlType::Q6_K, "mmq_q6_k")];
 /// Tokens per block of the int8 matmul kernels (`MQ_T` in cuda.cu).
 const MMQ_TILE: usize = 64;
+/// Fewest tokens the int8 matmul kernels take; fewer run as an int8 matvec each.
+const MMQ_MIN_TOKENS: usize = 8;
 /// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
@@ -136,10 +138,13 @@ pub struct Gpu {
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     mmq: Vec<(GgmlType, CudaFunction)>,
+    /// The int8 matvecs (`mvq_*`) of the same types.
+    mvq: Vec<(GgmlType, CudaFunction)>,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     other: Vec<(&'static str, CudaFunction)>,
-    /// One zero: the expert id of a plain matvec.
+    /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
+    /// for the matmul kernels.
     zero_id: GpuIds,
     name: String,
 }
@@ -205,6 +210,10 @@ impl Gpu {
                 .map(|&(t, n)| Ok((t, func(n)?)))
                 .collect::<Result<_, String>>()?
         };
+        let mvq = MMQ_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, func(&n.replace("mmq", "mvq"))?)))
+            .collect::<Result<_, String>>()?;
         let other = OTHER_KERNELS
             .iter()
             .map(|&n| Ok((n, func(n)?)))
@@ -251,7 +260,11 @@ impl Gpu {
                 .memcpy_htod(src, &mut weights.slice_mut(p.dev_off..p.dev_off + p.len))
                 .map_err(err("upload weights"))?;
         }
-        let zero_id = GpuIds(stream.alloc_zeros(1).map_err(err("allocate"))?);
+        let zero_id = GpuIds(
+            stream
+                .alloc_zeros(MMQ_MIN_TOKENS)
+                .map_err(err("allocate"))?,
+        );
         let name = format!("cuda ({})", ctx.name().map_err(err("device name"))?);
         Ok(Self {
             stream,
@@ -259,6 +272,7 @@ impl Gpu {
             placed,
             matvec,
             mmq,
+            mvq,
             mma,
             other,
             zero_id,
@@ -286,6 +300,15 @@ impl Gpu {
     /// Whether a `ty` matrix of `cols` columns can go through [`Batch::matmul_q`].
     pub fn has_matmul_q(ty: GgmlType, cols: usize) -> bool {
         MMQ_KERNELS.iter().any(|(t, _)| *t == ty) && cols.is_multiple_of(256)
+    }
+
+    /// Whether the int8 kernels can run the matrix of `ty` and `cols` columns at byte `offset`
+    /// of the model file: [`Gpu::has_matmul_q`], and for Q4_K a start at a multiple of 16 bytes
+    /// on the device, which the matvec's 16-byte reads need (its rows are multiples of 144
+    /// bytes, and GGUF aligns tensors to 32).
+    pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
+        Self::has_matmul_q(ty, cols)
+            && (ty != GgmlType::Q4_K || self.device_offset(offset, 1).is_multiple_of(16))
     }
 
     /// Room for `n` quantized activations (a multiple of 32).
@@ -395,6 +418,11 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// [`Gpu::has_int8`] of the batch's device.
+    pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
+        self.gpu.has_int8(ty, cols, offset)
+    }
+
     /// `y = W x`, `W` being `rows x cols` of `ty` at byte `offset` of the model file.
     pub fn matvec(
         &mut self,
@@ -470,8 +498,8 @@ impl Batch<'_> {
     }
 
     /// [`Batch::matmul`] over activations quantized by [`Batch::quantize`] (`n_tok` rows of
-    /// `cols` in `xq`), for the types and sizes [`Gpu::has_matmul_q`] accepts. The result
-    /// differs from the f32 matmul's by the activations' rounding.
+    /// `cols` in `xq`), for the matrices [`Gpu::has_int8`] accepts. The result differs from the
+    /// f32 matmul's by the activations' rounding.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_q(
         &mut self,
@@ -483,8 +511,14 @@ impl Batch<'_> {
         y: At<'_>,
         n_tok: usize,
     ) {
-        assert!(Gpu::has_matmul_q(ty, cols) && rows > 0 && n_tok > 0);
+        assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n_tok > 0);
         assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
+        if n_tok < MMQ_MIN_TOKENS {
+            let zero = &self.gpu.zero_id;
+            return self.matvec_q_id(
+                ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok,
+            );
+        }
         let row_bytes = ty.row_bytes(cols);
         let w_off = self.gpu.device_offset(offset, rows * row_bytes) as u64;
         let f = &self
@@ -518,6 +552,72 @@ impl Batch<'_> {
             grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256)
         };
         launch(a, cfg);
+    }
+
+    /// [`Batch::matvec_id`] over activations quantized by [`Batch::quantize`], for the matrices
+    /// [`Gpu::has_int8`] accepts; `x_stride` counts values, a multiple of 32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_q_id(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        stride: usize,
+        n_stack: usize,
+        ids: &GpuIds,
+        xq: &GpuQ,
+        x_stride: usize,
+        x_div: usize,
+        y: At<'_>,
+        y_stride: usize,
+        n: usize,
+    ) {
+        assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n > 0 && x_div > 0);
+        assert!(
+            ids.0.len() >= n
+                && x_stride.is_multiple_of(32)
+                && xq.q.len() * 4 >= (n - 1) / x_div * x_stride + cols
+                && y.1 + (n - 1) * y_stride + rows <= y.0.len(),
+            "matvec buffer too small"
+        );
+        let row_bytes = ty.row_bytes(cols);
+        let span = (n_stack - 1) * stride + rows * row_bytes;
+        let w_off = self.gpu.device_offset(offset, span) as u64;
+        let f = &self
+            .gpu
+            .mvq
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("checked by has_matmul_q")
+            .1;
+        let (y_off, id_stride, rb) = (y.1 as u64, stride as u64, row_bytes as u32);
+        let (rows_u, cols_u) = (rows as u32, cols as u32);
+        let (xs, xd, ys) = (x_stride as u32, x_div as u32, y_stride as u32);
+        let mut a = self.gpu.stream.launch_builder(f);
+        a.arg(&self.gpu.weights)
+            .arg(&w_off)
+            .arg(&xq.q)
+            .arg(&xq.d)
+            .arg(&xq.s)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb)
+            .arg(&ids.0)
+            .arg(&id_stride)
+            .arg(&xs)
+            .arg(&xd)
+            .arg(&ys);
+        launch(
+            a,
+            grid2(
+                rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
+                n,
+                (MATVEC_ROWS_PER_BLOCK * 32) as u32,
+            ),
+        );
     }
 
     /// `n` matvecs in one launch, over matrices of a stack of `n_stack` that lie `stride` bytes
@@ -808,14 +908,18 @@ impl Batch<'_> {
 mod tests {
     use super::*;
 
-    /// The int8 matmul against the f32 one over the same random weights: they differ only by
-    /// the rounding of activations to int8. The sizes leave a row tile and a token tile partly
-    /// filled. Needs an NVIDIA GPU, so CI doesn't run it; `RLI_CUDA_NO_MMA=1` checks the dp4a
-    /// kernels on a GPU that would use the tensor-core ones.
+    /// The int8 matmul, and the int8 matvec (under 8 tokens), against the f32 ones over the same
+    /// random weights: they differ only by the rounding of activations to int8. The sizes
+    /// leave a row tile, a token tile and a matvec step partly filled. Needs an NVIDIA GPU, so
+    /// CI doesn't run it; `RLI_CUDA_NO_MMA=1` checks the dp4a matmuls on a GPU that would use
+    /// the tensor-core ones.
     #[test]
     fn matmul_q_matches_f32_matmul() {
-        let (rows, cols, n) = (200, 512, 137);
-        for (ty, scales_at) in [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])] {
+        let types = [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])];
+        for ((rows, cols, n), (ty, scales_at)) in [(200, 512, 137), (203, 1280, 1), (64, 1024, 5)]
+            .into_iter()
+            .flat_map(|size| types.map(|t| (size, t)))
+        {
             let mut seed = 1u32;
             let mut next = move || {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -852,7 +956,7 @@ mod tests {
             let size = rms(&mut want.iter().copied());
             assert!(
                 err < 0.01 * size,
-                "{ty:?}: rms error {err} against rms {size}"
+                "{ty:?}, {n} tokens: rms error {err} against rms {size}"
             );
         }
     }
