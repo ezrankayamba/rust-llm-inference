@@ -20,8 +20,9 @@ const VOCAB: usize = 96;
 const EXPERTS: usize = 4;
 const EXPERTS_USED: usize = 2;
 const SHARED_FF: usize = 64;
-/// Longer than the Metal batch chunk (256), so the second chunk reads the first one's cache.
-const PROMPT: usize = 300;
+/// Longer than the backend's batch chunk (256 on Metal, 512 on CUDA), so the second chunk
+/// reads the first one's cache.
+const PROMPT: usize = if cfg!(feature = "cuda") { 600 } else { 300 };
 
 struct Rng(u32);
 impl Rng {
@@ -152,7 +153,7 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 
 /// Returns (logits after the prompt, logits of one more decoded token).
 fn run(m: &Model, prompt: &[u32], batched: bool) -> (Vec<f32>, Vec<f32>) {
-    let mut s = m.new_session(512);
+    let mut s = m.new_session(1024);
     let after_prompt = if batched {
         m.forward_batch(&mut s, prompt, true)
     } else {
@@ -266,7 +267,9 @@ fn batched_prefill_matches_per_token_qwen2moe_with_shared_expert() {
 }
 
 /// With every layer offloaded, `precise` only changes the KV cache type, so this isolates the
-/// f16 cache's rounding error (decode and batched attention both read it).
+/// f16 cache's rounding error (decode and batched attention both read it). On CUDA it also
+/// turns off the f16 GEMM that long prompts run quantized matrices through, which rounds
+/// activations and weights to f16: batched and per-token logits differed by 0.0017 here.
 #[test]
 fn f16_kv_cache_stays_close_to_f32() {
     if !rli_models::backend::HAS_GPU {
@@ -280,6 +283,7 @@ fn f16_kv_cache_stays_close_to_f32() {
         run(&f16_model, &prompt, false),
         run(&f16_model, &prompt, true),
     );
+    let gemm = if cfg!(feature = "cuda") { 1e-2 } else { 1e-3 };
     for (what, a, b, tol) in [
         ("f16 vs f32 prompt logits", &f16_bat.0, &f32_kv.0, 1e-2),
         ("f16 vs f32 next-token logits", &f16_bat.1, &f32_kv.1, 1e-2),
@@ -287,13 +291,13 @@ fn f16_kv_cache_stays_close_to_f32() {
             "f16 batched vs per-token prompt logits",
             &f16_bat.0,
             &f16_seq.0,
-            1e-3,
+            gemm,
         ),
         (
             "f16 batched vs per-token next-token logits",
             &f16_bat.1,
             &f16_seq.1,
-            1e-3,
+            gemm,
         ),
     ] {
         let d = max_diff(a, b);
@@ -309,9 +313,9 @@ fn cpu_f16_kv_cache_stays_close_to_f32_at_half_the_memory() {
     let path = model_path("llama", 4, 2, false);
     let prompt = prompt();
     let mut m = load_with(&path, 0, false);
-    let mut s16 = m.new_session(512);
+    let mut s16 = m.new_session(1024);
     m.precise = true;
-    let mut s32 = m.new_session(512);
+    let mut s32 = m.new_session(1024);
     let p16 = m.forward_batch(&mut s16, &prompt, true).expect("logits");
     let p32 = m.forward_batch(&mut s32, &prompt, true).expect("logits");
     let n16 = m.forward(&mut s16, 7, true).expect("logits");
@@ -408,7 +412,7 @@ fn generate_slices_prompts_without_changing_logits() {
     let prompt = prompt();
     for gpu_layers in gpu_layer_counts() {
         let e = engine(gpu_layers);
-        let mut s = e.new_session(512);
+        let mut s = e.new_session(1024);
         e.generate(&mut s, &prompt, &greedy(0), || false, |_| true);
         let sliced = e.model.forward(&mut s, 7, true).expect("logits");
         let (_, whole) = run(&e.model, &prompt, true);
@@ -421,7 +425,7 @@ fn generate_slices_prompts_without_changing_logits() {
 fn generate_cancelled_before_starting_keeps_the_cached_prefix() {
     for gpu_layers in gpu_layer_counts() {
         let e = engine(gpu_layers);
-        let mut s = e.new_session(512);
+        let mut s = e.new_session(1024);
         e.generate(&mut s, &[1, 2, 3, 4], &greedy(2), || false, |_| true);
         let cached = s.tokens.clone();
         let out = e.generate(&mut s, &[9, 9], &greedy(2), || true, |_| true);
@@ -435,11 +439,12 @@ fn generate_cancelled_between_prompt_slices_keeps_the_finished_slice() {
     let prompt = prompt();
     for gpu_layers in gpu_layer_counts() {
         let e = engine(gpu_layers);
-        let mut s = e.new_session(512);
+        let mut s = e.new_session(1024);
         let out = e.generate(&mut s, &prompt, &greedy(4), cancel_after(1), |_| true);
         assert_eq!(out.finish, Finish::Cancelled);
         assert_eq!(out.completion_tokens, 0);
-        assert_eq!(s.tokens, prompt[..256], "gpu_layers={gpu_layers}");
+        let slice = e.model.prompt_slice();
+        assert_eq!(s.tokens, prompt[..slice], "gpu_layers={gpu_layers}");
     }
 }
 
@@ -448,14 +453,14 @@ fn generate_retried_after_cancelling_matches_an_uninterrupted_run() {
     let prompt = prompt();
     for gpu_layers in gpu_layer_counts() {
         let e = engine(gpu_layers);
-        let mut straight = e.new_session(512);
+        let mut straight = e.new_session(1024);
         let want = e.generate(&mut straight, &prompt, &greedy(4), || false, |_| true);
 
-        let mut s = e.new_session(512);
+        let mut s = e.new_session(1024);
         e.generate(&mut s, &prompt, &greedy(4), cancel_after(1), |_| true);
         let got = e.generate(&mut s, &prompt, &greedy(4), || false, |_| true);
 
-        assert_eq!(got.prompt_evaluated, PROMPT - 256);
+        assert_eq!(got.prompt_evaluated, PROMPT - e.model.prompt_slice());
         assert_eq!(got.text, want.text, "gpu_layers={gpu_layers}");
         assert_eq!(s.tokens, straight.tokens);
         let a = e.model.forward(&mut s, 7, true).expect("logits");
@@ -470,9 +475,16 @@ fn generate_cancelled_while_decoding_keeps_the_generated_tokens() {
     let prompt = prompt();
     for gpu_layers in gpu_layer_counts() {
         let e = engine(gpu_layers);
-        let mut s = e.new_session(512);
-        // Polls: before starting, at the prompt's second slice, then once per token.
-        let out = e.generate(&mut s, &prompt, &greedy(50), cancel_after(2 + 3), |_| true);
+        let mut s = e.new_session(1024);
+        // Polls: before starting, at each prompt slice after the first, then once per token.
+        let slices = PROMPT.div_ceil(e.model.prompt_slice());
+        let out = e.generate(
+            &mut s,
+            &prompt,
+            &greedy(50),
+            cancel_after(slices + 3),
+            |_| true,
+        );
         assert_eq!(out.finish, Finish::Cancelled);
         assert_eq!(out.completion_tokens, 3);
         assert_eq!(s.len(), PROMPT + 3, "gpu_layers={gpu_layers}");

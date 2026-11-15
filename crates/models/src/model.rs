@@ -13,8 +13,9 @@ use std::collections::HashMap;
 /// pass, which cost about as much as multiplying them by 64 tokens: 128 made prompts 21-24% faster
 /// than 64 there (no change on NEON), and 256 gained 2-6% on one model and lost as much on another.
 const CPU_CHUNK: usize = 128;
-/// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls. A multiple
-/// of every backend's chunk size, so slicing a prompt moves no chunk boundaries.
+/// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls
+/// ([`Model::prompt_slice`]), unless an accelerator that runs every layer takes more. A multiple
+/// of the CPU's and Metal's chunk sizes, so slicing a prompt moves no chunk boundaries.
 pub const PROMPT_SLICE: usize = 256;
 const _: () = assert!(PROMPT_SLICE.is_multiple_of(CPU_CHUNK));
 
@@ -48,6 +49,11 @@ impl Weight {
 pub trait Accelerator: Send + Sync {
     fn name(&self) -> &str;
     fn layers(&self) -> usize;
+    /// Most prompt tokens one [`Accelerator::forward_batch`] pass takes, when that is more
+    /// than [`PROMPT_SLICE`] (a multiple of it).
+    fn prompt_slice(&self) -> usize {
+        PROMPT_SLICE
+    }
     /// Per-session state, e.g. the KV cache of the accelerated layers.
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send>;
     /// Runs the accelerated layers on the embedding `x` (in place) at position `pos`. When it
@@ -570,6 +576,15 @@ impl Model {
     /// `want_logits` (prompt tokens other than the last don't need the output head).
     pub fn forward(&self, sess: &mut Session, token: u32, want_logits: bool) -> Option<Vec<f32>> {
         self.forward_batch(sess, &[token], want_logits)
+    }
+
+    /// Tokens per [`Model::forward_batch`] call for a caller that wants to stop between calls:
+    /// the largest pass of an accelerator that runs every layer, else [`PROMPT_SLICE`].
+    pub fn prompt_slice(&self) -> usize {
+        match &self.accel {
+            Some(a) if a.layers() == self.layers.len() => a.prompt_slice(),
+            _ => PROMPT_SLICE,
+        }
     }
 
     /// Runs `tokens` at positions `sess.len()..` and appends them to the session; the logits

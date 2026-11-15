@@ -1,7 +1,7 @@
 //! Model + tokenizer + chat template, and the token generation loop shared by the CLI and server.
 
 use crate::chat::{self, ChatDefaults, ChatTemplate, Message, Rendered};
-use crate::model::{Model, PROMPT_SLICE, Session};
+use crate::model::{Model, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::stop::StopMatcher;
 use crate::tokenizer::Tokenizer;
@@ -201,7 +201,7 @@ impl Engine {
         let to_eval = &prompt[keep..];
         let mut evaluated = 0;
         let mut last = None;
-        for slice in to_eval.chunks(PROMPT_SLICE) {
+        for slice in to_eval.chunks(self.model.prompt_slice()) {
             if evaluated > 0 && is_cancelled() {
                 out.prompt_evaluated = evaluated;
                 out.finish = Finish::Cancelled;

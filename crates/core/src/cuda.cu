@@ -510,6 +510,100 @@ MATMUL_Q(mmq_q4_k, mq_load_q4_k, 144)
 MATMUL_Q(mmq_q6_k, mq_load_q6_k, 210)
 #endif
 
+// The n (token, expert) pairs of a chunk grouped by expert: perm lists the pairs expert by
+// expert, and expert e's are perm[start[e]] up to perm[start[e + 1]]. One block.
+extern "C" __global__ void moe_group(const uint* ids, uint* perm, uint* start, uint n,
+                                     uint n_expert) {
+    __shared__ uint cnt[2049];
+    uint t = threadIdx.x;
+    for (uint e = t; e <= n_expert; e += blockDim.x) cnt[e] = 0;
+    __syncthreads();
+    for (uint i = t; i < n; i += blockDim.x) atomicAdd(&cnt[ids[i] + 1], 1u);
+    __syncthreads();
+    if (t == 0)
+        for (uint e = 1; e <= n_expert; e++) cnt[e] += cnt[e - 1];
+    __syncthreads();
+    for (uint e = t; e <= n_expert; e += blockDim.x) start[e] = cnt[e];
+    __syncthreads();
+    for (uint i = t; i < n; i += blockDim.x) perm[atomicAdd(&cnt[ids[i]], 1u)] = i;
+}
+
+// MATMUL_Q for stacked experts over the pairs moe_group listed: block (x, e) takes 32 rows of
+// expert e (matrices `stride` bytes apart) and multiplies them into every pair that chose e,
+// MQI_T at a time, so an expert's weights are decoded once per chunk and not once per pair.
+// Pair p reads activation row p / x_div and writes row p of y. An expert has few pairs, so
+// they are dealt out to the warps in turn: 16 pairs are two per warp, not two warps' worth.
+#ifndef MQI_T
+#define MQI_T 64
+#endif
+#define MQI_TPW (MQI_T / 8)
+#define MATMUL_Q_ID(NAME, LOAD, SB_BYTES)                                                      \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const uint* perm,   \
+                                const uint* start, const uint* xq, const float* xd,            \
+                                const float* xs, uint x_div, float* y, ulong y_off, uint rows, \
+                                uint cols, uint row_bytes) {                                   \
+    __shared__ uint wq[64 * MQ_PAD];                                                           \
+    __shared__ float ws[16 * MQ_PAD];                                                          \
+    __shared__ float wm[16 * MQ_PAD];                                                          \
+    __shared__ uint tq[MQI_T * 64];                                                             \
+    __shared__ float td[MQI_T * 8];                                                             \
+    __shared__ float ts[MQI_T * 16];                                                            \
+    __shared__ uint pr[MQI_T];                                                                 \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint row0 = blockIdx.x * 32, p1 = start[blockIdx.y + 1];                                   \
+    w += w_off + blockIdx.y * stride;                                                          \
+    for (uint p0 = start[blockIdx.y]; p0 < p1; p0 += MQI_T) {                                  \
+        uint last = (p1 - p0 < MQI_T ? p1 - p0 : MQI_T) - 1;                                    \
+        if (threadIdx.x <= last) pr[threadIdx.x] = perm[p0 + threadIdx.x];                     \
+        __syncthreads();                                                                       \
+        float acc[MQI_TPW];                                                                    \
+        for (uint j = 0; j < MQI_TPW; j++) acc[j] = 0;                                         \
+        for (uint k = 0; k < cols / 256; k++) {                                                \
+            for (uint r = warp; r < 32; r += 8) {                                              \
+                uint row = row0 + r < rows ? row0 + r : rows - 1;                              \
+                LOAD(w + (ulong)row * row_bytes + (ulong)k * SB_BYTES, lane, r, wq, ws, wm);   \
+            }                                                                                  \
+            for (uint t = warp; t <= last; t += 8) {                                           \
+                ulong tok = pr[t] / x_div;                                                     \
+                const uint* src = xq + tok * (cols / 4) + k * 64;                              \
+                tq[t * 64 + lane] = src[lane];                                                 \
+                tq[t * 64 + 32 + lane] = src[32 + lane];                                       \
+                if (lane < 8) td[t * 8 + lane] = xd[tok * (cols / 32) + k * 8 + lane];         \
+                if (lane < 16) ts[t * 16 + lane] = xs[tok * (cols / 16) + k * 16 + lane];      \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+            if (warp <= last) {                                                                \
+                for (uint g = 0; g < 16; g++) {                                                \
+                    const uint* wg = wq + 4 * g * MQ_PAD + lane;                               \
+                    int w0 = wg[0], w1 = wg[MQ_PAD], w2 = wg[2 * MQ_PAD], w3 = wg[3 * MQ_PAD]; \
+                    float sc = ws[g * MQ_PAD + lane], mn = wm[g * MQ_PAD + lane];              \
+                    for (uint j = 0; j < MQI_TPW; j++) {                                       \
+                        uint t = j * 8 + warp;                                                 \
+                        if (t > last) break;                                                   \
+                        const int* xw = (const int*)tq + t * 64 + 4 * g;                       \
+                        int si = dp4a(w0, xw[0], 0);                                           \
+                        si = dp4a(w1, xw[1], si);                                              \
+                        si = dp4a(w2, xw[2], si);                                              \
+                        si = dp4a(w3, xw[3], si);                                              \
+                        acc[j] += sc * td[t * 8 + g / 2] * (float)si - mn * ts[t * 16 + g];    \
+                    }                                                                          \
+                }                                                                              \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+        for (uint j = 0; j < MQI_TPW; j++) {                                                   \
+            uint t = j * 8 + warp;                                                             \
+            if (t <= last && row0 + lane < rows) y[y_off + (ulong)pr[t] * rows + row0 + lane] = acc[j]; \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+    }                                                                                          \
+}
+
+#ifndef RLI_MMA
+MATMUL_Q_ID(mmq_q4_k_id, mq_load_q4_k, 144)
+MATMUL_Q_ID(mmq_q6_k_id, mq_load_q6_k, 210)
+#endif
+
 // ---- Int8 matvec: one token (or one matrix of a stack per grid row) over quant_x's output ----
 //
 // A warp takes one weight row, several super-blocks a step, and each lane a whole sub-block:
@@ -616,7 +710,6 @@ __device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float
     return h_bits((uint)sc[2] & 0xFFFF) * (fa * dx[0] * (float)sa + fb * dx[2] * (float)sb);
 }
 
-#ifndef RLI_MMA
 // Scale and minimum of sub-block i, from the 12 scale bytes in words 1..3 of a Q4_K
 // super-block's first 16 bytes.
 __device__ inline void q4_k_scale(const U128& hd, uint i, float* sc, float* mn) {
@@ -626,6 +719,8 @@ __device__ inline void q4_k_scale(const U128& hd, uint i, float* sc, float* mn) 
     *sc = h_bits(hd.v[0] & 0xFFFF) * (float)(i < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4));
     *mn = h_bits(hd.v[0] >> 16) * (float)(i < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4));
 }
+
+#ifndef RLI_MMA
 
 // Q4_K written out as f16, in 16-byte reads and stores (the row must lie at a multiple of 16
 // bytes; `dequant_q4_k_any` below takes any). A warp takes 4 super-blocks of a row; lane
@@ -995,6 +1090,163 @@ extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong 
 
 GEMM_F16(gemm_f16_64x64, 64, 64, 8)
 GEMM_F16(gemm_f16_64x128, 64, 128, 8)
+
+// Eight bytes at any address, as two aligned reads (so up to 8 bytes past the end are read;
+// the weights end in slack for that).
+__device__ inline ulong ld8(const uchar* p) {
+    const ulong* a = (const ulong*)((ulong)p & ~7ull);
+    uint sh = 8 * (uint)((ulong)p & 7);
+    ulong lo = a[0], hi = a[1];
+    return sh ? (lo >> sh) | (hi << (64 - sh)) : lo;
+}
+
+// The decoders of GEMM_ID. A step is 64 columns: quarter j of the super-block at b, of which
+// a thread decodes 16 weights of one row, columns 8 dp.. (lo) and 32 + 8 dp.. (hi), as f16.
+// *_hdr reads what a super-block's four steps share, *_load a step's bytes, *_dec decodes.
+//
+// Q4_K: the quarter is 32 bytes, the low nibbles one sub-block and the high ones the next.
+// The row must lie at a multiple of 16 bytes.
+__device__ inline void gq4_k_hdr(const uchar* b, ulong* hdr) {
+    hdr[0] = ((const ulong*)b)[0];
+    hdr[1] = ((const ulong*)b)[1];
+}
+__device__ inline void gq4_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
+    raw[0] = *(const ulong*)(b + 16 + 32 * j + 8 * dp);
+}
+__device__ inline void gq4_k_dec(const ulong* hdr, const ulong* raw, uint j, uint dp, V128& lo,
+                                 V128& hi) {
+    U128 hd;
+    hd.v[0] = (uint)hdr[0];
+    hd.v[1] = (uint)(hdr[0] >> 32);
+    hd.v[2] = (uint)hdr[1];
+    hd.v[3] = (uint)(hdr[1] >> 32);
+    float sa, ma, sc, mc;
+    q4_k_scale(hd, 2 * j, &sa, &ma);
+    q4_k_scale(hd, 2 * j + 1, &sc, &mc);
+    #pragma unroll
+    for (uint k = 0; k < 4; k++) {
+        uint by = (uint)(raw[0] >> 16 * k) & 0xFFFF;
+        uint a0 = f2h(sa * (float)(by & 15) - ma);
+        uint a1 = f2h(sa * (float)((by >> 8) & 15) - ma);
+        uint c0 = f2h(sc * (float)((by >> 4) & 15) - mc);
+        uint c1 = f2h(sc * (float)(by >> 12) - mc);
+        lo.v[k] = a0 | (a1 << 16);
+        hi.v[k] = c0 | (c1 << 16);
+    }
+}
+
+// Q6_K: half j / 2 of the super-block has 64 bytes of low nibbles and 32 of high bit pairs;
+// quarter j takes the nibbles' low (j even) or high halves, and a scale per 16 weights.
+__device__ inline void gq6_k_hdr(const uchar* b, ulong* hdr) {
+    hdr[0] = ld8(b + 192);
+    hdr[1] = ld8(b + 200);
+    hdr[2] = ld8(b + 208);
+}
+__device__ inline void gq6_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
+    uint n = j / 2;
+    raw[0] = ld8(b + 64 * n + 8 * dp);
+    raw[1] = ld8(b + 64 * n + 32 + 8 * dp);
+    raw[2] = ld8(b + 128 + 32 * n + 8 * dp);
+}
+__device__ inline void gq6_k_dec(const ulong* hdr, const ulong* raw, uint j, uint dp, V128& lo,
+                                 V128& hi) {
+    uint sh = 4 * (j % 2), is = 8 * (j / 2) + dp / 2 + sh;
+    float d = h_bits((uint)hdr[2] & 0xFFFF);
+    float fa = d * (float)(signed char)(hdr[is / 8] >> 8 * (is % 8));
+    float fb = d * (float)(signed char)(hdr[(is + 2) / 8] >> 8 * ((is + 2) % 8));
+    ulong qa = raw[0] >> sh, qb = raw[1] >> sh, ha = raw[2] >> sh, hb = raw[2] >> (sh + 2);
+    #pragma unroll
+    for (uint k = 0; k < 4; k++) {
+        uint a = (uint)(qa >> 16 * k), c = (uint)(qb >> 16 * k);
+        uint e = (uint)(ha >> 16 * k), g = (uint)(hb >> 16 * k);
+        int a0 = (a & 15) | ((e & 3) << 4), a1 = ((a >> 8) & 15) | (((e >> 8) & 3) << 4);
+        int c0 = (c & 15) | ((g & 3) << 4), c1 = ((c >> 8) & 15) | (((g >> 8) & 3) << 4);
+        lo.v[k] = f2h(fa * (float)(a0 - 32)) | ((uint)f2h(fa * (float)(a1 - 32)) << 16);
+        hi.v[k] = f2h(fb * (float)(c0 - 32)) | ((uint)f2h(fb * (float)(c1 - 32)) << 16);
+    }
+}
+
+// GEMM_F16 for stacked experts over the pairs moe_group listed, the weights decoded to f16 on
+// the way into shared memory: block (x, e) takes 64 rows of expert e (matrices `stride` bytes
+// apart) and the pairs that chose e, 64 at a time. Pair p reads row p / x_div of xh and writes
+// row p of y. Thread i decodes for row i / 4, into words 4 (i % 4).. of each half of the step.
+// As in GEMM_F16, a step's reads are all issued before its first store.
+#define GEMM_ID(NAME, SB_BYTES, HDR, LOAD, DEC)                                                \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const uint* perm,   \
+                                const uint* start, const uint* xh, uint x_div, float* y,       \
+                                ulong y_off, uint rows, uint cols, uint row_bytes) {           \
+    __shared__ uint wt[64 * GE_S];                                                             \
+    __shared__ uint xt[64 * GE_S];                                                             \
+    __shared__ uint pr[64];                                                                    \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint gi = lane / 4, gj = lane % 4;                                                         \
+    uint row0 = blockIdx.x * 64, p1 = start[blockIdx.y + 1], kw = cols / 2;                    \
+    uint ra = 16 * (warp % 4) + gi, ow = warp / 4;                                             \
+    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);                                     \
+    uint dr = threadIdx.x / 4, dp = threadIdx.x % 4;                                           \
+    const uchar* wr = w + w_off + blockIdx.y * stride +                                        \
+                      (ulong)(row0 + dr < rows ? row0 + dr : rows - 1) * row_bytes;            \
+    for (uint p0 = start[blockIdx.y]; p0 < p1; p0 += 64) {                                     \
+        uint last = (p1 - p0 < 64 ? p1 - p0 : 64) - 1;                                         \
+        if (threadIdx.x <= last) pr[threadIdx.x] = perm[p0 + threadIdx.x];                     \
+        __syncthreads();                                                                       \
+        ulong xr[2];                                                                           \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < 2; p++) xr[p] = tr + 32 * p <= last ? pr[tr + 32 * p] / x_div : 0; \
+        float c[4][4];                                                                         \
+        _Pragma("unroll")                                                                      \
+        for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;                \
+        ulong hdr[3], raw[3];                                                                  \
+        for (uint ks = 0; ks < cols / 64; ks++) {                                              \
+            uint j = ks % 4;                                                                   \
+            const uchar* b = wr + (ulong)(ks / 4) * SB_BYTES;                                  \
+            if (j == 0) HDR(b, hdr);                                                           \
+            LOAD(b, j, dp, raw);                                                               \
+            V128 v[2];                                                                         \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 2; p++)                                                       \
+                if (tr + 32 * p <= last) v[p] = *(const V128*)(xh + xr[p] * kw + ks * 32 + tw); \
+            V128 lo, hi;                                                                       \
+            DEC(hdr, raw, j, dp, lo, hi);                                                      \
+            *(V128*)(wt + dr * GE_S + 4 * dp) = lo;                                            \
+            *(V128*)(wt + dr * GE_S + 16 + 4 * dp) = hi;                                       \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 2; p++)                                                       \
+                if (tr + 32 * p <= last) *(V128*)(xt + (tr + 32 * p) * GE_S + tw) = v[p];      \
+            __syncthreads();                                                                   \
+            uint a[4][4];                                                                      \
+            _Pragma("unroll")                                                                  \
+            for (uint k = 0; k < 4; k++) {                                                     \
+                const uint* ap = wt + ra * GE_S + 8 * k + gj;                                  \
+                a[k][0] = ap[0];                                                               \
+                a[k][1] = ap[8 * GE_S];                                                        \
+                a[k][2] = ap[4];                                                               \
+                a[k][3] = ap[8 * GE_S + 4];                                                    \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint o = 0; o < 4; o++) {                                                     \
+                uint tb = (2 * o + ow) * 8;                                                    \
+                if (tb > last) continue;                                                       \
+                _Pragma("unroll")                                                              \
+                for (uint k = 0; k < 4; k++) {                                                 \
+                    const uint* bp = xt + (tb + gi) * GE_S + 8 * k + gj;                       \
+                    mma16_f16(a[k], bp[0], bp[4], c[o]);                                       \
+                }                                                                              \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < 16; j++) {                                                        \
+            uint t = (2 * (j / 4) + ow) * 8 + 2 * gj + j % 2;                                  \
+            uint row = row0 + ra + 8 * (j / 2 % 2);                                            \
+            if (t <= last && row < rows) y[y_off + (ulong)pr[t] * rows + row] = c[j / 4][j % 4]; \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+    }                                                                                          \
+}
+
+GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec)
+GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec)
 
 #else  // the rest of the file is not part of the tensor-core compile
 

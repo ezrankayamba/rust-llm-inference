@@ -53,7 +53,8 @@ Workspace crates (dependencies flow downward only):
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
   mutex held only during generation. A client disconnect or a 30 s write stall cancels generation;
-  `Engine::generate` polls between 256-token prompt slices and before each token. Responses carry
+  `Engine::generate` polls between prompt slices (`Model::prompt_slice`: 256 tokens, 512 with
+  every layer on CUDA) and before each token. Responses carry
   OpenAI's `usage` (streams need `stream_options.include_usage`) plus a non-standard `timings`.
 
 Design points that span files:
@@ -110,7 +111,7 @@ Design points that span files:
   and the next value of x: `wt_*` decodes one weight per lane (the matmuls), `sb_*` 8 weights per
   lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that
   each took a separate 32-weight chunk ran prompts 6-7x slower on an A100. Prompts run in chunks
-  of 256 tokens (`BATCH_CHUNK`): a warp multiplies its weight row into a tile of 32 tokens, and
+  of 512 tokens (`BATCH_CHUNK`; a matrix is decoded once per chunk, so 512 beat 256 by 14-30%): a warp multiplies its weight row into a tile of 32 tokens, and
   causal attention runs as tiled products (`attn_scores`, `attn_softmax`, `attn_pv`: 32 positions
   of K or V against 32 query rows per block, so a cached row is read once per tile, not once
   per head and token). Its scores need a row per head and token,
@@ -121,7 +122,12 @@ Design points that span files:
   71 -> 107 tok/s); under 128 the second launch costs more than it saves. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
   `moe_topk` takes a warp per token, then every token's k experts run as grid rows of one launch
   per matrix (each matvec kernel takes an expert id per row, `Batch::matvec_id`), so a (token,
-  expert) pair decodes its expert's weights again; Metal's gathered matmuls don't. File ranges
+  expert) pair decodes its expert's weights again. Chunks of 64+ tokens (`MOE_GROUP_TOKENS`)
+  don't: `moe_group` sorts the chunk's pairs by expert on the GPU, and a block of
+  `gemm_q4_k_id` / `gemm_q6_k_id` takes 64 rows of one expert and the pairs that chose it,
+  decoding the weights to f16 in shared memory on the way into f16 `mma.sync` (no scratch
+  copy; Qwen3-30B-A3B prompts 830 -> 3115 tok/s, 3900 with 512-token chunks). Without f16
+  tensor cores the same grouping runs `dp4a` (`mmq_*_id`, 1810 tok/s). File ranges
   that touch are uploaded as one, so stacked experts keep their stride in VRAM. Experts stored
   as separate tensors are routed on the CPU, one token at a time with a sync per layer.
   Prompt chunks of 8+ tokens (`MMQ_MIN_TOKENS`) use int8 activations unless `precise`:
@@ -164,13 +170,14 @@ Design points that span files:
   out as f16 into a scratch buffer the size of the largest one (`Scratch::wh`), and
   `gemm_f16_64x64` / `_64x128` multiply them with f16 `mma.sync` and f32 sums (the second
   compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
-  under `precise`, not for F32/F16 weights (they keep f32 activations), not for MoE experts.
+  under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
+  own kernels (above).
   Only Q4_K has a wide dequantizer; the int8 matmuls remain for chunks of 8-63 tokens.
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
   is 10-16% ahead on all three models; decode at 2048 positions is 6-11% behind, and prompts
-  1.2x (Llama-3.2-1B), 1.8x (Mistral-7B) and 5.1x (Qwen3-30B-A3B) behind.
+  level on Llama-3.2-1B (within its noise), 1.4x behind on Mistral-7B and 1.1x on Qwen3-30B-A3B.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

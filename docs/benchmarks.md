@@ -3,6 +3,61 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: CUDA prompts: experts grouped per chunk, 512-token chunks
+
+Same A100, Q4_K_M, all layers offloaded, `bench --pp 512 --tg 128 --reps 5`, each build twice;
+`--pp 2048 --tg 0 --reps 2` once. tok/s. The baseline is ab28911, so the rows include the
+section below.
+
+| Model | Measure | ab28911 | Now | llama.cpp |
+|---|---|---:|---:|---:|
+| Llama-3.2-1B | pp512 | 9048-9459 | 12042-15164 | 14500.7 |
+| Llama-3.2-1B | pp2048 | 7238 | 10012 | |
+| Mistral-7B | pp512 | 2169-2174 | 3424-3479 | 4911.9 |
+| Mistral-7B | pp2048 | 1726 | 2336 | |
+| Qwen3-30B-A3B | pp512 | 802-803 | 3859-3879 | 4241.7 |
+| Qwen3-30B-A3B | pp2048 | 712 | 2214 | |
+
+Llama's pp512 takes 35-45 ms and varies by ±2500 tok/s from run to run. Decode (tg128) did
+not change: 595-611 / 171 / 195. Still behind llama.cpp on prompts: Mistral 1.4x, Qwen3 1.1x.
+
+Qwen3-30B-A3B pp512, step by step (each measured twice, within 0.3%):
+
+| Step | tok/s |
+|---|---:|
+| One int8 matvec per (token, expert) pair, after the section below | 828-831 |
+| Pairs grouped by expert (`moe_group`), `dp4a` matmul per expert (`mmq_*_id`) | 1554-1555 |
+| An expert's pairs dealt out to the 8 warps in turn, not 8 to a warp | 1812-1814 |
+| Q4_K stacks decoded to f16 in the block, f16 `mma.sync` (`gemm_q4_k_id`) | 2862-2865 |
+| The same for Q6_K stacks (`gemm_q6_k_id`) | 3115 |
+| 512-token chunks | 3932-3947 |
+
+- **Grouping.** A 256-token chunk has 2048 pairs over 128 experts, so each expert's three
+  matrices were decoded 16 times a chunk on average. `moe_group` (one block: count, prefix
+  sum, scatter) lists the pairs expert by expert, and block (row tile, expert) runs that
+  expert's rows against all of its pairs.
+- **Token tiles of the `dp4a` kernel.** 16 / 32 / 64 pairs per pass: 1590 / 1700 / 1810
+  tok/s. Smaller tiles let more blocks share a multiprocessor but decode a busy expert again;
+  the profile had the kernel at 73% of the prompt either way, bound by the multiply.
+- **f16 in the block.** Writing the expert stacks out as f16 first, as the dense GEMM does,
+  would move 600M weights per layer and chunk through device memory (about 160 ms a prompt
+  at the dequantizer's rate). Decoding into shared memory has no such traffic.
+- **512-token chunks** halve the decodes per token for every matrix, dense ones included:
+  pp512 Llama 12.4k -> 14.1k, Mistral 2720 -> 3536, Qwen3 3115 -> 3940. The engine's
+  cancellation poll follows (`Model::prompt_slice`), only when every layer is on CUDA.
+
+Profile of a Qwen3 prompt before the Q6_K kernel and the larger chunk (`RLI_CUDA_PROF=1`,
+ms per 512 tokens): experts 78 (Q4_K, f16) + 37 (Q6_K, `dp4a`), dense GEMM 28, attention
+(`attn_scores`, `attn_pv`, `attn_softmax`) 39, dequant 10, router 8.
+
+Logits against `--precise` (largest difference; top-1 always unchanged), on a prompt of
+about 660 (Llama), 820 (Mistral) and 760 (Qwen3) tokens, so two chunks: Llama 0.063 (was
+0.184), Mistral 0.075 (was 0.691). Qwen3 over eight prompt lengths from about 150 to 790
+tokens: 0.37-1.04, mean 0.59 (was 0.50-0.92, mean 0.66), KL lower or equal each time; its
+largest differences come with expert choices that flip. `--precise` batched against
+per-token on the two-chunk prompt: 1.1e-5 / 6.3e-5 / 8.1e-6. Token counts are estimated from
+the 14-sentence version of the prompt (357 / 444 / 408).
+
 ## 2026-11-15: long CUDA prompts through an f16 tensor-core GEMM
 
 llama.cpp's CUDA backend writes a quantized matrix out as f16 and multiplies it with cuBLAS for

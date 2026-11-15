@@ -15,9 +15,11 @@ use rli_core::{GgmlType, ops};
 use std::any::Any;
 use std::sync::Mutex;
 
-/// Prompt tokens per batched pass.
-const BATCH_CHUNK: usize = 256;
-const _: () = assert!(crate::model::PROMPT_SLICE.is_multiple_of(BATCH_CHUNK));
+/// Prompt tokens per batched pass. A matrix is decoded once per pass, whatever the tokens:
+/// 512 against 256 took prompts from 12.4k to 14.1k tok/s on Llama-3.2-1B, 2720 to 3540 on
+/// Mistral-7B and 3115 to 3940 on Qwen3-30B-A3B (A100).
+const BATCH_CHUNK: usize = 512;
+const _: () = assert!(BATCH_CHUNK.is_multiple_of(crate::model::PROMPT_SLICE));
 /// Most f32s of attention scores scratch a session allocates for batched prompts (128 MB). A
 /// chunk whose scores need more runs its attention a few tokens at a time.
 const SCORE_BUDGET: usize = 1 << 25;
@@ -47,6 +49,9 @@ struct Scratch {
     shared_gate: GpuBuf,
     /// The chosen experts of an MoE layer, and their weights (then the shared expert's gate).
     route_ids: GpuIds,
+    /// A chunk's (token, expert) pairs grouped by expert, and where each expert's begin.
+    perm: GpuIds,
+    starts: GpuIds,
     route_w: GpuBuf,
     /// A matmul's input, quantized to int8.
     xq: GpuQ,
@@ -81,10 +86,12 @@ impl Scratch {
             router: gpu.alloc(n * c.n_expert.max(1)),
             shared_gate: gpu.alloc(n),
             route_ids: gpu.alloc_ids(n * k),
+            perm: gpu.alloc_ids(n * k),
+            starts: gpu.alloc_ids(c.n_expert + 1),
             route_w: gpu.alloc(n * (k + 1)),
             xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)),
             xh: gpu.alloc_half(if gemm {
-                n * c.n_embd.max(c.q_dim()).max(max_ff)
+                n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)
             } else {
                 0
             }),
@@ -143,6 +150,9 @@ fn mv(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>) {
 fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
+
+/// Fewest tokens of a chunk whose expert matrices run grouped by expert.
+const MOE_GROUP_TOKENS: usize = 64;
 
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
 fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
@@ -286,6 +296,20 @@ fn moe(
     }
     // In decode, stacks of one type and stride run as one launch. Over a prompt chunk that was
     // 1.5% slower than two.
+    // A long chunk's (token, expert) pairs are grouped by expert, whose weights are then
+    // decoded once for all of its tokens.
+    // Q4_K stacks then go through f16 tensor cores, where the GPU has them.
+    let grouped = n >= MOE_GROUP_TOKENS;
+    if grouped && wants_q(b, &[&e.gate, &e.up, &e.down], int8) {
+        b.moe_group(ids, &s.perm, &s.starts, n * k, ne);
+    }
+    let groups = (&s.perm, &s.starts);
+    let half = |b: &Batch<'_>, m: &Weight, stride| {
+        grouped && int8 && b.has_gemm_id(m.ty, m.cols, m.offset, stride)
+    };
+    if half(b, &e.gate, gate_stride) || half(b, &e.up, up_stride) {
+        b.to_f16(xb, n * n_embd, &s.xh);
+    }
     let paired = n < MMQ_MIN_TOKENS
         && e.gate.ty == e.up.ty
         && gate_stride == up_stride
@@ -294,7 +318,11 @@ fn moe(
     for (m, stride, out) in &stacks[..2 - paired as usize] {
         let (m, stride, out) = (*m, *stride, *out);
         let (ty, at) = (m.ty, m.offset);
-        if wants_q(b, &[m], int8) {
+        if half(b, m, stride) {
+            b.gemm_id(ty, ff, n_embd, at, stride, ne, groups, &s.xh, k, out, n * k);
+        } else if grouped && wants_q(b, &[m], int8) {
+            b.matmul_q_id(ty, ff, n_embd, at, stride, ne, groups, &s.xq, k, out, n * k);
+        } else if wants_q(b, &[m], int8) {
             let xq = &s.xq;
             let second = paired.then_some((e.up.offset, up));
             b.matvec_q_id(
@@ -334,26 +362,58 @@ fn moe(
     }
     let d = &e.down;
     let (ty, at) = (d.ty, d.offset);
-    if wants_q(b, &[d], int8) {
-        b.swiglu(gate, up, n * k * ff, Some(&s.xq));
-        let xq = &s.xq;
-        b.matvec_q_id(
+    if half(b, d, down_stride) {
+        b.swiglu(gate, up, n * k * ff, None);
+        b.to_f16(gate, n * k * ff, &s.xh);
+        b.gemm_id(
             ty,
             n_embd,
             ff,
             at,
             down_stride,
             ne,
-            ids,
-            xq,
-            ff,
+            groups,
+            &s.xh,
             1,
             tmp,
-            n_embd,
             n * k,
-            false,
-            None,
         );
+    } else if wants_q(b, &[d], int8) {
+        b.swiglu(gate, up, n * k * ff, Some(&s.xq));
+        let xq = &s.xq;
+        if grouped {
+            b.matmul_q_id(
+                ty,
+                n_embd,
+                ff,
+                at,
+                down_stride,
+                ne,
+                groups,
+                xq,
+                1,
+                tmp,
+                n * k,
+            );
+        } else {
+            b.matvec_q_id(
+                ty,
+                n_embd,
+                ff,
+                at,
+                down_stride,
+                ne,
+                ids,
+                xq,
+                ff,
+                1,
+                tmp,
+                n_embd,
+                n * k,
+                false,
+                None,
+            );
+        }
     } else {
         b.swiglu(gate, up, n * k * ff, None);
         b.matvec_id(
@@ -558,6 +618,10 @@ impl Accelerator for Cuda {
 
     fn layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn prompt_slice(&self) -> usize {
+        BATCH_CHUNK
     }
 
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send> {

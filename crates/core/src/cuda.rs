@@ -71,7 +71,7 @@ const GEMM_COLS: usize = 64;
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 64;
-const OTHER_KERNELS: [&str; 15] = [
+const OTHER_KERNELS: [&str; 16] = [
     "quant_x",
     "rmsnorm",
     "axpy",
@@ -86,6 +86,7 @@ const OTHER_KERNELS: [&str; 15] = [
     "attn_softmax",
     "attn_pv",
     "moe_topk",
+    "moe_group",
     "moe_combine",
 ];
 /// Most experts `moe_topk` can choose among.
@@ -178,6 +179,8 @@ pub struct Gpu {
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     mmq: Vec<(GgmlType, CudaFunction)>,
+    /// The int8 matmuls over pairs grouped by expert (`mmq_*_id`).
+    mmq_id: Vec<(GgmlType, CudaFunction)>,
     /// The int8 matvecs of the same types: `mvq_*`, and `mvq_*_pair` for two matrices.
     mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
@@ -189,6 +192,8 @@ pub struct Gpu {
     dequant_q4_k_any: CudaFunction,
     to_f16: CudaFunction,
     gemm: Option<Vec<CudaFunction>>,
+    /// The f16 products for stacked experts, which decode as they go (`gemm_*_id`).
+    gemm_id: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -240,7 +245,7 @@ impl Gpu {
                 .map_err(err("compute capability"))?
                 .0
                 >= 8;
-        let mut gemm = None;
+        let (mut gemm, mut gemm_id) = (None, Vec::new());
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -260,6 +265,13 @@ impl Gpu {
                     })
                     .collect::<Result<_, String>>()?,
             );
+            gemm_id = MMQ_KERNELS
+                .iter()
+                .map(|&(t, n)| {
+                    let n = format!("{}_id", n.replace("mmq", "gemm"));
+                    Ok((t, module.load_function(&n).map_err(err(&n))?))
+                })
+                .collect::<Result<_, String>>()?;
             MMQ_KERNELS
                 .iter()
                 .map(|&(t, n)| {
@@ -273,6 +285,10 @@ impl Gpu {
                 .map(|&(t, n)| Ok((t, func(n)?)))
                 .collect::<Result<_, String>>()?
         };
+        let mmq_id = MMQ_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, func(&format!("{n}_id"))?)))
+            .collect::<Result<_, String>>()?;
         let mvq = MMQ_KERNELS
             .iter()
             .map(|&(t, n)| {
@@ -350,12 +366,14 @@ impl Gpu {
             placed,
             matvec,
             mmq,
+            mmq_id,
             mvq,
             mma,
             dequant,
             dequant_q4_k_any,
             to_f16,
             gemm,
+            gemm_id,
             other,
             zero_id,
             no_q,
@@ -766,8 +784,12 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if let Some((t, _)) = self.gemm_id.iter().find(|(_, g)| eq(g)) {
+            format!("gemm by expert {t:?}")
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul {t:?}")
+        } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
+            format!("int8 matmul by expert {t:?}")
         } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
             format!("int8 matvec {t:?}")
         } else {
@@ -1013,6 +1035,64 @@ impl<'a> Batch<'a> {
         self.launch(l, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt), threads));
     }
 
+    /// Whether [`Batch::gemm_id`] takes a stack of `ty` matrices of `cols` columns at byte
+    /// `offset` of the model file, `stride` bytes apart: Q4_K or Q6_K on a GPU with f16 tensor
+    /// cores, and for Q4_K every row at a multiple of 16 bytes on the device.
+    pub fn has_gemm_id(&self, ty: GgmlType, cols: usize, offset: usize, stride: usize) -> bool {
+        let aligned = stride.is_multiple_of(16) && self.gpu.has_int8(ty, cols, offset);
+        self.gpu.gemm_id.iter().any(|(t, _)| *t == ty)
+            && cols.is_multiple_of(256)
+            && (ty != GgmlType::Q4_K || aligned)
+    }
+
+    /// [`Batch::matmul_q_id`] on f16 tensor cores, over f16 activations (`xh`, rows of
+    /// `cols`): the weights are decoded to f16 inside the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_id(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        stride: usize,
+        n_stack: usize,
+        (perm, start): (&GpuIds, &GpuIds),
+        xh: &GpuHalf,
+        x_div: usize,
+        y: At<'_>,
+        n: usize,
+    ) {
+        assert!(self.has_gemm_id(ty, cols, offset, stride) && rows > 0 && n > 0 && x_div > 0);
+        assert!(
+            perm.0.len() >= n
+                && start.0.len() > n_stack
+                && xh.0.len() >= ((n - 1) / x_div + 1) * cols
+                && y.1 + n * rows <= y.0.len(),
+            "matmul buffer too small"
+        );
+        let gpu: &'a Gpu = self.gpu;
+        let row_bytes = ty.row_bytes(cols);
+        let span = (n_stack - 1) * stride + rows * row_bytes;
+        let w_off = gpu.device_offset(offset, span) as u64;
+        let (stride, xd, y_off) = (stride as u64, x_div as u32, y.1 as u64);
+        let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
+        let f = gpu.gemm_id.iter().find(|(t, _)| *t == ty);
+        let mut a = self.call(&f.expect("checked by has_gemm_id").1);
+        a.arg(&gpu.weights)
+            .arg(&w_off)
+            .arg(&stride)
+            .arg(&perm.0)
+            .arg(&start.0)
+            .arg(&xh.0)
+            .arg(&xd)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb);
+        self.launch(a, grid2(rows.div_ceil(64), n_stack, 256));
+    }
+
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
     pub fn quantize(&mut self, x: At<'_>, n: usize, out: &GpuQ) {
         assert!(n.is_multiple_of(32) && x.1 + n <= x.0.len());
@@ -1086,6 +1166,82 @@ impl<'a> Batch<'a> {
             grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256)
         };
         self.launch(a, cfg);
+    }
+
+    /// Groups the `n` expert ids in `ids` (each under `n_expert`) for [`Batch::matmul_q_id`]:
+    /// `perm` gets the positions in `ids` expert by expert, `start` (`n_expert + 1` long) where
+    /// each expert's begin.
+    pub fn moe_group(
+        &mut self,
+        ids: &GpuIds,
+        perm: &GpuIds,
+        start: &GpuIds,
+        n: usize,
+        n_expert: usize,
+    ) {
+        assert!(n_expert <= MOE_MAX_EXPERTS && start.0.len() > n_expert);
+        assert!(ids.0.len() >= n && perm.0.len() >= n);
+        let (n_u, ne) = (n as u32, n_expert as u32);
+        let mut l = self.call(self.gpu.other("moe_group"));
+        l.arg(&ids.0).arg(&perm.0).arg(&start.0).arg(&n_u).arg(&ne);
+        self.launch(l, grid(1, 256));
+    }
+
+    /// [`Batch::matvec_q_id`] for many rows at once, over the grouping [`Batch::moe_group`]
+    /// made of the `n` ids: an expert's weights are decoded once for all the rows that chose
+    /// it. Row `i` of `y` (rows of `rows`) is its expert's matrix times row `i / x_div` of `xq`
+    /// (rows of `cols`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q_id(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        stride: usize,
+        n_stack: usize,
+        (perm, start): (&GpuIds, &GpuIds),
+        xq: &GpuQ,
+        x_div: usize,
+        y: At<'_>,
+        n: usize,
+    ) {
+        assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n > 0 && x_div > 0);
+        assert!(
+            perm.0.len() >= n
+                && start.0.len() > n_stack
+                && xq.q.len() * 4 >= ((n - 1) / x_div + 1) * cols
+                && y.1 + n * rows <= y.0.len(),
+            "matmul buffer too small"
+        );
+        let row_bytes = ty.row_bytes(cols);
+        let span = (n_stack - 1) * stride + rows * row_bytes;
+        let w_off = self.gpu.device_offset(offset, span) as u64;
+        let f = &self
+            .gpu
+            .mmq_id
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("checked by has_matmul_q")
+            .1;
+        let (stride, xd, y_off) = (stride as u64, x_div as u32, y.1 as u64);
+        let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
+        let mut a = self.call(f);
+        a.arg(&self.gpu.weights)
+            .arg(&w_off)
+            .arg(&stride)
+            .arg(&perm.0)
+            .arg(&start.0)
+            .arg(&xq.q)
+            .arg(&xq.d)
+            .arg(&xq.s)
+            .arg(&xd)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb);
+        self.launch(a, grid2(rows.div_ceil(32), n_stack, 256));
     }
 
     /// [`Batch::matvec_id`] over activations quantized by [`Batch::quantize`], for the matrices
@@ -1781,6 +1937,118 @@ mod tests {
         }
     }
 
+    /// The matmul over rows grouped by expert against one int8 matvec per row: the same
+    /// arithmetic in another order. An expert with more rows than a block takes, experts with
+    /// none, and a last row tile partly filled. Needs an NVIDIA GPU.
+    #[test]
+    fn matmul_q_id_matches_matvec_q_id() {
+        let (rows, cols, ne, k, n_tok) = (72, 512, 7, 3, 90);
+        for (ty, scales_at) in [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])] {
+            let mut seed = 7u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let stride = rows * ty.row_bytes(cols);
+            let mut w: Vec<u8> = (0..ne * stride).map(|_| next() as u8).collect();
+            for block in w.chunks_exact_mut(ty.block_bytes()) {
+                for &i in scales_at {
+                    block[i + 1] = 0x24 | (block[i + 1] & 3); // an f16 in [2^-6, 2^-5)
+                }
+            }
+            let x: Vec<f32> = (0..n_tok * cols)
+                .map(|_| next() as f32 / 8388608.0 - 1.0)
+                .collect();
+            // Experts 0..5 only, and mostly expert 2.
+            let n = n_tok * k;
+            let ids: Vec<u32> = (0..n)
+                .map(|_| if next() % 4 == 0 { next() % 5 } else { 2 })
+                .collect();
+
+            let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            let ids = GpuIds(gpu.stream.clone_htod(&ids).expect("upload"));
+            let (perm, start) = (gpu.alloc_ids(n), gpu.alloc_ids(ne + 1));
+            let (xb, xq) = (gpu.upload(&x), gpu.alloc_q(n_tok * cols));
+            let (y_each, y_grouped) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
+            let mut b = gpu.batch();
+            b.quantize(At(&xb, 0), n_tok * cols, &xq);
+            b.matvec_q_id(
+                ty,
+                rows,
+                cols,
+                0,
+                stride,
+                ne,
+                &ids,
+                &xq,
+                cols,
+                k,
+                At(&y_each, 0),
+                rows,
+                n,
+                false,
+                None,
+            );
+            b.moe_group(&ids, &perm, &start, n, ne);
+            let groups = (&perm, &start);
+            b.matmul_q_id(
+                ty,
+                rows,
+                cols,
+                0,
+                stride,
+                ne,
+                groups,
+                &xq,
+                k,
+                At(&y_grouped, 0),
+                n,
+            );
+            b.finish();
+            let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+            gpu.read(&y_each, &mut want);
+            gpu.read(&y_grouped, &mut got);
+            let largest = |v: &[f32]| v.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff =
+                |a: &[f32], b: &[f32]| a.iter().zip(b).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let (size, err) = (largest(&want), diff(&got, &want));
+            assert!(size > 0.0 && err < 1e-4 * size, "{ty:?}: {err} of {size}");
+
+            // The f16 tensor-core kernel, where there is one, against f32 matvecs.
+            let mut b = gpu.batch();
+            if !b.has_gemm_id(ty, cols, 0, stride) {
+                continue;
+            }
+            let xh = gpu.alloc_half(n_tok * cols);
+            b.matvec_id(
+                ty,
+                rows,
+                cols,
+                0,
+                stride,
+                ne,
+                &ids,
+                At(&xb, 0),
+                cols,
+                k,
+                At(&y_each, 0),
+                rows,
+                n,
+            );
+            b.to_f16(At(&xb, 0), n_tok * cols, &xh);
+            let y = At(&y_grouped, 0);
+            b.gemm_id(ty, rows, cols, 0, stride, ne, groups, &xh, k, y, n);
+            b.finish();
+            gpu.read(&y_each, &mut want);
+            gpu.read(&y_grouped, &mut got);
+            let (size, err) = (largest(&want), diff(&got, &want));
+            assert!(
+                size > 0.0 && err < 2e-3 * size,
+                "f16 {ty:?}: {err} of {size}"
+            );
+        }
+    }
+
     /// The f16 GEMM against the f32 matmul over the same random weights of every type: they
     /// differ by the rounding of weights and activations to f16. The sizes leave a row tile
     /// and a token tile partly filled. Needs an NVIDIA GPU with f16 tensor cores.
@@ -1835,7 +2103,9 @@ mod tests {
                 let (wh, xh) = (gpu.alloc_half(rows * cols), gpu.alloc_half(n * cols));
                 let (y_f32, y_h) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
                 let mut b = gpu.batch();
-                assert!(b.has_gemm(cols, n), "no f16 tensor cores");
+                if !b.has_gemm(cols, n) {
+                    return; // no f16 tensor cores, or RLI_CUDA_NO_MMA
+                }
                 b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
                 b.to_f16(At(&xb, 0), n * cols, &xh);
                 b.dequant(ty, rows, cols, 0, &wh);
