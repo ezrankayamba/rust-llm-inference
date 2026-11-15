@@ -113,11 +113,14 @@ Design points that span files:
   of 256 tokens (`BATCH_CHUNK`): a warp multiplies its weight row into a tile of 32 tokens, and
   causal attention runs one block per head and token. Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
-  launches. Offloaded MoE layers run one token at a time, prompts included, routed on the GPU as
-  on Metal (`moe_topk`, then the k experts as one launch per matrix: every matvec kernel takes
-  an expert id per grid row, `Batch::matvec_id`). File ranges that touch are uploaded as one, so
-  stacked experts keep their stride in VRAM. Experts stored as separate tensors are routed on
-  the CPU with a sync per layer.
+  launches. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
+  `moe_topk` takes a warp per token, then every token's k experts run as grid rows of one launch
+  per matrix (each matvec kernel takes an expert id per row, `Batch::matvec_id`), so a (token,
+  expert) pair decodes its expert's weights again; Metal's gathered matmuls don't. File ranges
+  that touch are uploaded as one, so stacked experts keep their stride in VRAM. Experts stored
+  as separate tensors are routed on the CPU, one token at a time with a sync per layer.
+  llama.cpp's CUDA backend was 9-22x faster on prompts and 2-3x on decode on the same A100
+  (`docs/benchmarks.md`, 2026-11-15).
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
   the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
   against `ref_forward.py` both batched and with `--per-token` (the decode kernels).

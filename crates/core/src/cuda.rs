@@ -344,7 +344,7 @@ impl Batch<'_> {
     ) {
         if n_tok == 1 {
             let zero = &self.gpu.zero_id;
-            return self.matvec_id(ty, rows, cols, offset, 0, 1, zero, x, 0, y, 0, 1);
+            return self.matvec_id(ty, rows, cols, offset, 0, 1, zero, x, 0, 1, y, 0, 1);
         }
         let span = rows * ty.row_bytes(cols);
         let (f, w_off, row_bytes) = self.matrix(ty, rows, cols, offset, span, true);
@@ -376,8 +376,8 @@ impl Batch<'_> {
     }
 
     /// `n` matvecs in one launch, over matrices of a stack of `n_stack` that lie `stride` bytes
-    /// apart from `offset`: matvec `i` multiplies matrix `ids[i]` into `x` at `i * x_stride`
-    /// (0: all read the same x) and writes `y` at `i * y_stride`.
+    /// apart from `offset`: matvec `i` multiplies matrix `ids[i]` into `x` at
+    /// `i / x_div * x_stride` and writes `y` at `i * y_stride`.
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_id(
         &mut self,
@@ -390,6 +390,7 @@ impl Batch<'_> {
         ids: &GpuIds,
         x: At<'_>,
         x_stride: usize,
+        x_div: usize,
         y: At<'_>,
         y_stride: usize,
         n: usize,
@@ -399,13 +400,14 @@ impl Batch<'_> {
         assert!(
             n > 0
                 && ids.0.len() >= n
-                && x.1 + (n - 1) * x_stride + cols <= x.0.len()
+                && x_div > 0
+                && x.1 + (n - 1) / x_div * x_stride + cols <= x.0.len()
                 && y.1 + (n - 1) * y_stride + rows <= y.0.len(),
             "matvec buffer too small"
         );
         let (x_off, y_off, id_stride) = (x.1 as u64, y.1 as u64, stride as u64);
         let (rows_u, cols_u) = (rows as u32, cols as u32);
-        let (xs, ys) = (x_stride as u32, y_stride as u32);
+        let (xs, xd, ys) = (x_stride as u32, x_div as u32, y_stride as u32);
         let mut a = self.gpu.stream.launch_builder(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
@@ -419,6 +421,7 @@ impl Batch<'_> {
             .arg(&ids.0)
             .arg(&id_stride)
             .arg(&xs)
+            .arg(&xd)
             .arg(&ys);
         launch(
             a,
@@ -456,9 +459,10 @@ impl Batch<'_> {
         (if matmul { mm } else { mv }, w_off, row_bytes as u32)
     }
 
-    /// Softmax over the first `n_expert` values of `logits` (the router's output), then the `k`
-    /// largest: their ids into `ids` and weights into `w` (renormalized to sum to 1 when
-    /// `norm`). With `shared`, `w[k]` is the sigmoid of the first value of `shared_gate`.
+    /// For each of `n_tok` tokens: softmax over its `n_expert` values of `logits` (the router's
+    /// output), then the `k` largest: their ids into `ids` and weights into `w` (renormalized
+    /// to sum to 1 when `norm`). With `shared`, a token has `k + 1` weights, the last the
+    /// sigmoid of its value of `shared_gate`.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_topk(
         &mut self,
@@ -470,10 +474,11 @@ impl Batch<'_> {
         k: usize,
         norm: bool,
         shared: bool,
+        n_tok: usize,
     ) {
         assert!(n_expert <= MOE_MAX_EXPERTS && k <= n_expert);
-        assert!(n_expert <= logits.len() && !shared_gate.is_empty());
-        assert!(ids.0.len() >= k && w.len() >= k + usize::from(shared));
+        assert!(n_tok * n_expert <= logits.len() && n_tok <= shared_gate.len());
+        assert!(ids.0.len() >= n_tok * k && w.len() >= n_tok * (k + usize::from(shared)));
         let (ne, k_u, norm_u, shared_u) = (n_expert as u32, k as u32, norm as u32, shared as u32);
         let mut l = self.gpu.stream.launch_builder(self.gpu.other("moe_topk"));
         l.arg(&logits.0)
@@ -484,24 +489,43 @@ impl Batch<'_> {
             .arg(&k_u)
             .arg(&norm_u)
             .arg(&shared_u);
-        launch(l, grid(1, 32));
+        launch(l, grid(n_tok, 32));
     }
 
-    /// `x += sum over r < m of w[r] * (row r of src)`, rows of `n`.
-    pub fn moe_combine(&mut self, x: At<'_>, src: &GpuBuf, w: &GpuBuf, m: usize, n: usize) {
-        assert!(x.1 + n <= x.0.len() && src.len() >= m * n && w.len() >= m);
-        let (x_off, n_u, m_u) = (x.1 as u64, n as u32, m as u32);
+    /// For each of `n_tok` tokens `t`: row `t` of `x` `+= sum over r < m of
+    /// w[t * w_stride + r] * (row t * m + r of src)`, rows of `n`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_combine(
+        &mut self,
+        x: At<'_>,
+        src: At<'_>,
+        w: At<'_>,
+        w_stride: usize,
+        m: usize,
+        n: usize,
+        n_tok: usize,
+    ) {
+        assert!(n_tok > 0 && x.1 + n_tok * n <= x.0.len());
+        assert!(src.1 + n_tok * m * n <= src.0.len());
+        assert!(w.1 + (n_tok - 1) * w_stride + m <= w.0.len());
+        let (x_off, src_off, w_off) = (x.1 as u64, src.1 as u64, w.1 as u64);
+        let (ws, n_u, m_u, nt) = (w_stride as u32, n as u32, m as u32, n_tok as u32);
         let mut l = self
             .gpu
             .stream
             .launch_builder(self.gpu.other("moe_combine"));
         l.arg(&x.0.0)
             .arg(&x_off)
-            .arg(&src.0)
-            .arg(&w.0)
+            .arg(&src.0.0)
+            .arg(&src_off)
+            .arg(&w.0.0)
+            .arg(&w_off)
+            .arg(&ws)
             .arg(&n_u)
-            .arg(&m_u);
-        launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+            .arg(&m_u)
+            .arg(&nt);
+        let len = n * n_tok;
+        launch(l, grid(len.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).

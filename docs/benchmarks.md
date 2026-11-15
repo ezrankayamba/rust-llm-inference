@@ -3,6 +3,60 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: CUDA against llama.cpp on the A100, and batched MoE prompts
+
+Same instance as the next section. llama.cpp v0.9.0 (cd959ba) built with `-DGGML_CUDA=ON` against
+the CUDA 12.4 toolkit; `llama-bench -ngl 99 -p 512 -n 128 -r 3 -t 8`, and `-p 0 -n 128 -d 2048`.
+rli: `bench --gpu-layers N` and `--pp 0 --depth 2048`, 3 reps. Q4_K_M files, tok/s, peak VRAM
+from `nvidia-smi` sampled during the prompt and decode run.
+
+| Model | Engine | Prompt | Decode | Decode at 2048 | Peak VRAM MiB |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B | rli | 1563.5 | 264.9 | 168.3 | 1291 |
+| | llama.cpp | 14500.7 | 524.4 | 522.4 | 1597 |
+| Mistral-7B | rli | 221.1 | 71.4 | 49.9 | 4747 |
+| | llama.cpp | 4911.9 | 155.4 | 150.9 | 5005 |
+| Qwen3-30B-A3B (MoE) | rli | 299.0 | 91.8 | 50.6 | 18155 |
+| | llama.cpp | 4241.7 | 171.5 | 166.4 | 18603 |
+
+llama.cpp is 9-22x ahead on prompts, about 2x on decode and 3x on decode at 2048 tokens of
+context, for 3-24% more VRAM. Its prompt numbers varied by up to 7% between repetitions and
+rli's by under 1%. Why it is ahead was not profiled. Things to look at first: its prompt path
+(rli's matmul is a hand-written kernel that decodes each weight once per 32 tokens and has no
+tiling of x in shared memory), and rli's attention at long context, where decode loses 30-45%
+against llama.cpp's 0-3%.
+
+Batched MoE prompts, the change measured in the rli rows above: a chunk's tokens are routed on
+the GPU (`moe_topk` with a warp per token) and every token's 8 experts run as rows of one launch
+per matrix. Before it (previous section) MoE prompts ran one token at a time.
+
+| Qwen3-30B-A3B | Before | After |
+|---|---:|---:|
+| pp512 | 94.8 | 299.0 |
+| pp24 (5 reps) | not measured | 242.5 ± 20.7 |
+| tg128 | 93.5 | 91.8 |
+| Peak VRAM MiB, decode only / with a 512-token prompt | 17995 | 18155 |
+
+Dense models did not move (Llama-3.2-1B 1550.6 -> 1563.5 prompt, 262.2 -> 264.9 decode;
+Mistral-7B 220.5 -> 221.1, 70.7 -> 71.4). Checks on this code: the workspace tests with
+`--features rli-models/cuda`; Qwen3-30B-A3B `--precise` logits for a 99-token prompt within
+1.5e-5 of the CPU's with 48 layers offloaded and 9.1e-6 with 24; a 309-token prompt (two chunks)
+within 7.2e-6 of the same prompt run one token at a time on the GPU; Llama-3.2-1B against
+`ref_forward.py` 1.0e-5 batched and 8.3e-6 per token.
+
+Each (token, expert) pair decodes its expert's weights again. Gathering the tokens that chose an
+expert into one matmul, as Metal does, would decode them once per chunk; not tried.
+
+The same change stopped sizing the feed-forward scratch from the vocabulary matrix, which had
+made a batched prompt on a dense model allocate about 2 x 150 MB it never used (computed from
+the sizes, not measured before the fix).
+
+About the host: the GPU numbers repeat within 1%, but the machine is shared (load average 8-15
+from other tenants while idle, 46 of its 96 threads ours), so its CPU numbers swing by 2-10% and
+the small model's decode, which is limited by the CPU thread that launches kernels, swung by
+20% under load. The CPU is a Zen 2 EPYC 7F72: AVX2 only, so it says nothing about the AVX-512
+kernels.
+
 ## 2026-11-15: first CUDA runs, on an A100
 
 The CUDA backend ran on an NVIDIA GPU for the first time: a rented A100-PCIE-40GB (driver

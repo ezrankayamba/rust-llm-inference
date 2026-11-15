@@ -3,7 +3,7 @@
 //! run on the CPU from the file mapping. One stream sync per token: MoE layers pick their
 //! experts on the GPU (experts stored as separate tensors are routed on the CPU instead, with a
 //! sync per layer). Prompts run in chunks of up to [`BATCH_CHUNK`] tokens per pass (matmul
-//! instead of matvec, one sync per chunk), unless an offloaded layer is MoE.
+//! instead of matvec, one sync per chunk), unless an offloaded layer is routed on the CPU.
 
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
@@ -52,21 +52,21 @@ struct Scratch {
 
 impl Scratch {
     fn new(gpu: &Gpu, c: &crate::config::Config, max_ff: usize, logits: usize, n: usize) -> Self {
-        // An MoE token holds its chosen experts' activations side by side, and their outputs
-        // plus a shared expert's.
+        // An MoE token holds its k chosen experts' activations side by side; their outputs are
+        // followed by the shared expert's, one row per token.
         let k = c.n_expert_used;
         Self {
             x: gpu.alloc(n * c.n_embd),
             xb: gpu.alloc(n * c.n_embd),
             q: gpu.alloc(n * c.q_dim()),
             att: gpu.alloc(n * c.q_dim()),
-            tmp: gpu.alloc(n.max(k + 1) * c.n_embd),
-            gate: gpu.alloc(n.max(k) * max_ff),
-            up: gpu.alloc(n.max(k) * max_ff),
-            router: gpu.alloc(c.n_expert.max(1)),
-            shared_gate: gpu.alloc(1),
-            route_ids: gpu.alloc_ids(k),
-            route_w: gpu.alloc(k + 1),
+            tmp: gpu.alloc(n * (k + 1) * c.n_embd),
+            gate: gpu.alloc(n * k.max(1) * max_ff),
+            up: gpu.alloc(n * k.max(1) * max_ff),
+            router: gpu.alloc(n * c.n_expert.max(1)),
+            shared_gate: gpu.alloc(n),
+            route_ids: gpu.alloc_ids(n * k),
+            route_w: gpu.alloc(n * (k + 1)),
             logits: gpu.alloc(logits),
         }
     }
@@ -86,7 +86,7 @@ struct Cuda {
     output_norm: GpuBuf,
     rope_freqs: Option<GpuBuf>,
     covers_all: bool,
-    /// No offloaded layer is MoE, so prompts can run as matmuls.
+    /// No offloaded layer is routed on the CPU, so prompts can run as batches.
     batchable: bool,
     max_ff: usize,
     kv_dim: usize,
@@ -124,19 +124,26 @@ fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, out: At<'_>, n: usize) {
     mm(b, &e.down, At(&s.gate, 0), out, n);
 }
 
-/// Queues one token's MoE FFN over `s.xb`, adding into `s.x`, once the router's (and shared
-/// gate's) outputs are queued: the experts are picked on the GPU, so nothing waits, and the k
-/// chosen ones run as one id-indexed matvec per matrix.
-fn moe_decode(
+/// Queues the MoE FFN of `n` tokens over `s.xb`, adding into `s.x`. The experts are picked on
+/// the GPU, so nothing waits, and every token's k chosen ones run as one id-indexed matvec per
+/// matrix.
+#[allow(clippy::too_many_arguments)]
+fn moe(
     c: &crate::config::Config,
     b: &mut Batch<'_>,
     s: &Scratch,
+    router: &Weight,
     experts: &[Expert],
     shared: Option<&(Weight, Expert)>,
     [gate_stride, up_stride, down_stride]: [usize; 3],
+    n: usize,
 ) {
     let (ne, k, n_embd) = (experts.len(), c.n_expert_used, c.n_embd);
-    let ids = &s.route_ids;
+    let (xb, ids) = (At(&s.xb, 0), &s.route_ids);
+    mm(b, router, xb, At(&s.router, 0), n);
+    if let Some((gi, _)) = shared {
+        mm(b, gi, xb, At(&s.shared_gate, 0), n);
+    }
     b.moe_topk(
         &s.router,
         &s.shared_gate,
@@ -146,16 +153,29 @@ fn moe_decode(
         k,
         c.norm_topk,
         shared.is_some(),
+        n,
     );
     let e = &experts[0];
     let ff = e.gate.rows;
-    let (xb, gate, up, tmp) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
+    let (gate, up, tmp) = (At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
     for (m, stride, out) in [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)] {
         b.matvec_id(
-            m.ty, m.rows, m.cols, m.offset, stride, ne, ids, xb, 0, out, ff, k,
+            m.ty,
+            m.rows,
+            m.cols,
+            m.offset,
+            stride,
+            ne,
+            ids,
+            xb,
+            n_embd,
+            k,
+            out,
+            ff,
+            n * k,
         );
     }
-    b.swiglu(gate, up, k * ff);
+    b.swiglu(gate, up, n * k * ff);
     let d = &e.down;
     b.matvec_id(
         d.ty,
@@ -167,15 +187,18 @@ fn moe_decode(
         ids,
         gate,
         ff,
+        1,
         tmp,
         n_embd,
-        k,
+        n * k,
     );
+    let w_stride = k + usize::from(shared.is_some());
+    b.moe_combine(At(&s.x, 0), tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
     if let Some((_, e)) = shared {
-        ffn(b, s, e, At(&s.tmp, k * n_embd), 1);
+        let out = At(&s.tmp, n * k * n_embd);
+        ffn(b, s, e, out, n);
+        b.moe_combine(At(&s.x, 0), out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
-    let m = k + usize::from(shared.is_some());
-    b.moe_combine(At(&s.x, 0), &s.tmp, &s.route_w, m, n_embd);
 }
 
 impl Cuda {
@@ -262,16 +285,13 @@ impl Cuda {
                     experts,
                     shared,
                 } => {
-                    assert_eq!(n, 1, "MoE layers run one token at a time");
-                    mv(&mut b, router, At(&s.xb, 0), At(&s.router, 0));
                     if let Some(strides) = g.expert_strides {
-                        if let Some((gi, _)) = shared {
-                            mv(&mut b, gi, At(&s.xb, 0), At(&s.shared_gate, 0));
-                        }
-                        moe_decode(c, &mut b, s, experts, shared.as_ref(), strides);
+                        moe(c, &mut b, s, router, experts, shared.as_ref(), strides, n);
                         continue;
                     }
+                    assert_eq!(n, 1, "CPU-routed MoE layers run one token at a time");
                     // Routing needs the router output on the CPU: one sync per MoE layer.
+                    mv(&mut b, router, At(&s.xb, 0), At(&s.router, 0));
                     let mut shared_gate = [0.0f32];
                     if let Some((gi, _)) = shared {
                         mv(&mut b, gi, At(&s.xb, 0), At(&s.shared_gate, 0));
@@ -431,15 +451,15 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
     }
     let ranges: Vec<(usize, usize)> = weights.iter().map(|w| (w.offset, w.n_bytes())).collect();
     let gpu = Gpu::new(model.gguf().mapped_bytes(), &ranges).map_err(BackendError)?;
-    let max_ff = weights
+    // The widest feed-forward activation among the offloaded layers' experts.
+    let max_ff = model.layers[..n]
         .iter()
-        .filter(|w| w.cols == c.n_embd)
-        .map(|w| w.rows)
+        .flat_map(|l| experts_of(&l.ffn))
+        .map(|e| e.gate.rows)
         .max()
-        .unwrap_or(0)
-        .max(c.n_ff);
+        .unwrap_or(0);
     let opt = |v: &Option<Vec<f32>>| v.as_ref().map(|v| gpu.upload(v));
-    let gpu_layers = model.layers[..n]
+    let gpu_layers: Vec<GpuLayer> = model.layers[..n]
         .iter()
         .map(|l| GpuLayer {
             attn_norm: gpu.upload(&l.attn_norm),
@@ -461,7 +481,8 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
     let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1);
     let batchable = model.layers[..n]
         .iter()
-        .all(|l| matches!(l.ffn, Ffn::Dense(_)));
+        .zip(&gpu_layers)
+        .all(|(l, g)| matches!(l.ffn, Ffn::Dense(_)) || g.expert_strides.is_some());
     let accel = Cuda {
         output_norm: gpu.upload(&model.output_norm),
         rope_freqs: opt(&model.rope_freqs),

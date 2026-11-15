@@ -105,19 +105,20 @@ __device__ inline float wt_q6_k(const uchar* r, uint c, uint l) {
 }
 
 // y = W x, one grid row (y) per matrix of a stack: row e uses the matrix ids[e] * id_stride
-// bytes after w_off, x at e * x_stride and y at e * y_stride. A plain matvec is one row with
-// ids[0] = 0. MoE layers run their chosen experts as rows.
+// bytes after w_off, x at (e / x_div) * x_stride and y at e * y_stride. A plain matvec is one
+// row with ids[0] = 0. MoE layers run every token's chosen experts as rows: x_div experts read
+// one token's x.
 #define MATVEC(NAME, WT)                                                                       \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulong x_off,      \
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
                                 const uint* ids, ulong id_stride, uint x_stride,               \
-                                uint y_stride) {                                               \
+                                uint x_div, uint y_stride) {                                   \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     if (row >= rows) return;                                                                   \
     uint e = blockIdx.y;                                                                       \
     const uchar* r = w + w_off + (ulong)ids[e] * id_stride + (ulong)row * row_bytes;           \
-    const float* xs = x + x_off + (ulong)e * x_stride + lane;                                  \
+    const float* xs = x + x_off + (ulong)(e / x_div) * x_stride + lane;                        \
     float acc = 0;                                                                             \
     for (uint c = 0; c < cols / 32; c++) acc += WT(r, c, lane) * xs[c * 32];                   \
     acc = warp_sum(acc);                                                                       \
@@ -230,13 +231,13 @@ __device__ inline float sb_q6_k(const uchar* b, const float* x, uint lane) {
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulong x_off,      \
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
                                 const uint* ids, ulong id_stride, uint x_stride,               \
-                                uint y_stride) {                                               \
+                                uint x_div, uint y_stride) {                                   \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     if (row >= rows) return;                                                                   \
     uint e = blockIdx.y;                                                                       \
     const uchar* r = w + w_off + (ulong)ids[e] * id_stride + (ulong)row * row_bytes;           \
-    const float* xs = x + x_off + (ulong)e * x_stride;                                         \
+    const float* xs = x + x_off + (ulong)(e / x_div) * x_stride;                               \
     float acc = 0;                                                                             \
     for (uint c = 0; c < cols / 256; c++) acc += SB(r + c * SB_BYTES, xs + c * 256, lane);     \
     for (uint c = cols / 256 * 8; c < cols / 32; c++) acc += WT(r, c, lane) * xs[c * 32 + lane]; \
@@ -379,12 +380,16 @@ __device__ inline uint warp_min_u(uint v) {
     return v;
 }
 
-// One warp: softmax over the n_expert router logits, then the k largest as ids[] and w[]
-// (renormalized to sum to 1 when norm is set). With a shared expert, w[k] is its sigmoid gate.
-// Takes up to 2048 experts (64 per lane).
+// One warp per token: softmax over its n_expert router logits, then the k largest as its ids[]
+// and w[] (renormalized to sum to 1 when norm is set). With a shared expert, a token has k + 1
+// weights, the last its sigmoid gate. Takes up to 2048 experts (64 per lane).
 extern "C" __global__ void moe_topk(const float* logits, const float* shared_gate, uint* ids,
                                     float* w, uint n_expert, uint k, uint norm, uint shared) {
-    uint lane = threadIdx.x;
+    uint lane = threadIdx.x, tok = blockIdx.x;
+    logits += (ulong)tok * n_expert;
+    shared_gate += tok;
+    ids += (ulong)tok * k;
+    w += (ulong)tok * (k + shared);
     float mx = NEG_INF;
     for (uint e = lane; e < n_expert; e += 32) mx = fmaxf(mx, logits[e]);
     mx = warp_max(mx);
@@ -418,14 +423,19 @@ extern "C" __global__ void moe_topk(const float* logits, const float* shared_gat
     }
 }
 
-// x += sum over r < m of w[r] * src row r (rows of n): the chosen experts' outputs, combined.
-extern "C" __global__ void moe_combine(float* x, ulong x_off, const float* src, const float* w,
-                                       uint n, uint m) {
-    uint j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
+// Row t of x (n_tok rows of n) += sum over r < m of w[t * w_stride + r] * src row t * m + r:
+// each token's chosen experts' outputs, combined.
+extern "C" __global__ void moe_combine(float* x, ulong x_off, const float* src, ulong src_off,
+                                       const float* w, ulong w_off, uint w_stride, uint n,
+                                       uint m, uint n_tok) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * n_tok) return;
+    uint t = i / n, j = i % n;
+    const float* wt = w + w_off + (ulong)t * w_stride;
+    const float* rows = src + src_off + (ulong)t * m * n + j;
     float s = 0;
-    for (uint r = 0; r < m; r++) s += w[r] * src[(ulong)r * n + j];
-    x[x_off + j] += s;
+    for (uint r = 0; r < m; r++) s += wt[r] * rows[(ulong)r * n];
+    x[x_off + i] += s;
 }
 
 // One block per query head (x) and token (y): token tok0 + y of the batch attends to the first
