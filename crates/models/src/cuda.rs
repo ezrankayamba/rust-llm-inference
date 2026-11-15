@@ -8,7 +8,7 @@
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::cuda::{
-    ATTN_THREADS, At, AttnParams, Batch, Gpu, GpuBuf, GpuIds, MOE_MAX_EXPERTS, RopeArgs,
+    ATTN_THREADS, At, AttnParams, Batch, Gpu, GpuBuf, GpuIds, GpuQ, MOE_MAX_EXPERTS, RopeArgs,
 };
 use rli_core::ops;
 use std::any::Any;
@@ -17,6 +17,8 @@ use std::sync::Mutex;
 /// Prompt tokens per batched pass.
 const BATCH_CHUNK: usize = 256;
 const _: () = assert!(crate::model::PROMPT_SLICE.is_multiple_of(BATCH_CHUNK));
+/// Fewest prompt tokens in a pass for the int8 matmuls; under it the f32 ones run.
+const MMQ_MIN_TOKENS: usize = 8;
 /// Most f32s of attention scores scratch a session allocates for batched prompts (128 MB). A
 /// chunk whose scores need more runs its attention a few tokens at a time.
 const SCORE_BUDGET: usize = 1 << 25;
@@ -47,6 +49,8 @@ struct Scratch {
     /// The chosen experts of an MoE layer, and their weights (then the shared expert's gate).
     route_ids: GpuIds,
     route_w: GpuBuf,
+    /// A matmul's input, quantized to int8.
+    xq: GpuQ,
     logits: GpuBuf,
 }
 
@@ -67,6 +71,11 @@ impl Scratch {
             shared_gate: gpu.alloc(n),
             route_ids: gpu.alloc_ids(n * k),
             route_w: gpu.alloc(n * (k + 1)),
+            xq: gpu.alloc_q(if n < MMQ_MIN_TOKENS {
+                0
+            } else {
+                n * c.n_embd.max(c.q_dim()).max(max_ff)
+            }),
             logits: gpu.alloc(logits),
         }
     }
@@ -117,11 +126,35 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
-fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, out: At<'_>, n: usize) {
-    mm(b, &e.gate, At(&s.xb, 0), At(&s.gate, 0), n);
-    mm(b, &e.up, At(&s.xb, 0), At(&s.up, 0), n);
-    b.swiglu(At(&s.gate, 0), At(&s.up, 0), n * e.gate.rows);
-    mm(b, &e.down, At(&s.gate, 0), out, n);
+/// Each of `ws` applied to the `n` tokens at `x`, into the matching `ys`. With `int8`, the
+/// matrices that have an int8 kernel run over `x` quantized once into `s.xq`.
+fn mm_each(
+    b: &mut Batch<'_>,
+    s: &Scratch,
+    ws: &[&Weight],
+    x: At<'_>,
+    ys: &[At<'_>],
+    n: usize,
+    int8: bool,
+) {
+    let q = |w: &Weight| int8 && Gpu::has_matmul_q(w.ty, w.cols);
+    if ws.iter().any(|w| q(w)) {
+        b.quantize(x, n * ws[0].cols, &s.xq);
+    }
+    for (w, &y) in ws.iter().zip(ys) {
+        if q(w) {
+            b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n);
+        } else {
+            mm(b, w, x, y, n);
+        }
+    }
+}
+
+fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, out: At<'_>, n: usize, int8: bool) {
+    let (gate, up) = (At(&s.gate, 0), At(&s.up, 0));
+    mm_each(b, s, &[&e.gate, &e.up], At(&s.xb, 0), &[gate, up], n, int8);
+    b.swiglu(gate, up, n * e.gate.rows);
+    mm_each(b, s, &[&e.down], gate, &[out], n, int8);
 }
 
 /// Queues the MoE FFN of `n` tokens over `s.xb`, adding into `s.x`. The experts are picked on
@@ -196,7 +229,7 @@ fn moe(
     b.moe_combine(At(&s.x, 0), tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
     if let Some((_, e)) = shared {
         let out = At(&s.tmp, n * k * n_embd);
-        ffn(b, s, e, out, n);
+        ffn(b, s, e, out, n, false);
         b.moe_combine(At(&s.x, 0), out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
 }
@@ -225,6 +258,8 @@ impl Cuda {
         );
         self.gpu.write(&mut s.x, xs);
         let s = &*s;
+        // Prompts multiply in int8, as the CPU does; `precise` keeps every product in f32.
+        let int8 = n >= MMQ_MIN_TOKENS && !model.precise;
 
         let x_at = At(&s.x, 0);
         let rope = |n_heads| RopeArgs {
@@ -241,9 +276,9 @@ impl Cuda {
         for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
             let (k_at, v_at) = (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim));
             b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
-            mm(&mut b, &layer.wq, At(&s.xb, 0), At(&s.q, 0), n);
-            mm(&mut b, &layer.wk, At(&s.xb, 0), k_at, n);
-            mm(&mut b, &layer.wv, At(&s.xb, 0), v_at, n);
+            let qkv = [&layer.wq, &layer.wk, &layer.wv];
+            let outs = [At(&s.q, 0), k_at, v_at];
+            mm_each(&mut b, s, &qkv, At(&s.xb, 0), &outs, n, int8);
             for (t, bias, len) in [
                 (At(&s.q, 0), &g.bq, c.q_dim()),
                 (k_at, &g.bk, kv_dim),
@@ -272,12 +307,13 @@ impl Cuda {
                 scale: 1.0 / (hd as f32).sqrt(),
             };
             b.attention(&s.q, &kv.k[l], &kv.v[l], &s.att, &kv.scores, &p);
-            mm(&mut b, &layer.wo, At(&s.att, 0), At(&s.tmp, 0), n);
+            let tmp = [At(&s.tmp, 0)];
+            mm_each(&mut b, s, &[&layer.wo], At(&s.att, 0), &tmp, n, int8);
             b.add(x_at, At(&s.tmp, 0), n * n_embd);
             b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
             match &layer.ffn {
                 Ffn::Dense(e) => {
-                    ffn(&mut b, s, e, At(&s.tmp, 0), n);
+                    ffn(&mut b, s, e, At(&s.tmp, 0), n, int8);
                     b.add(x_at, At(&s.tmp, 0), n * n_embd);
                 }
                 Ffn::Moe {
@@ -309,11 +345,11 @@ impl Cuda {
                         1.0
                     };
                     for &e in chosen {
-                        ffn(&mut b, s, &experts[e], At(&s.tmp, 0), 1);
+                        ffn(&mut b, s, &experts[e], At(&s.tmp, 0), 1, false);
                         b.axpy(x_at, At(&s.tmp, 0), probs[e] / norm, n_embd);
                     }
                     if let Some((_, e)) = shared {
-                        ffn(&mut b, s, e, At(&s.tmp, 0), 1);
+                        ffn(&mut b, s, e, At(&s.tmp, 0), 1, false);
                         let gate = 1.0 / (1.0 + (-shared_gate[0]).exp());
                         b.axpy(x_at, At(&s.tmp, 0), gate, n_embd);
                     }

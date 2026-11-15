@@ -3,6 +3,54 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: int8 prompt matmul on CUDA (`dp4a`)
+
+Same A100 instance as the next two sections. Prompt chunks of 8+ tokens now quantize activations
+to int8 once per input (`quant_x`, one scale per 32 values) and multiply Q4_K and Q6_K matrices
+with `mmq_*`: a block takes 32 weight rows and 64 tokens, decodes 256 columns of weights to int8
+in shared memory, and each thread runs `dp4a` over its row and its warp's 8 tokens. `--precise`,
+decode, the other weight types and MoE experts keep the f32 kernels. `bench --gpu-layers N
+--reps 5`, Q4_K_M, tok/s; "before" is 95d536b rerun in the same session.
+
+| Model | pp512 before | pp512 after | tg128 before | tg128 after | llama.cpp pp512 |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 1537.1 | 5201.6 ± 250.2 | 263.9 | 260.9 | 14500.7 |
+| Mistral-7B | 219.1 | 965.5 | 70.9 | 72.0 | 4911.9 |
+| Qwen3-30B-A3B (MoE) | 299.4 | 347.9 | 95.5 | 93.9 | 4241.7 |
+
+llama.cpp is now 2.8x, 5.1x and 12.2x ahead on prompts (was 9-22x). Qwen3-30B-A3B gains only
+its attention matrices: the experts are still f32, one (token, expert) pair at a time.
+
+Last-token logits of a 99-token prompt against the GPU's own f32 (`--precise`) run, with the
+CPU's int8 path (AVX2) for scale. Top-1 matched in every row.
+
+| Model | GPU int8 max / mean abs diff | KL | CPU int8 max / mean abs diff | KL |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B | 0.157 / 0.030 | 2.7e-4 | 0.161 / 0.027 | 6.2e-4 |
+| Mistral-7B | 0.121 / 0.021 | 4.0e-4 | 0.168 / 0.030 | 9.2e-4 |
+| Qwen3-30B-A3B | 0.615 / 0.110 | 3.3e-3 | 0.418 / 0.076 | 1.2e-2 |
+
+One prompt per model, so this shows the size of the difference, not a perplexity result;
+`eval_quant` runs the decode path and does not cover this. Other checks: the workspace tests with
+`--features rli-models/cuda`; Llama-3.2-1B `--precise` against `ref_forward.py`, 421 tokens,
+3.8e-5 batched and 3.3e-5 per token; `scripts/cuda_cpu_check` (its new `mq` mode rebuilds
+weights from the tile loaders: Q4_K 1.8e-7, Q6_K 4.1e-7 relative).
+
+The kernel source is now compiled for compute capability 6.1 (`dp4a`), so a GPU older than
+Pascal (2016) fails to attach and falls back to the CPU. Not tested on one.
+
+What is left of the gap: llama.cpp's kernels on this GPU are not `dp4a` ones. On Turing and
+newer its `ggml_cuda_should_use_mmq` always picks MMQ, and MMQ there uses int8 tensor-core
+instructions (read from its source, v0.9.0; `GGML_CUDA_FORCE_MMQ` changes nothing on an A100,
+which is why that build measured the same). Mistral-7B at 965 tok/s is about 7e12 int8
+multiply-adds a second; the A100's 6912 cores at about 1.4 GHz give `dp4a` a ceiling near 4e13
+with nothing else in the loop, and this loop spends about one instruction per multiply-add
+(estimated from the source, not profiled). llama.cpp's 4912 tok/s is 3.5e13.
+
+Tried first and dropped: giving each warp several weight rows in the f32 matmul (rows x tokens
+per warp, exact f32). Best was 4 rows x 32 tokens at 1518 tok/s against 1563 for one row
+(Llama-3.2-1B pp512), so it was not kept.
+
 ## 2026-11-15: CUDA against llama.cpp on the A100, and batched MoE prompts
 
 Same instance as the next section. llama.cpp v0.9.0 (cd959ba) built with `-DGGML_CUDA=ON` against

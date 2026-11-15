@@ -119,8 +119,14 @@ Design points that span files:
   expert) pair decodes its expert's weights again; Metal's gathered matmuls don't. File ranges
   that touch are uploaded as one, so stacked experts keep their stride in VRAM. Experts stored
   as separate tensors are routed on the CPU, one token at a time with a sync per layer.
-  llama.cpp's CUDA backend was 9-22x faster on prompts and 2-3x on decode on the same A100
-  (`docs/benchmarks.md`, 2026-11-15).
+  Prompt chunks of 8+ tokens (`MMQ_MIN_TOKENS`) use int8 activations unless `precise`:
+  `quant_x` quantizes a matmul's input once (one scale per 32 values), and `mmq_q4_k` /
+  `mmq_q6_k` decode a 32-row, 256-column weight tile to int8 in shared memory and run `dp4a`
+  over 64 tokens per block; 3.4-4.4x on dense prompts, logits within ~0.16 of f32 (0.6 on
+  Qwen3-30B-A3B). Other weight types, MoE experts and decode stay f32. `dp4a` has no header
+  under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
+  llama.cpp's CUDA backend, which uses int8 tensor-core instructions, was 3-12x faster on
+  prompts and 2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
   the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
   against `ref_forward.py` both batched and with `--per-token` (the decode kernels).

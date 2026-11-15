@@ -32,7 +32,7 @@ for name in ["F32", "F16", "Q4_0", "Q5_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K"]:
     x = rng.standard_normal(cols).astype(np.float32)
     raw.tofile(f"{d}/w.bin"); x.tofile(f"{d}/x.f32")
     ref = W @ x.astype(np.float64)
-    for kind in ["wt"] + (["sb"] if name[0] == "Q" else []):
+    for kind in ["wt"] + (["sb"] if name[0] == "Q" else []) + (["mq"] if name in ("Q4_K", "Q6_K") else []):
         subprocess.run([harness, name, str(rows), str(cols), str(raw.shape[1]), f"{d}/w.bin", f"{d}/x.f32", f"{d}/y.f32", kind], check=True)
         y = np.fromfile(f"{d}/y.f32", dtype=np.float32)
         rel = np.max(np.abs(y - ref)) / max(1e-9, np.max(np.abs(ref)))

@@ -291,6 +291,142 @@ MATMUL(matmul_q4_k, wt_q4_k)
 MATMUL(matmul_q5_k, wt_q5_k)
 MATMUL(matmul_q6_k, wt_q6_k)
 
+// ---- Int8 matmul: activations quantized to int8, 4 products per dp4a ----
+//
+// Y = X W^T for n_tok tokens over activations quantized by quant_x. A block of 8 warps takes 32
+// weight rows (a lane each) and MQ_T tokens (MQ_T / 8 per warp). Per 256 columns it copies that
+// tile to shared memory, the weights decoded to int8 with a scale and an offset per 16 values,
+// then every thread multiplies its row into its warp's tokens. Weights are stored transposed
+// with a pad (word * MQ_PAD + row) so a warp's 32 rows read 32 different banks.
+#define MQ_T 64
+#define MQ_TPW (MQ_T / 8)
+#define MQ_PAD 33
+
+// c plus the dot product of the four int8 in a with those in b: one instruction on compute
+// capability 6.1 and up, which this file is compiled for. No headers are included here, so the
+// intrinsic is spelled out; a host build of this file supplies its own.
+#ifndef RLI_HOST_BUILD
+__device__ inline int dp4a(int a, int b, int c) {
+    int r;
+    asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+#endif
+
+// Four bytes at p (even address) as a little-endian u32.
+__device__ inline uint u32e(const uchar* p) {
+    return u16(p) | (u16(p + 2) << 16);
+}
+
+// One 32-value block of one token per warp: q = round(x / d) with d = max|x| / 127, as int8 in
+// xq; d in xd; and d * (the sum of q) for each half of the block in xs, which the weight
+// formats with an offset need.
+extern "C" __global__ void quant_x(const float* x, ulong x_off, signed char* xq, float* xd,
+                                   float* xs, uint n_blocks) {
+    uint lane = threadIdx.x % 32;
+    uint blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (blk >= n_blocks) return;
+    float v = x[x_off + (ulong)blk * 32 + lane];
+    float mx = warp_max(fabsf(v));
+    float inv = mx > 0 ? 127.0f / mx : 0.0f;
+    int q = (int)rintf(v * inv);
+    xq[(ulong)blk * 32 + lane] = (signed char)q;
+    float lo = warp_sum(lane < 16 ? (float)q : 0.0f), hi = warp_sum(lane < 16 ? 0.0f : (float)q);
+    if (lane == 0) {
+        float d = mx / 127.0f;
+        xd[blk] = d;
+        xs[2 * (ulong)blk] = d * lo;
+        xs[2 * (ulong)blk + 1] = d * hi;
+    }
+}
+
+// Tile loaders: a lane's share of the 256 weights at b, for tile row r. They fill wq (64 words
+// of 4 int8), and per 16 weights ws and wm, so that weight = ws * q - wm.
+__device__ inline void mq_load_q4_k(const uchar* b, uint lane, uint r, uint* wq, float* ws,
+                                    float* wm) {
+    uint q = u32e(b + 16 + 4 * lane);  // low nibbles: sub-block 2p; high: 2p + 1
+    uint p = lane / 8, i = lane % 8;
+    wq[(16 * p + i) * MQ_PAD + r] = q & 0x0F0F0F0Fu;
+    wq[(16 * p + 8 + i) * MQ_PAD + r] = (q >> 4) & 0x0F0F0F0Fu;
+    if (lane < 16) {
+        float sc, m;
+        scale_min_k4(lane / 2, b + 4, &sc, &m);
+        ws[lane * MQ_PAD + r] = h(b) * sc;
+        wm[lane * MQ_PAD + r] = h(b + 2) * m;
+    }
+}
+
+__device__ inline void mq_load_q6_k(const uchar* b, uint lane, uint r, uint* wq, float* ws,
+                                    float* wm) {
+    uint k = lane / 8, l = 4 * (lane % 8);  // quarter k of a half, values l..l + 3 of its 32
+    for (uint n = 0; n < 2; n++) {
+        uint ql = u32e(b + 64 * n + 32 * (k % 2) + l), qh = u32e(b + 128 + 32 * n + l);
+        uint v = ((ql >> (k < 2 ? 0 : 4)) & 0x0F0F0F0Fu) | (((qh >> (2 * k)) & 0x03030303u) << 4);
+        // Each byte is 0..63; subtract 32 from each without borrowing across bytes.
+        wq[(32 * n + lane) * MQ_PAD + r] = ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+    }
+    if (lane < 16) {
+        ws[lane * MQ_PAD + r] = h(b + 208) * (float)((const signed char*)b)[192 + lane];
+        wm[lane * MQ_PAD + r] = 0;
+    }
+}
+
+#define MATMUL_Q(NAME, LOAD, SB_BYTES)                                                         \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, const float* xd,  \
+                                const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
+                                uint row_bytes, uint n_tok) {                                  \
+    __shared__ uint wq[64 * MQ_PAD];                                                           \
+    __shared__ float ws[16 * MQ_PAD];                                                          \
+    __shared__ float wm[16 * MQ_PAD];                                                          \
+    __shared__ uint tq[MQ_T * 64];                                                             \
+    __shared__ float td[MQ_T * 8];                                                             \
+    __shared__ float ts[MQ_T * 16];                                                            \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint row0 = blockIdx.x * 32, t0 = blockIdx.y * MQ_T;                                       \
+    uint last = n_tok - 1 - t0;                                                                \
+    float acc[MQ_TPW];                                                                         \
+    for (uint j = 0; j < MQ_TPW; j++) acc[j] = 0;                                              \
+    for (uint k = 0; k < cols / 256; k++) {                                                    \
+        for (uint r = warp; r < 32; r += 8) {                                                  \
+            uint row = row0 + r < rows ? row0 + r : rows - 1;                                  \
+            LOAD(w + w_off + (ulong)row * row_bytes + (ulong)k * SB_BYTES, lane, r, wq, ws, wm); \
+        }                                                                                      \
+        for (uint t = warp; t < MQ_T; t += 8) {                                                \
+            ulong tok = t0 + (t < last ? t : last);                                            \
+            const uint* src = xq + tok * (cols / 4) + k * 64;                                  \
+            tq[t * 64 + lane] = src[lane];                                                     \
+            tq[t * 64 + 32 + lane] = src[32 + lane];                                           \
+            if (lane < 8) td[t * 8 + lane] = xd[tok * (cols / 32) + k * 8 + lane];             \
+            if (lane < 16) ts[t * 16 + lane] = xs[tok * (cols / 16) + k * 16 + lane];          \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+        if (warp * MQ_TPW <= last) {                                                           \
+            for (uint g = 0; g < 16; g++) {                                                    \
+                const uint* wg = wq + 4 * g * MQ_PAD + lane;                                   \
+                int w0 = wg[0], w1 = wg[MQ_PAD], w2 = wg[2 * MQ_PAD], w3 = wg[3 * MQ_PAD];     \
+                float sc = ws[g * MQ_PAD + lane], mn = wm[g * MQ_PAD + lane];                  \
+                for (uint j = 0; j < MQ_TPW; j++) {                                            \
+                    uint t = warp * MQ_TPW + j;                                                \
+                    const int* xw = (const int*)tq + t * 64 + 4 * g;                           \
+                    int si = dp4a(w0, xw[0], 0);                                             \
+                    si = dp4a(w1, xw[1], si);                                                \
+                    si = dp4a(w2, xw[2], si);                                                \
+                    si = dp4a(w3, xw[3], si);                                                \
+                    acc[j] += sc * td[t * 8 + g / 2] * (float)si - mn * ts[t * 16 + g];        \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+        __syncthreads();                                                                       \
+    }                                                                                          \
+    for (uint j = 0; j < MQ_TPW; j++) {                                                        \
+        uint t = warp * MQ_TPW + j;                                                            \
+        if (t <= last && row0 + lane < rows) y[y_off + (ulong)(t0 + t) * rows + row0 + lane] = acc[j]; \
+    }                                                                                          \
+}
+
+MATMUL_Q(mmq_q4_k, mq_load_q4_k, 144)
+MATMUL_Q(mmq_q6_k, mq_load_q6_k, 210)
+
 // Block-wide reductions for blockDim.x <= 1024 (a multiple of 32).
 __device__ inline float block_sum(float v, float* red) {
     uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, n_warps = blockDim.x / 32;

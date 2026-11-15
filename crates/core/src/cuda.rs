@@ -33,7 +33,13 @@ const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::Q5_K, "matvec_q5_k"),
     (GgmlType::Q6_K, "matvec_q6_k"),
 ];
-const OTHER_KERNELS: [&str; 8] = [
+/// Weight types with an int8 matmul kernel, which needs whole 256-weight super-blocks.
+const MMQ_KERNELS: [(GgmlType, &str); 2] =
+    [(GgmlType::Q4_K, "mmq_q4_k"), (GgmlType::Q6_K, "mmq_q6_k")];
+/// Tokens per block of the int8 matmul kernels (`MQ_T` in cuda.cu).
+const MMQ_TILE: usize = 64;
+const OTHER_KERNELS: [&str; 9] = [
+    "quant_x",
     "rmsnorm",
     "axpy",
     "add_bias",
@@ -67,6 +73,14 @@ impl GpuBuf {
 
 /// A device u32 buffer: the expert ids [`Batch::moe_topk`] chooses.
 pub struct GpuIds(CudaSlice<u32>);
+
+/// Activations quantized to int8 by [`Batch::quantize`], for [`Batch::matmul_q`]: the values,
+/// a scale per 32 and a scaled sum per 16.
+pub struct GpuQ {
+    q: CudaSlice<u32>,
+    d: CudaSlice<f32>,
+    s: CudaSlice<f32>,
+}
 
 /// A view into a [`GpuBuf`] starting at element `off`.
 #[derive(Clone, Copy)]
@@ -117,6 +131,7 @@ pub struct Gpu {
     placed: Vec<Placed>,
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
+    mmq: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// One zero: the expert id of a plain matvec.
     zero_id: GpuIds,
@@ -138,13 +153,22 @@ impl Gpu {
         }
         let ctx = CudaContext::new(0).map_err(err("no CUDA device"))?;
         let stream = ctx.default_stream();
-        let ptx = cudarc::nvrtc::compile_ptx(SOURCE)
+        // compute_61 (Pascal, 2016) for the int8 kernels' dp4a instruction.
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch: Some("compute_61"),
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
             .map_err(|e| format!("CUDA kernel compile failed: {e:?}"))?;
         let module = ctx.load_module(ptx).map_err(err("load CUDA module"))?;
         let func = |n: &str| module.load_function(n).map_err(err(n));
         let matvec = MATVEC_KERNELS
             .iter()
             .map(|&(t, n)| Ok((t, func(n)?, func(&n.replace("matvec", "matmul"))?)))
+            .collect::<Result<_, String>>()?;
+        let mmq = MMQ_KERNELS
+            .iter()
+            .map(|&(t, n)| Ok((t, func(n)?)))
             .collect::<Result<_, String>>()?;
         let other = OTHER_KERNELS
             .iter()
@@ -199,6 +223,7 @@ impl Gpu {
             weights,
             placed,
             matvec,
+            mmq,
             other,
             zero_id,
             name,
@@ -220,6 +245,24 @@ impl Gpu {
                 .alloc_zeros(n.max(1))
                 .expect("CUDA buffer allocation failed"),
         )
+    }
+
+    /// Whether a `ty` matrix of `cols` columns can go through [`Batch::matmul_q`].
+    pub fn has_matmul_q(ty: GgmlType, cols: usize) -> bool {
+        MMQ_KERNELS.iter().any(|(t, _)| *t == ty) && cols.is_multiple_of(256)
+    }
+
+    /// Room for `n` quantized activations (a multiple of 32).
+    pub fn alloc_q(&self, n: usize) -> GpuQ {
+        let zeros = |n: usize| self.stream.alloc_zeros::<f32>(n.max(1));
+        GpuQ {
+            q: self
+                .stream
+                .alloc_zeros(n.div_ceil(4).max(1))
+                .expect("CUDA buffer allocation failed"),
+            d: zeros(n / 32).expect("CUDA buffer allocation failed"),
+            s: zeros(n / 16).expect("CUDA buffer allocation failed"),
+        }
     }
 
     /// A zeroed device buffer of `n` expert ids.
@@ -373,6 +416,63 @@ impl Batch<'_> {
                 (MATVEC_ROWS_PER_BLOCK * 32) as u32,
             ),
         );
+    }
+
+    /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
+    pub fn quantize(&mut self, x: At<'_>, n: usize, out: &GpuQ) {
+        assert!(n.is_multiple_of(32) && x.1 + n <= x.0.len());
+        assert!(out.q.len() * 4 >= n && out.d.len() * 32 >= n && out.s.len() * 16 >= n);
+        let (x_off, blocks) = (x.1 as u64, (n / 32) as u32);
+        let mut l = self.gpu.stream.launch_builder(self.gpu.other("quant_x"));
+        l.arg(&x.0.0)
+            .arg(&x_off)
+            .arg(&out.q)
+            .arg(&out.d)
+            .arg(&out.s)
+            .arg(&blocks);
+        launch(l, grid((n / 32).div_ceil(8), 256));
+    }
+
+    /// [`Batch::matmul`] over activations quantized by [`Batch::quantize`] (`n_tok` rows of
+    /// `cols` in `xq`), for the types and sizes [`Gpu::has_matmul_q`] accepts. The result
+    /// differs from the f32 matmul's by the activations' rounding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        xq: &GpuQ,
+        y: At<'_>,
+        n_tok: usize,
+    ) {
+        assert!(Gpu::has_matmul_q(ty, cols) && rows > 0 && n_tok > 0);
+        assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
+        let row_bytes = ty.row_bytes(cols);
+        let w_off = self.gpu.device_offset(offset, rows * row_bytes) as u64;
+        let f = &self
+            .gpu
+            .mmq
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .expect("checked by has_matmul_q")
+            .1;
+        let (y_off, rb) = (y.1 as u64, row_bytes as u32);
+        let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
+        let mut a = self.gpu.stream.launch_builder(f);
+        a.arg(&self.gpu.weights)
+            .arg(&w_off)
+            .arg(&xq.q)
+            .arg(&xq.d)
+            .arg(&xq.s)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb)
+            .arg(&nt);
+        launch(a, grid2(rows.div_ceil(32), n_tok.div_ceil(MMQ_TILE), 256));
     }
 
     /// `n` matvecs in one launch, over matrices of a stack of `n_stack` that lie `stride` bytes
