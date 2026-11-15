@@ -934,4 +934,135 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
         oh[d] = o / sum;
     }
 }
+
+// Decode attention, in two launches so a long context is read by many blocks at once.
+// `attention_part`: one block of AP_T threads per KV head (x) and 32 cached positions (y).
+// The up to AP_G query heads sharing the KV head are scored together, so K and V are read
+// once. Each block's softmax is relative to its own maximum; it writes that, the sum and the
+// unnormalized weighted V per query head to `parts` (head_dim + 2 floats per head and block),
+// which `attention_merge` combines. Needs head_dim <= AP_T and a multiple of 4. Under about
+// 128 positions the second launch costs more than `attention` loses by reading in turn.
+#define AP_T 256
+#define AP_G 8   // AP_T / 32: a warp per query head in the softmax
+#define AP_B 8   // reads issued together
+#define AP_PARTS 2048
+
+extern "C" __global__ void attention_part(const float* q, const float* kc, const float* vc,
+                                          float* parts, uint n_head, uint n_kv, uint head_dim,
+                                          uint n_pos, uint kv_dim, float scale) {
+    __shared__ float qs[AP_G * AP_T];
+    __shared__ float sc[AP_G * AP_T];
+    __shared__ float ev[AP_G * 32];
+    __shared__ float ms[AP_G * 2];
+    uint tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    uint g_n = n_head / n_kv, h0 = blockIdx.x * g_n;
+    uint base = blockIdx.y * 32, cnt = min(32u, n_pos - base);
+    ulong kv_off = (ulong)base * kv_dim + blockIdx.x * head_dim;
+    for (uint i = tid; i < g_n * head_dim; i += AP_T) qs[i] = q[(ulong)h0 * head_dim + i];
+    __syncthreads();
+    // Scores: 8 threads per position (the lane), each taking every 8th group of 4 values of
+    // its K row against four query heads. All of a batch's reads are issued before the first
+    // is used: a read that is used at once makes the thread wait out the memory latency.
+    uint n4 = head_dim / 4;
+    for (uint g0 = 0; g0 < g_n; g0 += 4) {
+        float s[4] = {0, 0, 0, 0};
+        if (lane < cnt) {
+            const float4* k = (const float4*)(kc + kv_off + (ulong)lane * kv_dim);
+            for (uint j0 = warp; j0 < n4; j0 += 8 * AP_B) {
+                float4 kk[AP_B];
+                for (uint j = 0; j < AP_B; j++) kk[j] = k[min(j0 + 8 * j, n4 - 1)];
+                for (uint j = 0; j < AP_B && j0 + 8 * j < n4; j++) {
+                    for (uint i = 0; i < 4 && g0 + i < g_n; i++) {
+                        const float* qg = qs + (g0 + i) * head_dim + 4 * (j0 + 8 * j);
+                        s[i] += qg[0] * kk[j].x + qg[1] * kk[j].y + qg[2] * kk[j].z
+                            + qg[3] * kk[j].w;
+                    }
+                }
+            }
+        }
+        for (uint i = 0; i < 4; i++) sc[(g0 + i) % AP_G * AP_T + tid] = s[i];
+    }
+    __syncthreads();
+    // Softmax within the block: warp g takes query head g, its lanes the positions.
+    if (warp < g_n) {
+        float v = 0;
+        for (uint j = 0; j < 8; j++) v += sc[warp * AP_T + 32 * j + lane];
+        v = lane < cnt ? v * scale : NEG_INF;
+        float mx = warp_max(v);
+        float e = lane < cnt ? expf(v - mx) : 0.0f;
+        ev[warp * 32 + lane] = e;
+        float sum = warp_sum(e);
+        if (lane == 0) {
+            ms[2 * warp] = mx;
+            ms[2 * warp + 1] = sum;
+        }
+    }
+    __syncthreads();
+    // The weighted sum of V: `np` threads per output value, each over every np-th position.
+    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
+    for (uint g0 = 0; g0 < g_n; g0 += 4) {
+        float o[4] = {0, 0, 0, 0};
+        if (pt < np) {
+            for (uint p0 = pt; p0 < cnt; p0 += np * AP_B) {
+                float v[AP_B];
+                for (uint j = 0; j < AP_B; j++)
+                    v[j] = vc[kv_off + (ulong)min(p0 + j * np, cnt - 1) * kv_dim + d];
+                for (uint j = 0; j < AP_B && p0 + j * np < cnt; j++)
+                    for (uint i = 0; i < 4; i++)
+                        o[i] += ev[(g0 + i) % AP_G * 32 + p0 + j * np] * v[j];
+            }
+        }
+        for (uint i = 0; i < 4; i++) sc[(g0 + i) % AP_G * AP_T + tid] = o[i];
+    }
+    __syncthreads();
+    if (pt != 0) return;
+    for (uint g = 0; g < g_n; g++) {
+        float o = 0;
+        for (uint p = 0; p < np; p++) o += sc[g * AP_T + p * head_dim + d];
+        float* part = parts + ((ulong)(h0 + g) * gridDim.y + blockIdx.y) * (head_dim + 2);
+        part[d] = o;
+        if (d == 0) {
+            part[head_dim] = ms[2 * g];
+            part[head_dim + 1] = ms[2 * g + 1];
+        }
+    }
+}
+
+// One block of AP_T threads per query head: the head's `n_parts` (at most AP_PARTS) partial
+// results rescaled to their common maximum, added and normalized.
+extern "C" __global__ void attention_merge(const float* parts, float* out, uint head_dim,
+                                           uint n_parts) {
+    __shared__ float red[32];
+    __shared__ float wf[AP_PARTS];
+    __shared__ float pa[AP_T];
+    uint tid = threadIdx.x, stride = head_dim + 2;
+    const float* part = parts + (ulong)blockIdx.x * n_parts * stride;
+    float mx = NEG_INF;
+    for (uint c = tid; c < n_parts; c += AP_T) mx = fmaxf(mx, part[c * stride + head_dim]);
+    mx = block_max(mx, red);
+    float sum = 0;
+    for (uint c = tid; c < n_parts; c += AP_T) {
+        float f = expf(part[c * stride + head_dim] - mx);
+        wf[c] = f;
+        sum += part[c * stride + head_dim + 1] * f;
+    }
+    sum = block_sum(sum, red);  // its __syncthreads also orders the wf[] writes
+    // `np` threads per output value, each over every np-th part.
+    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
+    float o = 0;
+    if (pt < np) {
+        for (uint c0 = pt; c0 < n_parts; c0 += np * AP_B) {
+            float v[AP_B];
+            for (uint j = 0; j < AP_B; j++)
+                v[j] = part[min(c0 + j * np, n_parts - 1) * stride + d];
+            for (uint j = 0; j < AP_B && c0 + j * np < n_parts; j++) o += v[j] * wf[c0 + j * np];
+        }
+    }
+    pa[tid] = o;
+    __syncthreads();
+    if (pt != 0) return;
+    o = 0;
+    for (uint p = 0; p < np; p++) o += pa[p * head_dim + d];
+    out[(ulong)blockIdx.x * head_dim + d] = o / sum;
+}
 #endif  // RLI_MMA

@@ -94,6 +94,7 @@ struct Cuda {
     max_ff: usize,
     kv_dim: usize,
     n_head: usize,
+    head_dim: usize,
     scratch: Mutex<Scratch>,
     /// Scratch for [`BATCH_CHUNK`] tokens, allocated by the first batched prompt.
     batch: Mutex<Option<Scratch>>,
@@ -384,7 +385,11 @@ impl Accelerator for Cuda {
             v: (0..n)
                 .map(|_| self.gpu.alloc(max_ctx * self.kv_dim))
                 .collect(),
-            scores: self.gpu.alloc(self.n_head * max_ctx),
+            scores: self.gpu.alloc(Batch::attention_scratch(
+                self.n_head,
+                self.head_dim,
+                max_ctx,
+            )),
             max_ctx,
         })
     }
@@ -523,6 +528,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         max_ff,
         kv_dim: c.kv_dim(),
         n_head: c.n_head,
+        head_dim: c.head_dim,
         scratch: Mutex::new(scratch),
         batch: Mutex::new(None),
         gpu,

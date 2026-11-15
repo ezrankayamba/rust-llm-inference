@@ -19,6 +19,17 @@ const MATVEC_ROWS_PER_BLOCK: usize = 4;
 const REDUCE_THREADS: u32 = 256;
 /// Threads per attention block, which is also the largest head_dim the kernel takes.
 pub const ATTN_THREADS: u32 = 1024;
+/// The decode attention kernel's cached positions per block, threads per block, most query
+/// heads per KV head and most blocks of context (`AP_T`, `AP_G` and `AP_PARTS` in the
+/// source; 65536 positions).
+const ATTN_PART: usize = 32;
+const ATTN_PART_THREADS: u32 = 256;
+const ATTN_PART_HEADS: u32 = 8;
+const ATTN_PART_MAX: usize = 2048;
+/// Fewest cached positions it runs for; under that its second launch costs more than the
+/// one-launch kernel loses (A100: 13-20 against 10-17 microseconds at 128 positions, 19-26
+/// against 37-55 at 512).
+const ATTN_PART_MIN: u32 = 128;
 const ELT_THREADS: usize = 256;
 /// Weight placement alignment in the device arena (f32 weights are read as `float*`).
 const WEIGHT_ALIGN: usize = 256;
@@ -44,7 +55,7 @@ const MMQ_MIN_TOKENS: usize = 8;
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
 const MMA_REGS: usize = 96;
-const OTHER_KERNELS: [&str; 9] = [
+const OTHER_KERNELS: [&str; 11] = [
     "quant_x",
     "rmsnorm",
     "axpy",
@@ -52,6 +63,8 @@ const OTHER_KERNELS: [&str; 9] = [
     "swiglu",
     "rope",
     "attention",
+    "attention_part",
+    "attention_merge",
     "moe_topk",
     "moe_combine",
 ];
@@ -859,9 +872,52 @@ impl Batch<'_> {
         launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
+    /// f32s of `scores` scratch [`Batch::attention`] needs for one token at `max_ctx`.
+    pub fn attention_scratch(n_head: usize, head_dim: usize, max_ctx: usize) -> usize {
+        n_head * max_ctx.max(max_ctx.div_ceil(ATTN_PART) * (head_dim + 2))
+    }
+
+    /// One token's attention with the context split over blocks of [`ATTN_PART`] positions,
+    /// then merged.
+    fn attention_decode(
+        &mut self,
+        q: &GpuBuf,
+        k: &GpuBuf,
+        v: &GpuBuf,
+        out: &GpuBuf,
+        scores: &GpuBuf,
+        p: &AttnParams,
+    ) {
+        let n_parts = (p.n_pos as usize).div_ceil(ATTN_PART);
+        assert!(scores.len() >= (p.n_head * (p.head_dim + 2)) as usize * n_parts);
+        let mut l = self
+            .gpu
+            .stream
+            .launch_builder(self.gpu.other("attention_part"));
+        l.arg(&q.0)
+            .arg(&k.0)
+            .arg(&v.0)
+            .arg(&scores.0)
+            .arg(&p.n_head)
+            .arg(&p.n_kv)
+            .arg(&p.head_dim)
+            .arg(&p.n_pos)
+            .arg(&p.kv_dim)
+            .arg(&p.scale);
+        launch(l, grid2(p.n_kv as usize, n_parts, ATTN_PART_THREADS));
+        let n_parts = n_parts as u32;
+        let mut l = self
+            .gpu
+            .stream
+            .launch_builder(self.gpu.other("attention_merge"));
+        l.arg(&scores.0).arg(&out.0).arg(&p.head_dim).arg(&n_parts);
+        launch(l, grid(p.n_head as usize, ATTN_PART_THREADS));
+    }
+
     /// Causal attention for `p.n_tok` query tokens over the cached positions. `q`, `k`, `v` and
-    /// `out` start at element 0 of their buffers. `scores` is scratch of `n_head * max_ctx` per
-    /// token; when it holds fewer tokens than `p.n_tok`, the tokens run in several launches.
+    /// `out` start at element 0 of their buffers. `scores` is scratch of
+    /// [`Batch::attention_scratch`] per token; when it holds fewer tokens than `p.n_tok`, the
+    /// tokens run in several launches.
     pub fn attention(
         &mut self,
         q: &GpuBuf,
@@ -878,6 +934,15 @@ impl Batch<'_> {
         assert!(q.len() >= q_len && out.len() >= q_len);
         assert!(p.n_pos + p.n_tok - 1 <= p.max_ctx);
         assert!(k.len() >= ((p.n_pos + p.n_tok - 1) * p.kv_dim) as usize && v.len() >= k.len());
+        if p.n_tok == 1
+            && p.n_pos > ATTN_PART_MIN
+            && p.n_head / p.n_kv <= ATTN_PART_HEADS
+            && p.head_dim <= ATTN_PART_THREADS
+            && p.head_dim.is_multiple_of(4)
+            && p.n_pos as usize <= ATTN_PART * ATTN_PART_MAX
+        {
+            return self.attention_decode(q, k, v, out, scores, p);
+        }
         for tok0 in (0..p.n_tok).step_by(per_launch) {
             let mut l = self.gpu.stream.launch_builder(self.gpu.other("attention"));
             l.arg(&q.0)
@@ -957,6 +1022,63 @@ mod tests {
             assert!(
                 err < 0.01 * size,
                 "{ty:?}, {n} tokens: rms error {err} against rms {size}"
+            );
+        }
+    }
+
+    /// One token's attention past [`ATTN_PART_MIN`] positions (split over blocks and merged)
+    /// against the batched kernel's first token, which sees the same positions. The shapes
+    /// cover 1, 4 and 8 query heads per KV head and a last block partly filled. Needs an
+    /// NVIDIA GPU, so CI doesn't run it.
+    #[test]
+    fn decode_attention_matches_batched_attention() {
+        for (n_head, n_kv, head_dim, n_pos) in [(8, 2, 64, 300), (4, 4, 36, 129), (16, 2, 128, 517)]
+        {
+            let mut seed = 7u32;
+            let mut rand = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (seed >> 8) as f32 / 8388608.0 - 1.0
+                    })
+                    .collect()
+            };
+            let gpu = Gpu::new(&[0; 256], &[(0, 256)]).expect("CUDA device");
+            let (max_ctx, kv_dim, q_len) = (n_pos + 1, n_kv * head_dim, n_head * head_dim);
+            let q = gpu.upload(&rand(2 * q_len));
+            let (k, v) = (
+                gpu.upload(&rand(max_ctx * kv_dim)),
+                gpu.upload(&rand(max_ctx * kv_dim)),
+            );
+            let (one, two) = (gpu.alloc(q_len), gpu.alloc(2 * q_len));
+            let scores = gpu.alloc(2 * Batch::attention_scratch(n_head, head_dim, max_ctx));
+            let mut p = AttnParams {
+                n_head: n_head as u32,
+                n_kv: n_kv as u32,
+                head_dim: head_dim as u32,
+                n_tok: 1,
+                n_pos: n_pos as u32,
+                kv_dim: kv_dim as u32,
+                max_ctx: max_ctx as u32,
+                scale: 0.5,
+            };
+            let mut b = gpu.batch();
+            b.attention(&q, &k, &v, &one, &scores, &p);
+            p.n_tok = 2;
+            b.attention(&q, &k, &v, &two, &scores, &p);
+            b.finish();
+            let (mut got, mut want) = (vec![0f32; q_len], vec![0f32; q_len]);
+            gpu.read(&one, &mut got);
+            gpu.read(&two, &mut want);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(want.iter().any(|w| w.abs() > 0.01), "degenerate reference");
+            assert!(
+                err < 1e-5,
+                "{n_head}/{n_kv} heads of {head_dim}: max difference {err}"
             );
         }
     }

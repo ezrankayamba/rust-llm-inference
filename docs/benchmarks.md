@@ -26,6 +26,42 @@ warps and has others to run while one waits; the tensor-core kernels at 128 x 12
 For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
 for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
 
+## 2026-11-15: decode attention split over the context on CUDA
+
+Same A100 instance. Past 128 cached positions, one token's attention now runs as
+`attention_part` (a block per KV head and 32 positions, scoring the query heads that share the
+KV head together, so K and V are read once) and `attention_merge`. The one-launch kernel had a
+block per query head walk the whole context. One layer's attention, microseconds
+(`bench_cuda`, 16 layers' caches in turn), old -> new by cached positions:
+
+| Heads / KV heads x head_dim | 128 | 512 | 2048 | 4096 |
+|---|---:|---:|---:|---:|
+| 32 / 8 x 64 (Llama-3.2-1B) | 9.8 -> 13.2 | 37.2 -> 19.0 | 132.2 -> 36.0 | 259.8 -> 61.3 |
+| 32 / 8 x 128 (Mistral-7B) | 16.8 -> 16.1 | 54.6 -> 24.9 | 201.9 -> 49.2 | 400.6 -> 89.1 |
+| 32 / 4 x 128 (Qwen3-30B-A3B) | 12.0 -> 19.6 | 51.5 -> 25.9 | 191.4 -> 42.2 | 380.3 -> 75.2 |
+
+At 16 and 64 positions the old kernel takes 5.6-8.9 and the new pair 7.4-19.1 (the merge is a
+second launch, 5-7 microseconds), so the old one still runs up to 128. Whole models, before is
+0a05f6a, `bench --gpu-layers N --reps 3 --pp 0 --tg 128 [--depth 2048]`, Q4_K_M, tok/s:
+
+| Model | tg128 before | after | tg128 at 2048 before | after | llama.cpp tg128 / at 2048 |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 339.1 | 349.7 | 198.1 | 282.8 ± 17.9 | 524.4 / 522.4 |
+| Mistral-7B | 129.4 | 129.4 | 70.8 | 107.2 | 155.4 / 150.9 |
+| Qwen3-30B-A3B (MoE) | 106.9 | 104.2 | 54.4 | 89.5 | 171.5 / 166.4 |
+
+With `--precise`, a 357-token prompt through decode matches `ref_forward.py` to 6.7e-6
+(Llama-3.2-1B), and decode matches the batched prompt to 1.7e-5 on Mistral-7B (444 tokens) and
+6.7e-6 on Qwen3-30B-A3B (408).
+
+Tried on the way: a block per 256 positions with a thread per position (2048 positions: 34-55
+microseconds, but 8-15 at 16 positions and whole-model tg128 down 4-20%), and 64 positions with
+4 threads each (the same at depth, 10-26 at 64 positions). In the kept kernel a query head's 32
+scores are one warp, so the softmax needs no block-wide reduction. Issuing 8 reads before using
+the first, as the tensor-core loaders do, changed nothing measurable here. At 2048 positions the
+part kernel is 28-38 of the microseconds and the merge the rest; the part kernel is bound by its
+arithmetic (every product reads a query value from shared memory), not by memory.
+
 ## 2026-11-15: int8 decode matvec on CUDA
 
 Same A100 instance. Decode, and prompts of under 8 tokens, now run Q4_K and Q6_K matrices over

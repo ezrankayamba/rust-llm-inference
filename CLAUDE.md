@@ -113,7 +113,10 @@ Design points that span files:
   of 256 tokens (`BATCH_CHUNK`): a warp multiplies its weight row into a tile of 32 tokens, and
   causal attention runs one block per head and token. Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
-  launches. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
+  launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
+  a KV head and 32 positions per block, scoring the query heads that share the KV head
+  together, and `attention_merge` combines the blocks (decode at 2048 positions: Mistral-7B
+  71 -> 107 tok/s); under 128 the second launch costs more than it saves. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
   `moe_topk` takes a warp per token, then every token's k experts run as grid rows of one launch
   per matrix (each matvec kernel takes an expert id per row, `Batch::matvec_id`), so a (token,
   expert) pair decodes its expert's weights again; Metal's gathered matmuls don't. File ranges

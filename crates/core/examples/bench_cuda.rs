@@ -1,11 +1,11 @@
 //! CUDA matvec throughput, back to back over distinct matrices as in decode: the f32 kernel
-//! and, where there is one, the int8 kernel over quantized activations.
+//! and, where there is one, the int8 kernel over quantized activations. Then decode attention.
 //! usage: cargo run --release -p rli-core --features cuda --example bench_cuda
 
 #[cfg(feature = "cuda")]
 fn main() {
     use rli_core::GgmlType;
-    use rli_core::cuda::{At, Gpu};
+    use rli_core::cuda::{At, AttnParams, Batch, Gpu};
     use std::time::Instant;
     // 1 GB of weights, more than the caches hold. Zeroed: the kernels' time does not depend
     // on the values.
@@ -60,6 +60,46 @@ fn main() {
             String::new()
         };
         println!("{ty:?} {rows}x{cols}: f32 {}{q}", time(false));
+    }
+    // Decode attention over 16 layers' caches in turn, by context length.
+    for (n_head, n_kv, head_dim) in [(32, 8, 64), (32, 8, 128), (32, 4, 128)] {
+        let max_ctx = 4096;
+        let kv_dim = n_kv * head_dim;
+        let kv: Vec<_> = (0..32).map(|_| gpu.alloc(max_ctx * kv_dim)).collect();
+        let (q, out) = (gpu.alloc(n_head * head_dim), gpu.alloc(n_head * head_dim));
+        let scores = gpu.alloc(Batch::attention_scratch(n_head, head_dim, max_ctx));
+        print!("attention {n_head}/{n_kv} heads of {head_dim}, us:");
+        for n_pos in [16, 64, 128, 512, 2048, 4096] {
+            let p = AttnParams {
+                n_head: n_head as u32,
+                n_kv: n_kv as u32,
+                head_dim: head_dim as u32,
+                n_tok: 1,
+                n_pos,
+                kv_dim: kv_dim as u32,
+                max_ctx: max_ctx as u32,
+                scale: 0.1,
+            };
+            let run = || {
+                let mut b = gpu.batch();
+                for _ in 0..16 {
+                    for l in 0..16 {
+                        b.attention(&q, &kv[2 * l], &kv[2 * l + 1], &out, &scores, &p);
+                    }
+                }
+                b.finish();
+            };
+            run();
+            let best = (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    run();
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min);
+            print!("  {n_pos}: {:.1}", best / 256.0 * 1e6);
+        }
+        println!();
     }
 }
 
