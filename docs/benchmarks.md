@@ -26,6 +26,48 @@ warps and has others to run while one waits; the tensor-core kernels at 128 x 12
 For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
 for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
 
+## 2026-11-15: a per-kernel profile on CUDA, rmsnorm with a thread per value, tiled prompt attention
+
+Same A100 instance. `RLI_CUDA_PROF=1` waits for every launch and prints the time per kernel
+when the device is dropped (a launch and its wait cost about 11-12 microseconds by themselves,
+so read small kernels against `rope` or `swiglu`). Two things it showed:
+
+**`rmsnorm` cost twice a trivial kernel** (23.2 microseconds a launch in the profile against
+12.7 for `rope`), at 2 launches a layer: its 256 threads each read 8 values of a 2048-wide row
+in turn, waiting out the memory latency for every one. With up to 1024 threads a block it is
+15.4. Decode, before is b99a488 (`bench --reps 3 --pp 0 --tg 128 [--depth 2048]`, Q4_K_M, tok/s):
+
+| Model | tg128 before | after | tg128 at 2048 before | after | llama.cpp tg128 / at 2048 |
+|---|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 467.2 | 513.8 | 380.5 | 416.4 | 524.4 / 522.4 |
+| Mistral-7B | 149.3 | 166.1 | 126.8 | 138.6 | 155.4 / 150.9 |
+| Qwen3-30B-A3B (MoE) | 144.5 | 162.9 | 116.7 | 124.7 | 171.5 / 166.4 |
+
+**Prompt attention read every cached row again for each query head and token** (a block per
+head and token). It now runs as three launches of tiled products (`attn_scores`,
+`attn_softmax`, `attn_pv`): a block holds 32 positions of K or V and 32 query rows (the query
+heads sharing the KV head, for 32 / heads-per-KV-head tokens) in shared memory. pp512, 5 reps,
+before is b99a488: Llama-3.2-1B 7663.5 ± 1409.9 -> 8801.2 ± 1442.4, Mistral-7B 1885.3 -> 2167.7,
+Qwen3-30B-A3B 743.5 -> 814.8 (llama.cpp 14500.7, 4911.9, 4241.7). pp4: 672.4, 199.3, 193.0.
+
+Where a 512-token prompt's time goes now (profile, share of the kernels' total):
+
+| Kernel | Llama-3.2-1B | Mistral-7B | Qwen3-30B-A3B |
+|---|---:|---:|---:|
+| int8 matmuls (tensor cores) | 75.8% | 85.6% | 8.4% |
+| int8 matvecs (a token's experts, one by one) | 0.4% | 0.0% | 81.4% |
+| attention (3 kernels) | 16.5% | 9.6% | 5.9% |
+| everything else | 7.3% | 4.8% | 4.3% |
+
+So the dense models' prompts are bound by the tensor-core matmul, and Qwen3's by running each
+(token, expert) pair as its own matvec, which decodes an expert's weights again for every token
+that picked it.
+
+`--precise`: Mistral-7B batched against `ref_forward.py` 4.8e-6 (36-word prompt); decode against
+batched on the long prompts 9.8e-6 (Llama-3.2-1B), 8.2e-5 (Mistral-7B), 9.5e-6 (Qwen3-30B-A3B);
+Llama-3.2-1B decode against the reference 7.6e-6. Int8 against f32, max logit difference:
+0.154 / 0.144, 0.132 / 0.122, 0.302 / 0.519 (batched / decode), top-1 the same.
+
 ## 2026-11-15: decode replayed as a CUDA graph, and MoE experts in int8
 
 Same A100 instance. One token's launches are captured into a CUDA graph the first time and

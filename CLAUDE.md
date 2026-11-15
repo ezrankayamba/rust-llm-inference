@@ -111,7 +111,9 @@ Design points that span files:
   lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that
   each took a separate 32-weight chunk ran prompts 6-7x slower on an A100. Prompts run in chunks
   of 256 tokens (`BATCH_CHUNK`): a warp multiplies its weight row into a tile of 32 tokens, and
-  causal attention runs one block per head and token. Its scores need a row per head and token,
+  causal attention runs as tiled products (`attn_scores`, `attn_softmax`, `attn_pv`: 32 positions
+  of K or V against 32 query rows per block, so a cached row is read once per tile, not once
+  per head and token). Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
   launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
   a KV head and 32 positions per block, scoring the query heads that share the KV head
@@ -154,6 +156,11 @@ Design points that span files:
   matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
   llama.cpp's CUDA backend was 1.9-2.6x faster on dense prompts, 12x on Qwen3-30B-A3B's and
   2-3x on decode on the same A100 (`docs/benchmarks.md`, 2026-11-15).
+- **CUDA kernels wait on memory per read.** A thread that reads values in a loop and uses each
+  at once waits out the latency every time round, so a small kernel wants a thread per value
+  (`rmsnorm` with 256 threads for a 2048-wide row cost twice a trivial launch). `RLI_CUDA_PROF=1`
+  times every launch and prints the totals per kernel when the device is dropped; it is how
+  that was found.
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
   the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
   against `ref_forward.py` both batched and with `--per-token` (the decode kernels).

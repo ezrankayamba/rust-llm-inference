@@ -486,7 +486,7 @@ impl Cuda {
         };
         // One token's launches are replayed as a graph, which costs less per launch and leaves
         // the CPU out of it. A layer routed on the CPU reads back mid-pass, so it can't be.
-        if n == 1 && self.batchable {
+        if n == 1 && self.batchable && !rli_core::cuda::profiling() {
             let mut graph = self.graph.lock().unwrap_or_else(|p| p.into_inner());
             self.gpu.run_graph(&mut graph, queue);
         } else {

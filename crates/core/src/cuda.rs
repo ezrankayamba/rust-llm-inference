@@ -12,11 +12,12 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchArgs,
     LaunchConfig, PushKernelArg, sys,
 };
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("cuda.cu");
 const MATVEC_ROWS_PER_BLOCK: usize = 4;
-const REDUCE_THREADS: u32 = 256;
+const REDUCE_THREADS: u32 = 1024;
 /// Threads per attention block, which is also the largest head_dim the kernel takes.
 pub const ATTN_THREADS: u32 = 1024;
 /// The decode attention kernel's cached positions per block, threads per block, most query
@@ -58,7 +59,7 @@ pub const MMQ_MIN_TOKENS: usize = 8;
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
 const MMA_REGS: usize = 96;
-const OTHER_KERNELS: [&str; 11] = [
+const OTHER_KERNELS: [&str; 14] = [
     "quant_x",
     "rmsnorm",
     "axpy",
@@ -68,6 +69,9 @@ const OTHER_KERNELS: [&str; 11] = [
     "attention",
     "attention_part",
     "attention_merge",
+    "attn_scores",
+    "attn_softmax",
+    "attn_pv",
     "moe_topk",
     "moe_combine",
 ];
@@ -464,8 +468,8 @@ impl<T> ArgBits for CudaSlice<T> {
 #[derive(Clone, Copy, PartialEq)]
 struct Rec {
     func: *const CudaFunction,
-    /// Grid x and y, and threads per block.
-    dims: [u32; 3],
+    /// The grid, and threads per block.
+    dims: [u32; 4],
     bits: [u64; MAX_ARGS],
     sizes: [u8; MAX_ARGS],
     n: usize,
@@ -529,7 +533,7 @@ impl Graph {
             *p = b as *const u64 as *mut std::ffi::c_void;
         }
         let p = &mut self.params[i];
-        (p.gridDimX, p.gridDimY, p.blockDimX) = (rec.dims[0], rec.dims[1], rec.dims[2]);
+        [p.gridDimX, p.gridDimY, p.gridDimZ, p.blockDimX] = rec.dims;
         p.kernelParams = ptrs.as_mut_ptr();
         // SAFETY: the node belongs to this graph; the driver copies the arguments (each 4 or
         // 8 bytes, the low bytes of its u64) before returning.
@@ -614,7 +618,7 @@ impl Gpu {
         );
         for (p, r) in params.iter().zip(&recs) {
             assert_eq!(
-                [p.gridDimX, p.gridDimY, p.blockDimX],
+                [p.gridDimX, p.gridDimY, p.gridDimZ, p.blockDimX],
                 r.dims,
                 "CUDA graph node order"
             );
@@ -648,6 +652,51 @@ impl Gpu {
     }
 }
 
+static PROFILE: OnceLock<bool> = OnceLock::new();
+static PROFILE_TIMES: Mutex<BTreeMap<String, (f64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Whether `RLI_CUDA_PROF` is set: every queued launch is then run to completion and timed, and
+/// the totals per kernel are printed when the device is dropped. A graph's launches can't be
+/// timed, so callers queue instead of [`Gpu::run_graph`] while profiling.
+pub fn profiling() -> bool {
+    *PROFILE.get_or_init(|| std::env::var_os("RLI_CUDA_PROF").is_some())
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let times = std::mem::take(&mut *PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut rows: Vec<_> = times.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let total: f64 = rows.iter().map(|r| r.1.0).sum();
+        for (name, (t, n)) in rows {
+            eprintln!(
+                "{name:16} {:9.2} ms {:5.1}% {n:7} launches {:8.1} us each",
+                t * 1e3,
+                t / total * 100.0,
+                t / n as f64 * 1e6
+            );
+        }
+    }
+}
+
+impl Gpu {
+    /// A kernel's name, for the profile.
+    fn name_of(&self, f: *const CudaFunction) -> String {
+        let eq = |g: &CudaFunction| std::ptr::eq(g, f);
+        if let Some((n, _)) = self.other.iter().find(|(_, g)| eq(g)) {
+            n.to_string()
+        } else if let Some((t, ..)) = self.matvec.iter().find(|(_, a, b)| eq(a) || eq(b)) {
+            format!("f32 {t:?}")
+        } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
+            format!("int8 matmul {t:?}")
+        } else if let Some((t, _)) = self.mvq.iter().find(|(_, g)| eq(g)) {
+            format!("int8 matvec {t:?}")
+        } else {
+            "?".into()
+        }
+    }
+}
+
 /// Where a [`Batch`]'s launches go.
 enum Mode<'a> {
     /// To the stream.
@@ -670,7 +719,7 @@ impl<'a> Batch<'a> {
             args: (!matches!(self.mode, Mode::Replay(..))).then(|| gpu.stream.launch_builder(func)),
             rec: Rec {
                 func,
-                dims: [0; 3],
+                dims: [0; 4],
                 bits: [0; MAX_ARGS],
                 sizes: [0; MAX_ARGS],
                 n: 0,
@@ -679,11 +728,28 @@ impl<'a> Batch<'a> {
     }
 
     fn launch(&mut self, mut call: Call<'_>, cfg: LaunchConfig) {
-        call.rec.dims = [cfg.grid_dim.0, cfg.grid_dim.1, cfg.block_dim.0];
+        call.rec.dims = [
+            cfg.grid_dim.0,
+            cfg.grid_dim.1,
+            cfg.grid_dim.2,
+            cfg.block_dim.0,
+        ];
         if let Some(args) = &mut call.args {
+            let timed = profiling() && matches!(self.mode, Mode::Queue);
+            if timed {
+                self.gpu.sync();
+            }
+            let start = std::time::Instant::now();
             // SAFETY: each caller passes exactly the parameters of the kernel's signature in
             // cuda.cu, with buffer bounds asserted or sized by construction.
             unsafe { args.launch(cfg) }.expect("CUDA launch failed");
+            if timed {
+                self.gpu.sync();
+                let dt = start.elapsed().as_secs_f64();
+                let mut times = PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner());
+                let e = times.entry(self.gpu.name_of(call.rec.func)).or_default();
+                (e.0, e.1) = (e.0 + dt, e.1 + 1);
+            }
         }
         match &mut self.mode {
             Mode::Queue => {}
@@ -1165,7 +1231,10 @@ impl<'a> Batch<'a> {
             .arg(&q.d)
             .arg(&q.s)
             .arg(&quant);
-        self.launch(a, grid(rows, REDUCE_THREADS));
+        // A thread per value where the block can hold them: with fewer, each thread reads
+        // several values in turn and waits out the memory latency for every one.
+        let threads = (n.next_multiple_of(32) as u32).min(REDUCE_THREADS);
+        self.launch(a, grid(rows, threads));
     }
 
     /// The buffers and flag a kernel takes for quantizing its `n` results (rows of `row`, a
@@ -1344,6 +1413,61 @@ impl<'a> Batch<'a> {
             && p.n_pos as usize <= ATTN_PART * ATTN_PART_MAX
         {
             return self.attention_decode(q, k, v, out, scores, p, quant);
+        }
+        // Several tokens run as tiled products where the kernels take the shape.
+        let g_n = p.n_head / p.n_kv;
+        if p.n_tok > 1 && 32 % g_n == 0 && p.head_dim <= 128 && p.head_dim.is_multiple_of(4) {
+            for tok0 in (0..p.n_tok).step_by(per_launch) {
+                let n = (per_launch as u32).min(p.n_tok - tok0);
+                let seen = (p.n_pos + tok0 + n - 1) as usize;
+                let (tiles, rows) = (
+                    seen.div_ceil(32),
+                    (n as usize).div_ceil((32 / g_n) as usize),
+                );
+                let mut l = self.call(self.gpu.other("attn_scores"));
+                l.arg(&q.0)
+                    .arg(&k.0)
+                    .arg(&scores.0)
+                    .arg(&p.n_head)
+                    .arg(&p.n_kv)
+                    .arg(&p.head_dim)
+                    .arg(&p.n_pos)
+                    .arg(&p.kv_dim)
+                    .arg(&p.max_ctx)
+                    .arg(&p.scale)
+                    .arg(&tok0)
+                    .arg(&n);
+                let cfg = LaunchConfig {
+                    grid_dim: (p.n_kv, tiles as u32, rows as u32),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                self.launch(l, cfg);
+                let mut l = self.call(self.gpu.other("attn_softmax"));
+                l.arg(&scores.0)
+                    .arg(&p.n_head)
+                    .arg(&p.n_pos)
+                    .arg(&p.max_ctx)
+                    .arg(&tok0);
+                self.launch(l, grid2(p.n_head as usize, n as usize, 256));
+                let mut l = self.call(self.gpu.other("attn_pv"));
+                l.arg(&scores.0)
+                    .arg(&v.0)
+                    .arg(&out.0)
+                    .arg(&p.n_head)
+                    .arg(&p.n_kv)
+                    .arg(&p.head_dim)
+                    .arg(&p.n_pos)
+                    .arg(&p.kv_dim)
+                    .arg(&p.max_ctx)
+                    .arg(&tok0)
+                    .arg(&n);
+                self.launch(l, grid2(p.n_kv as usize, rows, 2 * p.head_dim));
+            }
+            if let Some(quant) = quant {
+                self.quantize(At(out, 0), q_len, quant);
+            }
+            return;
         }
         for tok0 in (0..p.n_tok).step_by(per_launch) {
             let mut l = self.call(self.gpu.other("attention"));

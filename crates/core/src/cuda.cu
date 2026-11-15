@@ -1134,4 +1134,111 @@ extern "C" __global__ void attention_merge(const float* parts, float* out, uint 
     out[(ulong)blockIdx.x * head_dim + d] = o;
     if (quant) quant_block(o, ((ulong)blockIdx.x * head_dim + d) / 32, xq, xd, xs);
 }
+
+// Prompt attention as tiled products, in three launches, so that a tile of K or V is read
+// once for all the queries it meets: `attention` reads every cached row again for each query
+// head and token. A query row is a (token, query head) pair; AB tokens' worth of the heads
+// sharing a KV head make a tile of 32 rows, so heads per KV head must divide 32. Needs
+// head_dim <= 128 and a multiple of 4. `scores` holds a row of max_ctx per head and token of
+// the launch; token tok0 + t attends to the first n_pos + tok0 + t positions.
+
+// Scores: one block of 256 threads per KV head (x), 32 cached positions (y) and tile of query
+// rows (z). Thread (rows 4 rg.., position p) takes four scores.
+extern "C" __global__ void attn_scores(const float* q, const float* kc, float* scores,
+                                       uint n_head, uint n_kv, uint head_dim, uint n_pos,
+                                       uint kv_dim, uint max_ctx, float scale, uint tok0,
+                                       uint n_tok) {
+    __shared__ float ks[32 * 129];  // rows padded by one, so a warp's reads fall in 32 banks
+    __shared__ float qs[32 * 128];
+    uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = 32 / g_n;
+    uint base = blockIdx.y * 32, t0 = blockIdx.z * tpt;
+    uint t_end = min(t0 + tpt, n_tok);
+    if (base >= n_pos + tok0 + t_end - 1) return;  // past what the tile's last token sees
+    for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
+        uint p = i / head_dim, d = i % head_dim;
+        ks[p * (head_dim + 1) + d] = base + p < n_pos + tok0 + t_end - 1
+            ? kc[(ulong)(base + p) * kv_dim + blockIdx.x * head_dim + d] : 0.0f;
+    }
+    for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
+        uint r = i / head_dim, d = i % head_dim, t = t0 + r / g_n;
+        qs[i] = t < n_tok
+            ? q[((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d] : 0.0f;
+    }
+    __syncthreads();
+    uint p = tid % 32, rg = tid / 32;
+    const float* k = ks + p * (head_dim + 1);
+    const float* q4 = qs + 4 * rg * head_dim;
+    float s[4] = {0, 0, 0, 0};
+    for (uint d = 0; d < head_dim; d++) {
+        float kd = k[d];
+        _Pragma("unroll")
+        for (uint j = 0; j < 4; j++) s[j] += q4[j * head_dim + d] * kd;
+    }
+    for (uint j = 0; j < 4; j++) {
+        uint r = 4 * rg + j, t = t0 + r / g_n;
+        if (t < n_tok && base + p < n_pos + tok0 + t)
+            scores[((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + base + p] =
+                s[j] * scale;
+    }
+}
+
+// Softmax of each row of scores in place: one block per query head (x) and token (y).
+extern "C" __global__ void attn_softmax(float* scores, uint n_head, uint n_pos, uint max_ctx,
+                                        uint tok0) {
+    __shared__ float red[32];
+    float* sc = scores + ((ulong)blockIdx.y * n_head + blockIdx.x) * max_ctx;
+    uint n = n_pos + tok0 + blockIdx.y;
+    float mx = NEG_INF;
+    for (uint t = threadIdx.x; t < n; t += blockDim.x) mx = fmaxf(mx, sc[t]);
+    mx = block_max(mx, red);
+    float sum = 0;
+    for (uint t = threadIdx.x; t < n; t += blockDim.x) sum += expf(sc[t] - mx);
+    sum = block_sum(sum, red);
+    for (uint t = threadIdx.x; t < n; t += blockDim.x) sc[t] = expf(sc[t] - mx) / sum;
+}
+
+// The weighted sums of V: one block of 2 head_dim threads per KV head (x) and tile of query
+// rows (y), walking the context 32 positions at a time. Thread (rows 4 rg.., values 4 dq..)
+// keeps 16 sums.
+extern "C" __global__ void attn_pv(const float* scores, const float* vc, float* out,
+                                   uint n_head, uint n_kv, uint head_dim, uint n_pos,
+                                   uint kv_dim, uint max_ctx, uint tok0, uint n_tok) {
+    __shared__ float vs[32 * 128];
+    __shared__ float ps[32 * 32];
+    uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = 32 / g_n, t0 = blockIdx.y * tpt;
+    uint t_end = min(t0 + tpt, n_tok), limit = n_pos + tok0 + t_end - 1;
+    uint dq = tid % (head_dim / 4), rg = tid / (head_dim / 4);
+    float o[16];
+    for (uint i = 0; i < 16; i++) o[i] = 0;
+    for (uint base = 0; base < limit; base += 32) {
+        for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
+            uint p = i / head_dim, d = i % head_dim;
+            vs[i] = base + p < limit
+                ? vc[(ulong)(base + p) * kv_dim + blockIdx.x * head_dim + d] : 0.0f;
+        }
+        for (uint i = tid; i < 32 * 32; i += blockDim.x) {
+            uint r = i / 32, p = i % 32, t = t0 + r / g_n;
+            ps[i] = t < n_tok && base + p < n_pos + tok0 + t
+                ? scores[((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + base + p]
+                : 0.0f;
+        }
+        __syncthreads();
+        for (uint p = 0; p < 32; p++) {
+            const float* v = vs + p * head_dim + 4 * dq;
+            _Pragma("unroll")
+            for (uint j = 0; j < 4; j++) {
+                float pr = ps[(4 * rg + j) * 32 + p];
+                _Pragma("unroll")
+                for (uint i = 0; i < 4; i++) o[4 * j + i] += pr * v[i];
+            }
+        }
+        __syncthreads();
+    }
+    for (uint j = 0; j < 4; j++) {
+        uint r = 4 * rg + j, t = t0 + r / g_n;
+        if (t >= n_tok) continue;
+        float* oh = out + ((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim;
+        for (uint i = 0; i < 4; i++) oh[4 * dq + i] = o[4 * j + i];
+    }
+}
 #endif  // RLI_MMA
