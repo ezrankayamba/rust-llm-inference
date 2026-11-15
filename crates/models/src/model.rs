@@ -77,7 +77,7 @@ pub trait Accelerator: Send + Sync {
 
 /// The byte strides between consecutive experts' gate, up and down matrices, if every expert
 /// sits at the same stride (slices of stacked tensors) with the same shape and type.
-#[cfg(any(feature = "metal", feature = "cuda"))]
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 pub(crate) fn expert_strides(experts: &[Expert]) -> Option<[usize; 3]> {
     fn pick(e: &Expert, i: usize) -> &Weight {
         [&e.gate, &e.up, &e.down][i]
