@@ -10,7 +10,7 @@
 
 use crate::backend::BackendError;
 use crate::config::Config;
-use crate::model::{Accelerator, Expert, Ffn, Model, Weight, forward_each};
+use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::metal::{
     At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs, attention_part_len,
 };
@@ -499,31 +499,6 @@ impl Accelerator for Metal {
         }
         done
     }
-}
-
-/// The byte strides between consecutive experts' gate, up and down matrices, if every expert
-/// sits at the same stride (slices of stacked tensors) with the same shape and type.
-fn expert_strides(experts: &[Expert]) -> Option<[usize; 3]> {
-    fn pick(e: &Expert, i: usize) -> &Weight {
-        [&e.gate, &e.up, &e.down][i]
-    }
-    let mut strides = [0; 3];
-    for (i, stride) in strides.iter_mut().enumerate() {
-        let first = pick(&experts[0], i);
-        *stride = match experts.get(1) {
-            Some(e) => pick(e, i).offset.checked_sub(first.offset)?,
-            None => 0,
-        };
-        let even = experts.iter().enumerate().all(|(j, e)| {
-            let m = pick(e, i);
-            m.offset == first.offset + j * *stride
-                && (m.ty, m.rows, m.cols) == (first.ty, first.rows, first.cols)
-        });
-        if !even {
-            return None;
-        }
-    }
-    Some(strides)
 }
 
 /// The matrices one layer's offload reads.

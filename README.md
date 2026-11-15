@@ -18,7 +18,7 @@ kernels, the GGUF loader, the tokenizers and the model graphs are all implemente
 | Quantization | F16/BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K; Q4_1, Q5_0 and Q5_1 also load |
 | Models | Llama family (Llama 2/3, Mistral, dense Qwen) and mixture-of-experts (Mixtral, Qwen MoE) |
 | CPU | AVX2 and AVX-512 VNNI on x86, NEON on ARM, chosen at runtime, with a portable fallback |
-| GPU | Apple Metal. A CUDA backend compiles in CI but has never been run on an NVIDIA GPU |
+| GPU | Apple Metal, and CUDA (checked by hand on an NVIDIA A100; CI only compiles it) |
 
 ## Quick start
 

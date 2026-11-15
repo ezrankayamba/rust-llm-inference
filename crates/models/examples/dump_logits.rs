@@ -1,7 +1,8 @@
 //! Debug aid: tokenizes a prompt, runs it, and writes the last position's logits.
-//! usage: dump_logits <model.gguf> <prompt> <out.f32> [--precise] [--gpu-layers=N]
+//! usage: dump_logits <model.gguf> <prompt> <out.f32> [--precise] [--gpu-layers=N] [--per-token]
 //! Prints the token ids. `--precise` keeps CPU activations in f32 so results can be compared
-//! tightly with a reference; `--gpu-layers` offloads layers (metal/cuda builds).
+//! tightly with a reference; `--gpu-layers` offloads layers (metal/cuda builds); `--per-token`
+//! runs the prompt one token at a time, as decoding does, instead of batched.
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -26,7 +27,15 @@ fn main() {
             .join(",")
     );
     let mut sess = engine.new_session(4096);
-    let logits = engine.model.forward_batch(&mut sess, &tokens, true);
+    let logits = if a[4..].iter().any(|f| f == "--per-token") {
+        let mut last = None;
+        for (i, &t) in tokens.iter().enumerate() {
+            last = engine.model.forward(&mut sess, t, i + 1 == tokens.len());
+        }
+        last
+    } else {
+        engine.model.forward_batch(&mut sess, &tokens, true)
+    };
     let bytes: Vec<u8> = logits
         .expect("non-empty prompt")
         .iter()

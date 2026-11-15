@@ -50,10 +50,11 @@ fn qwen2moe_with_shared_expert_matches_reference_logits() {
     check("tiny_qwen2moe");
 }
 
-/// Full and partial (1 of 2 layers) GPU offload must reproduce the same logits.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+/// Full and partial (1 of 2 layers) GPU offload must reproduce the same logits. With the `cuda`
+/// feature this needs an NVIDIA GPU, so CI doesn't run it.
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 #[test]
-fn metal_offload_matches_reference_logits() {
+fn gpu_offload_matches_reference_logits() {
     for name in ["tiny_mixtral", "tiny_qwen2moe"] {
         check_with(name, 2);
         check_with(name, 1);

@@ -106,9 +106,24 @@ Design points that span files:
   corrupts header fields and requires an error or a clean CPU run, never a panic. New tensors need
   a shape check in `Model::load`.
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
-- **Unverified path:** the whole CUDA backend (CI compiles it, but it has never run on an NVIDIA
-  GPU; only its weight decoders are checked, on the CPU, by `scripts/cuda_cpu_check`, which CI
-  doesn't run).
+- **CUDA kernels keep a warp's reads adjacent.** Each of a warp's 32 lanes takes the next weight
+  and the next value of x: `wt_*` decodes one weight per lane (the matmuls), `sb_*` 8 weights per
+  lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that
+  each took a separate 32-weight chunk ran prompts 6-7x slower on an A100. Prompts run in chunks
+  of 256 tokens (`BATCH_CHUNK`): a warp multiplies its weight row into a tile of 32 tokens, and
+  causal attention runs one block per head and token. Its scores need a row per head and token,
+  capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
+  launches. Offloaded MoE layers run one token at a time, prompts included, routed on the GPU as
+  on Metal (`moe_topk`, then the k experts as one launch per matrix: every matvec kernel takes
+  an expert id per grid row, `Batch::matvec_id`). File ranges that touch are uploaded as one, so
+  stacked experts keep their stride in VRAM. Experts stored as separate tensors are routed on
+  the CPU with a sync per layer.
+- **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
+  the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
+  against `ref_forward.py` both batched and with `--per-token` (the decode kernels).
+  `scripts/cuda_cpu_check` checks the weight decoders on the CPU; CI doesn't run it. It first ran
+  on 2026-11-15, on a rented A100; `libnvrtc` had to be put on the library path there
+  (`LD_LIBRARY_PATH=/opt/conda/lib` on a PyTorch image).
 
 ## Commands
 
@@ -147,8 +162,9 @@ gitignored.
 
 The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub` for the tokenizer check):
 
-- Logits: `cargo run --release -p rli-models --example dump_logits -- <model> "<prompt>" out.f32 --precise [--gpu-layers=N]`,
+- Logits: `cargo run --release -p rli-models --example dump_logits -- <model> "<prompt>" out.f32 --precise [--gpu-layers=N] [--per-token]`,
   then `python scripts/ref_forward.py <model> <ids> out.f32` (an independent NumPy forward pass).
+  `--per-token` runs the prompt through the decode path instead of the batched one.
 - Tokenizer: `python scripts/check_tokenizer.py <model.gguf> <hf-repo>`.
 - Chat format: `python scripts/check_chat_template.py <model.gguf>` renders the file's real Jinja
   template and compares it with `ChatTemplate::render` (needs `pip install gguf jinja2`).

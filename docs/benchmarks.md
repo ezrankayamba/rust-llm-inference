@@ -3,6 +3,61 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-15: first CUDA runs, on an A100
+
+The CUDA backend ran on an NVIDIA GPU for the first time: a rented A100-PCIE-40GB (driver
+580.178.04, NVRTC 12.1 from the image's conda), host CPU EPYC 7F72 with 46 threads available.
+`bench <model> --gpu-layers N` (pp512, tg128, 3 reps) and `--pp 0 --depth 2048`, all layers
+offloaded, Q4_K_M files. tok/s:
+
+| Model | | Prompt | Decode | Decode at 2048 |
+|---|---|---:|---:|---:|
+| Llama-3.2-1B | v0.2.0 | 107.4 | 88.6 | 59.6 |
+| | after | 1550.6 | 262.2 | 175.8 |
+| | CPU only | 260.3 | 36.7 | |
+| Mistral-7B | v0.2.0 | 17.2 | 17.2 | |
+| | after | 220.5 | 70.7 | 49.9 |
+| | CPU only | 60.0 | 12.5 | |
+| Qwen3-30B-A3B (MoE) | v0.2.0 | 27.8 | 27.0 | |
+| | after | 94.8 | 93.5 | 50.6 |
+| | CPU only (pp256, tg64) | 21.3 | 7.1 | |
+
+The v0.2.0 code was correct as written: `dump_logits --precise` against `ref_forward.py` gave
+max |diff| 1.0e-5 with all 16 layers of Llama-3.2-1B offloaded, 2.2e-5 with 8, and 5.7e-6 on
+Mistral-7B. After the changes: Llama-3.2-1B 421 tokens (two chunks) 3.8e-5 batched and 3.3e-5 with
+`--per-token`; 99 tokens 1.0e-5 batched, 8.3e-6 per token, 1.3e-5 and 1.0e-5 with 8 layers;
+Mistral-7B 16 tokens 4.3e-6 batched and 5.7e-6 per token; Qwen3-30B-A3B against the CPU 2.4e-5 (48 layers) and 2.1e-5
+(24). The workspace tests pass with `--features rli-models/cuda`.
+
+What changed, in order, with the run each number came from (one instance, so comparable):
+
+| Step | Llama-3.2-1B | Mistral-7B |
+|---|---:|---:|
+| Prompts one token at a time (v0.2.0), pp512 | 107.4 | 17.2 |
+| Batched, a lane per 32-weight chunk, 8-token tile | 151.6 | 21.3 |
+| A lane per weight, 8-token tile | 958.9 | 142.5 |
+| 16-token tile | 1287.1 | 180.5 |
+| 32-token tile | 1491.6 | 216.3 |
+| Matvec a lane per 32-weight chunk (v0.2.0), tg128 | 88.6 | 17.2 |
+| A lane per weight | 89.4 | 20.2 |
+| 8 weights per lane, 256 per step (`sb_*`) | 230.4 ± 52 | 65.9 |
+| Decode at 2048 with those | 71.5 | 26.4 |
+| Attention's value sum split over `1024 / head_dim` threads per value | 133.5 | 41.1 |
+| Attention's scores a warp per position | 172.0 | 50.0 |
+
+- With a lane per chunk, the GPU showed 100% utilization at 105 W of 250: a warp's 32 loads of x
+  were 128 bytes apart and its weight loads 18. Every workload moved weight bytes at 73-88 GB/s
+  whatever the model. That was not memory (the card streams about 1500 GB/s) but instructions
+  per weight, which is why decoding 8 weights per lane and a block's scales once gave 2.6-3.3x.
+- A 24-token prompt ran at 860 tok/s with a 16-token tile and 864 with 32.
+- Qwen3-30B-A3B decode: 27.0 -> 49.4 from the matvec kernels, -> 93.5 with the experts picked on
+  the GPU (`moe_topk`, one launch per matrix for the 8 experts instead of 4 per expert, no sync
+  per layer). Its prompts still ran one token at a time here.
+
+Not measured: any other NVIDIA GPU, partial offload speed, Q4_0/Q5_0/Q8_0/Q5_K/F16 speed (their
+kernels are checked by the tests and `cuda_cpu_check`, not timed), and thread count's effect on
+the launch path (decode of the 1B model swung by 20% while another process used the CPU).
+
 ## 2026-11-13: `--repack`, an 8-row copy of Q4_K weights for x86 decode
 
 `Benchmark` on the PR #11 branch (llama.cpp v0.9.0, native build), one thread, Llama-3.2-1B Q4_K_M.
