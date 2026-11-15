@@ -8,7 +8,8 @@
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::cuda::{
-    ATTN_THREADS, At, AttnParams, Batch, Gpu, GpuBuf, GpuIds, GpuQ, MOE_MAX_EXPERTS, RopeArgs,
+    ATTN_THREADS, At, AttnParams, Batch, Gpu, GpuBuf, GpuIds, GpuQ, MMQ_MIN_TOKENS,
+    MOE_MAX_EXPERTS, RopeArgs,
 };
 use rli_core::ops;
 use std::any::Any;
@@ -63,7 +64,8 @@ impl Scratch {
             q: gpu.alloc(n * c.q_dim()),
             att: gpu.alloc(n * c.q_dim()),
             tmp: gpu.alloc(n * (k + 1) * c.n_embd),
-            gate: gpu.alloc(n * k.max(1) * max_ff),
+            // A dense FFN keeps its up activations after its gate ones.
+            gate: gpu.alloc(n * k.max(2) * max_ff),
             up: gpu.alloc(n * k.max(1) * max_ff),
             router: gpu.alloc(n * c.n_expert.max(1)),
             shared_gate: gpu.alloc(n),
@@ -121,8 +123,15 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
+/// Whether any of `ws` runs in int8, so that their input is wanted quantized.
+fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
+    int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset))
+}
+
 /// Each of `ws` applied to the `n` tokens at `x`, into the matching `ys`. With `int8`, the
-/// matrices that have an int8 kernel run over `x` quantized once into `s.xq`.
+/// matrices that have an int8 kernel run over `s.xq`: `x` quantized, by the kernel that
+/// produced it (`quantized`) or else here.
+#[allow(clippy::too_many_arguments)]
 fn mm_each(
     b: &mut Batch<'_>,
     s: &Scratch,
@@ -131,25 +140,76 @@ fn mm_each(
     ys: &[At<'_>],
     n: usize,
     int8: bool,
+    quantized: bool,
 ) {
-    let q = |b: &Batch<'_>, w: &Weight| int8 && b.has_int8(w.ty, w.cols, w.offset);
-    if ws.iter().any(|w| q(b, w)) {
+    if !quantized && wants_q(b, ws, int8) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
     for (w, &y) in ws.iter().zip(ys) {
-        if q(b, w) {
-            b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n);
+        if wants_q(b, &[w], int8) {
+            b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n, false);
         } else {
             mm(b, w, x, y, n);
         }
     }
 }
 
-fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, out: At<'_>, n: usize, int8: bool) {
-    let (gate, up) = (At(&s.gate, 0), At(&s.up, 0));
-    mm_each(b, s, &[&e.gate, &e.up], At(&s.xb, 0), &[gate, up], n, int8);
-    b.swiglu(gate, up, n * e.gate.rows);
-    mm_each(b, s, &[&e.down], gate, &[out], n, int8);
+/// `x += w * src` for the `n` tokens at `src`, in one launch where the int8 matvec runs;
+/// otherwise through `s.tmp`. `int8` and `quantized` as in [`mm_each`].
+#[allow(clippy::too_many_arguments)]
+fn mm_add(
+    b: &mut Batch<'_>,
+    s: &Scratch,
+    w: &Weight,
+    src: At<'_>,
+    x: At<'_>,
+    n: usize,
+    int8: bool,
+    quantized: bool,
+) {
+    if n < MMQ_MIN_TOKENS && wants_q(b, &[w], int8) {
+        if !quantized {
+            b.quantize(src, n * w.cols, &s.xq);
+        }
+        b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, x, n, true);
+    } else {
+        let tmp = At(&s.tmp, 0);
+        mm_each(b, s, &[w], src, &[tmp], n, int8, quantized);
+        b.add(x, tmp, n * w.rows);
+    }
+}
+
+/// Queues the FFN `e` over the `n` tokens in `s.xb` (`quantized`: in `s.xq` too), into `out`,
+/// or added to `out` with `add`.
+#[allow(clippy::too_many_arguments)]
+fn ffn(
+    b: &mut Batch<'_>,
+    s: &Scratch,
+    e: &Expert,
+    out: At<'_>,
+    n: usize,
+    int8: bool,
+    quantized: bool,
+    add: bool,
+) {
+    let (g, u, ff) = (&e.gate, &e.up, e.gate.rows);
+    let (xb, gate, up) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.gate, n * ff));
+    // One token's gate and up are one launch when they are alike.
+    if n == 1 && wants_q(b, &[g], int8) && wants_q(b, &[u], int8) && g.ty == u.ty {
+        if !quantized {
+            b.quantize(xb, g.cols, &s.xq);
+        }
+        b.matvec_q_pair(g.ty, ff, g.cols, [g.offset, u.offset], &s.xq, gate);
+    } else {
+        mm_each(b, s, &[g, u], xb, &[gate, up], n, int8, quantized);
+    }
+    let q = wants_q(b, &[&e.down], int8);
+    b.swiglu(gate, up, n * ff, q.then_some(&s.xq));
+    if add {
+        mm_add(b, s, &e.down, gate, out, n, int8, q);
+    } else {
+        mm_each(b, s, &[&e.down], gate, &[out], n, int8, q);
+    }
 }
 
 /// Queues the MoE FFN of `n` tokens over `s.xb`, adding into `s.x`. The experts are picked on
@@ -203,7 +263,7 @@ fn moe(
             n * k,
         );
     }
-    b.swiglu(gate, up, n * k * ff);
+    b.swiglu(gate, up, n * k * ff, None);
     let d = &e.down;
     b.matvec_id(
         d.ty,
@@ -224,7 +284,7 @@ fn moe(
     b.moe_combine(At(&s.x, 0), tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
     if let Some((_, e)) = shared {
         let out = At(&s.tmp, n * k * n_embd);
-        ffn(b, s, e, out, n, false);
+        ffn(b, s, e, out, n, false, false, false);
         b.moe_combine(At(&s.x, 0), out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
 }
@@ -258,9 +318,10 @@ impl Cuda {
         let int8 = !model.precise;
 
         let x_at = At(&s.x, 0);
-        let rope = |n_heads| RopeArgs {
+        let rope = RopeArgs {
             n_tok: n,
-            n_heads,
+            n_heads: c.n_head,
+            n_heads2: c.n_head_kv,
             head_dim: hd,
             rope_dim: c.rope_dim,
             pos,
@@ -271,10 +332,14 @@ impl Cuda {
         let mut b = self.gpu.batch();
         for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
             let (k_at, v_at) = (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim));
-            b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
+            let (xb, eps) = (At(&s.xb, 0), c.rms_eps);
             let qkv = [&layer.wq, &layer.wk, &layer.wv];
             let outs = [At(&s.q, 0), k_at, v_at];
-            mm_each(&mut b, s, &qkv, At(&s.xb, 0), &outs, n, int8);
+            // A kernel whose result feeds int8 matrices quantizes it on the way out.
+            let quant = wants_q(&b, &qkv, int8);
+            let xq = quant.then_some(&s.xq);
+            b.rmsnorm(x_at, xb, &g.attn_norm, n, n_embd, eps, xq);
+            mm_each(&mut b, s, &qkv, xb, &outs, n, int8, quant);
             for (t, bias, len) in [
                 (At(&s.q, 0), &g.bq, c.q_dim()),
                 (k_at, &g.bk, kv_dim),
@@ -285,13 +350,12 @@ impl Cuda {
                 }
             }
             if let Some(w) = &g.q_norm {
-                b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, c.rms_eps);
+                b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, eps, None);
             }
             if let Some(w) = &g.k_norm {
-                b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, c.rms_eps);
+                b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None);
             }
-            b.rope(At(&s.q, 0), &rope(c.n_head));
-            b.rope(k_at, &rope(c.n_head_kv));
+            b.rope(At(&s.q, 0), k_at, &rope);
             let p = AttnParams {
                 n_head: c.n_head as u32,
                 n_kv: c.n_head_kv as u32,
@@ -302,16 +366,18 @@ impl Cuda {
                 max_ctx: kv.max_ctx as u32,
                 scale: 1.0 / (hd as f32).sqrt(),
             };
-            b.attention(&s.q, &kv.k[l], &kv.v[l], &s.att, &kv.scores, &p);
-            let tmp = [At(&s.tmp, 0)];
-            mm_each(&mut b, s, &[&layer.wo], At(&s.att, 0), &tmp, n, int8);
-            b.add(x_at, At(&s.tmp, 0), n * n_embd);
-            b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
+            let quant = wants_q(&b, &[&layer.wo], int8) && hd.is_multiple_of(32);
+            let xq = quant.then_some(&s.xq);
+            b.attention(&s.q, &kv.k[l], &kv.v[l], &s.att, &kv.scores, &p, xq);
+            mm_add(&mut b, s, &layer.wo, At(&s.att, 0), x_at, n, int8, quant);
+            let quant = match &layer.ffn {
+                Ffn::Dense(e) => wants_q(&b, &[&e.gate, &e.up], int8),
+                Ffn::Moe { .. } => false,
+            };
+            let xq = quant.then_some(&s.xq);
+            b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, xq);
             match &layer.ffn {
-                Ffn::Dense(e) => {
-                    ffn(&mut b, s, e, At(&s.tmp, 0), n, int8);
-                    b.add(x_at, At(&s.tmp, 0), n * n_embd);
-                }
+                Ffn::Dense(e) => ffn(&mut b, s, e, x_at, n, int8, quant, true),
                 Ffn::Moe {
                     router,
                     experts,
@@ -341,11 +407,20 @@ impl Cuda {
                         1.0
                     };
                     for &e in chosen {
-                        ffn(&mut b, s, &experts[e], At(&s.tmp, 0), 1, false);
+                        ffn(
+                            &mut b,
+                            s,
+                            &experts[e],
+                            At(&s.tmp, 0),
+                            1,
+                            false,
+                            false,
+                            false,
+                        );
                         b.axpy(x_at, At(&s.tmp, 0), probs[e] / norm, n_embd);
                     }
                     if let Some((_, e)) = shared {
-                        ffn(&mut b, s, e, At(&s.tmp, 0), 1, false);
+                        ffn(&mut b, s, e, At(&s.tmp, 0), 1, false, false, false);
                         let gate = 1.0 / (1.0 + (-shared_gate[0]).exp());
                         b.axpy(x_at, At(&s.tmp, 0), gate, n_embd);
                     }
@@ -355,8 +430,11 @@ impl Cuda {
         let want_logits = self.covers_all && logits.is_some();
         if want_logits {
             let last = At(&s.x, (n - 1) * n_embd);
-            b.rmsnorm(last, At(&s.xb, 0), &self.output_norm, 1, n_embd, c.rms_eps);
-            mv(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0));
+            let (xb, out) = (At(&s.xb, 0), [&model.output]);
+            let quant = wants_q(&b, &out, int8);
+            let xq = quant.then_some(&s.xq);
+            b.rmsnorm(last, xb, &self.output_norm, 1, n_embd, c.rms_eps, xq);
+            mm_each(&mut b, s, &out, xb, &[At(&s.logits, 0)], 1, int8, quant);
         }
         b.finish();
         self.gpu.read(&s.x, xs);

@@ -10,7 +10,7 @@
 use crate::quant::GgmlType;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchArgs, LaunchConfig,
-    PushKernelArg,
+    PushKernelArg, sys,
 };
 use std::sync::Arc;
 
@@ -33,6 +33,9 @@ const ATTN_PART_MIN: u32 = 128;
 const ELT_THREADS: usize = 256;
 /// Weight placement alignment in the device arena (f32 weights are read as `float*`).
 const WEIGHT_ALIGN: usize = 256;
+/// Bytes past the last weight that kernels may read (and ignore): the Q6_K matvec takes its
+/// unaligned blocks as whole 16-byte words.
+const WEIGHT_SLACK: usize = 16;
 
 const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::F32, "matvec_f32"),
@@ -50,7 +53,7 @@ const MMQ_KERNELS: [(GgmlType, &str); 2] =
 /// Tokens per block of the int8 matmul kernels (`MQ_T` in cuda.cu).
 const MMQ_TILE: usize = 64;
 /// Fewest tokens the int8 matmul kernels take; fewer run as an int8 matvec each.
-const MMQ_MIN_TOKENS: usize = 8;
+pub const MMQ_MIN_TOKENS: usize = 8;
 /// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
@@ -129,6 +132,8 @@ pub struct RopeArgs<'a> {
     /// Consecutive tokens in the buffer, `n_heads` heads each, the first at `pos`.
     pub n_tok: usize,
     pub n_heads: usize,
+    /// Heads per token in the second buffer.
+    pub n_heads2: usize,
     pub head_dim: usize,
     pub rope_dim: usize,
     pub pos: usize,
@@ -159,6 +164,10 @@ pub struct Gpu {
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
     zero_id: GpuIds,
+    /// 0 and 1: the ids of [`Batch::matvec_q_pair`]'s two matrices.
+    pair_ids: GpuIds,
+    /// Stands in for the quantized output of a kernel that isn't asked for one.
+    no_q: GpuQ,
     name: String,
 }
 
@@ -176,7 +185,11 @@ impl Gpu {
             return Err("NVRTC library (libnvrtc) not found".into());
         }
         let ctx = CudaContext::new(0).map_err(err("no CUDA device"))?;
-        let stream = ctx.default_stream();
+        // A stream of our own, since the default one can't be captured into a graph. It is the
+        // only stream, so cudarc's cross-stream events (several driver calls per launch) are off.
+        // SAFETY: every buffer is used on this one stream.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream().map_err(err("create stream"))?;
         // compute_61 (Pascal, 2016) for the int8 kernels' dp4a instruction.
         let opts = cudarc::nvrtc::CompileOptions {
             arch: Some("compute_61"),
@@ -265,7 +278,7 @@ impl Gpu {
             ));
         }
         let mut weights = stream
-            .alloc_zeros::<u8>(total.max(1))
+            .alloc_zeros::<u8>(total + WEIGHT_SLACK)
             .map_err(err("allocate weight arena"))?;
         for p in &placed {
             let src = &mapped[p.file_off..p.file_off + p.len];
@@ -278,6 +291,15 @@ impl Gpu {
                 .alloc_zeros(MMQ_MIN_TOKENS)
                 .map_err(err("allocate"))?,
         );
+        let mut pair_ids = GpuIds(stream.alloc_zeros(2).map_err(err("allocate"))?);
+        stream
+            .memcpy_htod(&[0u32, 1], &mut pair_ids.0)
+            .map_err(err("upload"))?;
+        let no_q = GpuQ {
+            q: stream.alloc_zeros(8).map_err(err("allocate"))?,
+            d: stream.alloc_zeros(1).map_err(err("allocate"))?,
+            s: stream.alloc_zeros(2).map_err(err("allocate"))?,
+        };
         let name = format!("cuda ({})", ctx.name().map_err(err("device name"))?);
         Ok(Self {
             stream,
@@ -289,6 +311,8 @@ impl Gpu {
             mma,
             other,
             zero_id,
+            pair_ids,
+            no_q,
             name,
         })
     }
@@ -316,12 +340,10 @@ impl Gpu {
     }
 
     /// Whether the int8 kernels can run the matrix of `ty` and `cols` columns at byte `offset`
-    /// of the model file: [`Gpu::has_matmul_q`], and for Q4_K a start at a multiple of 16 bytes
-    /// on the device, which the matvec's 16-byte reads need (its rows are multiples of 144
-    /// bytes, and GGUF aligns tensors to 32).
+    /// of the model file: [`Gpu::has_matmul_q`], and a start at a multiple of 16 bytes on the
+    /// device, which the matvecs' 16-byte reads assume (GGUF aligns tensors to 32).
     pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
-        Self::has_matmul_q(ty, cols)
-            && (ty != GgmlType::Q4_K || self.device_offset(offset, 1).is_multiple_of(16))
+        Self::has_matmul_q(ty, cols) && self.device_offset(offset, 1).is_multiple_of(16)
     }
 
     /// Room for `n` quantized activations (a multiple of 32).
@@ -404,6 +426,60 @@ impl Gpu {
         b.matvec(ty, rows, cols, offset, (&xb).into(), (&yb).into());
         b.finish();
         self.read(&yb, y);
+    }
+}
+
+/// Launches recorded by [`Gpu::capture`], replayed in order by [`Gpu::replay`].
+pub struct Graph {
+    graph: sys::CUgraph,
+    exec: sys::CUgraphExec,
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        // SAFETY: both handles came from `Gpu::capture` and are not used again.
+        unsafe {
+            sys::cuGraphExecDestroy(self.exec);
+            sys::cuGraphDestroy(self.graph);
+        }
+    }
+}
+
+impl Gpu {
+    /// Records the launches `f` queues instead of running them.
+    pub fn capture(&self, f: impl FnOnce(&mut Batch<'_>)) -> Graph {
+        let stream = self.stream.cu_stream();
+        let (mut graph, mut exec) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: the stream is live; capture is ended before the handles are used.
+        unsafe {
+            sys::cuStreamBeginCapture_v2(
+                stream,
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            )
+            .result()
+            .expect("CUDA capture failed");
+            f(&mut self.batch());
+            sys::cuStreamEndCapture(stream, &mut graph)
+                .result()
+                .expect("CUDA capture failed");
+            sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0)
+                .result()
+                .expect("CUDA graph failed");
+        }
+        Graph { graph, exec }
+    }
+
+    /// Queues the recorded launches.
+    pub fn replay(&self, g: &Graph) {
+        // SAFETY: the handles are live until `g` drops.
+        unsafe { sys::cuGraphLaunch(g.exec, self.stream.cu_stream()) }
+            .result()
+            .expect("CUDA graph launch failed");
+    }
+
+    /// Waits for all queued work.
+    pub fn sync(&self) {
+        self.stream.synchronize().expect("CUDA command failed");
     }
 }
 
@@ -512,7 +588,8 @@ impl Batch<'_> {
 
     /// [`Batch::matmul`] over activations quantized by [`Batch::quantize`] (`n_tok` rows of
     /// `cols` in `xq`), for the matrices [`Gpu::has_int8`] accepts. The result differs from the
-    /// f32 matmul's by the activations' rounding.
+    /// f32 matmul's by the activations' rounding. Under [`MMQ_MIN_TOKENS`] tokens, `add` adds
+    /// it to `y` instead of storing it.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_q(
         &mut self,
@@ -523,15 +600,17 @@ impl Batch<'_> {
         xq: &GpuQ,
         y: At<'_>,
         n_tok: usize,
+        add: bool,
     ) {
         assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n_tok > 0);
         assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
         if n_tok < MMQ_MIN_TOKENS {
             let zero = &self.gpu.zero_id;
             return self.matvec_q_id(
-                ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok,
+                ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok, add,
             );
         }
+        assert!(!add, "the int8 matmul kernels don't accumulate");
         let row_bytes = ty.row_bytes(cols);
         let w_off = self.gpu.device_offset(offset, rows * row_bytes) as u64;
         let f = &self
@@ -585,6 +664,7 @@ impl Batch<'_> {
         y: At<'_>,
         y_stride: usize,
         n: usize,
+        add: bool,
     ) {
         assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n > 0 && x_div > 0);
         assert!(
@@ -597,6 +677,63 @@ impl Batch<'_> {
         let row_bytes = ty.row_bytes(cols);
         let span = (n_stack - 1) * stride + rows * row_bytes;
         let w_off = self.gpu.device_offset(offset, span) as u64;
+        let (id_stride, xs, xd) = (stride as u64, x_stride as u32, x_div as u32);
+        self.launch_mvq(
+            ty, rows, cols, w_off, id_stride, ids, xq, xs, xd, y, y_stride, n, add,
+        );
+    }
+
+    /// Two matrices of one type and shape at `offsets`, over the same quantized token in `xq`,
+    /// as one launch: the second's result follows the first's at `y`.
+    pub fn matvec_q_pair(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offsets: [usize; 2],
+        xq: &GpuQ,
+        y: At<'_>,
+    ) {
+        assert!(offsets.iter().all(|&o| self.gpu.has_int8(ty, cols, o)) && rows > 0);
+        assert!(xq.q.len() * 4 >= cols && y.1 + 2 * rows <= y.0.len());
+        let len = rows * ty.row_bytes(cols);
+        let [a, b] = offsets.map(|o| self.gpu.device_offset(o, len) as u64);
+        // The kernel adds id * stride to the first matrix's offset, modulo 2^64.
+        let ids = &self.gpu.pair_ids;
+        self.launch_mvq(
+            ty,
+            rows,
+            cols,
+            a,
+            b.wrapping_sub(a),
+            ids,
+            xq,
+            0,
+            1,
+            y,
+            rows,
+            2,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_mvq(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        w_off: u64,
+        id_stride: u64,
+        ids: &GpuIds,
+        xq: &GpuQ,
+        xs: u32,
+        xd: u32,
+        y: At<'_>,
+        y_stride: usize,
+        n: usize,
+        add: bool,
+    ) {
         let f = &self
             .gpu
             .mvq
@@ -604,9 +741,8 @@ impl Batch<'_> {
             .find(|(t, _)| *t == ty)
             .expect("checked by has_matmul_q")
             .1;
-        let (y_off, id_stride, rb) = (y.1 as u64, stride as u64, row_bytes as u32);
-        let (rows_u, cols_u) = (rows as u32, cols as u32);
-        let (xs, xd, ys) = (x_stride as u32, x_div as u32, y_stride as u32);
+        let (y_off, rb) = (y.1 as u64, ty.row_bytes(cols) as u32);
+        let (rows_u, cols_u, ys, add) = (rows as u32, cols as u32, y_stride as u32, add as u32);
         let mut a = self.gpu.stream.launch_builder(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
@@ -622,7 +758,8 @@ impl Batch<'_> {
             .arg(&id_stride)
             .arg(&xs)
             .arg(&xd)
-            .arg(&ys);
+            .arg(&ys)
+            .arg(&add);
         launch(
             a,
             grid2(
@@ -787,9 +924,20 @@ impl Batch<'_> {
     }
 
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
-    pub fn rmsnorm(&mut self, x: At<'_>, out: At<'_>, w: &GpuBuf, rows: usize, n: usize, eps: f32) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm(
+        &mut self,
+        x: At<'_>,
+        out: At<'_>,
+        w: &GpuBuf,
+        rows: usize,
+        n: usize,
+        eps: f32,
+        quant: Option<&GpuQ>,
+    ) {
         assert!(x.1 + rows * n <= x.0.len() && out.1 + rows * n <= out.0.len());
         let (x_off, o_off, n_u) = (x.1 as u64, out.1 as u64, n as u32);
+        let (q, quant) = self.quant_out(quant, rows * n, n);
         let mut a = self.gpu.stream.launch_builder(self.gpu.other("rmsnorm"));
         a.arg(&x.0.0)
             .arg(&x_off)
@@ -797,8 +945,22 @@ impl Batch<'_> {
             .arg(&o_off)
             .arg(&w.0)
             .arg(&n_u)
-            .arg(&eps);
+            .arg(&eps)
+            .arg(&q.q)
+            .arg(&q.d)
+            .arg(&q.s)
+            .arg(&quant);
         launch(a, grid(rows, REDUCE_THREADS));
+    }
+
+    /// The buffers and flag a kernel takes for quantizing its `n` results (rows of `row`, a
+    /// multiple of 32) on the way out, as [`Batch::quantize`] would.
+    fn quant_out<'a>(&'a self, q: Option<&'a GpuQ>, n: usize, row: usize) -> (&'a GpuQ, u32) {
+        if let Some(q) = q {
+            assert!(row.is_multiple_of(32));
+            assert!(q.q.len() * 4 >= n && q.d.len() * 32 >= n && q.s.len() * 16 >= n);
+        }
+        (q.unwrap_or(&self.gpu.no_q), q.is_some() as u32)
     }
 
     /// `a += alpha * b`
@@ -830,23 +992,31 @@ impl Batch<'_> {
         launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
-    /// `gate = silu(gate) * up`
-    pub fn swiglu(&mut self, gate: At<'_>, up: At<'_>, n: usize) {
+    /// `gate = silu(gate) * up`, quantized into `quant` as well when given.
+    pub fn swiglu(&mut self, gate: At<'_>, up: At<'_>, n: usize, quant: Option<&GpuQ>) {
         assert!(gate.1 + n <= gate.0.len() && up.1 + n <= up.0.len());
         let (g_off, u_off, n_u) = (gate.1 as u64, up.1 as u64, n as u32);
+        let (q, quant) = self.quant_out(quant, n, n);
         let mut l = self.gpu.stream.launch_builder(self.gpu.other("swiglu"));
         l.arg(&gate.0.0)
             .arg(&g_off)
             .arg(&up.0.0)
             .arg(&u_off)
-            .arg(&n_u);
+            .arg(&n_u)
+            .arg(&q.q)
+            .arg(&q.d)
+            .arg(&q.s)
+            .arg(&quant);
         launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
-    pub fn rope(&mut self, x: At<'_>, r: &RopeArgs<'_>) {
-        let heads = r.n_tok * r.n_heads;
+    /// Rotates the heads at `x`, and those at `x2` (`r.n_heads2` per token) in the same launch.
+    pub fn rope(&mut self, x: At<'_>, x2: At<'_>, r: &RopeArgs<'_>) {
+        let (heads, heads2) = (r.n_tok * r.n_heads, r.n_tok * r.n_heads2);
         assert!(x.1 + heads * r.head_dim <= x.0.len());
-        let x_off = x.1 as u64;
+        assert!(x2.1 + heads2 * r.head_dim <= x2.0.len());
+        let (x_off, x2_off) = (x.1 as u64, x2.1 as u64);
+        let (nh2, per_tok2) = (heads2 as u32, r.n_heads2 as u32);
         let ff = r.freq_factors.unwrap_or(x.0);
         let has_ff = r.freq_factors.is_some() as u32;
         let (nh, hd, rd, pos) = (
@@ -867,8 +1037,12 @@ impl Batch<'_> {
             .arg(&pos)
             .arg(&r.theta)
             .arg(&neox)
-            .arg(&per_tok);
-        let n = heads * r.rope_dim / 2;
+            .arg(&per_tok)
+            .arg(&x2.0.0)
+            .arg(&x2_off)
+            .arg(&nh2)
+            .arg(&per_tok2);
+        let n = (heads + heads2) * r.rope_dim / 2;
         launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
@@ -879,6 +1053,7 @@ impl Batch<'_> {
 
     /// One token's attention with the context split over blocks of [`ATTN_PART`] positions,
     /// then merged.
+    #[allow(clippy::too_many_arguments)]
     fn attention_decode(
         &mut self,
         q: &GpuBuf,
@@ -887,6 +1062,7 @@ impl Batch<'_> {
         out: &GpuBuf,
         scores: &GpuBuf,
         p: &AttnParams,
+        quant: Option<&GpuQ>,
     ) {
         let n_parts = (p.n_pos as usize).div_ceil(ATTN_PART);
         assert!(scores.len() >= (p.n_head * (p.head_dim + 2)) as usize * n_parts);
@@ -910,14 +1086,25 @@ impl Batch<'_> {
             .gpu
             .stream
             .launch_builder(self.gpu.other("attention_merge"));
-        l.arg(&scores.0).arg(&out.0).arg(&p.head_dim).arg(&n_parts);
+        let (xq, quant) =
+            self.quant_out(quant, (p.n_head * p.head_dim) as usize, p.head_dim as usize);
+        l.arg(&scores.0)
+            .arg(&out.0)
+            .arg(&p.head_dim)
+            .arg(&n_parts)
+            .arg(&xq.q)
+            .arg(&xq.d)
+            .arg(&xq.s)
+            .arg(&quant);
         launch(l, grid(p.n_head as usize, ATTN_PART_THREADS));
     }
 
     /// Causal attention for `p.n_tok` query tokens over the cached positions. `q`, `k`, `v` and
     /// `out` start at element 0 of their buffers. `scores` is scratch of
     /// [`Batch::attention_scratch`] per token; when it holds fewer tokens than `p.n_tok`, the
-    /// tokens run in several launches.
+    /// tokens run in several launches. The result is quantized into `quant` as well when given
+    /// (head_dim a multiple of 32).
+    #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &mut self,
         q: &GpuBuf,
@@ -926,6 +1113,7 @@ impl Batch<'_> {
         out: &GpuBuf,
         scores: &GpuBuf,
         p: &AttnParams,
+        quant: Option<&GpuQ>,
     ) {
         let per_launch = (scores.len() / (p.n_head * p.max_ctx) as usize).min(p.n_tok as usize);
         assert!(per_launch > 0, "attention scores scratch too small");
@@ -934,6 +1122,7 @@ impl Batch<'_> {
         assert!(q.len() >= q_len && out.len() >= q_len);
         assert!(p.n_pos + p.n_tok - 1 <= p.max_ctx);
         assert!(k.len() >= ((p.n_pos + p.n_tok - 1) * p.kv_dim) as usize && v.len() >= k.len());
+        let (xq, quant_u) = self.quant_out(quant, q_len, p.head_dim as usize);
         if p.n_tok == 1
             && p.n_pos > ATTN_PART_MIN
             && p.n_head / p.n_kv <= ATTN_PART_HEADS
@@ -941,7 +1130,7 @@ impl Batch<'_> {
             && p.head_dim.is_multiple_of(4)
             && p.n_pos as usize <= ATTN_PART * ATTN_PART_MAX
         {
-            return self.attention_decode(q, k, v, out, scores, p);
+            return self.attention_decode(q, k, v, out, scores, p, quant);
         }
         for tok0 in (0..p.n_tok).step_by(per_launch) {
             let mut l = self.gpu.stream.launch_builder(self.gpu.other("attention"));
@@ -957,7 +1146,11 @@ impl Batch<'_> {
                 .arg(&p.kv_dim)
                 .arg(&p.max_ctx)
                 .arg(&p.scale)
-                .arg(&tok0);
+                .arg(&tok0)
+                .arg(&xq.q)
+                .arg(&xq.d)
+                .arg(&xq.s)
+                .arg(&quant_u);
             let n = per_launch.min((p.n_tok - tok0) as usize);
             launch(l, grid2(p.n_head as usize, n, ATTN_THREADS));
         }
@@ -1008,7 +1201,7 @@ mod tests {
             let mut b = gpu.batch();
             b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
             b.quantize(At(&xb, 0), n * cols, &xq);
-            b.matmul_q(ty, rows, cols, 0, &xq, At(&y_q, 0), n);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&y_q, 0), n, false);
             b.finish();
             let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
             gpu.read(&y_f32, &mut want);
@@ -1063,9 +1256,9 @@ mod tests {
                 scale: 0.5,
             };
             let mut b = gpu.batch();
-            b.attention(&q, &k, &v, &one, &scores, &p);
+            b.attention(&q, &k, &v, &one, &scores, &p, None);
             p.n_tok = 2;
-            b.attention(&q, &k, &v, &two, &scores, &p);
+            b.attention(&q, &k, &v, &two, &scores, &p, None);
             b.finish();
             let (mut got, mut want) = (vec![0f32; q_len], vec![0f32; q_len]);
             gpu.read(&one, &mut got);

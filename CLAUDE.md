@@ -130,7 +130,13 @@ Design points that span files:
   `mvq_q6_k`): a Q4_K lane takes one sub-block in four aligned 16-byte reads, since the number
   of separate loads per step, not the arithmetic, was what the f32 matvec spent its time on
   (Mistral-7B decode 72 -> 129 tok/s). Those reads need the tensor at a multiple of 16 bytes in
-  VRAM (`Gpu::has_int8`), else f32 runs. Other weight types and MoE experts stay f32. `dp4a` has no header
+  VRAM (`Gpu::has_int8`), else f32 runs. Q6_K blocks are 210 bytes, so its lanes read the
+  aligned 16-byte words around each span and shift (`ld24`; the arena ends in 16 bytes of slack
+  for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose
+  result feeds int8 matrices quantize it on the way out (`quant_block` in `rmsnorm`, `swiglu`,
+  `attention`), the int8 matvec can add into the residual stream, `rope` takes queries and keys
+  together and a token's gate and up are one launch (`matvec_q_pair`): 12 launches a dense layer,
+  was 20. Other weight types and MoE experts stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,

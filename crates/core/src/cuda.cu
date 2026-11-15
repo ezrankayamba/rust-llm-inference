@@ -328,26 +328,31 @@ __device__ inline uint u32e(const uchar* p) {
     return u16(p) | (u16(p + 2) << 16);
 }
 
-// One 32-value block of one token per warp: q = round(x / d) with d = max|x| / 127, as int8 in
-// xq; d in xd; and d * (the sum of q) for each half of the block in xs, which the weight
-// formats with an offset need.
-extern "C" __global__ void quant_x(const float* x, ulong x_off, signed char* xq, float* xd,
-                                   float* xs, uint n_blocks) {
+// The 32 values a warp holds, one per lane, as block `blk` of quantized activations:
+// q = round(v / d) with d = max|v| / 127, as int8 in xq; d in xd; and d * (the sum of q) for
+// each half of the block in xs, which the weight formats with an offset need. The kernels
+// that produce a matvec's input call it on their way out, which saves `quant_x`'s launch.
+__device__ inline void quant_block(float v, ulong blk, signed char* xq, float* xd, float* xs) {
     uint lane = threadIdx.x % 32;
-    uint blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (blk >= n_blocks) return;
-    float v = x[x_off + (ulong)blk * 32 + lane];
     float mx = warp_max(fabsf(v));
     float inv = mx > 0 ? 127.0f / mx : 0.0f;
     int q = (int)rintf(v * inv);
-    xq[(ulong)blk * 32 + lane] = (signed char)q;
+    xq[blk * 32 + lane] = (signed char)q;
     float lo = warp_sum(lane < 16 ? (float)q : 0.0f), hi = warp_sum(lane < 16 ? 0.0f : (float)q);
     if (lane == 0) {
         float d = mx / 127.0f;
         xd[blk] = d;
-        xs[2 * (ulong)blk] = d * lo;
-        xs[2 * (ulong)blk + 1] = d * hi;
+        xs[2 * blk] = d * lo;
+        xs[2 * blk + 1] = d * hi;
     }
+}
+
+// One 32-value block of one token per warp.
+extern "C" __global__ void quant_x(const float* x, ulong x_off, signed char* xq, float* xd,
+                                   float* xs, uint n_blocks) {
+    uint blk = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (blk >= n_blocks) return;
+    quant_block(x[x_off + (ulong)blk * 32 + threadIdx.x % 32], blk, xq, xd, xs);
 }
 
 // Tile loaders: a lane's share of the 256 weights at b, for tile row r. They fill wq (64 words
@@ -491,29 +496,67 @@ __device__ inline float mvq_q4_k_step(const uchar* r, const int* xq, const float
     return (hf ? fo : f) * (float)s0 + (hf ? f : fo) * (float)s1 - mins;
 }
 
-// Q6_K, 2 super-blocks a step: lane 16u + g takes the 16 weights g of super-block u.
-__device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float* xd,
-                                      const float* xs, uint left, uint lane) {
-    uint u = lane / 16, g = lane % 16;
-    if (u >= left) return 0;
-    uint n = g / 8, k = g % 8 / 2;  // half n, quarter k of it, which 16 of its 32: g % 2
-    const uchar* b = r + u * 210;
-    const uchar* lp = b + 64 * n + 32 * (k % 2) + 16 * (g % 2);
-    const uchar* hp = b + 128 + 32 * n + 16 * (g % 2);
-    const int* xp = xq + 64 * u + 4 * g;
-    int s = 0;
-    _Pragma("unroll")
-    for (uint t = 0; t < 4; t++)
-        s = dp4a(word_q6_k(u32e(lp + 4 * t), u32e(hp + 4 * t), k), xp[t], s);
-    return h(b + 208) * (float)((const signed char*)b)[192 + g] * xd[8 * u + g / 2] * (float)s;
+struct __attribute__((aligned(16))) UL2 {
+    ulong v[2];
+};
+
+// The 24 bytes at p, at any address, from the two 16-byte words around it: two reads where
+// byte or 2-byte loads would be a dozen. Reads up to 14 bytes past them, which the weight
+// arena's slack allows for.
+__device__ inline void ld24(const uchar* p, ulong* out) {
+    uint o = (uint)((ulong)p & 15), sh = 8 * (o & 7);
+    const UL2* w = (const UL2*)(p - o);
+    UL2 lo = w[0], hi = w[1];
+    ulong a = o < 8 ? lo.v[0] : lo.v[1], b = o < 8 ? lo.v[1] : hi.v[0];
+    ulong c = o < 8 ? hi.v[0] : hi.v[1], d = o < 8 ? hi.v[1] : 0;
+    if (sh) {
+        a = (a >> sh) | (b << (64 - sh));
+        b = (b >> sh) | (c << (64 - sh));
+        c = (c >> sh) | (d << (64 - sh));
+    }
+    out[0] = a;
+    out[1] = b;
+    out[2] = c;
 }
 
-// Grid rows, ids and strides as in MATVEC; x_stride counts values of x.
+// Q6_K, 4 super-blocks a step. Lane 8u + j of super-block u takes 16 bytes of low bits (half
+// n = j / 4 of the block, its bytes 32 kk + 16 hf on): their low nibbles are 16 weights of
+// quarter kk and their high nibbles 16 of quarter kk + 2, 64 weights on.
+__device__ inline float mvq_q6_k_step(const uchar* r, const int* xq, const float* xd,
+                                      const float* xs, uint left, uint lane) {
+    uint u = lane / 8, j = lane % 8;
+    if (u >= left) return 0;
+    uint n = j / 4, kk = j / 2 % 2, hf = j % 2;
+    const uchar* b = r + u * 210;
+    ulong ql[3], qh[3], sc[3];
+    ld24(b + 64 * n + 32 * kk + 16 * hf, ql);
+    ld24(b + 128 + 32 * n + 16 * hf, qh);
+    ld24(b + 192, sc);
+    uint at = 128 * n + 32 * kk + 16 * hf;  // the first weight's index in the super-block
+    U128 xa = *(const U128*)(xq + 64 * u + at / 4);
+    U128 xb = *(const U128*)(xq + 64 * u + at / 4 + 16);
+    int sa = 0, sb = 0;
+    _Pragma("unroll")
+    for (uint t = 0; t < 4; t++) {
+        uint lw = (uint)(ql[t / 2] >> 32 * (t % 2)), hw = (uint)(qh[t / 2] >> 32 * (t % 2));
+        sa = dp4a(word_q6_k(lw, hw, kk), xa.v[t], sa);
+        sb = dp4a(word_q6_k(lw, hw, kk + 2), xb.v[t], sb);
+    }
+    // The scales of the two groups of 16: bytes at / 16 and at / 16 + 4 of 16, then d.
+    uint ia = at / 16;
+    float fa = (float)(signed char)(sc[ia / 8] >> 8 * (ia % 8));
+    float fb = (float)(signed char)(sc[ia / 8] >> 8 * (ia % 8 + 4));
+    const float* dx = xd + 8 * u + at / 32;
+    return h_bits((uint)sc[2] & 0xFFFF) * (fa * dx[0] * (float)sa + fb * dx[2] * (float)sb);
+}
+
+// Grid rows, ids and strides as in MATVEC; x_stride counts values of x. With `add`, the result
+// is added to y.
 #define MATVEC_Q(NAME, STEP, SB_BYTES, NSB)                                                    \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, const float* xd,   \
                                 const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
                                 uint row_bytes, const uint* ids, ulong id_stride,              \
-                                uint x_stride, uint x_div, uint y_stride) {                    \
+                                uint x_stride, uint x_div, uint y_stride, uint add) {          \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     if (row >= rows) return;                                                                   \
@@ -527,12 +570,13 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, cons
     for (uint c = 0; c < n_sb; c += NSB)                                                       \
         acc += STEP(r + c * SB_BYTES, q + 64 * c, d + 8 * c, s + 16 * c, n_sb - c, lane);      \
     acc = warp_sum(acc);                                                                       \
-    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
+    float* yr = y + y_off + (ulong)e * y_stride + row;                                         \
+    if (lane == 0) *yr = add ? *yr + acc : acc;                                                \
 }
 
 #ifndef RLI_MMA
 MATVEC_Q(mvq_q4_k, mvq_q4_k_step, 144, 4)
-MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 2)
+MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4)
 #endif
 
 #ifdef RLI_MMA
@@ -767,8 +811,10 @@ __device__ inline float block_max(float v, float* red) {
 }
 
 // One block per row of n; in-place when x_off == out_off on the same buffer.
+// With `quant` (n a multiple of 32), the result is quantized into xq, xd, xs as well.
 extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulong out_off,
-                                   const float* w, uint n, float eps) {
+                                   const float* w, uint n, float eps, signed char* xq,
+                                   float* xd, float* xs, uint quant) {
     __shared__ float red[32];
     const float* xr = x + x_off + (ulong)blockIdx.x * n;
     float* o = out + out_off + (ulong)blockIdx.x * n;
@@ -776,7 +822,11 @@ extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulon
     for (uint i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
     s = block_sum(s, red);
     float scale = rsqrtf(s / (float)n + eps);
-    for (uint i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * scale * w[i];
+    for (uint i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i] * scale * w[i];
+        o[i] = v;
+        if (quant) quant_block(v, ((ulong)blockIdx.x * n + i) / 32, xq, xd, xs);
+    }
 }
 
 extern "C" __global__ void axpy(float* a, ulong a_off, const float* b, ulong b_off, uint n, float alpha) {
@@ -790,21 +840,33 @@ extern "C" __global__ void add_bias(float* a, ulong a_off, const float* b, uint 
     if (i < n) a[a_off + i] += b[i % m];
 }
 
-extern "C" __global__ void swiglu(float* g, ulong g_off, const float* u, ulong u_off, uint n) {
+// With `quant` (n a multiple of 32), the result is quantized into xq, xd, xs as well.
+extern "C" __global__ void swiglu(float* g, ulong g_off, const float* u, ulong u_off, uint n,
+                                  signed char* xq, float* xd, float* xs, uint quant) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = g[g_off + i];
-        g[g_off + i] = v / (1.0f + expf(-v)) * u[u_off + i];
+        v = v / (1.0f + expf(-v)) * u[u_off + i];
+        g[g_off + i] = v;
+        if (quant) quant_block(v, i / 32, xq, xd, xs);
     }
 }
 
-// x holds n_heads heads of consecutive tokens, heads_per_tok each, the first at position pos.
+// x holds n_heads heads of consecutive tokens, heads_per_tok each, the first at position pos;
+// x2 likewise (the keys, after the queries).
 extern "C" __global__ void rope(float* x, ulong x_off, const float* ff, uint has_ff, uint n_heads,
                                 uint head_dim, uint rope_dim, uint pos, float theta, uint neox,
-                                uint heads_per_tok) {
+                                uint heads_per_tok, float* x2, ulong x2_off, uint n_heads2,
+                                uint heads_per_tok2) {
     uint half_dim = rope_dim / 2;
     uint gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= n_heads * half_dim) return;
+    if (gid >= n_heads * half_dim) {
+        gid -= n_heads * half_dim;
+        if (gid >= n_heads2 * half_dim) return;
+        x = x2;
+        x_off = x2_off;
+        heads_per_tok = heads_per_tok2;
+    }
     uint hh = gid / half_dim, i = gid % half_dim;
     float freq = powf(theta, -2.0f * (float)i / (float)rope_dim);
     if (has_ff) freq /= ff[i];
@@ -886,10 +948,12 @@ extern "C" __global__ void moe_combine(float* x, ulong x_off, const float* src, 
 
 // One block per query head (x) and token (y): token tok0 + y of the batch attends to the first
 // n_pos + tok0 + y cached positions. `scores` is one row of max_ctx per block. Needs
-// head_dim <= blockDim.x <= 1024.
+// head_dim <= blockDim.x <= 1024. With `quant` (head_dim a multiple of 32), the result is
+// quantized into xq, xd, xs as well.
 extern "C" __global__ void attention(const float* q, const float* kc, const float* vc, float* out,
                                      float* scores, uint n_head, uint n_kv, uint head_dim, uint n_pos,
-                                     uint kv_dim, uint max_ctx, float scale, uint tok0) {
+                                     uint kv_dim, uint max_ctx, float scale, uint tok0,
+                                     signed char* xq, float* xd, float* xs, uint quant) {
     __shared__ float red[32];
     __shared__ float part[1024];
     uint hh = blockIdx.x;
@@ -931,7 +995,9 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
     if (pt == 0) {
         float o = 0;
         for (uint p = 0; p < parts; p++) o += part[p * head_dim + d];
-        oh[d] = o / sum;
+        o /= sum;
+        oh[d] = o;
+        if (quant) quant_block(o, (((ulong)tok * n_head + hh) * head_dim + d) / 32, xq, xd, xs);
     }
 }
 
@@ -1029,9 +1095,10 @@ extern "C" __global__ void attention_part(const float* q, const float* kc, const
 }
 
 // One block of AP_T threads per query head: the head's `n_parts` (at most AP_PARTS) partial
-// results rescaled to their common maximum, added and normalized.
+// results rescaled to their common maximum, added and normalized. `quant` as in `attention`.
 extern "C" __global__ void attention_merge(const float* parts, float* out, uint head_dim,
-                                           uint n_parts) {
+                                           uint n_parts, signed char* xq, float* xd, float* xs,
+                                           uint quant) {
     __shared__ float red[32];
     __shared__ float wf[AP_PARTS];
     __shared__ float pa[AP_T];
@@ -1063,6 +1130,8 @@ extern "C" __global__ void attention_merge(const float* parts, float* out, uint 
     if (pt != 0) return;
     o = 0;
     for (uint p = 0; p < np; p++) o += pa[p * head_dim + d];
-    out[(ulong)blockIdx.x * head_dim + d] = o / sum;
+    o /= sum;
+    out[(ulong)blockIdx.x * head_dim + d] = o;
+    if (quant) quant_block(o, ((ulong)blockIdx.x * head_dim + d) / 32, xq, xd, xs);
 }
 #endif  // RLI_MMA

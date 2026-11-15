@@ -33,7 +33,7 @@ fn main() {
                 let mut b = gpu.batch();
                 for i in 0..count {
                     if int8 {
-                        b.matmul_q(ty, rows, cols, i * bytes, &xq, At(&y, 0), 1);
+                        b.matmul_q(ty, rows, cols, i * bytes, &xq, At(&y, 0), 1, false);
                     } else {
                         b.matvec(ty, rows, cols, i * bytes, At(&x, 0), At(&y, 0));
                     }
@@ -61,6 +61,40 @@ fn main() {
         };
         println!("{ty:?} {rows}x{cols}: f32 {}{q}", time(false));
     }
+    // Launch cost: small matvecs queued one by one, and replayed as a captured graph.
+    for (rows, cols) in [(256, 256), (2048, 2048), (4096, 4096)] {
+        let ty = GgmlType::Q4_K;
+        let bytes = ty.row_bytes(cols) * rows;
+        let count = (mem.len() / bytes).min(1024);
+        let queue = |b: &mut Batch<'_>| {
+            for i in 0..count {
+                b.matmul_q(ty, rows, cols, i * bytes, &xq, At(&y, 0), 1, false);
+            }
+        };
+        let graph = gpu.capture(queue);
+        let best = |f: &dyn Fn()| {
+            f();
+            (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    f();
+                    t.elapsed().as_secs_f64()
+                })
+                .fold(f64::MAX, f64::min)
+                / count as f64
+                * 1e6
+        };
+        let direct = best(&|| {
+            let mut b = gpu.batch();
+            queue(&mut b);
+            b.finish();
+        });
+        let replayed = best(&|| {
+            gpu.replay(&graph);
+            gpu.sync();
+        });
+        println!("launches {rows}x{cols}: direct {direct:.2} us, graph {replayed:.2} us");
+    }
     // Decode attention over 16 layers' caches in turn, by context length.
     for (n_head, n_kv, head_dim) in [(32, 8, 64), (32, 8, 128), (32, 4, 128)] {
         let max_ctx = 4096;
@@ -84,7 +118,7 @@ fn main() {
                 let mut b = gpu.batch();
                 for _ in 0..16 {
                     for l in 0..16 {
-                        b.attention(&q, &kv[2 * l], &kv[2 * l + 1], &out, &scores, &p);
+                        b.attention(&q, &kv[2 * l], &kv[2 * l + 1], &out, &scores, &p, None);
                     }
                 }
                 b.finish();

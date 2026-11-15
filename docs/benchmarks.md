@@ -26,6 +26,46 @@ warps and has others to run while one waits; the tensor-core kernels at 128 x 12
 For decode the number to look at is arithmetic instead: about 13.6 ms a token on Mistral-7B
 for 7.1e9 f32 multiply-adds, where llama.cpp's decode runs on int8 activations.
 
+## 2026-11-15: fewer launches per decoded token on CUDA, and a Q6_K matvec of wide reads
+
+Same A100 instance. A launch costs about 4 microseconds however little it does (a 256x256
+matvec, back to back), and a dense layer took 20 of them, so launches were 1.3 of
+Llama-3.2-1B's 2.9 ms a token. Now 12:
+
+- `rmsnorm`, `swiglu`, `attention` and `attention_merge` quantize their result on the way out
+  when int8 matrices read it (`quant_block`), which was a `quant_x` launch each: 4 a layer.
+- The int8 matvec adds into `y` on request, so the attention output and FFN down projections
+  write the residual stream themselves: 2 `axpy` launches a layer.
+- `rope` rotates the queries and the keys in one launch.
+- One token's gate and up projections are one launch (`matvec_q_pair`: the int8 matvec's
+  per-row matrix id, with the two tensors' distance as the stride).
+
+The output projection now runs in int8 too (it was f32: 215 MB of Q6_K a token on
+Llama-3.2-1B), and the Q6_K matvec reads 16 bytes at a time as the Q4_K one does: a lane takes
+32 weights of one of 4 super-blocks in 10 loads where 16 weights took 24. Q6_K blocks are 210
+bytes, so it reads the two aligned 16-byte words around each unaligned span and shifts
+(`ld24`). `bench_cuda`, microseconds a matvec: Q6_K 4096x4096 35.9 -> 27.4 (f32 36.8), 4096x14336
+76.8 (f32 113.1).
+
+Before is d4622a4, `bench --gpu-layers N --reps 3 --pp 0 --tg 128 [--depth 2048]`, Q4_K_M, tok/s:
+
+| Model | tg128 before | fused launches | and Q6_K | tg128 at 2048 before | after | llama.cpp tg128 / at 2048 |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 349.7 | 391.4 | 437.8 | 282.8 | 353.8 | 524.4 / 522.4 |
+| Mistral-7B | 129.4 | 135.6 | 143.5 | 107.2 | 121.9 | 155.4 / 150.9 |
+| Qwen3-30B-A3B (MoE) | 104.2 | 100.4 ± 7.1 | 114.9 | 89.5 | 96.9 | 171.5 / 166.4 |
+
+The host's load average was 65-100 during these runs (other tenants), and decode here waits on
+the CPU thread that queues launches, so a run can come out 10-20% low: one Llama-3.2-1B run of
+the last build gave 354.2 ± 36.0. Prompts are unchanged (pp512 7295.6 ± 896.3, 1881.4, 357.8).
+Int8 logits against f32, max difference on the 36-word prompt, batched / through decode:
+Llama-3.2-1B 0.148 / 0.145, Mistral-7B 0.107 / 0.121, Qwen3-30B-A3B 0.461 / 0.267; top-1 the
+same. `--precise` is unchanged (decode against batched: 7.2e-6, 1.7e-5, 6.7e-6).
+
+A captured CUDA graph replays the same launches for 2.8 microseconds each where queueing them
+takes 4.0 (`bench_cuda`, "launches"; `Gpu::capture` / `Gpu::replay`); decode does not use it yet.
+The device stream is now one of our own, since the default stream cannot be captured.
+
 ## 2026-11-15: decode attention split over the context on CUDA
 
 Same A100 instance. Past 128 cached positions, one token's attention now runs as
