@@ -68,11 +68,11 @@ fn main() {
     ] {
         let x = vec![0.5; n * cols];
         let mut y = vec![0.0; n * rows];
-        gpu.matmul(ty, rows, cols, 0, &x, &mut y, n);
+        gpu.matmul(ty, rows, cols, 0, &x, &mut y, n, true);
         let iters = 10;
         let t = Instant::now();
         for _ in 0..iters {
-            gpu.matmul(ty, rows, cols, 0, &x, &mut y, n);
+            gpu.matmul(ty, rows, cols, 0, &x, &mut y, n, true);
         }
         let s = t.elapsed().as_secs_f64() / iters as f64;
         println!(

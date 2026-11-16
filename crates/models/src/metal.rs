@@ -33,8 +33,8 @@ struct GpuLayer {
 }
 
 /// Most prompt tokens processed per GPU pass; bounds the batch scratch buffers.
-const BATCH_CHUNK: usize = 256;
-const _: () = assert!(crate::model::PROMPT_SLICE.is_multiple_of(BATCH_CHUNK));
+const BATCH_CHUNK: usize = 512;
+const _: () = assert!(BATCH_CHUNK.is_multiple_of(crate::model::PROMPT_SLICE));
 /// Positions a session's GPU KV cache holds at first; it doubles as needed, up to `max_ctx`.
 const KV_INITIAL: usize = 256;
 
@@ -75,7 +75,10 @@ impl Kv {
     fn new(m: &Metal, cap: usize, max_ctx: usize) -> Self {
         let alloc = || {
             (0..m.layers.len())
-                .map(|_| m.gpu.alloc_kv(cap * m.kv_dim, m.kv_half))
+                .map(|_| {
+                    m.gpu
+                        .alloc_kv(cap.next_multiple_of(8) * m.kv_dim, m.kv_half)
+                })
                 .collect()
         };
         Kv {
@@ -147,7 +150,8 @@ struct Metal {
     kv_dim: usize,
     n_head: usize,
     head_dim: usize,
-    /// KV cache stored as f16 (chosen at attach: f32 when the model is in precise mode).
+    /// KV cache stored as f16 and prompt matmuls on half tiles (chosen at attach: f32 when the
+    /// model is in precise mode).
     kv_half: bool,
     scratch: Mutex<Scratch>,
     /// Allocated on the first batched call.
@@ -198,6 +202,7 @@ impl Metal {
             freq_factors: self.rope_freqs.as_ref(),
         };
         let mut b = self.gpu.batch();
+        b.half = self.kv_half;
         for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
             let (k_at, v_at) = (At(&s.k, 0), At(&s.v, 0));
             b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
@@ -386,6 +391,7 @@ impl Metal {
             s.route.as_mut_slice()[w0..w0 + wts.len()].copy_from_slice(&wts);
         }
         let mut b = self.gpu.batch();
+        b.half = self.kv_half;
         let x_at = At(&s.x, 0);
         let mut off = 0;
         for (e, list) in experts.iter().zip(&lists) {
@@ -440,6 +446,10 @@ impl Accelerator for Metal {
 
     fn layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn prompt_slice(&self) -> usize {
+        BATCH_CHUNK
     }
 
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send> {
@@ -636,7 +646,7 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
         .collect();
     let logits = if covers_all { model.output.rows } else { 0 };
     let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1);
-    let batchable = c.head_dim.is_multiple_of(32) && c.head_dim <= 256;
+    let batchable = c.head_dim.is_multiple_of(8) && c.head_dim <= 256;
     let accel = Metal {
         batchable,
         kv_half: !model.precise,

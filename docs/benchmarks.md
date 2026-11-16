@@ -3,6 +3,57 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: Metal prompts against llama.cpp: half tiles, a 64-row matmul, matrix-unit attention
+
+Apple M4 (24 GB), Q4_K_M files, every layer on Metal, llama.cpp v0.9.0 (cd959ba) built with
+Metal and `-DGGML_BLAS=OFF`. tok/s, one run after the other on a quiet machine:
+
+    bench <model> --pp N --tg 128 --reps 3 --gpu-layers 999
+    llama-bench -m <model> -ngl 99 -p N -n 128 -r 3
+
+| model | test | before | after | llama.cpp |
+|---|---|---|---|---|
+| Llama-3.2-1B | pp512 | 757.5 | 1314.6 | 1395.0 |
+| Llama-3.2-1B | pp16 | 279.1 | 611.1 | 796.1 |
+| Llama-3.2-1B | tg128 | 92.5 | 92.8 | 110.6 |
+| Qwen2.5-0.5B | pp512 | 1689.7 | 2896.4 | 3358.3 |
+| Qwen2.5-0.5B | pp16 | | 996.2 | 1447.3 |
+| Qwen2.5-0.5B | tg128 | 153.3 | 153.5 | 182.3 |
+| Mistral-7B | pp512 | 117.9 | 181.6 | 181.9 |
+| Mistral-7B | pp16 | | 81.4 | 116.5 |
+| Mistral-7B | tg128 | 19.1 | 18.4 | 21.2 |
+
+Prompts went from 1.6-2x behind to level on Mistral-7B, 6% behind on Llama-3.2-1B and 14% on
+Qwen2.5-0.5B; short prompts are 1.3-1.45x behind and decode (untouched here) 16-19%.
+
+What moved Llama-3.2-1B pp512, in order (tok/s): half-precision tiles with f32 sums 757 -> 791;
+decoding weights into registers before the barrier 839; every thread loading the same amount
+(32 weights and 32 activations) and full tiles stored straight to `y` 940; 64 columns per step
+973; a 64x64 tile on four simdgroups 1044; batched attention on the matrix units with an online
+softmax 1192; K and V staged per 32 keys for the query heads of a KV head 1254; 512-token chunks
+1284; a kernel per head size 1344 (with run-time loop bounds the compiler keeps the matrices in
+memory). A 64x128 tile on eight simdgroups was slower. The later odd-chunk fix (a matrix whose
+columns are an odd multiple of 32) and the tile sizes below cost about 2%.
+
+Short prompts: one 64-token tile cost the same however few tokens it held, so a tile is now
+compiled for 8, 16, 32 and 64 tokens and the smallest that fits the rest is used. Llama-3.2-1B:
+
+| tokens | 2 | 4 | 5 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| before (matvec under 5, else a 64-token tile) | | 126.4 | 88.2 | 140.3 | 279.1 | 549.9 | 1062.5 |
+| after | 95.9 | 188.5 | 235.5 | 375.1 | 622.0 | 859.1 | 1060.2 |
+| llama.cpp | | 313.9 | 388.8 | 621.4 | 802.6 | 1109.2 | 1290.2 |
+
+A pass costs about 17 ms plus 0.68 ms a token there (a decoded token is 10.8 ms).
+
+Where the rest of pp512 goes (Llama-3.2-1B, about 390 ms): the multiplies alone are ~275 ms
+(the GPU's matrix units reach about 3.6 TFLOPS), weight reads and decode ~32 ms, activation
+reads ~27 ms, tile loads ~15 ms, attention ~30 ms, other kernels ~20 ms.
+
+Accuracy, last-token logits of a 97-token prompt against `--precise` (which keeps f32 tiles and
+an f32 cache): 0.0072 on Llama-3.2-1B, 0.0111 on Qwen2.5-0.5B, 0.0035 on Mistral-7B, top-1
+unchanged. `--precise` batched against `ref_forward.py`: 2.98e-5.
+
 ## 2026-11-15: CUDA prompts: experts grouped per chunk, 512-token chunks
 
 Same A100, Q4_K_M, all layers offloaded, `bench --pp 512 --tg 128 --reps 5`, each build twice;

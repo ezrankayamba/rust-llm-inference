@@ -53,14 +53,18 @@ const MATVEC_ID_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::Q5_K, "matvec_id_q5_k"),
     (GgmlType::Q6_K, "matvec_id_q6_k"),
 ];
-/// Below this many tokens a matmul runs as one matvec per token: a tile costs about six matvecs
-/// (measured 4.5x-6x) however few of its 32 tokens are used. MoE experts often get only a few.
-const MATMUL_MIN_TOKENS: usize = 5;
-/// Matmul output tile (`MM_R` x `MM_T` in metal.metal), computed by 128 threads.
+/// Below this many tokens a matmul runs as one matvec per token.
+const MATMUL_MIN_TOKENS: usize = 2;
+/// Rows of a matmul output tile (`MM_R` in metal.metal), computed by 128 threads, and the
+/// token counts a tile is compiled for (`matmul_*_t<tokens>`).
 const MATMUL_TILE_ROWS: usize = 64;
-const MATMUL_TILE_TOKENS: usize = 32;
+const MATMUL_TILE_TOKENS: [usize; 4] = [8, 16, 32, 64];
 const MATMUL_THREADS: usize = 128;
-const OTHER_KERNELS: [&str; 17] = [
+/// Query heads per threadgroup of `attention_batch_staged_*` (`AG_HEADS` in metal.metal), and
+/// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
+const ATTN_STAGED_HEADS: u32 = 4;
+const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
+const OTHER_KERNELS: [&str; 22] = [
     "moe_topk",
     "moe_combine",
     "rmsnorm",
@@ -78,6 +82,11 @@ const OTHER_KERNELS: [&str; 17] = [
     "attention_merge",
     "attention_batch_f32",
     "attention_batch_f16",
+    "attention_batch_staged_16",
+    "attention_batch_staged_32",
+    "attention_batch_staged_64",
+    "attention_batch_staged_96",
+    "attention_batch_staged_128",
 ];
 
 /// A shared (CPU- and GPU-visible) f32 buffer.
@@ -255,7 +264,10 @@ pub struct Gpu {
     /// `maxBufferLength`), in file order.
     weights: Vec<WeightBuf>,
     matvec: Vec<(GgmlType, Pipeline)>,
-    matmul: Vec<(GgmlType, Pipeline)>,
+    /// A kernel per tile size of [`MATMUL_TILE_TOKENS`].
+    matmul: Vec<(GgmlType, Vec<Pipeline>)>,
+    /// `matmul_h_*`: the same with half-precision tiles, for the quantized types.
+    matmul_half: Vec<(GgmlType, Vec<Pipeline>)>,
     matvec_id: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
     name: String,
@@ -282,6 +294,7 @@ struct MatmulParams {
     rows: u32,
     cols: u32,
     row_bytes: u32,
+    tok0: u32,
     n: u32,
 }
 #[repr(C)]
@@ -353,6 +366,7 @@ struct AttnMergeParams {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct BatchAttnParams {
     pub n_head: u32,
     pub n_kv: u32,
@@ -466,9 +480,20 @@ impl Gpu {
             .iter()
             .map(|&(t, n)| Ok((t, pipeline(n)?)))
             .collect::<Result<_, String>>()?;
+        let tiles = |name: &str| -> Result<Vec<Pipeline>, String> {
+            MATMUL_TILE_TOKENS
+                .iter()
+                .map(|t| pipeline(&format!("{name}_t{t}")))
+                .collect()
+        };
         let matmul = MATMUL_KERNELS
             .iter()
-            .map(|&(t, n)| Ok((t, pipeline(n)?)))
+            .map(|&(t, n)| Ok((t, tiles(n)?)))
+            .collect::<Result<_, String>>()?;
+        let matmul_half = MATMUL_KERNELS
+            .iter()
+            .filter(|(t, _)| !matches!(t, GgmlType::F32 | GgmlType::F16))
+            .map(|&(t, n)| Ok((t, tiles(&n.replace("matmul_", "matmul_h_"))?)))
             .collect::<Result<_, String>>()?;
         let matvec_id = MATVEC_ID_KERNELS
             .iter()
@@ -488,6 +513,7 @@ impl Gpu {
             weights,
             matvec,
             matmul,
+            matmul_half,
             matvec_id,
             other,
             name,
@@ -542,6 +568,7 @@ impl Gpu {
         let cmd = self.queue.commandBuffer().expect("Metal command buffer");
         let enc = cmd.computeCommandEncoder().expect("Metal compute encoder");
         Batch {
+            half: false,
             gpu: self,
             cmd,
             enc,
@@ -589,9 +616,11 @@ impl Gpu {
         x: &[f32],
         y: &mut [f32],
         n: usize,
+        half: bool,
     ) {
         let (xb, yb) = (self.upload(x), self.alloc(n * rows));
         let mut b = self.batch();
+        b.half = half;
         b.matmul(ty, rows, cols, offset, (&xb).into(), (&yb).into(), n);
         b.finish();
         // SAFETY: the batch has completed.
@@ -601,6 +630,9 @@ impl Gpu {
 
 /// Recorded GPU work; dispatches run in order. Nothing executes until [`Batch::finish`].
 pub struct Batch<'a> {
+    /// Run matmuls over quantized weights with half-precision tiles (f32 sums): about 1.4x the
+    /// speed of f32 tiles, for a relative error near 1e-3 per product. Off by default.
+    pub half: bool,
     gpu: &'a Gpu,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
@@ -740,36 +772,53 @@ impl Batch<'_> {
         );
         let row_bytes = ty.row_bytes(cols);
         let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
-        let pipeline = &self
-            .gpu
-            .matmul
+        // F32 and F16 weights keep f32 tiles: on them the activations' rounding would be the
+        // only error there is.
+        let half = self.half && !matches!(ty, GgmlType::F32 | GgmlType::F16);
+        let kernels = if half {
+            &self.gpu.matmul_half
+        } else {
+            &self.gpu.matmul
+        };
+        let tiles = &kernels
             .iter()
             .find(|(t, _)| *t == ty)
             .expect("unsupported type for Metal")
             .1;
-        self.enc.setComputePipelineState(pipeline);
-        // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
-        self.bind(1, x);
-        self.bind(2, y);
-        self.params(
-            3,
-            &MatmulParams {
-                offset: offset as u64,
-                rows: rows as u32,
-                cols: cols as u32,
-                row_bytes: row_bytes as u32,
-                n: n as u32,
-            },
-        );
-        self.dispatch2(
-            pipeline,
-            (
+        // Whole 64-token tiles, then the smallest tile that holds the rest.
+        let largest = MATMUL_TILE_TOKENS[MATMUL_TILE_TOKENS.len() - 1];
+        let full = n / largest * largest;
+        let rest = MATMUL_TILE_TOKENS
+            .iter()
+            .position(|&t| t >= n - full)
+            .expect("the rest is under the largest tile");
+        for (tok0, end, tile) in [(0, full, MATMUL_TILE_TOKENS.len() - 1), (full, n, rest)] {
+            if tok0 == end {
+                continue;
+            }
+            let pipeline = &tiles[tile];
+            self.enc.setComputePipelineState(pipeline);
+            // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset`.
+            unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+            self.bind(1, x);
+            self.bind(2, y);
+            self.params(
+                3,
+                &MatmulParams {
+                    offset: offset as u64,
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    row_bytes: row_bytes as u32,
+                    tok0: tok0 as u32,
+                    n: end as u32,
+                },
+            );
+            let grid = (
                 rows.div_ceil(MATMUL_TILE_ROWS),
-                n.div_ceil(MATMUL_TILE_TOKENS),
-            ),
-            MATMUL_THREADS,
-        );
+                (end - tok0).div_ceil(MATMUL_TILE_TOKENS[tile]),
+            );
+            self.dispatch2(pipeline, grid, MATMUL_THREADS);
+        }
     }
 
     /// Routes one token's MoE layer on the GPU: from the `n_expert` router logits, writes the
@@ -1087,7 +1136,8 @@ impl Batch<'_> {
     }
 
     /// Causal attention for `n` query rows at positions `p.pos..p.pos + n`; `k`/`v` are the
-    /// caches (rows `0..p.pos + n` filled). Needs `head_dim % 32 == 0` and `head_dim <= 256`.
+    /// caches (rows `0..p.pos + n` filled, and allocated up to the next multiple of 8 rows:
+    /// the kernel reads keys 8 at a time). Needs `head_dim % 8 == 0` and `head_dim <= 256`.
     pub fn attention_batch(
         &mut self,
         q: At<'_>,
@@ -1099,22 +1149,37 @@ impl Batch<'_> {
     ) {
         let (hd, q_dim) = (p.head_dim as usize, (p.n_head * p.head_dim) as usize);
         assert!(
-            hd.is_multiple_of(32) && hd <= 256,
+            hd.is_multiple_of(8) && hd <= 256,
             "unsupported head_dim {hd}"
         );
         assert!(q.1 + n * q_dim <= q.0.len && out.1 + n * q_dim <= out.0.len);
-        assert!(k.half == v.half && (p.pos as usize + n) * p.kv_dim as usize <= k.len.min(v.len));
+        let rows = (p.pos as usize + n).next_multiple_of(8);
+        assert!(k.half == v.half && rows * p.kv_dim as usize <= k.len.min(v.len));
         self.bind(0, q);
         self.bind_kv(1, k);
         self.bind_kv(2, v);
         self.bind(3, out);
-        self.params(4, p);
+        #[repr(C)]
+        struct Params {
+            p: BatchAttnParams,
+            n: u32,
+        }
+        self.params(4, &Params { p: *p, n: n as u32 });
+        let tiles = n.div_ceil(8);
+        if k.half && ATTN_STAGED_DIMS.contains(&hd) {
+            let subs = (p.n_head / p.n_kv).div_ceil(ATTN_STAGED_HEADS) as usize;
+            let grid = (p.n_kv as usize * subs, tiles);
+            let threads = 32 * ATTN_STAGED_HEADS as usize;
+            let kernel = format!("attention_batch_staged_{hd}");
+            self.dispatch2(self.gpu.other(&kernel), grid, threads);
+            return;
+        }
         let kernel = if k.half {
             "attention_batch_f16"
         } else {
             "attention_batch_f32"
         };
-        self.dispatch2(self.gpu.other(kernel), (p.n_head as usize, n), 32);
+        self.dispatch2(self.gpu.other(kernel), (p.n_head as usize, tiles), 32);
     }
 
     /// Submits the recorded work and waits for it.

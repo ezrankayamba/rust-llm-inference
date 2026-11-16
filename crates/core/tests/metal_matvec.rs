@@ -104,9 +104,13 @@ fn cpu_matvec(buf: &[u8], ty: GgmlType, off: usize, x: &[f32]) -> Vec<f32> {
 }
 
 fn assert_close(ty: GgmlType, what: &str, got: &[f32], want: &[f32]) {
+    assert_close_to(ty, what, got, want, 1e-3);
+}
+
+fn assert_close_to(ty: GgmlType, what: &str, got: &[f32], want: &[f32], tol: f32) {
     for (r, (g, w)) in got.iter().zip(want).enumerate() {
         assert!(
-            (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+            (g - w).abs() <= tol * (1.0 + w.abs()),
             "{ty:?} {what} row {r}: gpu {g} vs cpu {w}"
         );
     }
@@ -133,19 +137,28 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
     let buf = mem.bytes();
     let gpu =
         unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
-    // 2, 4: one matvec per token; 5: one partial token tile; 17: two full tiles plus a partial one.
-    for n in [2, 4, 5, 17] {
+    // 1: a matvec; 2 and 5: a partial 8-token tile; 12, 20, 64: the 16-, 32- and 64-token tiles;
+    // 70: a 64-token tile and an 8-token one.
+    // Half tiles round every weight and activation to f16: about 5e-4 of each product, where
+    // the fixture's products reach 10 to 40 (random K-quant scales) and 512 of them cancel to
+    // sums near 1; the largest error seen was 0.05. A misplaced tile would be off by whole
+    // products.
+    for (n, half) in [1, 2, 5, 12, 20, 64, 70]
+        .into_iter()
+        .flat_map(|n| [(n, false), (n, true)])
+    {
         let x = input(n);
         for (&ty, &off) in TYPES.iter().zip(&offsets) {
             let mut got = vec![0.0; n * ROWS];
-            gpu.matmul(ty, ROWS, COLS, off, &x, &mut got, n);
+            gpu.matmul(ty, ROWS, COLS, off, &x, &mut got, n, half);
             for t in 0..n {
                 let want = cpu_matvec(buf, ty, off, &x[t * COLS..(t + 1) * COLS]);
-                assert_close(
+                assert_close_to(
                     ty,
-                    &format!("n={n} token {t}"),
+                    &format!("n={n} half={half} token {t}"),
                     &got[t * ROWS..(t + 1) * ROWS],
                     &want,
+                    if half { 0.1 } else { 1e-3 },
                 );
             }
         }

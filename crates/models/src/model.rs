@@ -15,7 +15,8 @@ use std::collections::HashMap;
 const CPU_CHUNK: usize = 128;
 /// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls
 /// ([`Model::prompt_slice`]), unless an accelerator that runs every layer takes more. A multiple
-/// of the CPU's and Metal's chunk sizes, so slicing a prompt moves no chunk boundaries.
+/// of the CPU's chunk size and a divisor of the GPU backends', so slicing a prompt moves no
+/// chunk boundaries.
 pub const PROMPT_SLICE: usize = 256;
 const _: () = assert!(PROMPT_SLICE.is_multiple_of(CPU_CHUNK));
 

@@ -54,7 +54,7 @@ Workspace crates (dependencies flow downward only):
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
   mutex held only during generation. A client disconnect or a 30 s write stall cancels generation;
   `Engine::generate` polls between prompt slices (`Model::prompt_slice`: 256 tokens, 512 with
-  every layer on CUDA) and before each token. Responses carry
+  every layer on a GPU) and before each token. Responses carry
   OpenAI's `usage` (streams need `stream_options.include_usage`) plus a non-standard `timings`.
 
 Design points that span files:
@@ -72,12 +72,23 @@ Design points that span files:
   one sync (MoE included, see below). Per-matvec offload was measured slower than the CPU. `Model.accel` is declared first so it drops before the mapping.
 - **Prompts are batched on Metal.** `Model::forward_batch` hands the whole prompt to
   `Accelerator::forward_batch` (the default implementation loops over `forward`). Metal runs it
-  in chunks of up to 256 tokens: a tiled `simdgroup_matrix` matmul (f32; under 5 tokens, one
-  matvec per token, since a tile costs about 5-6 matvecs however few tokens it holds), and causal
-  `attention_batch` with an online softmax. Decode uses matvec, and attention split over
+  in chunks of up to 512 tokens. The matmul is tiled on `simdgroup_matrix`: 64 rows by 8, 16, 32
+  or 64 tokens (a kernel per size, since a tile costs its weight decode however few tokens it
+  holds; whole 64-token tiles, then the smallest that fits the rest), 64 columns a step, each
+  thread decoding 32 weights into registers before the barrier. Tiles are half precision with
+  f32 sums for quantized weights (logits within ~0.01 of f32 tiles), f32 for F32/F16 weights
+  and under `precise`. Causal `attention_batch` also runs on the matrix units with an online
+  softmax: over an f16 cache, `attention_batch_staged_<head size>` (16, 32, 64, 96, 128) stages
+  32 keys of K and V once for up to four query heads of a KV head; other head sizes and f32
+  caches take the general kernel. Loop bounds in these kernels are compile-time constants:
+  with run-time bounds the compiler keeps the matrices in memory (Llama-3.2-1B pp512 was 4.5%
+  slower for it). Decode uses matvec, and attention split over
   chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
   `attention_merge`), so decode speed holds up at long context.
-  head_dim not a multiple of 32 or above 256 falls back to one token at a time.
+  head_dim not a multiple of 8 or above 256 falls back to one token at a time.
+  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 level
+  on Mistral-7B, 6% behind on Llama-3.2-1B, 14% on Qwen2.5-0.5B; 16-token prompts 1.3-1.45x
+  behind; decode 16-19% behind.
 - **CPU prompts are batched too**, in chunks of 128 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers

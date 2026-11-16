@@ -14,15 +14,16 @@ use rli_models::{Engine, Finish, GenParams, Model, SamplerConfig};
 use std::cell::Cell;
 
 const D: usize = 128;
-const FF: usize = 192;
+/// An odd multiple of 32: Metal's matmul takes 64 columns a step, so `down` ends on a half step.
+const FF: usize = 160;
 const LAYERS: usize = 2;
 const VOCAB: usize = 96;
 const EXPERTS: usize = 4;
 const EXPERTS_USED: usize = 2;
 const SHARED_FF: usize = 64;
-/// Longer than the backend's batch chunk (256 on Metal, 512 on CUDA), so the second chunk
-/// reads the first one's cache.
-const PROMPT: usize = if cfg!(feature = "cuda") { 600 } else { 300 };
+/// Longer than a GPU backend's batch chunk (512 tokens), so the second chunk reads the first
+/// one's cache.
+const PROMPT: usize = 600;
 
 struct Rng(u32);
 impl Rng {
@@ -266,16 +267,30 @@ fn batched_prefill_matches_per_token_qwen2moe_with_shared_expert() {
     check("qwen2moe", 4, 2);
 }
 
-/// With every layer offloaded, `precise` only changes the KV cache type, so this isolates the
-/// f16 cache's rounding error (decode and batched attention both read it). On CUDA it also
-/// turns off the f16 GEMM that long prompts run quantized matrices through, which rounds
-/// activations and weights to f16: batched and per-token logits differed by 0.0017 here.
+/// With every layer offloaded, `precise` changes the KV cache type (decode and batched
+/// attention both read it) and turns off the half-precision prompt matmuls: CUDA's f16 GEMM
+/// for long prompts and Metal's half tiles, which round activations and weights to f16.
+/// Batched and per-token logits differed by 0.0017 on CUDA and 0.0046 on Metal here.
 #[test]
 fn f16_kv_cache_stays_close_to_f32() {
+    f16_kv_close_to_f32(4, 2);
+}
+
+/// Metal's batched attention over an f16 cache is a kernel per head size, taking the query
+/// heads that share a KV head four at a time: head sizes 16 (8 heads on one KV head, so two
+/// groups of four), 64 and 128 here, 32 above.
+#[test]
+fn f16_kv_cache_stays_close_to_f32_at_other_head_shapes() {
+    for (heads, kv_heads) in [(8, 1), (2, 1), (1, 1)] {
+        f16_kv_close_to_f32(heads, kv_heads);
+    }
+}
+
+fn f16_kv_close_to_f32(heads: usize, kv_heads: usize) {
     if !rli_models::backend::HAS_GPU {
         return;
     }
-    let path = model_path("llama", 4, 2, false);
+    let path = model_path("llama", heads, kv_heads, false);
     let prompt = prompt();
     let f32_kv = run(&load_with(&path, LAYERS, true), &prompt, true);
     let f16_model = load_with(&path, LAYERS, false);
@@ -283,7 +298,6 @@ fn f16_kv_cache_stays_close_to_f32() {
         run(&f16_model, &prompt, false),
         run(&f16_model, &prompt, true),
     );
-    let gemm = if cfg!(feature = "cuda") { 1e-2 } else { 1e-3 };
     for (what, a, b, tol) in [
         ("f16 vs f32 prompt logits", &f16_bat.0, &f32_kv.0, 1e-2),
         ("f16 vs f32 next-token logits", &f16_bat.1, &f32_kv.1, 1e-2),
@@ -291,18 +305,18 @@ fn f16_kv_cache_stays_close_to_f32() {
             "f16 batched vs per-token prompt logits",
             &f16_bat.0,
             &f16_seq.0,
-            gemm,
+            1e-2,
         ),
         (
             "f16 batched vs per-token next-token logits",
             &f16_bat.1,
             &f16_seq.1,
-            gemm,
+            1e-2,
         ),
     ] {
         let d = max_diff(a, b);
-        eprintln!("{what}: max diff {d}");
-        assert!(d < tol, "{what}: max diff {d}");
+        eprintln!("{heads} heads on {kv_heads}: {what}: max diff {d}");
+        assert!(d < tol, "{heads} heads on {kv_heads}: {what}: max diff {d}");
     }
 }
 

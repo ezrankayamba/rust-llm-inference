@@ -197,6 +197,10 @@ fn stop_ends_the_reply_before_the_match_on_both_endpoints() {
             v
         };
         let full_req = with(json!({"max_tokens": 20, "temperature": 0}));
+        // Twice: the first evaluates the prompt as a batch, every later one finds it cached and
+        // re-runs only its last token. The two paths round differently (half-precision prompt
+        // matmuls on Metal), which is enough to change this random model's text.
+        request(a, "POST", path, Some(&full_req));
         let (st, full) = request(a, "POST", path, Some(&full_req));
         assert_eq!(st, 200, "{full}");
         let full = body_text(path, &full);
