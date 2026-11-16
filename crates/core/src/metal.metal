@@ -725,11 +725,12 @@ kernel void add_bcast(device float* a [[buffer(0)]], device const float* b [[buf
     if (i < p.n) a[i] += b[i % p.m];
 }
 
-// MoE routing: dst row r = src row idx[r] (p.n = rows * dim, p.m = dim).
+// MoE routing: dst row r = src row idx[r] (p.n = rows * dim, p.m = dim, a multiple of 4).
+// Four values a thread.
 kernel void gather_rows(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
                         device const uint* idx [[buffer(2)]], constant EltParams& p [[buffer(3)]],
                         uint i [[thread_position_in_grid]]) {
-    if (i < p.n) dst[i] = src[ulong(idx[i / p.m]) * p.m + i % p.m];
+    if (4 * i < p.n) F4(dst, i) = CF4(src + ulong(idx[4 * i / p.m]) * p.m + 4 * i % p.m, 0);
 }
 
 // MoE routing for one token: softmax over the router logits, the top k (ties go to the lower
@@ -786,6 +787,22 @@ kernel void moe_combine(device float* x [[buffer(0)]], device const float* src [
     float s = 0;
     for (uint r = 0; r < p.m; r++) s += w[r] * src[r * p.n + j];
     x[j] += s;
+}
+
+// MoE combine over a chunk: row t of x += sum over j < k of w[t * k + j] * src row
+// ids[t * k + j], the outputs of the experts token t chose. Four values a thread.
+struct CombineRowsParams { uint n; uint dim; uint k; };
+
+kernel void moe_combine_rows(device float* x [[buffer(0)]], device const float* src [[buffer(1)]],
+                             device const uint* ids [[buffer(2)]], device const float* w [[buffer(3)]],
+                             constant CombineRowsParams& p [[buffer(4)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (4 * i >= p.n * p.dim) return;
+    uint t = 4 * i / p.dim, d = 4 * i % p.dim;
+    float4 s = float4(0.0f);
+    for (uint j = 0; j < p.k; j++)
+        s += w[t * p.k + j] * float4(CF4(src + ulong(ids[t * p.k + j]) * p.dim + d, 0));
+    F4(x, i) = float4(F4(x, i)) + s;
 }
 
 // MoE combine: dst row idx[r] += w[r] * src row r. Indices within one call must be distinct.

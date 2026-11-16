@@ -81,7 +81,7 @@ const MATMUL_THREADS: usize = 128;
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
 const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
-const OTHER_KERNELS: [&str; 32] = [
+const OTHER_KERNELS: [&str; 33] = [
     "matvec4_q4_k",
     "matvec4_q6_k",
     "matvec4_q8_0",
@@ -94,6 +94,7 @@ const OTHER_KERNELS: [&str; 32] = [
     "rope_store_f16",
     "moe_topk",
     "moe_combine",
+    "moe_combine_rows",
     "rmsnorm",
     "add",
     "add_bcast",
@@ -355,6 +356,12 @@ struct TopkParams {
 struct CombineParams {
     n: u32,
     m: u32,
+}
+#[repr(C)]
+struct CombineRowsParams {
+    n: u32,
+    dim: u32,
+    k: u32,
 }
 #[repr(C)]
 struct NormParams {
@@ -1141,6 +1148,41 @@ impl Batch<'_> {
         );
     }
 
+    /// Row `t` of `x` += `Σ_{j<k} w[t·k + j] · src[ids[t·k + j]]` for `n` rows of `dim` (a
+    /// multiple of 4): each token's chosen experts' outputs, combined. `ids` must index rows
+    /// within `src`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_combine_rows(
+        &mut self,
+        x: At<'_>,
+        src: At<'_>,
+        ids: At<'_>,
+        w: At<'_>,
+        n: usize,
+        dim: usize,
+        k: usize,
+    ) {
+        assert!(dim.is_multiple_of(4) && x.1 + n * dim <= x.0.len);
+        assert!(ids.1 + n * k <= ids.0.len && w.1 + n * k <= w.0.len);
+        self.bind(0, x);
+        self.bind(1, src);
+        self.bind(2, ids);
+        self.bind(3, w);
+        self.params(
+            4,
+            &CombineRowsParams {
+                n: n as u32,
+                dim: dim as u32,
+                k: k as u32,
+            },
+        );
+        self.dispatch(
+            self.gpu.other("moe_combine_rows"),
+            (n * dim).div_ceil(4 * ELT_THREADS),
+            ELT_THREADS,
+        );
+    }
+
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
     pub fn rmsnorm(&mut self, x: At<'_>, out: At<'_>, w: &GpuBuf, rows: usize, n: usize, eps: f32) {
         self.bind(0, x);
@@ -1205,7 +1247,20 @@ impl Batch<'_> {
         self.bind(0, src);
         self.bind(1, dst);
         self.bind(2, idx);
-        self.indexed("gather_rows", 3, rows, dim);
+        assert!(dim.is_multiple_of(4));
+        self.params(
+            3,
+            &EltParams {
+                n: (rows * dim) as u32,
+                alpha: 0.0,
+                m: dim as u32,
+            },
+        );
+        self.dispatch(
+            self.gpu.other("gather_rows"),
+            (rows * dim).div_ceil(4 * ELT_THREADS),
+            ELT_THREADS,
+        );
     }
 
     /// Row `idx[r]` of `dst` += `w[r]` * row `r` of `src`; the `rows` indices must be distinct.

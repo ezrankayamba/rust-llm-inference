@@ -116,9 +116,16 @@ Design points that span files:
   `moe_combine` adds the weighted outputs. A per-layer sync cost ~0.35 ms; removing it took
   Qwen3-30B-A3B decode from 19.6 to 29.1 tok/s. Experts stored as separate tensors (old
   Mixtral files) and prompts take the CPU-routed path: per layer and chunk, one router matmul
-  and one sync; the CPU picks each token's top-k, then each used expert runs as a matmul over
-  the rows gathered for it (`gather_rows`), added back weighted (`scatter_axpy`). A shared
-  expert runs over all rows with a per-token sigmoid gate.
+  and one sync; the CPU picks each token's top-k and sorts the (token, expert) pairs by expert.
+  Then one `gather_rows` of every pair's input, each used expert's gate and up as matmuls over
+  its own rows with no barrier between experts (a wait per expert halved the speed), one
+  SwiGLU, every down, and `moe_combine_rows` adds each token's k outputs, weighted. A shared
+  expert runs over all rows with a per-token sigmoid gate (`scatter_axpy`). That scratch is a
+  row per token and chosen expert (92 MB for 512 tokens of Qwen3-30B-A3B), so the batch
+  scratch is sized for the longest chunk seen, not for 512: on a model that barely fits,
+  Metal fails a command buffer with "Insufficient Memory" when its buffers can't all be
+  wired, and a few tens of MB decide it. Check `/usr/bin/time -l` (peak memory footprint)
+  after changing what is allocated.
 - **Accuracy.** The fast CPU path quantizes activations to int8 (Q8 blocks): logits differ from
   f32 by ~0.1–0.6 but top-1 matches. `Model.precise` (the `--precise` flag in `dump_logits`)
   keeps f32 activations and matches the NumPy reference to ≤4e-5 on the CPU and ≤1.1e-4 with Metal

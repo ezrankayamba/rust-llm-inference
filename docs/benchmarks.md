@@ -3,6 +3,37 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: Metal MoE prompts: experts side by side, and 600 MB of scratch that wasn't needed
+
+Qwen3-30B-A3B Q4_K_M (18.6 GB) on the 24 GB M4, every layer offloaded; alternating, rested.
+
+    bench models/Qwen3-30B-A3B-Q4_K_M.gguf --pp <n> --tg 48 --reps 3 --gpu-layers 999
+    llama-bench -m models/Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 -p <n> -n 48 -r 3
+
+| | before | after | llama.cpp |
+|---|---|---|---|
+| pp128 | 121-125 | 254 | 284-288 |
+| pp512 | | 290 | fails: Insufficient Memory |
+| tg48 | 37.9 | 37.9 | 42.0 |
+| peak memory footprint, pp128 | 784 MB | 185 MB | 190 MB |
+
+- **The gate and up scratch was a chunk of vocabulary-sized rows.** `max_ff` took the most rows
+  of any matrix with n_embd columns, which includes the output head: 2 x 512 x 151936 floats,
+  622 MB of GPU memory (525 MB on Llama-3.2-1B, whose footprint went 682 -> 218 MB). On this
+  model the machine has about 15 MB to spare, so it also decided what else could run: Metal
+  fails a command buffer with "Insufficient Memory" when its buffers can't all be wired, and a
+  larger scratch that still fits slows everything (the same pp128 with scratch for 512 tokens:
+  165 tok/s against 253). The batch scratch is now sized for the longest chunk seen.
+- **A layer's experts run side by side.** Per expert there was a gather, three matmuls, the
+  activation and a scatter, each waiting for the one before: 640 waits a layer for a few rows
+  of work each. Now one gather of every (token, expert) pair sorted by expert, each expert's
+  gate and up over its own rows with no barrier between them, one activation, every down, and
+  one combine per token (`moe_combine_rows`). With the barriers put back: 85 tok/s against 153
+  (measured at 64 tokens a group).
+- What remains is the small tile: a chunk of 128 tokens gives an expert 8 rows on average, so
+  all 17 GB of experts are decoded for 8-token tiles, at the 37 GB/s that dense 16-token
+  prompts get too (llama.cpp: 41).
+
 ## 2026-11-16: Metal prompts: direct 16-weight decoders, a matmul that adds into its output
 
 Same protocol as the decode entry below (alternating, rested). pp512, tok/s:

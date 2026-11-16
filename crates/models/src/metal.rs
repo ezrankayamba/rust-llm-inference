@@ -53,9 +53,10 @@ struct Scratch {
     up: GpuBuf,
     router: GpuBuf,
     shared_gate: GpuBuf,
-    /// Rows gathered for one expert.
+    /// A chunk's rows gathered for the experts that chose them, sorted by expert.
     gx: GpuBuf,
-    /// Per-expert token indices (u32 bits) in the first half, their weights in the second.
+    /// Three equal parts (see `Metal::moe`): each gathered row's token, each token's gathered
+    /// rows (both u32 bits), and the weights. GPU-routed decode keeps ids and weights in halves.
     route: GpuBuf,
     logits: GpuBuf,
 }
@@ -116,6 +117,8 @@ impl Kv {
 
 impl Scratch {
     fn new(gpu: &Gpu, c: &Config, max_ff: usize, logits: usize, cap: usize) -> Self {
+        // An MoE layer keeps a row per token and chosen expert.
+        let pairs = cap * c.n_expert_used;
         Scratch {
             cap,
             x: gpu.alloc(cap * c.n_embd),
@@ -124,15 +127,15 @@ impl Scratch {
             k: gpu.alloc(cap * c.kv_dim()),
             v: gpu.alloc(cap * c.kv_dim()),
             att: gpu.alloc(cap * c.q_dim()),
-            // GPU-routed MoE decode keeps one row per chosen expert (plus the shared one).
-            tmp: gpu.alloc(cap.max(c.n_expert_used + 1) * c.n_embd),
-            gate: gpu.alloc(cap.max(c.n_expert_used) * max_ff),
-            up: gpu.alloc(cap.max(c.n_expert_used) * max_ff),
+            // GPU-routed decode keeps a row per chosen expert, plus the shared one.
+            tmp: gpu.alloc(cap.max(pairs).max(c.n_expert_used + 1) * c.n_embd),
+            gate: gpu.alloc(cap.max(pairs) * max_ff),
+            up: gpu.alloc(cap.max(pairs) * max_ff),
             router: gpu.alloc(cap * c.n_expert.max(1)),
             shared_gate: gpu.alloc(cap),
-            gx: gpu.alloc(if c.n_expert > 0 { cap * c.n_embd } else { 0 }),
+            gx: gpu.alloc(pairs * c.n_embd),
             // Each token is in n_expert_used expert lists, plus the shared expert's list.
-            route: gpu.alloc(2 * cap * (c.n_expert_used + 1)),
+            route: gpu.alloc(3 * cap * (c.n_expert_used + 1)),
             logits: gpu.alloc(logits),
         }
     }
@@ -411,13 +414,14 @@ impl Metal {
             )
         };
         // Softmax over all experts, top-k, optionally renormalized over the chosen k.
+        let (k, ff) = (c.n_expert_used, experts[0].gate.rows);
         let mut lists: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne];
         for (t, row) in router_out.chunks_exact(ne).enumerate() {
             let mut probs = row.to_vec();
             ops::softmax(&mut probs);
             let mut order: Vec<usize> = (0..ne).collect();
             order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let chosen = &order[..c.n_expert_used];
+            let chosen = &order[..k];
             let norm = if c.norm_topk {
                 chosen.iter().map(|&e| probs[e]).sum::<f32>()
             } else {
@@ -427,36 +431,61 @@ impl Metal {
                 lists[e].push((t as u32, probs[e] / norm));
             }
         }
-        let (mut idx, mut wts): (Vec<u32>, Vec<f32>) = lists.iter().flatten().copied().unzip();
+        // The (token, expert) pairs sorted by expert: pair p is a row of the scratch buffers.
+        // `idx[p]` is its token; token t's k pairs and their weights are at `t * k..`.
+        let pairs = n * k;
+        let mut idx: Vec<u32> = Vec::with_capacity(pairs + n);
+        let (mut ids, mut wts) = (vec![0u32; pairs], vec![0.0f32; pairs]);
+        let mut filled = vec![0; n];
+        for &(t, w) in lists.iter().flatten() {
+            let slot = t as usize * k + filled[t as usize];
+            (ids[slot], wts[slot]) = (idx.len() as u32, w);
+            filled[t as usize] += 1;
+            idx.push(t);
+        }
         if shared.is_some() {
             idx.extend(0..n as u32);
             wts.extend(gates.iter().map(|g| 1.0 / (1.0 + (-g).exp())));
         }
-        let w0 = s.route.len() / 2;
+        let r = s.route.len() / 3;
         // SAFETY: nothing is in flight.
         unsafe {
             s.route.write_u32(0, &idx);
-            s.route.as_mut_slice()[w0..w0 + wts.len()].copy_from_slice(&wts);
+            s.route.write_u32(r, &ids);
+            s.route.as_mut_slice()[2 * r..2 * r + wts.len()].copy_from_slice(&wts);
         }
         let mut b = self.gpu.batch();
         b.half = self.kv_half;
-        let x_at = At(&s.x, 0);
-        let mut off = 0;
-        for (e, list) in experts.iter().zip(&lists) {
-            let m = list.len();
-            if m == 0 {
-                continue;
-            }
-            b.gather_rows(At(&s.xb, 0), At(&s.gx, 0), At(&s.route, off), m, n_embd);
-            ffn(&mut b, s, e, At(&s.gx, 0), At(&s.tmp, 0), m);
-            let (i, w) = (At(&s.route, off), At(&s.route, w0 + off));
-            b.scatter_axpy(x_at, At(&s.tmp, 0), i, w, m, n_embd);
-            off += m;
+        // A dispatch that waits costs more than a few rows' matmul, and there are three per
+        // expert: so one gather, every expert's gate and up side by side, one activation,
+        // every down, one combine. Each expert reads and writes its own rows.
+        b.gather_rows(At(&s.xb, 0), At(&s.gx, 0), At(&s.route, 0), pairs, n_embd);
+        let mut runs = Vec::new(); // each used expert and its rows: (expert, first, count)
+        for (e, list) in experts.iter().zip(&lists).filter(|(_, l)| !l.is_empty()) {
+            assert_eq!(e.gate.rows, ff);
+            let off = runs.last().map_or(0, |&(_, off, m)| off + m);
+            runs.push((e, off, list.len()));
         }
+        for &(e, off, m) in &runs {
+            let x = At(&s.gx, off * n_embd);
+            mm(&mut b, &e.gate, x, At(&s.gate, off * ff), m);
+            b.free = true;
+            mm(&mut b, &e.up, x, At(&s.up, off * ff), m);
+        }
+        b.free = false;
+        b.swiglu(At(&s.gate, 0), At(&s.up, 0), pairs * ff);
+        for &(e, off, m) in &runs {
+            let (x, y) = (At(&s.gate, off * ff), At(&s.tmp, off * n_embd));
+            mm(&mut b, &e.down, x, y, m);
+            b.free = true;
+        }
+        b.free = false;
+        let (ids, w) = (At(&s.route, r), At(&s.route, 2 * r));
+        b.moe_combine_rows(At(&s.x, 0), At(&s.tmp, 0), ids, w, n, n_embd, k);
         if let Some((_, e)) = shared {
             ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
-            let (i, w) = (At(&s.route, off), At(&s.route, w0 + off));
-            b.scatter_axpy(x_at, At(&s.tmp, 0), i, w, n, n_embd);
+            let (i, w) = (At(&s.route, pairs), At(&s.route, 2 * r + pairs));
+            b.scatter_axpy(At(&s.x, 0), At(&s.tmp, 0), i, w, n, n_embd);
         }
         b
     }
@@ -537,14 +566,24 @@ impl Accelerator for Metal {
             .expect("state created by this accelerator");
         kv.reserve(self, pos + xs.len() / n_embd);
         let mut guard = self.batch.lock().unwrap_or_else(|p| p.into_inner());
-        let s = guard.get_or_insert_with(|| {
+        // Sized for the longest chunk seen: an MoE layer's rows per token and chosen expert
+        // come to 92 MB for 512 tokens of Qwen3-30B-A3B.
+        let need = (xs.len() / n_embd).min(BATCH_CHUNK);
+        if guard.as_ref().is_none_or(|s| s.cap < need) {
             let logits = if self.covers_all {
                 model.output.rows
             } else {
                 0
             };
-            Scratch::new(&self.gpu, &model.cfg, self.max_ff, logits, BATCH_CHUNK)
-        });
+            *guard = Some(Scratch::new(
+                &self.gpu,
+                &model.cfg,
+                self.max_ff,
+                logits,
+                need,
+            ));
+        }
+        let s = guard.as_ref().expect("allocated above");
         let n_chunks = xs.len().div_ceil(BATCH_CHUNK * n_embd);
         let mut done = false;
         for (i, chunk) in xs.chunks_mut(BATCH_CHUNK * n_embd).enumerate() {
@@ -668,8 +707,12 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
             w.ty, w.cols
         )));
     }
-    let max_ff = weights
+    // The widest FFN among the layers. Not the output head, which has n_embd columns too:
+    // counting its rows made the gate and up scratch a chunk of vocabulary-sized rows each
+    // (622 MB on Qwen3-30B-A3B).
+    let max_ff = model.layers[..n]
         .iter()
+        .flat_map(layer_weights)
         .filter(|w| w.cols == c.n_embd)
         .map(|w| w.rows)
         .max()
