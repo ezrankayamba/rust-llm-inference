@@ -8,7 +8,12 @@ struct Params {
     uint rows;
     uint cols;
     uint row_bytes;
+    uint add;         // 0: y = W x, 1: y += W x (the residual stream), 2: y = W x + bias
 };
+
+inline float mv_base(uint add, device const float* y, device const float* bias, uint row) {
+    return add == 1 ? y[row] : add == 2 ? bias[row] : 0.0f;
+}
 
 constant uint ROWS_PER_TG = 4;
 
@@ -27,6 +32,13 @@ inline float chunk_f16(device const uchar* r, uint c, device const float* x) {
     for (uint i = 0; i < 32; i++) s += float(w[i]) * x[i];
     return s;
 }
+
+// Weights are read four bytes at a time: the number of loads, not the arithmetic, is what a
+// thread waits on.
+inline uint4 bytes4(device const uchar* p) { return uint4(*(device const packed_uchar4*)p); }
+inline float sum4(float4 v) { return (v.x + v.y) + (v.z + v.w); }
+inline uint word4(device const uchar* p) { return as_type<uint>(uchar4(*(device const packed_uchar4*)p)); }
+inline float4 unpack4(uint w) { return float4(as_type<uchar4>(w)); }
 
 inline float chunk_q4_0(device const uchar* r, uint c, device const float* x) {
     device const uchar* b = r + c * 18;
@@ -119,6 +131,7 @@ inline float chunk_q6_k(device const uchar* r, uint c, device const float* x) {
 #define MATVEC(NAME, CHUNK)                                                                   \
 kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
                  device float* y [[buffer(2)]], constant Params& p [[buffer(3)]],            \
+                 device const float* bias [[buffer(4)]],                                     \
                  uint tg [[threadgroup_position_in_grid]],                                    \
                  uint sg [[simdgroup_index_in_threadgroup]],                                  \
                  uint lane [[thread_index_in_simdgroup]]) {                                   \
@@ -128,17 +141,242 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
     float acc = 0;                                                                            \
     for (uint c = lane; c < p.cols / 32; c += 32) acc += CHUNK(r, c, x + c * 32);             \
     acc = simd_sum(acc);                                                                      \
-    if (lane == 0) y[row] = acc;                                                              \
+    if (lane == 0) y[row] = acc + mv_base(p.add, y, bias, row);                                       \
 }
+
+
+// Quantized matvecs: a lane takes a unit of two rows: 64 columns of a K-quant, as the two
+// 32-weight chunks that share their bytes, or one block of the 32-weight formats. It reads x once for both rows, and weights four bytes at a time. No arrays:
+// values a loop indexes are kept in memory.
+// Pair p of a Q4_K row is sub-blocks 2p' and 2p'+1 (p' = p % 4): the nibbles of 32 bytes.
+inline float2 pair_q4_k(device const uchar* r0, device const uchar* r1, uint p,
+                        device const float* x) {
+    uint sub = (p % 4) * 2;
+    device const uchar* b0 = r0 + (p / 4) * 144;
+    device const uchar* b1 = r1 + (p / 4) * 144;
+    float sa0, ma0, sa1, ma1, sb0, mb0, sb1, mb1;
+    scale_min_k4(sub, b0 + 4, sa0, ma0);
+    scale_min_k4(sub + 1, b0 + 4, sa1, ma1);
+    scale_min_k4(sub, b1 + 4, sb0, mb0);
+    scale_min_k4(sub + 1, b1 + 4, sb1, mb1);
+    float2 sc0 = float2(sa0, sb0), sc1 = float2(sa1, sb1);
+    float2 m0 = float2(ma0, mb0), m1 = float2(ma1, mb1);
+    device const uchar* q0 = b0 + 16 + 16 * sub;
+    device const uchar* q1 = b1 + 16 + 16 * sub;
+    device const packed_float4* xv = (device const packed_float4*)(x + p * 64);
+    float4 s00 = 0, s01 = 0, s10 = 0, s11 = 0, x0 = 0, x1 = 0;
+    for (uint l = 0; l < 8; l++) {
+        float4 a = xv[l], c = xv[8 + l];
+        uint v0 = word4(q0 + 4 * l), v1 = word4(q1 + 4 * l);
+        s00 += unpack4(v0 & 0x0F0F0F0Fu) * a;
+        s01 += unpack4((v0 >> 4) & 0x0F0F0F0Fu) * c;
+        s10 += unpack4(v1 & 0x0F0F0F0Fu) * a;
+        s11 += unpack4((v1 >> 4) & 0x0F0F0F0Fu) * c;
+        x0 += a;
+        x1 += c;
+    }
+    float2 d = float2(h(b0), h(b1)), dm = float2(h(b0 + 2), h(b1 + 2));
+    return d * (sc0 * float2(sum4(s00), sum4(s10)) + sc1 * float2(sum4(s01), sum4(s11))) -
+           dm * (m0 * sum4(x0) + m1 * sum4(x1));
+}
+
+// Pair p of a Q6_K row is chunks k and k + 2 of a 128-weight group: the nibbles of 32 bytes
+// of ql, with two of the four bit pairs of qh.
+// The six bits of a weight are put together a word (four weights) at a time, and the -32 that
+// centres them is taken off once per 16 weights, as 32 times the sum of x.
+inline void half_q6_k(device const uchar* ql, device const uchar* qh, uint k, uint l,
+                      float4 a, float4 c, thread float4& sa, thread float4& sb) {
+    uint lo = word4(ql + 4 * l), hi = word4(qh + 4 * l) >> (2 * k);
+    sa += unpack4((lo & 0x0F0F0F0Fu) | ((hi & 0x03030303u) << 4)) * a;
+    sb += unpack4(((lo >> 4) & 0x0F0F0F0Fu) | (hi & 0x30303030u)) * c;
+}
+inline float2 pair_q6_k(device const uchar* r0, device const uchar* r1, uint p,
+                        device const float* x) {
+    uint n = (p % 4) / 2, k = p % 2;
+    uint o = (p / 4) * 210;
+    device const uchar* b0 = r0 + o;
+    device const uchar* b1 = r1 + o;
+    uint lq = 64 * n + 32 * k, hq = 128 + 32 * n;
+    device const char* sc0 = (device const char*)(b0 + 192) + 8 * n + 2 * k;
+    device const char* sc1 = (device const char*)(b1 + 192) + 8 * n + 2 * k;
+    device const packed_float4* xv =
+        (device const packed_float4*)(x + (p / 4) * 256 + n * 128 + k * 32);
+    float4 a00 = 0, a01 = 0, a02 = 0, a03 = 0, a10 = 0, a11 = 0, a12 = 0, a13 = 0;
+    float4 x0 = 0, x1 = 0, x2 = 0, x3 = 0;
+    for (uint l = 0; l < 4; l++) {
+        float4 a = xv[l], c = xv[16 + l];
+        half_q6_k(b0 + lq, b0 + hq, k, l, a, c, a00, a02);
+        half_q6_k(b1 + lq, b1 + hq, k, l, a, c, a10, a12);
+        x0 += a;
+        x2 += c;
+    }
+    for (uint l = 4; l < 8; l++) {
+        float4 a = xv[l], c = xv[16 + l];
+        half_q6_k(b0 + lq, b0 + hq, k, l, a, c, a01, a03);
+        half_q6_k(b1 + lq, b1 + hq, k, l, a, c, a11, a13);
+        x1 += a;
+        x3 += c;
+    }
+    float4 xs = 32.0f * float4(sum4(x0), sum4(x1), sum4(x2), sum4(x3));
+    float4 s0 = float4(sum4(a00), sum4(a01), sum4(a02), sum4(a03)) - xs;
+    float4 s1 = float4(sum4(a10), sum4(a11), sum4(a12), sum4(a13)) - xs;
+    float4 w0 = float4(float(sc0[0]), float(sc0[1]), float(sc0[4]), float(sc0[5]));
+    float4 w1 = float4(float(sc1[0]), float(sc1[1]), float(sc1[4]), float(sc1[5]));
+    return float2(h(b0 + 208) * dot(w0, s0), h(b1 + 208) * dot(w1, s1));
+}
+
+// The 32-weight block formats, a block of two rows per lane.
+inline float2 two_q4_0(device const uchar* r0, device const uchar* r1, uint c,
+                       device const float* x) {
+    device const uchar* b0 = r0 + c * 18;
+    device const uchar* b1 = r1 + c * 18;
+    device const packed_float4* xv = (device const packed_float4*)(x + c * 32);
+    float4 s0 = 0, s1 = 0, xs = 0;
+    for (uint j = 0; j < 4; j++) {
+        float4 a = xv[j], e = xv[4 + j];
+        uint v0 = word4(b0 + 2 + 4 * j), v1 = word4(b1 + 2 + 4 * j);
+        s0 += unpack4(v0 & 0x0F0F0F0Fu) * a + unpack4((v0 >> 4) & 0x0F0F0F0Fu) * e;
+        s1 += unpack4(v1 & 0x0F0F0F0Fu) * a + unpack4((v1 >> 4) & 0x0F0F0F0Fu) * e;
+        xs += a + e;
+    }
+    return float2(h(b0), h(b1)) * (float2(sum4(s0), sum4(s1)) - 8.0f * sum4(xs));
+}
+
+// Four bits of n, one to bit 4 of each byte: a weight's fifth bit, beside its nibble.
+inline uint fifth4(uint n) { return (((n & 15u) * 0x00204081u) & 0x01010101u) << 4; }
+inline float4 quad_q5_0(uint v, uint qh, uint j, float4 a, float4 e) {
+    return unpack4((v & 0x0F0F0F0Fu) | fifth4(qh >> (4 * j))) * a +
+           unpack4(((v >> 4) & 0x0F0F0F0Fu) | fifth4(qh >> (16 + 4 * j))) * e;
+}
+inline float2 two_q5_0(device const uchar* r0, device const uchar* r1, uint c,
+                       device const float* x) {
+    device const uchar* b0 = r0 + c * 22;
+    device const uchar* b1 = r1 + c * 22;
+    device const packed_float4* xv = (device const packed_float4*)(x + c * 32);
+    uint h0 = word4(b0 + 2), h1 = word4(b1 + 2);
+    float4 s0 = 0, s1 = 0, xs = 0;
+    for (uint j = 0; j < 4; j++) {
+        float4 a = xv[j], e = xv[4 + j];
+        s0 += quad_q5_0(word4(b0 + 6 + 4 * j), h0, j, a, e);
+        s1 += quad_q5_0(word4(b1 + 6 + 4 * j), h1, j, a, e);
+        xs += a + e;
+    }
+    return float2(h(b0), h(b1)) * (float2(sum4(s0), sum4(s1)) - 16.0f * sum4(xs));
+}
+
+inline float2 two_q8_0(device const uchar* r0, device const uchar* r1, uint c,
+                       device const float* x) {
+    device const uchar* b0 = r0 + c * 34;
+    device const uchar* b1 = r1 + c * 34;
+    device const packed_float4* xv = (device const packed_float4*)(x + c * 32);
+    float4 s0 = 0, s1 = 0;
+    for (uint j = 0; j < 8; j++) {
+        float4 a = xv[j];
+        s0 += float4(char4(*(device const packed_char4*)(b0 + 2 + 4 * j))) * a;
+        s1 += float4(char4(*(device const packed_char4*)(b1 + 2 + 4 * j))) * a;
+    }
+    return float2(h(b0), h(b1)) * float2(sum4(s0), sum4(s1));
+}
+
+#define MATVEC2(NAME, PAIR, U)                                                                   \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant Params& p [[buffer(3)]],            \
+                 device const float* bias [[buffer(4)]],                                     \
+                 uint tg [[threadgroup_position_in_grid]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = (tg * ROWS_PER_TG + sg) * 2;                                                   \
+    if (row >= p.rows) return;                                                                \
+    device const uchar* r = w + p.offset + ulong(row) * p.row_bytes;                          \
+    /* An odd row count: the last simdgroup takes its row twice and drops one sum. */         \
+    device const uchar* r1 = row + 1 < p.rows ? r + p.row_bytes : r;                          \
+    float2 acc = 0;                                                                           \
+    for (uint c = lane; c < p.cols / U; c += 32) acc += PAIR(r, r1, c, x);                   \
+    float s0 = simd_sum(acc.x), s1 = simd_sum(acc.y);                                         \
+    if (lane == 0) {                                                                          \
+        y[row] = s0 + mv_base(p.add, y, bias, row);                                                    \
+        if (row + 1 < p.rows) y[row + 1] = s1 + mv_base(p.add, y, bias, row + 1);                      \
+    }                                                                                         \
+}
+
+// The same with four rows a simdgroup, for a matrix of very many rows (the output head):
+// 8% faster there, where a lane's fixed costs are spread over only 64 columns, but slower on
+// a layer's matrices, whose dispatch must wait for its last, longer threads.
+#define MATVEC4(NAME, PAIR, U)                                                                   \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant Params& p [[buffer(3)]],            \
+                 device const float* bias [[buffer(4)]],                                     \
+                 uint tg [[threadgroup_position_in_grid]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = (tg * ROWS_PER_TG + sg) * 4;                                                   \
+    if (row >= p.rows) return;                                                                \
+    device const uchar* r = w + p.offset + ulong(row) * p.row_bytes;                          \
+    /* Rows past the end repeat the last one; their sums are dropped. */                      \
+    uint last = p.rows - 1 - row;                                                             \
+    device const uchar* r1 = r + min(1u, last) * p.row_bytes;                                 \
+    device const uchar* r2 = r + min(2u, last) * p.row_bytes;                                 \
+    device const uchar* r3 = r + min(3u, last) * p.row_bytes;                                 \
+    float2 acc = 0, acd = 0;                                                                  \
+    for (uint c = lane; c < p.cols / U; c += 32) {                                            \
+        acc += PAIR(r, r1, c, x);                                                             \
+        acd += PAIR(r2, r3, c, x);                                                            \
+    }                                                                                         \
+    float s0 = simd_sum(acc.x), s1 = simd_sum(acc.y);                                         \
+    float s2 = simd_sum(acd.x), s3 = simd_sum(acd.y);                                         \
+    if (lane == 0) {                                                                          \
+        y[row] = s0 + mv_base(p.add, y, bias, row);                                                    \
+        if (last >= 1) y[row + 1] = s1 + mv_base(p.add, y, bias, row + 1);                             \
+        if (last >= 2) y[row + 2] = s2 + mv_base(p.add, y, bias, row + 2);                             \
+        if (last >= 3) y[row + 3] = s3 + mv_base(p.add, y, bias, row + 3);                             \
+    }                                                                                         \
+}
+
+MATVEC4(matvec4_q4_k, pair_q4_k, 64)
+MATVEC4(matvec4_q6_k, pair_q6_k, 64)
+MATVEC4(matvec4_q8_0, two_q8_0, 32)
+
+// One token's gate and up matvecs with the SwiGLU between them: the pair kernels' two rows
+// are row `row` of each matrix, so y = silu(gate x) * (up x) costs one dispatch, not three.
+struct SwigluParams {
+    ulong gate;       // byte offsets of row 0 in their weight buffers
+    ulong up;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+};
+
+#define MATVEC_SWIGLU(NAME, PAIR, U)                                                             \
+kernel void NAME(device const uchar* wg [[buffer(0)]], device const uchar* wu [[buffer(1)]], \
+                 device const float* x [[buffer(2)]], device float* y [[buffer(3)]],         \
+                 constant SwigluParams& p [[buffer(4)]],                                      \
+                 uint tg [[threadgroup_position_in_grid]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = tg * ROWS_PER_TG + sg;                                                         \
+    if (row >= p.rows) return;                                                                \
+    device const uchar* rg = wg + p.gate + ulong(row) * p.row_bytes;                          \
+    device const uchar* ru = wu + p.up + ulong(row) * p.row_bytes;                            \
+    float2 acc = 0;                                                                           \
+    for (uint c = lane; c < p.cols / U; c += 32) acc += PAIR(rg, ru, c, x);                   \
+    float g = simd_sum(acc.x), u = simd_sum(acc.y);                                           \
+    if (lane == 0) y[row] = g / (1.0f + exp(-g)) * u;                                         \
+}
+
+MATVEC_SWIGLU(matvec_swiglu_q4_k, pair_q4_k, 64)
+MATVEC_SWIGLU(matvec_swiglu_q6_k, pair_q6_k, 64)
+MATVEC_SWIGLU(matvec_swiglu_q4_0, two_q4_0, 32)
+MATVEC_SWIGLU(matvec_swiglu_q5_0, two_q5_0, 32)
+MATVEC_SWIGLU(matvec_swiglu_q8_0, two_q8_0, 32)
 
 MATVEC(matvec_f32, chunk_f32)
 MATVEC(matvec_f16, chunk_f16)
-MATVEC(matvec_q4_0, chunk_q4_0)
-MATVEC(matvec_q5_0, chunk_q5_0)
-MATVEC(matvec_q8_0, chunk_q8_0)
-MATVEC(matvec_q4_k, chunk_q4_k)
+MATVEC2(matvec_q4_0, two_q4_0, 32)
+MATVEC2(matvec_q5_0, two_q5_0, 32)
+MATVEC2(matvec_q8_0, two_q8_0, 32)
+MATVEC2(matvec_q4_k, pair_q4_k, 64)
 MATVEC(matvec_q5_k, chunk_q5_k)
-MATVEC(matvec_q6_k, chunk_q6_k)
+MATVEC2(matvec_q6_k, pair_q6_k, 64)
 
 // MoE decode without a CPU round trip: `MATVEC` for slot `tg.y` of the k chosen experts, whose
 // matrix is expert ids[slot] of a stacked tensor (`expert_stride` bytes apart). Slot inputs and
@@ -261,7 +499,6 @@ inline void deq_q6_k(device const uchar* r, uint c, thread float* w) {
 
 // Half of a 32-weight chunk (o = 0 or 16) as four float4, for the matmul's tile loads. The
 // K-quant ones read 4 bytes at a time: one byte per load was a sixth of a prompt's matmul time.
-inline uint4 bytes4(device const uchar* p) { return uint4(*(device const packed_uchar4*)p); }
 
 inline void deq16_q4_k(device const uchar* r, uint c, uint o, thread float4* w) {
     uint sub = c % 8;
@@ -594,6 +831,29 @@ kernel void rope(device float* x [[buffer(0)]], device const float* ff [[buffer(
 
 // ---- KV cache: stored as f16 (default) or f32 (precise mode); T is the storage type ----
 
+// rope, written to the cache instead of in place (rope_dim == head_dim, so every value moves).
+#define ROPE_STORE(NAME, T)                                                                   \
+kernel void NAME(device const float* x [[buffer(0)]], device const float* ff [[buffer(1)]],  \
+                 constant RopeParams& p [[buffer(2)]], device T* dst [[buffer(3)]],          \
+                 uint2 gid [[thread_position_in_grid]]) {                                     \
+    uint half_dim = p.rope_dim / 2;                                                           \
+    if (gid.x >= p.n_heads * half_dim) return;                                                \
+    uint h = gid.x / half_dim, i = gid.x % half_dim;                                          \
+    float freq = precise::pow(p.theta, -2.0f * float(i) / float(p.rope_dim));                 \
+    if (p.has_ff) freq /= ff[i];                                                              \
+    float ang = float(p.pos + gid.y) * freq;                                                  \
+    float c = precise::cos(ang), s = precise::sin(ang);                                       \
+    ulong at = ulong(gid.y) * p.n_heads * p.head_dim + h * p.head_dim;                        \
+    uint a = p.neox ? i : 2 * i;                                                              \
+    uint b = p.neox ? i + half_dim : 2 * i + 1;                                               \
+    float x0 = x[at + a], x1 = x[at + b];                                                     \
+    dst[at + a] = T(x0 * c - x1 * s);                                                         \
+    dst[at + b] = T(x0 * s + x1 * c);                                                         \
+}
+
+ROPE_STORE(rope_store_f32, float)
+ROPE_STORE(rope_store_f16, half)
+
 // dst[i] = src[i] for n elements, converting to the cache type.
 kernel void store_kv_f32(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
                          constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
@@ -614,8 +874,9 @@ constant uint ATTN_CHUNK = 256;
 
 template <typename T>
 inline void attention_part_impl(device const float* q, device const T* kc, device const T* vc,
-                                device float* part, constant AttnParams& p,
-                                threadgroup float* sc, threadgroup float* red, uint2 tg,
+                                device float* part, device float* res, constant AttnParams& p,
+                                threadgroup float* sc, threadgroup float* pv,
+                                threadgroup float* red, uint2 tg,
                                 uint n_chunks, uint tid, uint tgs, uint lane, uint sg) {
     uint h = tg.x, c = tg.y, hd = p.head_dim, n_sg = (tgs + 31) / 32;
     uint start = c * ATTN_CHUNK, cnt = min(ATTN_CHUNK, p.n_pos - start);
@@ -624,8 +885,12 @@ inline void attention_part_impl(device const float* q, device const T* kc, devic
     float mx = -INFINITY;
     for (uint i = tid; i < cnt; i += tgs) {
         device const T* k = kc + ulong(start + i) * p.kv_dim + kv_off;
-        float s = 0;
-        for (uint d = 0; d < hd; d++) s += qh[d] * float(k[d]);
+        float4 s4 = 0;
+        for (uint d = 0; d + 4 <= hd; d += 4)
+            s4 += float4(*(device const packed_float4*)(qh + d)) *
+                  float4(*(device const vec<T, 4>*)(k + d));
+        float s = sum4(s4);
+        for (uint d = hd & ~3u; d < hd; d++) s += qh[d] * float(k[d]);
         s *= p.scale;
         sc[i] = s;
         mx = max(mx, s);
@@ -640,12 +905,33 @@ inline void attention_part_impl(device const float* q, device const T* kc, devic
     sum = tg_reduce_sum(sum, red, lane, sg, n_sg);
     device float* out = part + (ulong(h) * n_chunks + c) * (hd + 2);
     device const T* v = vc + ulong(start) * p.kv_dim + kv_off;
-    for (uint d = tid; d < hd; d += tgs) {
-        float o = 0;
-        for (uint i = 0; i < cnt; i++) o += sc[i] * float(v[ulong(i) * p.kv_dim + d]);
-        out[2 + d] = o;
+    // Four dims a thread, the positions dealt out over the threads that share them, then
+    // one thread per four dims adds the shares up.
+    uint groups = hd / 4, shares = tgs / groups;
+    if (hd % 4 == 0 && shares >= 1 && tgs <= ATTN_CHUNK / 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint g = tid % groups, share = tid / groups;
+        float4 o = 0;
+        if (share < shares)
+            for (uint i = share; i < cnt; i += shares)
+                o += sc[i] * float4(*(device const vec<T, 4>*)(v + ulong(i) * p.kv_dim + 4 * g));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (share < shares) *(threadgroup float4*)(pv + 4 * tid) = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (share == 0) {
+            for (uint j = 1; j < shares; j++) o += *(threadgroup float4*)(pv + 4 * (j * groups + g));
+            /* The only chunk is the result; there is nothing to merge. */
+            device float* to = n_chunks == 1 ? res + h * hd + 4 * g : out + 2 + 4 * g;
+            *(device packed_float4*)to = n_chunks == 1 ? o / sum : o;
+        }
+    } else {
+        for (uint d = tid; d < hd; d += tgs) {
+            float o = 0;
+            for (uint i = 0; i < cnt; i++) o += sc[i] * float(v[ulong(i) * p.kv_dim + d]);
+            if (n_chunks == 1) res[h * hd + d] = o / sum; else out[2 + d] = o;
+        }
     }
-    if (tid == 0) {
+    if (tid == 0 && n_chunks > 1) {
         out[0] = mx;
         out[1] = sum;
     }
@@ -654,15 +940,16 @@ inline void attention_part_impl(device const float* q, device const T* kc, devic
 #define ATTENTION_PART(NAME, T)                                                               \
 kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffer(1)]],      \
                  device const T* vc [[buffer(2)]], device float* part [[buffer(3)]],         \
-                 constant AttnParams& p [[buffer(4)]],                                        \
+                 constant AttnParams& p [[buffer(4)]], device float* res [[buffer(5)]],      \
                  uint2 tg [[threadgroup_position_in_grid]],                                   \
                  uint2 n_tg [[threadgroups_per_grid]],                                        \
                  uint tid [[thread_index_in_threadgroup]],                                    \
                  uint2 tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],\
                  uint sg [[simdgroup_index_in_threadgroup]]) {                                \
     threadgroup float sc[ATTN_CHUNK];                                                         \
+    threadgroup float pv[ATTN_CHUNK * 2]; /* a float4 per thread */                           \
     threadgroup float red[32];                                                                \
-    attention_part_impl<T>(q, kc, vc, part, p, sc, red, tg, n_tg.y, tid, tgs.x, lane, sg);    \
+    attention_part_impl<T>(q, kc, vc, part, res, p, sc, pv, red, tg, n_tg.y, tid, tgs.x, lane, sg);    \
 }
 
 ATTENTION_PART(attention_part_f32, float)

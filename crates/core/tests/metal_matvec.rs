@@ -3,7 +3,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use rli_core::half::f32_to_f16;
-use rli_core::metal::Gpu;
+use rli_core::metal::{Batch, Gpu};
 use rli_core::{GgmlType, QMatrix};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 
@@ -42,11 +42,14 @@ const TYPES: [GgmlType; 8] = [
 /// Random `ROWS x COLS` matrices of every type, back to back at 32-byte-aligned offsets (as in a
 /// GGUF), with small finite f16 scales.
 fn fixture() -> (Pages, Vec<usize>) {
-    let (rows, cols, types) = (ROWS, COLS, TYPES);
+    fixture_of(ROWS, COLS, &TYPES)
+}
+
+fn fixture_of(rows: usize, cols: usize, types: &[GgmlType]) -> (Pages, Vec<usize>) {
     // Lay all matrices out back to back at 32-byte-aligned offsets, as in a GGUF.
     let mut offsets = Vec::new();
     let mut end = 0usize;
-    for ty in types {
+    for &ty in types {
         end = end.div_ceil(32) * 32;
         offsets.push(end);
         end += ty.row_bytes(cols) * rows;
@@ -97,8 +100,13 @@ fn input(n: usize) -> Vec<f32> {
 }
 
 fn cpu_matvec(buf: &[u8], ty: GgmlType, off: usize, x: &[f32]) -> Vec<f32> {
-    let m = QMatrix::new(ty, ROWS, COLS, &buf[off..off + ty.row_bytes(COLS) * ROWS]);
-    let mut y = vec![0.0; ROWS];
+    cpu_matvec_of(buf, ty, off, ROWS, x)
+}
+
+fn cpu_matvec_of(buf: &[u8], ty: GgmlType, off: usize, rows: usize, x: &[f32]) -> Vec<f32> {
+    let cols = x.len();
+    let m = QMatrix::new(ty, rows, cols, &buf[off..off + ty.row_bytes(cols) * rows]);
+    let mut y = vec![0.0; rows];
     m.matvec_with(x, &mut y, true);
     y
 }
@@ -162,6 +170,74 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
                 );
             }
         }
+    }
+}
+
+/// The decode path's variants: a matvec that adds into its output, one that adds a bias, and
+/// the gate and up matvecs of a SwiGLU as one kernel (here rows `r` and `r + 1` of one matrix).
+#[test]
+fn metal_matvec_add_bias_and_swiglu_match_cpu() {
+    let (mut mem, offsets) = fixture();
+    let buf = mem.bytes();
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
+    let x = input(1);
+    let base: Vec<f32> = (0..ROWS).map(|r| r as f32 * 0.25 - 4.0).collect();
+    for (&ty, &off) in TYPES.iter().zip(&offsets) {
+        let want = cpu_matvec(buf, ty, off, &x);
+        let sum: Vec<f32> = want.iter().zip(&base).map(|(w, b)| w + b).collect();
+        let (xb, bias) = (gpu.upload(&x), gpu.upload(&base));
+        let (added, biased, act) = (gpu.upload(&base), gpu.alloc(ROWS), gpu.alloc(ROWS - 1));
+        let swiglu = Batch::has_matvec_swiglu(ty);
+        let mut b = gpu.batch();
+        b.matvec_add(ty, ROWS, COLS, off, (&xb).into(), (&added).into());
+        b.matvec_bias(
+            ty,
+            ROWS,
+            COLS,
+            off,
+            (&xb).into(),
+            (&biased).into(),
+            (&bias).into(),
+        );
+        if swiglu {
+            let up = off + ty.row_bytes(COLS);
+            b.matvec_swiglu(ty, ROWS - 1, COLS, off, up, (&xb).into(), (&act).into());
+        }
+        b.finish();
+        // SAFETY: the batch has finished.
+        let (added, biased, act) = unsafe { (added.as_slice(), biased.as_slice(), act.as_slice()) };
+        assert_close(ty, "matvec_add", added, &sum);
+        assert_close(ty, "matvec_bias", biased, &sum);
+        if swiglu {
+            let silu: Vec<f32> = (0..ROWS - 1)
+                .map(|r| want[r] / (1.0 + (-want[r]).exp()) * want[r + 1])
+                .collect();
+            assert_close(ty, "matvec_swiglu", act, &silu);
+        }
+    }
+}
+
+/// From 16384 rows a quantized matvec takes four rows a simdgroup (the output head); the row
+/// count here leaves the last simdgroup with three.
+#[test]
+fn metal_matvec_of_a_tall_matrix_matches_cpu() {
+    let (rows, cols) = (16384 + 3, 256);
+    let types = [GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q6_K];
+    let (mut mem, offsets) = fixture_of(rows, cols, &types);
+    let buf = mem.bytes();
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
+    let x: Vec<f32> = input(1)[..cols].to_vec();
+    for (&ty, &off) in types.iter().zip(&offsets) {
+        let mut got = vec![0.0; rows];
+        gpu.matvec(ty, rows, cols, off, &x, &mut got);
+        assert_close(
+            ty,
+            "tall matvec",
+            &got,
+            &cpu_matvec_of(buf, ty, off, rows, &x),
+        );
     }
 }
 

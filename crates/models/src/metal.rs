@@ -174,10 +174,22 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
+/// `resid += x W^T` for `n` rows. One token's matvec adds into `resid` itself.
+fn mm_add(b: &mut Batch<'_>, s: &Scratch, w: &Weight, x: At<'_>, resid: At<'_>, n: usize) {
+    if n == 1 {
+        b.matvec_add(w.ty, w.rows, w.cols, w.offset, x, resid);
+    } else {
+        mm(b, w, x, At(&s.tmp, 0), n);
+        b.add(resid, At(&s.tmp, 0), n * w.rows);
+    }
+}
+
 /// SwiGLU FFN of `n` rows of `x` into `out`.
 fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, x: At<'_>, out: At<'_>, n: usize) {
     mm(b, &e.gate, x, At(&s.gate, 0), n);
+    b.free = true;
     mm(b, &e.up, x, At(&s.up, 0), n);
+    b.free = false;
     b.swiglu(At(&s.gate, 0), At(&s.up, 0), n * e.gate.rows);
     mm(b, &e.down, At(&s.gate, 0), out, n);
 }
@@ -204,19 +216,37 @@ impl Metal {
         let mut b = self.gpu.batch();
         b.half = self.kv_half;
         for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
+            if l == 1 && n == 1 {
+                b.start(); // a token's first layer runs while the others are queued
+            }
             let (k_at, v_at) = (At(&s.k, 0), At(&s.v, 0));
             b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
-            mm(&mut b, &layer.wq, At(&s.xb, 0), At(&s.q, 0), n);
-            mm(&mut b, &layer.wk, At(&s.xb, 0), k_at, n);
-            mm(&mut b, &layer.wv, At(&s.xb, 0), v_at, n);
-            for (t, bias, dim) in [
-                (At(&s.q, 0), &g.bq, c.q_dim()),
-                (k_at, &g.bk, kv_dim),
-                (v_at, &g.bv, kv_dim),
-            ] {
-                if let Some(bias) = bias {
-                    b.add_bcast(t, bias.into(), dim, n * dim);
+            // Q, K and V read the same input and write different buffers, so they (and their
+            // biases, which one token's matvec adds itself) run together.
+            let qkv = [
+                (&layer.wq, At(&s.q, 0), &g.bq),
+                (&layer.wk, k_at, &g.bk),
+                (&layer.wv, v_at, &g.bv),
+            ];
+            for (i, (w, out, bias)) in qkv.iter().enumerate() {
+                b.free = i > 0;
+                match bias {
+                    Some(bias) if n == 1 => {
+                        let x = At(&s.xb, 0);
+                        b.matvec_bias(w.ty, w.rows, w.cols, w.offset, x, *out, bias.into());
+                    }
+                    _ => mm(&mut b, w, At(&s.xb, 0), *out, n),
                 }
+            }
+            b.free = false;
+            if n > 1 {
+                for (w, out, bias) in &qkv {
+                    if let Some(bias) = bias {
+                        b.add_bcast(*out, bias.into(), w.rows, n * w.rows);
+                        b.free = true; // the first waits for the matmuls
+                    }
+                }
+                b.free = false;
             }
             if let Some(w) = &g.q_norm {
                 b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, c.rms_eps);
@@ -224,10 +254,19 @@ impl Metal {
             if let Some(w) = &g.k_norm {
                 b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, c.rms_eps);
             }
+            // Three dispatches that touch different buffers, so they run together; rotating K
+            // straight into the cache saves a fourth that would have to wait for them.
             b.rope(At(&s.q, 0), &rope(c.n_head));
-            b.rope(k_at, &rope(c.n_head_kv));
-            b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
+            b.free = true;
             b.store_kv(v_at, &kv.v[l], pos * kv_dim, n * kv_dim);
+            if c.rope_dim == hd {
+                b.rope_store(k_at, &kv.k[l], pos * kv_dim, &rope(c.n_head_kv));
+                b.free = false;
+            } else {
+                b.rope(k_at, &rope(c.n_head_kv));
+                b.free = false;
+                b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
+            }
             if n == 1 {
                 let p = AttnParams {
                     n_head: c.n_head as u32,
@@ -249,10 +288,24 @@ impl Metal {
                 };
                 b.attention_batch(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), n, &p);
             }
-            mm(&mut b, &layer.wo, At(&s.att, 0), At(&s.tmp, 0), n);
-            b.add(x_at, At(&s.tmp, 0), n * n_embd);
+            mm_add(&mut b, s, &layer.wo, At(&s.att, 0), x_at, n);
             b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
             match &layer.ffn {
+                Ffn::Dense(e)
+                    if n == 1 && Batch::has_matvec_swiglu(e.gate.ty) && e.up.ty == e.gate.ty =>
+                {
+                    let (g, u) = (&e.gate, &e.up);
+                    b.matvec_swiglu(
+                        g.ty,
+                        g.rows,
+                        g.cols,
+                        g.offset,
+                        u.offset,
+                        At(&s.xb, 0),
+                        At(&s.gate, 0),
+                    );
+                    mm_add(&mut b, s, &e.down, At(&s.gate, 0), x_at, n);
+                }
                 Ffn::Dense(e) => {
                     ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
                     b.add(x_at, At(&s.tmp, 0), n * n_embd);

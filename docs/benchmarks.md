@@ -3,6 +3,62 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: Metal decode against llama.cpp: two-row matvecs, fewer stages per layer
+
+Same machine and builds as the entry below. The two engines alternate with 30-45 s of rest
+before each run: back to back, whichever runs second inherits the other's heat (consecutive
+Mistral-7B runs fell from 20.5 to 19.0 tok/s), and an animated wallpaper was enough to add
+several percent of noise.
+
+    bench <model> --pp 512 --tg 128 --reps 3 --gpu-layers 999
+    llama-bench -m <model> -ngl 99 -p 512 -n 128 -r 3
+
+| model | tg128 before | tg128 after | llama.cpp | pp512 | llama.cpp pp512 |
+|---|---|---|---|---|---|
+| SmolLM2-135M | 222 | 363 | 326 | 7170 | 9180 |
+| Qwen2.5-0.5B | 153.5 | 185.2 | 177.9 | 2910 | 3382 |
+| Llama-3.2-1B | 92.8 | 106.8 | 107.2 | 1306 | 1422 |
+| Mistral-7B | 18.4-19.1 | 21.7 | 21.3 | 183 | 196 |
+
+Decode is ahead on three models and level on Llama-3.2-1B. Prompts are 6.5-8% behind on the
+two larger models, 14% on Qwen2.5-0.5B and 22% on SmolLM2 (these rested figures replace the
+"level on Mistral-7B" of the entry below, which was taken back to back).
+
+A decoded token is weight streaming plus what each dispatch adds. Llama-3.2-1B reads 799 MB a
+token; at the ~100 GB/s the kernels reach that is 8.0 ms, and the token took 10.8.
+
+- **Two rows a simdgroup, weights a word at a time.** A lane takes 64 columns (K-quants: the
+  two 32-weight chunks sharing their bytes) or one block (Q4_0, Q5_0, Q8_0) of two rows, reads
+  x once for both, and assembles four weights per 32-bit word (`bench_metal`, GB/s, matvecs
+  back to back): Q4_K 4096x4096 71.7 -> 85-92; Q6_K 78.5 -> 89-98; Q4_0 59 -> 78, Q5_0 66 -> 86.
+  One row a lane was 87 where two reach 100: x is half the loads. Values indexed by a loop (an
+  array of x, a `uint4` of weights) are kept in memory and ran 10-25% slower, so the kernels
+  are written without them. Four rows a simdgroup is 8% faster on the output head (Q6_K
+  128256x2048: 2347 -> 2176 us) and slower on a layer's matrices, so it is used from 16384 rows.
+- **Dispatches that must wait cost 5-9 us each.** `bench_metal`, Q4_K 2048x2048: 33 us after a
+  barrier, 24 when it may overlap its neighbour; a small kernel (`add`) costs 1.1-2 us and an
+  8-row matvec 4.1, so it is the matvec's last threads finishing and the next one's starting,
+  not the hand-over. The encoder is concurrent now with a barrier before each dispatch that
+  isn't marked `free`: Q, K and V run together, as do RoPE and the cache stores. A dense layer
+  went from 13 stages that wait to 8: the output and down matvecs add into the residual
+  stream, gate, up and the SwiGLU are one kernel (the pair kernel's two rows taken from two
+  matrices), K is rotated straight into the cache, a bias is added by its matvec, and decode
+  attention over one chunk of positions writes its result without the merge pass.
+- **Decode attention** (144 positions, Llama-3.2-1B): 0.41 -> 0.12 ms a token with four values
+  per load and the positions dealt out over the threads sharing a dim group.
+- **rmsnorm** with a thread per two values: 3.7 -> 2.7 us (256 -> 1024 threads; 32 threads took
+  17 us).
+- **The first layer is submitted before the rest is encoded** (`Batch::start`): +0.5%.
+
+Not kept: one row a lane, 16-byte weight loads (87 GB/s against 100), threadgroups of 1, 2, 8
+or 16 simdgroups (no change), thread QoS (no change), `sleep` then poll (oversleeps by 1 ms+).
+
+Polling for completion instead of sleeping in `waitUntilCompleted` gave Llama-3.2-1B another
+3.5% on a cool machine (106.5 -> 110.2 tok/s): with a CPU core awake the GPU itself streams
+faster (Q4_K 8192x2048: 84 -> 91 GB/s). Not adopted: it holds a core at 100%. llama.cpp gets
+part of this from its thread pool's polling (`llama-bench --poll 0`: 105.5 tok/s, default 107,
+`--poll 100` 108.3).
+
 ## 2026-11-16: Metal prompts against llama.cpp: half tiles, a 64-row matmul, matrix-unit attention
 
 Apple M4 (24 GB), Q4_K_M files, every layer on Metal, llama.cpp v0.9.0 (cd959ba) built with

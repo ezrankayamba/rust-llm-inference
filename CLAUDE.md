@@ -86,9 +86,24 @@ Design points that span files:
   chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
   `attention_merge`), so decode speed holds up at long context.
   head_dim not a multiple of 8 or above 256 falls back to one token at a time.
-  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 level
-  on Mistral-7B, 6% behind on Llama-3.2-1B, 14% on Qwen2.5-0.5B; 16-token prompts 1.3-1.45x
-  behind; decode 16-19% behind.
+  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 6.5-8%
+  behind on Mistral-7B and Llama-3.2-1B, 14% on Qwen2.5-0.5B, 22% on SmolLM2-135M; 16-token
+  prompts 1.3-1.45x behind; decode ahead by 2-11% on three of those and level on Llama-3.2-1B.
+- **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
+  one before it. The encoder is concurrent; `Batch` puts a barrier before each dispatch unless
+  `Batch.free` says it reads nothing the ones just before it write (Q, K and V; RoPE and the
+  cache stores). So a token's kernels are fused, not just fast: `matvec_add` adds into the
+  residual stream, `matvec_bias` adds its bias, `matvec_swiglu` is gate, up and the activation
+  in one (two matrices of one type), `rope_store` rotates K into the cache, and decode
+  attention over a single 256-position chunk writes its result itself. Quantized matvecs take
+  two rows a simdgroup (`MATVEC2`; four from 16384 rows, `MATVEC4`), read x once for them and
+  build four weights per 32-bit word (`pair_*`, `two_*` in metal.metal); Q5_K, F16, F32 and the
+  MoE `matvec_id_*` kernels still take a row and a chunk per lane. Kernels avoid arrays and
+  vectors indexed by a loop: the compiler keeps them in memory. `Batch::start` submits a
+  token's first layer while the rest is encoded.
+- **Benchmark the two engines alternately with rests** (30-45 s): the second of two back-to-back
+  runs is slower by several percent from heat alone, and anything else using the GPU (an
+  animated wallpaper) shows up as noise.
 - **CPU prompts are batched too**, in chunks of 128 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers

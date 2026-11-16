@@ -9,20 +9,37 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::ops::Range;
 use std::ptr::NonNull;
 
 const SOURCE: &str = include_str!("metal.metal");
 const MATVEC_ROWS_PER_TG: usize = 4;
-const REDUCE_THREADS: usize = 256;
+const REDUCE_THREADS: usize = 1024;
 const ELT_THREADS: usize = 256;
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
+/// The K-quant matvec kernels take two rows a simdgroup, or four in the `matvec4_*` kernels
+/// used from this many rows up (the output head; see `MATVEC4` in metal.metal).
+const MATVEC4_MIN_ROWS: usize = 16384;
+/// The types whose matvec kernels take two rows a simdgroup, with the kernel that runs two
+/// matrices' rows as a SwiGLU ([`Batch::matvec_swiglu`]).
+fn swiglu_kernel(ty: GgmlType) -> Option<&'static str> {
+    match ty {
+        GgmlType::Q4_0 => Some("matvec_swiglu_q4_0"),
+        GgmlType::Q5_0 => Some("matvec_swiglu_q5_0"),
+        GgmlType::Q8_0 => Some("matvec_swiglu_q8_0"),
+        GgmlType::Q4_K => Some("matvec_swiglu_q4_k"),
+        GgmlType::Q6_K => Some("matvec_swiglu_q6_k"),
+        _ => None,
+    }
+}
 const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::F32, "matvec_f32"),
     (GgmlType::F16, "matvec_f16"),
@@ -64,7 +81,17 @@ const MATMUL_THREADS: usize = 128;
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
 const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
-const OTHER_KERNELS: [&str; 22] = [
+const OTHER_KERNELS: [&str; 32] = [
+    "matvec4_q4_k",
+    "matvec4_q6_k",
+    "matvec4_q8_0",
+    "matvec_swiglu_q4_0",
+    "matvec_swiglu_q5_0",
+    "matvec_swiglu_q8_0",
+    "matvec_swiglu_q4_k",
+    "matvec_swiglu_q6_k",
+    "rope_store_f32",
+    "rope_store_f16",
     "moe_topk",
     "moe_combine",
     "rmsnorm",
@@ -284,6 +311,15 @@ unsafe extern "C" {
 #[repr(C)]
 struct MatvecParams {
     offset: u64,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    add: u32,
+}
+#[repr(C)]
+struct SwigluParams {
+    gate: u64,
+    up: u64,
     rows: u32,
     cols: u32,
     row_bytes: u32,
@@ -565,15 +601,26 @@ impl Gpu {
     }
 
     pub fn batch(&self) -> Batch<'_> {
-        let cmd = self.queue.commandBuffer().expect("Metal command buffer");
-        let enc = cmd.computeCommandEncoder().expect("Metal compute encoder");
+        let (cmd, enc) = self.encoder();
         Batch {
             half: false,
+            free: false,
             gpu: self,
             cmd,
             enc,
             ended: false,
+            started: Vec::new(),
         }
+    }
+
+    /// A command buffer and its encoder. Dispatches may overlap unless a barrier separates
+    /// them, which [`Batch`] encodes before each one that isn't marked `free`.
+    fn encoder(&self) -> (CommandBuffer, Encoder) {
+        let cmd = self.queue.commandBuffer().expect("Metal command buffer");
+        let enc = cmd
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .expect("Metal compute encoder");
+        (cmd, enc)
     }
 
     fn other(&self, name: &str) -> &Pipeline {
@@ -633,10 +680,15 @@ pub struct Batch<'a> {
     /// Run matmuls over quantized weights with half-precision tiles (f32 sums): about 1.4x the
     /// speed of f32 tiles, for a relative error near 1e-3 per product. Off by default.
     pub half: bool,
+    /// The dispatches queued while this is set read nothing an earlier one of them writes, so
+    /// they may run at the same time as the dispatch before them.
+    pub free: bool,
     gpu: &'a Gpu,
-    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    cmd: CommandBuffer,
+    enc: Encoder,
     ended: bool,
+    /// Command buffers already submitted by [`Batch::start`].
+    started: Vec<CommandBuffer>,
 }
 
 /// A batch dropped unfinished (e.g. by a panic while recording) must still end its encoder:
@@ -679,6 +731,9 @@ impl Batch<'_> {
     }
 
     fn dispatch2(&self, pipeline: &Pipeline, groups: (usize, usize), threads: usize) {
+        if !self.free {
+            self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
         self.enc.setComputePipelineState(pipeline);
         self.enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
@@ -704,6 +759,50 @@ impl Batch<'_> {
         x: At<'_>,
         y: At<'_>,
     ) {
+        self.matvec_impl(ty, rows, cols, offset, x, y, 0, y);
+    }
+
+    /// `y += W x`: a matvec that adds into the residual stream, saving the `add` after it.
+    pub fn matvec_add(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+    ) {
+        self.matvec_impl(ty, rows, cols, offset, x, y, 1, y);
+    }
+
+    /// `y = W x + bias`, saving the `add_bcast` after the matvec.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_bias(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        bias: At<'_>,
+    ) {
+        assert!(bias.1 + rows <= bias.0.len);
+        self.matvec_impl(ty, rows, cols, offset, x, y, 2, bias);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_impl(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        add: u32,
+        bias: At<'_>,
+    ) {
         assert!(
             cols.is_multiple_of(32),
             "matvec cols must be a multiple of 32"
@@ -714,18 +813,29 @@ impl Batch<'_> {
         );
         let row_bytes = ty.row_bytes(cols);
         let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
-        let pipeline = &self
-            .gpu
-            .matvec
-            .iter()
-            .find(|(t, _)| *t == ty)
-            .expect("unsupported type for Metal")
-            .1;
+        // Rows a simdgroup takes: see `MATVEC2` and `MATVEC4` in metal.metal.
+        let tall = rows >= MATVEC4_MIN_ROWS;
+        let (pipeline, sg_rows) = match ty {
+            GgmlType::Q4_K if tall => (self.gpu.other("matvec4_q4_k"), 4),
+            GgmlType::Q6_K if tall => (self.gpu.other("matvec4_q6_k"), 4),
+            GgmlType::Q8_0 if tall => (self.gpu.other("matvec4_q8_0"), 4),
+            _ => {
+                let p = &self
+                    .gpu
+                    .matvec
+                    .iter()
+                    .find(|(t, _)| *t == ty)
+                    .expect("unsupported type for Metal")
+                    .1;
+                (p, if swiglu_kernel(ty).is_some() { 2 } else { 1 })
+            }
+        };
         self.enc.setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
         unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
+        self.bind(4, bias); // `y` again when there is none
         self.params(
             3,
             &MatvecParams {
@@ -733,10 +843,59 @@ impl Batch<'_> {
                 rows: rows as u32,
                 cols: cols as u32,
                 row_bytes: row_bytes as u32,
+                add,
             },
         );
         self.dispatch(
             pipeline,
+            rows.div_ceil(MATVEC_ROWS_PER_TG * sg_rows),
+            MATVEC_ROWS_PER_TG * 32,
+        );
+    }
+
+    /// Whether [`Batch::matvec_swiglu`] has a kernel for weights of type `ty`.
+    pub fn has_matvec_swiglu(ty: GgmlType) -> bool {
+        swiglu_kernel(ty).is_some()
+    }
+
+    /// `y = silu(G x) * (U x)` for one token: the gate and up matvecs of a SwiGLU FFN and the
+    /// activation between them as one dispatch. `gate` and `up` are the offsets of two
+    /// `rows x cols` matrices of type `ty`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_swiglu(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        gate: usize,
+        up: usize,
+        x: At<'_>,
+        y: At<'_>,
+    ) {
+        assert!(x.1 + cols <= x.0.len && y.1 + rows <= y.0.len);
+        let row_bytes = ty.row_bytes(cols);
+        let (gbuf, gate) = self.gpu.weight_buf(gate, rows * row_bytes);
+        let (ubuf, up) = self.gpu.weight_buf(up, rows * row_bytes);
+        // SAFETY: weight buffers bound read-only at offset 0; the kernel adds the offsets.
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(gbuf), 0, 0);
+            self.enc.setBuffer_offset_atIndex(Some(ubuf), 0, 1);
+        }
+        self.bind(2, x);
+        self.bind(3, y);
+        self.params(
+            4,
+            &SwigluParams {
+                gate: gate as u64,
+                up: up as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+                row_bytes: row_bytes as u32,
+            },
+        );
+        let kernel = swiglu_kernel(ty).expect("no SwiGLU matvec for this type");
+        self.dispatch(
+            self.gpu.other(kernel),
             rows.div_ceil(MATVEC_ROWS_PER_TG),
             MATVEC_ROWS_PER_TG * 32,
         );
@@ -952,7 +1111,11 @@ impl Batch<'_> {
         self.bind(1, out);
         self.bind(2, w.into());
         self.params(3, &NormParams { n: n as u32, eps });
-        self.dispatch(self.gpu.other("rmsnorm"), rows, REDUCE_THREADS);
+        // A thread per two values, up to the largest threadgroup: one that reads several
+        // waits on each read in turn (2048 values: 3.7 us a dispatch with 256 threads, 2.7
+        // with 1024).
+        let threads = (n / 2).next_multiple_of(32).clamp(32, REDUCE_THREADS);
+        self.dispatch(self.gpu.other("rmsnorm"), rows, threads);
     }
 
     fn elementwise(&mut self, kernel: &str, a: At<'_>, b: At<'_>, n: usize, alpha: f32) {
@@ -1070,6 +1233,43 @@ impl Batch<'_> {
         );
     }
 
+    /// [`Batch::rope`] of `x`, written to the cache `dst` from element `off` instead of in
+    /// place. Needs `rope_dim == head_dim`.
+    pub fn rope_store(&mut self, x: At<'_>, dst: &KvBuf, off: usize, r: &RopeArgs<'_>) {
+        let n = r.n_tokens * r.n_heads * r.head_dim;
+        assert!(r.rope_dim == r.head_dim && x.1 + n <= x.0.len && off + n <= dst.len);
+        self.bind(0, x);
+        self.bind(1, r.freq_factors.unwrap_or(x.0).into());
+        self.params(
+            2,
+            &RopeParams {
+                n_heads: r.n_heads as u32,
+                head_dim: r.head_dim as u32,
+                rope_dim: r.rope_dim as u32,
+                pos: r.pos as u32,
+                theta: r.theta,
+                neox: r.neox as u32,
+                has_ff: r.freq_factors.is_some() as u32,
+            },
+        );
+        // SAFETY: binding a live buffer at an in-bounds byte offset.
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&dst.buf), off * dst.elem(), 3)
+        };
+        let kernel = if dst.half {
+            "rope_store_f16"
+        } else {
+            "rope_store_f32"
+        };
+        let pairs = r.n_heads * r.rope_dim / 2;
+        self.dispatch2(
+            self.gpu.other(kernel),
+            (pairs.div_ceil(ELT_THREADS), r.n_tokens),
+            ELT_THREADS,
+        );
+    }
+
     /// Converts `n` f32s from `src` into `dst` starting at element `off`.
     pub fn store_kv(&mut self, src: At<'_>, dst: &KvBuf, off: usize, n: usize) {
         assert!(src.1 + n <= src.0.len && off + n <= dst.len);
@@ -1117,12 +1317,16 @@ impl Batch<'_> {
         self.bind_kv(2, v);
         self.bind(3, part.into());
         self.params(4, p);
+        self.bind(5, out);
         let kernel = if k.half {
             "attention_part_f16"
         } else {
             "attention_part_f32"
         };
         self.dispatch2(self.gpu.other(kernel), (n_head, n_chunks), ATTN_THREADS);
+        if n_chunks == 1 {
+            return; // the kernel wrote `out` itself
+        }
         self.bind(0, part.into());
         self.bind(1, out);
         self.params(
@@ -1182,14 +1386,28 @@ impl Batch<'_> {
         self.dispatch2(self.gpu.other(kernel), (p.n_head as usize, tiles), 32);
     }
 
+    /// Submits what is recorded so far without waiting, and goes on recording: the GPU starts
+    /// on it while the caller queues the rest (about 0.1 ms of a decoded token otherwise spent
+    /// with the GPU idle).
+    pub fn start(&mut self) {
+        self.enc.endEncoding();
+        self.cmd.commit();
+        let (cmd, enc) = self.gpu.encoder();
+        self.started.push(std::mem::replace(&mut self.cmd, cmd));
+        self.enc = enc;
+    }
+
     /// Submits the recorded work and waits for it.
     pub fn finish(mut self) {
         self.enc.endEncoding();
         self.ended = true;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
-        if let Some(e) = self.cmd.error() {
-            panic!("Metal command failed: {e}");
+        // The queue runs command buffers in order, so the earlier ones are done too.
+        for cmd in self.started.iter().chain([&self.cmd]) {
+            if let Some(e) = cmd.error() {
+                panic!("Metal command failed: {e}");
+            }
         }
     }
 }
