@@ -3,6 +3,20 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON one-row kernels for Q8_0, Q4_0, Q5_0: four sums
+
+These kernels were waiting on their one float sum after all: the same matrix laid out with longer
+rows ran slower (`bench_matvec` with 2048 x 5632 turned to 32768 columns: Q8_0 0.296 -> 0.383 ms),
+because shorter rows let consecutive rows overlap. Blocks now go into four sums in turn, in an inner
+loop of constant length. Two earlier attempts changed nothing or lost 5-12% because the sums ended
+up in memory: one indexed them by `block % 4`, the other passed the index to a closure.
+`RAYON_NUM_THREADS=1 bench_matvec`, 5632 x 2048, ms: Q8_0 0.292 -> 0.231, Q4_0 0.293 -> 0.241,
+Q5_0 0.324 -> 0.309.
+
+Qwen2.5-0.5B Q4_K_M, `bench --pp 0 --tg 64 --reps 3 --threads N`, alternated: one thread 74.8 ->
+78.8 tok/s (llama.cpp 80.5), four threads 155.7 -> 157.3 (156.4). Logits per token against the
+`--precise` reference 0.35, top-1 the same; `eval_quant` KL mean 0.0017, top-1 agreement 96.0%.
+
 ## 2026-11-16: NEON one-row kernels for Q8_0, Q4_0, Q5_0: fewer vector operations per block
 
 A block's f16 scale is loaded straight into a vector register (`ld16`; it went through a general

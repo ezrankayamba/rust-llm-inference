@@ -507,7 +507,9 @@ mod neon {
     /// Dot products of one encoded row with the activations of `N` tokens, into `out`. Each
     /// weight block is unpacked (and its scales decoded) once for all `N` tokens, and every
     /// token's arithmetic is the same whatever `N` is, so a matmul matches per-token matvecs
-    /// bit for bit. `false` for types without a NEON kernel. The 32-weight types use only the
+    /// bit for bit. `false` for types without a NEON kernel. A token's blocks go into its four
+    /// sums in turn, in a loop of constant length so that they stay in registers: added to one
+    /// sum, each block waited four cycles for the one before, more than its arithmetic takes. The 32-weight types use only the
     /// first of a token's sums: dealing their blocks over four (indexed by block) ran 5-12%
     /// slower.
     #[target_feature(enable = "neon,dotprod")]
@@ -535,39 +537,49 @@ mod neon {
         unsafe {
             match ty {
                 GgmlType::Q8_0 => {
-                    for i in 0..n_blocks {
-                        let w = row.as_ptr().add(i * bb + 2) as *const i8;
-                        let (w0, w1) = (vld1q_s8(w), vld1q_s8(w.add(16)));
-                        let d = ld16(row.as_ptr().add(i * bb));
-                        for t in 0..N {
-                            let s = dot32x4(w0, w1, xq[t].add(i * QK));
-                            let a = &mut acc[t][0];
-                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                    for i4 in (0..n_blocks).step_by(4) {
+                        for k in 0..(n_blocks - i4).min(4) {
+                            let i = i4 + k;
+                            let w = row.as_ptr().add(i * bb + 2) as *const i8;
+                            let (w0, w1) = (vld1q_s8(w), vld1q_s8(w.add(16)));
+                            let d = ld16(row.as_ptr().add(i * bb));
+                            for t in 0..N {
+                                let s = dot32x4(w0, w1, xq[t].add(i * QK));
+                                let a = &mut acc[t][k];
+                                *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                            }
                         }
                     }
                 }
                 GgmlType::Q4_0 => {
                     let eight = vdupq_n_s8(8);
-                    for i in 0..n_blocks {
-                        let v = vld1q_u8(row.as_ptr().add(i * bb + 2));
-                        let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight);
-                        let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), eight);
-                        let d = ld16(row.as_ptr().add(i * bb));
-                        for t in 0..N {
-                            let s = dot32x4(lo, hi, xq[t].add(i * QK));
-                            let a = &mut acc[t][0];
-                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                    for i4 in (0..n_blocks).step_by(4) {
+                        for k in 0..(n_blocks - i4).min(4) {
+                            let i = i4 + k;
+                            let v = vld1q_u8(row.as_ptr().add(i * bb + 2));
+                            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight);
+                            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), eight);
+                            let d = ld16(row.as_ptr().add(i * bb));
+                            for t in 0..N {
+                                let s = dot32x4(lo, hi, xq[t].add(i * QK));
+                                let a = &mut acc[t][k];
+                                *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                            }
                         }
                     }
                 }
                 GgmlType::Q5_0 => {
-                    for (i, b) in row.chunks_exact(bb).enumerate() {
-                        let (lo, hi) = q5_0(b);
-                        let d = ld16(b.as_ptr());
-                        for t in 0..N {
-                            let s = dot32x4(lo, hi, xq[t].add(i * QK));
-                            let a = &mut acc[t][0];
-                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                    for i4 in (0..n_blocks).step_by(4) {
+                        for k in 0..(n_blocks - i4).min(4) {
+                            let i = i4 + k;
+                            let b = row.get_unchecked(i * bb..);
+                            let (lo, hi) = q5_0(b);
+                            let d = ld16(b.as_ptr());
+                            for t in 0..N {
+                                let s = dot32x4(lo, hi, xq[t].add(i * QK));
+                                let a = &mut acc[t][k];
+                                *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
+                            }
                         }
                     }
                 }
