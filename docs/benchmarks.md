@@ -3,6 +3,14 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON block kernel: K-quant scale decode inlined
+
+`k_scales` stayed a call from `rows2` (a `#[target_feature]` function is only inlined at the
+compiler's discretion), returning 16 vectors through the stack once per super-block and row pair.
+Marked `#[inline(always)]`. `RAYON_NUM_THREADS=1 bench_matvec`, 64 tokens, ms: Q4_K 6.55 -> 6.35,
+Q5_K 7.83 -> 7.65. Llama-3.2-1B Q4_K_M, `bench --pp 128 --tg 0 --reps 3 --threads N`, alternated:
+one thread 100.1 -> 102.9 tok/s (llama.cpp 116.4), four 309.3 -> 318.5 (411.9).
+
 ## 2026-11-16: NEON Q4_K/Q5_K row kernel: multipliers taken by lane
 
 `k_rows` multiplied each sub-block's dot product by a multiplier it had stored as i32 and loaded

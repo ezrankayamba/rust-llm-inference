@@ -875,43 +875,45 @@ mod neon {
 
     /// For the Q4_K/Q5_K block holding chunk `j` of both rows, each chunk's scale and min as
     /// `[r0, r0, r1, r1]`, the lanes of an `smmla` result.
-    #[target_feature(enable = "neon")]
-    #[inline]
+    #[inline(always)]
     fn k_scales(
         block_bytes: usize,
         r0: &[u8],
         r1: &[u8],
         j: usize,
     ) -> ([float32x4_t; 8], [float32x4_t; 8]) {
-        let at = (j / 8) * block_bytes;
-        // A row's eight scales and mins as floats, times its d and dmin.
-        let row = |r: &[u8]| {
-            let b = &r[at..at + block_bytes];
-            let (sc, mn) = scales_mins_k4(&b[4..16]);
-            let f = |v: u64, by: f32| {
-                let v = vmovl_u8(vcreate_u8(v));
-                [
-                    vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(v))), by),
-                    vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(v)), by),
-                ]
+        // SAFETY: NEON is in every aarch64 target's baseline; the slices are bounds-checked.
+        unsafe {
+            let at = (j / 8) * block_bytes;
+            // A row's eight scales and mins as floats, times its d and dmin.
+            let row = |r: &[u8]| {
+                let b = &r[at..at + block_bytes];
+                let (sc, mn) = scales_mins_k4(&b[4..16]);
+                let f = |v: u64, by: f32| {
+                    let v = vmovl_u8(vcreate_u8(v));
+                    [
+                        vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(v))), by),
+                        vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(v)), by),
+                    ]
+                };
+                (f(sc, le16(b, 0)), f(mn, le16(b, 2)))
             };
-            (f(sc, le16(b, 0)), f(mn, le16(b, 2)))
-        };
-        let ((d0, m0), (d1, m1)) = (row(r0), row(r1));
-        // [a0, a1, a2, a3] and [b0, ..] to [a0, a0, b0, b0], [a1, a1, b1, b1], ...
-        let spread = |a: [float32x4_t; 2], b: [float32x4_t; 2]| {
-            let mut out = [vdupq_n_f32(0.0); 8];
-            for h in 0..2 {
-                let (al, ah) = (vzip1q_f32(a[h], a[h]), vzip2q_f32(a[h], a[h]));
-                let (bl, bh) = (vzip1q_f32(b[h], b[h]), vzip2q_f32(b[h], b[h]));
-                out[4 * h] = vcombine_f32(vget_low_f32(al), vget_low_f32(bl));
-                out[4 * h + 1] = vcombine_f32(vget_high_f32(al), vget_high_f32(bl));
-                out[4 * h + 2] = vcombine_f32(vget_low_f32(ah), vget_low_f32(bh));
-                out[4 * h + 3] = vcombine_f32(vget_high_f32(ah), vget_high_f32(bh));
-            }
-            out
-        };
-        (spread(d0, d1), spread(m0, m1))
+            let ((d0, m0), (d1, m1)) = (row(r0), row(r1));
+            // [a0, a1, a2, a3] and [b0, ..] to [a0, a0, b0, b0], [a1, a1, b1, b1], ...
+            let spread = |a: [float32x4_t; 2], b: [float32x4_t; 2]| {
+                let mut out = [vdupq_n_f32(0.0); 8];
+                for h in 0..2 {
+                    let (al, ah) = (vzip1q_f32(a[h], a[h]), vzip2q_f32(a[h], a[h]));
+                    let (bl, bh) = (vzip1q_f32(b[h], b[h]), vzip2q_f32(b[h], b[h]));
+                    out[4 * h] = vcombine_f32(vget_low_f32(al), vget_low_f32(bl));
+                    out[4 * h + 1] = vcombine_f32(vget_high_f32(al), vget_high_f32(bl));
+                    out[4 * h + 2] = vcombine_f32(vget_low_f32(ah), vget_low_f32(bh));
+                    out[4 * h + 3] = vcombine_f32(vget_high_f32(ah), vget_high_f32(bh));
+                }
+                out
+            };
+            (spread(d0, d1), spread(m0, m1))
+        }
     }
 
     /// Rows `r0`, `r1` (type `T`) against token pairs `first..first + NP`; `out[p]` =
