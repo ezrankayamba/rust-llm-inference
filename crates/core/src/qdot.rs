@@ -875,7 +875,7 @@ mod neon {
         r1: &[u8],
         acts: &BlockActs,
         first: usize,
-        out: &mut [[f32; 4]; 4],
+        out: &mut [[f32; 4]; 8],
     ) {
         let n_chunks = acts.n_chunks;
         let mut acc = [vdupq_n_f32(0.0); NP];
@@ -947,8 +947,9 @@ mod neon {
         }
     }
 
-    /// [`super::dot_block`]: rows in pairs and tokens in groups of up to 8, an odd last row
-    /// paired with itself.
+    /// [`super::dot_block`]: rows in pairs and tokens in groups of up to 16, an odd last row
+    /// paired with itself. A row pair's weights are decoded once per group, and 16 tokens of
+    /// activations still fit L1 beside them; groups of 8 ran Q6_K 28% slower.
     #[target_feature(enable = "neon,dotprod,i8mm")]
     pub unsafe fn dot_block(
         ty: GgmlType,
@@ -963,8 +964,8 @@ mod neon {
         assert_eq!(rb / ty.block_bytes() * ty.block_size(), acts.n_chunks * QK);
         // Tokens outside rows: a group's activations stay in L1 while it meets every row, where
         // the other way round each row would cycle through all the tokens' activations.
-        for t0 in (0..nt).step_by(8) {
-            let k = (nt - t0).min(8);
+        for t0 in (0..nt).step_by(16) {
+            let k = (nt - t0).min(16);
             for rp in (0..n_rows).step_by(2) {
                 let r0 = &rows[rp * rb..(rp + 1) * rb];
                 let two = rp + 1 < n_rows;
@@ -973,7 +974,7 @@ mod neon {
                 } else {
                     r0
                 };
-                let mut res = [[0.0f32; 4]; 4];
+                let mut res = [[0.0f32; 4]; 8];
                 macro_rules! run {
                     ($($t:ident),*) => {
                         match (t, k.div_ceil(2)) {
@@ -981,7 +982,11 @@ mod neon {
                                 ($t, 1) => rows2::<$t, 1>(r0, r1, acts, t0 / 2, &mut res),
                                 ($t, 2) => rows2::<$t, 2>(r0, r1, acts, t0 / 2, &mut res),
                                 ($t, 3) => rows2::<$t, 3>(r0, r1, acts, t0 / 2, &mut res),
-                                ($t, _) => rows2::<$t, 4>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 4) => rows2::<$t, 4>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 5) => rows2::<$t, 5>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 6) => rows2::<$t, 6>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 7) => rows2::<$t, 7>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, _) => rows2::<$t, 8>(r0, r1, acts, t0 / 2, &mut res),
                             )*
                             _ => unreachable!(),
                         }

@@ -3,6 +3,28 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON block kernel (prompts): token groups of 16
+
+`dot_block` decoded each row pair's weights once per group of 8 tokens; with 16 the decode is shared
+by twice as many `smmla`. `RAYON_NUM_THREADS=1 bench_matvec`, 5632 x 2048, 64 tokens, ms:
+
+| | Q8_0 | Q4_0 | Q5_0 | Q4_K | Q5_K | Q6_K |
+|---|---:|---:|---:|---:|---:|---:|
+| groups of 8 | 5.54 | 6.03 | 8.14 | 6.77 | 9.70 | 10.18 |
+| groups of 16 | 5.25 | 5.46 | 6.54 | 6.55 | 7.83 | 8.00 |
+
+`bench --pp 128 --tg 0 --reps 3 --threads N`, alternated: Qwen2.5-0.5B Q4_K_M (Q5_0 and Q8_0),
+4 threads, 663.1 -> 760.8 tok/s (llama.cpp 552); Llama-3.2-1B Q4_K_M (its layers are mostly Q4_K),
+one thread 96.6 -> 99.8 (llama.cpp 116.3), 4 threads 311.2 -> 309.5 (411.4).
+
+What is left on Llama-3.2-1B is the kernel: with 4 threads each spends 82% of its time in it and
+6% waiting, and the kernel alone scales 3.5x (6.27 -> 1.80 ms). `smmla` costs as much per multiply
+as `sdot` on the M4 (0.127 ns for 32 against 0.062 ns for 16, 16 independent chains), so a pair of
+rows and tokens over 32 weights is 2.25 cycles of all four vector pipes before the three float
+operations that apply the scales per 32 activations (llama.cpp has one activation scale per 256).
+Writing each task's results straight into the token outputs instead of transposing afterwards
+gained 1%, within noise, so it was dropped.
+
 ## 2026-11-16: NEON Q6_K decode kernel: fewer instructions per chunk
 
 The one-row Q6_K kernel is bound by instruction count, not by a chain (about 21 vector operations
