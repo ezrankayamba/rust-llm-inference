@@ -299,7 +299,8 @@ The Python tools need `pip install gguf numpy` (plus `tokenizers huggingface_hub
   prints throughput, first-token time and peak memory on the CPU. The manual `Benchmark` workflow
   (`.github/workflows/bench.yml`) runs it on x86; GitHub runners vary in CPU and have 2 vCPUs on one core, so
   compare only within one run and don't read thread scaling from it. On macOS build llama.cpp with
-  `-DGGML_BLAS=OFF`: its default BLAS backend dequantizes Q5_0 and similar weights and runs prompts on
+  `-DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF` (and `-DGGML_METAL=OFF` for CPU runs; with Accelerate on, Q5_0
+  prompts still ran at one speed whatever the thread count): its default BLAS backend dequantizes Q5_0 and similar weights and runs prompts on
   Apple's matrix hardware (Qwen2.5 0.5B on the M4: 517 tok/s against 110.6 without), so that's not a
   comparison of int8 kernels, and it doesn't carry over to x86.
 

@@ -362,6 +362,25 @@ mod neon {
         }
     }
 
+    /// The f16 at `p` as f32, loaded straight into a vector register: [`le16`] goes through a
+    /// general one, an extra operation on the vector pipes that the one-row kernels are short of.
+    #[inline(always)]
+    unsafe fn ld16(p: *const u8) -> f32 {
+        let out: f32;
+        // SAFETY: the caller passes two readable bytes.
+        unsafe {
+            std::arch::asm!(
+                "ldr {t:h}, [{p}]",
+                "fcvt {o:s}, {t:h}",
+                p = in(reg) p,
+                t = out(vreg) _,
+                o = lateout(vreg) out,
+                options(pure, readonly, nostack),
+            );
+        }
+        out
+    }
+
     /// A Q5_0 block's 32 weights as i8, -16 to 15, in two halves. The four bytes of high bits
     /// are loaded into every lane and spread by a table, staying in vector registers: moving
     /// them over from general ones made this the slowest of the decoders.
@@ -372,21 +391,21 @@ mod neon {
             0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
             3, 3, 3,
         ];
-        assert!(b.len() >= 22);
-        // SAFETY: the block holds 22 bytes, as asserted.
+        debug_assert!(b.len() >= 22);
+        // SAFETY: the caller passes a whole block, 22 bytes.
         unsafe {
             let qh = vreinterpretq_u8_u32(vld1q_dup_u32(b.as_ptr().add(2) as *const u32));
             let v = vld1q_u8(b.as_ptr().add(6));
-            let (bit, f0) = (vld1q_u8(BIT.as_ptr()), vdupq_n_u8(0xf0));
-            // 0xf0 where the high bit is clear: or-ed with the nibble, that is the weight
-            // less 16.
-            let high = |half: usize| {
-                let bytes = vqtbl1q_u8(qh, vld1q_u8(BYTES.as_ptr().add(16 * half)));
-                vbicq_u8(f0, vtstq_u8(bytes, bit))
+            let (bit, not_qh) = (vld1q_u8(BIT.as_ptr()), vmvnq_u8(qh));
+            // 0xff where the high bit is clear: its top four bits over the nibble are the
+            // weight less 16.
+            let clear = |half: usize| {
+                let bytes = vqtbl1q_u8(not_qh, vld1q_u8(BYTES.as_ptr().add(16 * half)));
+                vtstq_u8(bytes, bit)
             };
             (
-                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v, vdupq_n_u8(0xf)), high(0))),
-                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v, 4), high(1))),
+                vreinterpretq_s8_u8(vbslq_u8(vdupq_n_u8(0xf), v, clear(0))),
+                vreinterpretq_s8_u8(vsriq_n_u8::<4>(clear(1), v)),
             )
         }
     }
@@ -519,11 +538,11 @@ mod neon {
                     for i in 0..n_blocks {
                         let w = row.as_ptr().add(i * bb + 2) as *const i8;
                         let (w0, w1) = (vld1q_s8(w), vld1q_s8(w.add(16)));
-                        let d = le16(&row[i * bb..], 0);
+                        let d = ld16(row.as_ptr().add(i * bb));
                         for t in 0..N {
                             let s = dot32x4(w0, w1, xq[t].add(i * QK));
                             let a = &mut acc[t][0];
-                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
+                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
                         }
                     }
                 }
@@ -533,23 +552,22 @@ mod neon {
                         let v = vld1q_u8(row.as_ptr().add(i * bb + 2));
                         let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight);
                         let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), eight);
-                        let d = le16(&row[i * bb..], 0);
+                        let d = ld16(row.as_ptr().add(i * bb));
                         for t in 0..N {
                             let s = dot32x4(lo, hi, xq[t].add(i * QK));
                             let a = &mut acc[t][0];
-                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
+                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
                         }
                     }
                 }
                 GgmlType::Q5_0 => {
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..];
+                    for (i, b) in row.chunks_exact(bb).enumerate() {
                         let (lo, hi) = q5_0(b);
-                        let d = le16(b, 0);
+                        let d = ld16(b.as_ptr());
                         for t in 0..N {
                             let s = dot32x4(lo, hi, xq[t].add(i * QK));
                             let a = &mut acc[t][0];
-                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
+                            *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * *ad[t].get_unchecked(i));
                         }
                     }
                 }

@@ -3,6 +3,28 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON one-row kernels for Q8_0, Q4_0, Q5_0: fewer vector operations per block
+
+A block's f16 scale is loaded straight into a vector register (`ld16`; it went through a general
+one), the multiply and add of its sum are one fused operation, and the Q5_0 decoder builds its
+weights with `bsl` and `sri` from the inverted high bits. `RAYON_NUM_THREADS=1 bench_matvec`,
+5632 x 2048, ms per matvec: Q8_0 0.298 -> 0.292, Q4_0 0.322 -> 0.293, Q5_0 0.354 -> 0.324.
+
+Qwen2.5-0.5B Q4_K_M, `bench --pp 0 --tg 64 --reps 3 --threads N`, alternated: one thread 67.1 ->
+74.9 tok/s, four threads 150.9 -> 155.9. Logits against the `--precise` reference 0.37 batched,
+0.35 per token, top-1 the same; `eval_quant` KL mean 0.0017, top-1 agreement 96.0%.
+
+Against llama.cpp built with `-DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF -DGGML_METAL=OFF`
+(`llama-bench -t N -p 128 -n 64 -r 3`; the build used for the entries above had Accelerate on,
+and its Qwen prompts did not change with the thread count: 511, 480, 547 tok/s at 1, 2, 4):
+
+| Model | Threads | pp128 rli | llama.cpp | tg64 rli | llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 1 | 270.7 | 117.2 | 74.9 | 80.5 |
+| Qwen2.5-0.5B | 4 | 814.8 | 372.7 | 155.9 | 156.4 |
+| Llama-3.2-1B | 1 | 99.6 | 116.4 | 35.2 | 45.6 |
+| Llama-3.2-1B | 4 | 307.5 | 411.9 | 83.5 | 85.2 |
+
 ## 2026-11-16: NEON Q5_0 decoder kept in vector registers
 
 A Q5_0 block's 32 high bits were moved byte by byte from general registers into vector ones. `q5_0`
