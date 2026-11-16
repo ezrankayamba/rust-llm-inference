@@ -432,25 +432,30 @@ mod neon {
             let sixteen = vdupq_n_u8(16);
             let zero = vdupq_n_s32(0);
             for (i, b) in row.chunks_exact(bb).enumerate() {
-                let (d, dmin) = (le16(b, 0), le16(b, 2));
+                let (d, dmin) = (ld16(b.as_ptr()), -ld16(b.as_ptr().add(2)));
                 let (sc, mn) = scales_mins_k4(&b[4..16]);
                 let sc = vreinterpretq_s16_u16(vmovl_u8(vcreate_u8(sc)));
                 let mn = vmovl_u8(vcreate_u8(mn));
+                // The mins, negated.
                 let mins = [
                     vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(mn))), dmin),
                     vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(mn)), dmin),
                 ];
                 let xb = i * (QK_K / QK);
                 // Each token's eight multipliers, and its two sums.
-                let mut mult = [[0i32; 8]; N];
+                let mut mult = [[zero; 2]; N];
                 let mut sum = [[zero; 2]; N];
                 for t in 0..N {
                     let xs = acts[t].sum.as_ptr().add(xb);
-                    extra[t][0] = vfmsq_f32(extra[t][0], mins[0], vld1q_f32(xs));
-                    extra[t][1] = vfmsq_f32(extra[t][1], mins[1], vld1q_f32(xs.add(4)));
-                    let m = vmulq_s16(sc, vld1q_s16(acts[t].ratio.as_ptr().add(xb)));
-                    vst1q_s32(mult[t].as_mut_ptr(), vmovl_s16(vget_low_s16(m)));
-                    vst1q_s32(mult[t].as_mut_ptr().add(4), vmovl_high_s16(m));
+                    extra[t][0] = vfmaq_f32(extra[t][0], mins[0], vld1q_f32(xs));
+                    extra[t][1] = vfmaq_f32(extra[t][1], mins[1], vld1q_f32(xs.add(4)));
+                    // Widening multiplies: from a 16-bit product the compiler broadcasts and
+                    // widens each multiplier again where it is used.
+                    let r = vld1q_s16(acts[t].ratio.as_ptr().add(xb));
+                    mult[t] = [
+                        vmull_s16(vget_low_s16(sc), vget_low_s16(r)),
+                        vmull_high_s16(sc, r),
+                    ];
                 }
                 let (qh0, qh1) = if FIVE {
                     (vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)))
@@ -475,17 +480,27 @@ mod neon {
                         let (w0, w1) = (vreinterpretq_s8_u8(w0), vreinterpretq_s8_u8(w1));
                         for t in 0..N {
                             let x = acts[t].qs.as_ptr().add((xb + sub) * QK);
-                            let m = vld1q_dup_s32(mult[t].as_ptr().add(sub));
+                            // `sum + p * multiplier`, the multiplier taken from its lane by
+                            // the instruction: broadcast first, it cost two more operations
+                            // per sub-block.
+                            let mla = |sum: int32x4_t, p: int32x4_t| {
+                                let m = mult[t][sub / 4];
+                                match sub % 4 {
+                                    0 => vmlaq_laneq_s32::<0>(sum, p, m),
+                                    1 => vmlaq_laneq_s32::<1>(sum, p, m),
+                                    2 => vmlaq_laneq_s32::<2>(sum, p, m),
+                                    _ => vmlaq_laneq_s32::<3>(sum, p, m),
+                                }
+                            };
                             if FIVE {
                                 let p0 = vdotq_s32(zero, w0, vld1q_s8(x));
                                 let p1 = vdotq_s32(zero, w1, vld1q_s8(x.add(16)));
-                                sum[t][0] = vaddq_s32(sum[t][0], vmulq_s32(p0, m));
-                                sum[t][1] = vaddq_s32(sum[t][1], vmulq_s32(p1, m));
+                                sum[t][0] = mla(sum[t][0], p0);
+                                sum[t][1] = mla(sum[t][1], p1);
                             } else {
                                 // Sub-blocks in turn into the two sums, so neither waits on
                                 // the one before.
-                                let p = dot32x4(w0, w1, x);
-                                sum[t][half] = vaddq_s32(sum[t][half], vmulq_s32(p, m));
+                                sum[t][half] = mla(sum[t][half], dot32x4(w0, w1, x));
                             }
                         }
                     }

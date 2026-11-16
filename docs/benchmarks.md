@@ -3,6 +3,20 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON Q4_K/Q5_K row kernel: multipliers taken by lane
+
+`k_rows` multiplied each sub-block's dot product by a multiplier it had stored as i32 and loaded
+into every lane. The compiler saw through the store and, since the multipliers came from a 16-bit
+product, broadcast and widened one again for every sub-block (`dup.4h` + `sshll`, 16 operations a
+super-block; asking for the lane directly compiled to the same). Computed with widening multiplies
+(`smull`), they are 32-bit from the start and `mla` takes its lane. The mins are also negated once
+per super-block as a scalar. `RAYON_NUM_THREADS=1 bench_matvec`, 5632 x 2048, ms: Q4_K 0.226 ->
+0.198, Q5_K 0.355 -> 0.315. Four integer sums a super-block instead of two changed nothing.
+
+Llama-3.2-1B Q4_K_M, `bench --pp 0 --tg 64 --reps 3 --threads N`, alternated, tok/s: one thread
+35.1 -> 38.2 (llama.cpp 45.6), two 66.3 -> 71.6, four 83.2 -> 83.5 (85.2). Logits and `eval_quant`
+as before (the arithmetic is the same).
+
 ## 2026-11-16: NEON one-row kernels for Q8_0, Q4_0, Q5_0: four sums
 
 These kernels were waiting on their one float sum after all: the same matrix laid out with longer
