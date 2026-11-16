@@ -40,6 +40,26 @@ fn swiglu_kernel(ty: GgmlType) -> Option<&'static str> {
         _ => None,
     }
 }
+fn swiglu_id_kernel(ty: GgmlType) -> Option<&'static str> {
+    match ty {
+        GgmlType::Q4_0 => Some("matvec_swiglu_id_q4_0"),
+        GgmlType::Q5_0 => Some("matvec_swiglu_id_q5_0"),
+        GgmlType::Q8_0 => Some("matvec_swiglu_id_q8_0"),
+        GgmlType::Q4_K => Some("matvec_swiglu_id_q4_k"),
+        GgmlType::Q6_K => Some("matvec_swiglu_id_q6_k"),
+        _ => None,
+    }
+}
+fn id_add_kernel(ty: GgmlType) -> Option<&'static str> {
+    match ty {
+        GgmlType::Q4_0 => Some("matvec_id_add_q4_0"),
+        GgmlType::Q5_0 => Some("matvec_id_add_q5_0"),
+        GgmlType::Q8_0 => Some("matvec_id_add_q8_0"),
+        GgmlType::Q4_K => Some("matvec_id_add_q4_k"),
+        GgmlType::Q6_K => Some("matvec_id_add_q6_k"),
+        _ => None,
+    }
+}
 const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::F32, "matvec_f32"),
     (GgmlType::F16, "matvec_f16"),
@@ -81,7 +101,7 @@ const MATMUL_THREADS: usize = 128;
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
 const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
-const OTHER_KERNELS: [&str; 33] = [
+const OTHER_KERNELS: [&str; 43] = [
     "matvec4_q4_k",
     "matvec4_q6_k",
     "matvec4_q8_0",
@@ -90,6 +110,16 @@ const OTHER_KERNELS: [&str; 33] = [
     "matvec_swiglu_q8_0",
     "matvec_swiglu_q4_k",
     "matvec_swiglu_q6_k",
+    "matvec_swiglu_id_q4_0",
+    "matvec_swiglu_id_q5_0",
+    "matvec_swiglu_id_q8_0",
+    "matvec_swiglu_id_q4_k",
+    "matvec_swiglu_id_q6_k",
+    "matvec_id_add_q4_0",
+    "matvec_id_add_q5_0",
+    "matvec_id_add_q8_0",
+    "matvec_id_add_q4_k",
+    "matvec_id_add_q6_k",
     "rope_store_f32",
     "rope_store_f16",
     "moe_topk",
@@ -324,6 +354,27 @@ struct SwigluParams {
     rows: u32,
     cols: u32,
     row_bytes: u32,
+}
+#[repr(C)]
+struct IdAddParams {
+    offset: u64,
+    expert_stride: u64,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    x_stride: u32,
+    slots: u32,
+}
+#[repr(C)]
+struct SwigluIdParams {
+    gate: u64,
+    up: u64,
+    gate_stride: u64,
+    up_stride: u64,
+    rows: u32,
+    cols: u32,
+    row_bytes: u32,
+    y_stride: u32,
 }
 #[repr(C)]
 struct MatmulParams {
@@ -1121,8 +1172,113 @@ impl Batch<'_> {
             },
         );
         self.bind(4, ids);
+        // The types with a pair kernel take two rows a simdgroup.
+        let sg_rows = if swiglu_kernel(ty).is_some() { 2 } else { 1 };
         self.dispatch2(
             pipeline,
+            (rows.div_ceil(MATVEC_ROWS_PER_TG * sg_rows), slots),
+            MATVEC_ROWS_PER_TG * 32,
+        );
+    }
+
+    /// `y += Σ_slot wt[slot] · (W[ids[slot]] x[slot])`: [`Batch::matvec_id`] over `slots`
+    /// slots and the weighted sum of its results, as one dispatch. Only for the types with
+    /// [`Batch::has_matvec_swiglu`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_id_add(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        expert_stride: usize,
+        n_expert: usize,
+        ids: At<'_>,
+        wt: At<'_>,
+        x: At<'_>,
+        x_stride: usize,
+        y: At<'_>,
+        slots: usize,
+    ) {
+        assert!(slots >= 1 && ids.1 + slots <= ids.0.len && wt.1 + slots <= wt.0.len);
+        assert!(x.1 + (slots - 1) * x_stride + cols <= x.0.len && y.1 + rows <= y.0.len);
+        let row_bytes = ty.row_bytes(cols);
+        let span = (n_expert - 1) * expert_stride + rows * row_bytes;
+        let (wbuf, offset) = self.gpu.weight_buf(offset, span);
+        // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
+        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+        self.bind(1, x);
+        self.bind(2, y);
+        self.params(
+            3,
+            &IdAddParams {
+                offset: offset as u64,
+                expert_stride: expert_stride as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+                row_bytes: row_bytes as u32,
+                x_stride: x_stride as u32,
+                slots: slots as u32,
+            },
+        );
+        self.bind(4, ids);
+        self.bind(5, wt);
+        let kernel = id_add_kernel(ty).expect("no adding id matvec for this type");
+        self.dispatch(
+            self.gpu.other(kernel),
+            rows.div_ceil(MATVEC_ROWS_PER_TG * 2),
+            MATVEC_ROWS_PER_TG * 32,
+        );
+    }
+
+    /// [`Batch::matvec_swiglu`] over the chosen experts of stacked gate and up tensors (see
+    /// [`Batch::matvec_id`]): `y[slot] = silu(G[ids[slot]] x) * (U[ids[slot]] x)`, every slot
+    /// reading the one `x`, outputs `y_stride` floats apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_swiglu_id(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        [gate, up]: [usize; 2],
+        [gate_stride, up_stride]: [usize; 2],
+        n_expert: usize,
+        ids: At<'_>,
+        x: At<'_>,
+        y: At<'_>,
+        y_stride: usize,
+        slots: usize,
+    ) {
+        assert!(slots >= 1 && ids.1 + slots <= ids.0.len && x.1 + cols <= x.0.len);
+        assert!(y.1 + (slots - 1) * y_stride + rows <= y.0.len);
+        let row_bytes = ty.row_bytes(cols);
+        let span = |stride| (n_expert - 1) * stride + rows * row_bytes;
+        let (gbuf, gate) = self.gpu.weight_buf(gate, span(gate_stride));
+        let (ubuf, up) = self.gpu.weight_buf(up, span(up_stride));
+        // SAFETY: weight buffers bound read-only at offset 0; the kernel adds the offsets.
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(Some(gbuf), 0, 0);
+            self.enc.setBuffer_offset_atIndex(Some(ubuf), 0, 1);
+        }
+        self.bind(2, x);
+        self.bind(3, y);
+        self.params(
+            4,
+            &SwigluIdParams {
+                gate: gate as u64,
+                up: up as u64,
+                gate_stride: gate_stride as u64,
+                up_stride: up_stride as u64,
+                rows: rows as u32,
+                cols: cols as u32,
+                row_bytes: row_bytes as u32,
+                y_stride: y_stride as u32,
+            },
+        );
+        self.bind(5, ids);
+        let kernel = swiglu_id_kernel(ty).expect("no SwiGLU matvec for this type");
+        self.dispatch2(
+            self.gpu.other(kernel),
             (rows.div_ceil(MATVEC_ROWS_PER_TG), slots),
             MATVEC_ROWS_PER_TG * 32,
         );

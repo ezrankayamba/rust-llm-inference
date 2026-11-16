@@ -266,6 +266,106 @@ fn metal_matvec_add_bias_and_swiglu_match_cpu() {
     }
 }
 
+/// MoE decode: the fixture's rows as three stacked experts of 12 rows, of which two are chosen.
+/// `matvec_id` gives each slot its expert's product (11 rows: an odd count for the two-row
+/// kernels), `matvec_swiglu_id` the SwiGLU of a gate and an up stack (the same rows, one down),
+/// and `matvec_id_add` adds the slots' products of their own inputs, weighted, into a buffer.
+#[test]
+fn metal_matvec_id_and_swiglu_id_match_cpu() {
+    let (mut mem, offsets) = fixture();
+    let buf = mem.bytes();
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
+    let (rows, n_expert, chosen) = (11, 3, [2u32, 0]);
+    let x = input(1);
+    let (xb, ids) = (gpu.upload(&x), gpu.alloc(chosen.len()));
+    // SAFETY: nothing is in flight.
+    unsafe { ids.write_u32(0, &chosen) };
+    for (&ty, &off) in TYPES.iter().zip(&offsets) {
+        let row_bytes = ty.row_bytes(COLS);
+        let stride = 12 * row_bytes;
+        let want = cpu_matvec(buf, ty, off, &x);
+        let (y, act) = (gpu.alloc(2 * 16), gpu.alloc(2 * 16));
+        let swiglu = Batch::has_matvec_swiglu(ty);
+        let mut b = gpu.batch();
+        let (i, xa) = ((&ids).into(), (&xb).into());
+        b.matvec_id(
+            ty,
+            rows,
+            COLS,
+            off,
+            stride,
+            n_expert,
+            i,
+            xa,
+            0,
+            (&y).into(),
+            16,
+            2,
+        );
+        if swiglu {
+            let (at, strides) = ([off, off + row_bytes], [stride, stride]);
+            b.matvec_swiglu_id(
+                ty,
+                rows,
+                COLS,
+                at,
+                strides,
+                n_expert,
+                i,
+                xa,
+                (&act).into(),
+                16,
+                2,
+            );
+        }
+        let (x2, wts) = (input(2), [0.5f32, -1.25]);
+        let base: Vec<f32> = (0..rows).map(|r| r as f32 * 0.25 - 1.0).collect();
+        let (x2b, wt, sum) = (gpu.upload(&x2), gpu.upload(&wts), gpu.upload(&base));
+        if swiglu {
+            let (x2a, wt, sum) = ((&x2b).into(), (&wt).into(), (&sum).into());
+            b.matvec_id_add(
+                ty, rows, COLS, off, stride, n_expert, i, wt, x2a, COLS, sum, 2,
+            );
+        }
+        b.finish();
+        // SAFETY: the batch has finished.
+        let (y, act) = unsafe { (y.as_slice(), act.as_slice()) };
+        if swiglu {
+            let mut want_sum = base.clone();
+            for (slot, &e) in chosen.iter().enumerate() {
+                let y = cpu_matvec(buf, ty, off, &x2[slot * COLS..(slot + 1) * COLS]);
+                for (r, s) in want_sum.iter_mut().enumerate() {
+                    *s += wts[slot] * y[e as usize * 12 + r];
+                }
+            }
+            // SAFETY: the batch has finished.
+            assert_close(ty, "matvec_id_add", unsafe { sum.as_slice() }, &want_sum);
+        }
+        for (slot, &e) in chosen.iter().enumerate() {
+            let at = e as usize * 12;
+            let label = format!("slot {slot}");
+            assert_close(
+                ty,
+                &label,
+                &y[slot * 16..slot * 16 + rows],
+                &want[at..at + rows],
+            );
+            if swiglu {
+                let silu: Vec<f32> = (at..at + rows)
+                    .map(|r| want[r] / (1.0 + (-want[r]).exp()) * want[r + 1])
+                    .collect();
+                assert_close(
+                    ty,
+                    &format!("swiglu {label}"),
+                    &act[slot * 16..slot * 16 + rows],
+                    &silu,
+                );
+            }
+        }
+    }
+}
+
 /// From 16384 rows a quantized matvec takes four rows a simdgroup (the output head); the row
 /// count here leaves the last simdgroup with three.
 #[test]

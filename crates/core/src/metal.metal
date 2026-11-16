@@ -40,37 +40,6 @@ inline float sum4(float4 v) { return (v.x + v.y) + (v.z + v.w); }
 inline uint word4(device const uchar* p) { return as_type<uint>(uchar4(*(device const packed_uchar4*)p)); }
 inline float4 unpack4(uint w) { return float4(as_type<uchar4>(w)); }
 
-inline float chunk_q4_0(device const uchar* r, uint c, device const float* x) {
-    device const uchar* b = r + c * 18;
-    float s = 0;
-    for (uint j = 0; j < 16; j++) {
-        uchar q = b[2 + j];
-        s += float(int(q & 15) - 8) * x[j] + float(int(q >> 4) - 8) * x[j + 16];
-    }
-    return h(b) * s;
-}
-
-inline float chunk_q5_0(device const uchar* r, uint c, device const float* x) {
-    device const uchar* b = r + c * 22;
-    uint qh = uint(b[2]) | (uint(b[3]) << 8) | (uint(b[4]) << 16) | (uint(b[5]) << 24);
-    float s = 0;
-    for (uint j = 0; j < 16; j++) {
-        uchar q = b[6 + j];
-        int lo = int((q & 15) | (((qh >> j) << 4) & 0x10)) - 16;
-        int hi = int((q >> 4) | ((qh >> (j + 12)) & 0x10)) - 16;
-        s += float(lo) * x[j] + float(hi) * x[j + 16];
-    }
-    return h(b) * s;
-}
-
-inline float chunk_q8_0(device const uchar* r, uint c, device const float* x) {
-    device const uchar* b = r + c * 34;
-    device const char* q = (device const char*)(b + 2);
-    float s = 0;
-    for (uint i = 0; i < 32; i++) s += float(q[i]) * x[i];
-    return h(b) * s;
-}
-
 inline void scale_min_k4(uint j, device const uchar* q, thread float& sc, thread float& m) {
     if (j < 4) {
         sc = float(q[j] & 63);
@@ -82,21 +51,6 @@ inline void scale_min_k4(uint j, device const uchar* q, thread float& sc, thread
 }
 
 // K-quants: chunk c is sub-block c % 8 of super-block c / 8.
-inline float chunk_q4_k(device const uchar* r, uint c, device const float* x) {
-    uint sub = c % 8;
-    device const uchar* b = r + (c / 8) * 144;
-    float sc, m;
-    scale_min_k4(sub, b + 4, sc, m);
-    device const uchar* q = b + 16 + 32 * (sub / 2);
-    float s = 0, sx = 0;
-    for (uint l = 0; l < 32; l++) {
-        uint v = (sub & 1) ? (q[l] >> 4) : (q[l] & 15);
-        s += float(v) * x[l];
-        sx += x[l];
-    }
-    return h(b) * sc * s - h(b + 2) * m * sx;
-}
-
 inline float chunk_q5_k(device const uchar* r, uint c, device const float* x) {
     uint sub = c % 8;
     device const uchar* b = r + (c / 8) * 176;
@@ -111,21 +65,6 @@ inline float chunk_q5_k(device const uchar* r, uint c, device const float* x) {
         sx += x[l];
     }
     return h(b) * sc * s - h(b + 2) * m * sx;
-}
-
-inline float chunk_q6_k(device const uchar* r, uint c, device const float* x) {
-    uint j = c % 8, n = j / 4, k = j % 4;
-    device const uchar* b = r + (c / 8) * 210;
-    device const uchar* ql = b + 64 * n + 32 * (k % 2);
-    device const uchar* qh = b + 128 + 32 * n;
-    device const char* sc = (device const char*)(b + 192) + 8 * n + 2 * k;
-    float s0 = 0, s1 = 0;
-    for (uint l = 0; l < 32; l++) {
-        uint lo = k < 2 ? (ql[l] & 15) : (ql[l] >> 4);
-        int q = int(lo | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
-        if (l < 16) s0 += float(q) * x[l]; else s1 += float(q) * x[l];
-    }
-    return h(b + 208) * (float(sc[0]) * s0 + float(sc[1]) * s1);
 }
 
 #define MATVEC(NAME, CHUNK)                                                                   \
@@ -410,14 +349,121 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
     if (lane == 0) y[slot * p.y_stride + row] = acc;                                          \
 }
 
+// The same with two rows a simdgroup, as MATVEC2.
+#define MATVEC2_ID(NAME, PAIR, U)                                                             \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant IdParams& p [[buffer(3)]],          \
+                 device const uint* ids [[buffer(4)]],                                        \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = (tg.x * ROWS_PER_TG + sg) * 2;                                                 \
+    if (row >= p.rows) return;                                                                \
+    uint slot = tg.y;                                                                         \
+    device const uchar* r =                                                                   \
+        w + p.offset + ulong(ids[slot]) * p.expert_stride + ulong(row) * p.row_bytes;         \
+    device const uchar* r1 = row + 1 < p.rows ? r + p.row_bytes : r;                          \
+    device const float* xs = x + slot * p.x_stride;                                           \
+    float2 acc = 0;                                                                           \
+    for (uint c = lane; c < p.cols / U; c += 32) acc += PAIR(r, r1, c, xs);                   \
+    float s0 = simd_sum(acc.x), s1 = simd_sum(acc.y);                                         \
+    if (lane == 0) {                                                                          \
+        y[slot * p.y_stride + row] = s0;                                                      \
+        if (row + 1 < p.rows) y[slot * p.y_stride + row + 1] = s1;                            \
+    }                                                                                         \
+}
+
 MATVEC_ID(matvec_id_f32, chunk_f32)
 MATVEC_ID(matvec_id_f16, chunk_f16)
-MATVEC_ID(matvec_id_q4_0, chunk_q4_0)
-MATVEC_ID(matvec_id_q5_0, chunk_q5_0)
-MATVEC_ID(matvec_id_q8_0, chunk_q8_0)
-MATVEC_ID(matvec_id_q4_k, chunk_q4_k)
+MATVEC2_ID(matvec_id_q4_0, two_q4_0, 32)
+MATVEC2_ID(matvec_id_q5_0, two_q5_0, 32)
+MATVEC2_ID(matvec_id_q8_0, two_q8_0, 32)
+MATVEC2_ID(matvec_id_q4_k, pair_q4_k, 64)
 MATVEC_ID(matvec_id_q5_k, chunk_q5_k)
-MATVEC_ID(matvec_id_q6_k, chunk_q6_k)
+MATVEC2_ID(matvec_id_q6_k, pair_q6_k, 64)
+
+// The chosen experts' down matvecs and their weighted sum as one dispatch:
+// y += sum over slots s of wt[s] * (W[ids[s]] x[s]). A simdgroup takes two rows and deals
+// every slot's column units over its lanes (an expert's FFN is narrow: 768 columns are 12
+// units, so a lane has work only across slots).
+struct IdAddParams {
+    ulong offset;
+    ulong expert_stride;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    uint x_stride;
+    uint slots;
+};
+
+#define MATVEC2_ID_ADD(NAME, PAIR, U)                                                         \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant IdAddParams& p [[buffer(3)]],       \
+                 device const uint* ids [[buffer(4)]], device const float* wt [[buffer(5)]], \
+                 uint tg [[threadgroup_position_in_grid]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = (tg * ROWS_PER_TG + sg) * 2;                                                   \
+    if (row >= p.rows) return;                                                                \
+    bool two = row + 1 < p.rows;                                                              \
+    uint units = p.cols / U;                                                                  \
+    float2 acc = 0;                                                                           \
+    for (uint u = lane; u < units * p.slots; u += 32) {                                       \
+        uint slot = u / units;                                                                \
+        device const uchar* r =                                                               \
+            w + p.offset + ulong(ids[slot]) * p.expert_stride + ulong(row) * p.row_bytes;     \
+        acc += wt[slot] * PAIR(r, two ? r + p.row_bytes : r, u % units, x + slot * p.x_stride); \
+    }                                                                                         \
+    float s0 = simd_sum(acc.x), s1 = simd_sum(acc.y);                                         \
+    if (lane == 0) {                                                                          \
+        y[row] += s0;                                                                         \
+        if (two) y[row + 1] += s1;                                                            \
+    }                                                                                         \
+}
+
+MATVEC2_ID_ADD(matvec_id_add_q4_k, pair_q4_k, 64)
+MATVEC2_ID_ADD(matvec_id_add_q6_k, pair_q6_k, 64)
+MATVEC2_ID_ADD(matvec_id_add_q4_0, two_q4_0, 32)
+MATVEC2_ID_ADD(matvec_id_add_q5_0, two_q5_0, 32)
+MATVEC2_ID_ADD(matvec_id_add_q8_0, two_q8_0, 32)
+
+// MATVEC_SWIGLU over the chosen experts of stacked gate and up tensors: slot s writes
+// silu(gate[ids[s]] x) * (up[ids[s]] x) at y + s * y_stride.
+struct SwigluIdParams {
+    ulong gate;       // byte offsets of expert 0, row 0 in their weight buffers
+    ulong up;
+    ulong gate_stride; // bytes between experts
+    ulong up_stride;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    uint y_stride;
+};
+
+#define MATVEC_SWIGLU_ID(NAME, PAIR, U)                                                       \
+kernel void NAME(device const uchar* wg [[buffer(0)]], device const uchar* wu [[buffer(1)]], \
+                 device const float* x [[buffer(2)]], device float* y [[buffer(3)]],         \
+                 constant SwigluIdParams& p [[buffer(4)]],                                    \
+                 device const uint* ids [[buffer(5)]],                                        \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = tg.x * ROWS_PER_TG + sg;                                                       \
+    if (row >= p.rows) return;                                                                \
+    ulong e = ids[tg.y], at = ulong(row) * p.row_bytes;                                       \
+    device const uchar* rg = wg + p.gate + e * p.gate_stride + at;                            \
+    device const uchar* ru = wu + p.up + e * p.up_stride + at;                                \
+    float2 acc = 0;                                                                           \
+    for (uint c = lane; c < p.cols / U; c += 32) acc += PAIR(rg, ru, c, x);                   \
+    float g = simd_sum(acc.x), u = simd_sum(acc.y);                                           \
+    if (lane == 0) y[tg.y * p.y_stride + row] = g / (1.0f + exp(-g)) * u;                     \
+}
+
+MATVEC_SWIGLU_ID(matvec_swiglu_id_q4_k, pair_q4_k, 64)
+MATVEC_SWIGLU_ID(matvec_swiglu_id_q6_k, pair_q6_k, 64)
+MATVEC_SWIGLU_ID(matvec_swiglu_id_q4_0, two_q4_0, 32)
+MATVEC_SWIGLU_ID(matvec_swiglu_id_q5_0, two_q5_0, 32)
+MATVEC_SWIGLU_ID(matvec_swiglu_id_q8_0, two_q8_0, 32)
 
 // ---- Batched matmul for prompt processing: Y[n][rows] = X[n][cols] . W^T ----
 

@@ -99,8 +99,8 @@ Design points that span files:
   in one (two matrices of one type), `rope_store` rotates K into the cache, and decode
   attention over a single 256-position chunk writes its result itself. Quantized matvecs take
   two rows a simdgroup (`MATVEC2`; four from 16384 rows, `MATVEC4`), read x once for them and
-  build four weights per 32-bit word (`pair_*`, `two_*` in metal.metal); Q5_K, F16, F32 and the
-  MoE `matvec_id_*` kernels still take a row and a chunk per lane. Kernels avoid arrays and
+  build four weights per 32-bit word (`pair_*`, `two_*` in metal.metal); Q5_K, F16 and F32
+  still take a row and a chunk per lane. Kernels avoid arrays and
   vectors indexed by a loop: the compiler keeps them in memory. `Batch::start` submits a
   token's first layer while the rest is encoded.
 - **Benchmark the two engines alternately with rests** (30-45 s): the second of two back-to-back
@@ -111,10 +111,13 @@ Design points that span files:
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
   route each row, then run each used expert once over the rows that picked it.
 - **MoE on Metal.** Decode routes on the GPU, with no sync: `moe_topk` (one simdgroup) writes
-  the k expert ids and weights, `matvec_id` runs all k experts' gate/up/down as one dispatch
-  each (expert id read from the buffer, experts at a fixed stride in the stacked tensor), and
-  `moe_combine` adds the weighted outputs. A per-layer sync cost ~0.35 ms; removing it took
-  Qwen3-30B-A3B decode from 19.6 to 29.1 tok/s. Experts stored as separate tensors (old
+  the k expert ids and weights, then two dispatches (expert id read from the buffer, experts
+  at a fixed stride in the stacked tensor): `matvec_swiglu_id` is the k experts' gate, up and
+  activation, and `matvec_id_add` their down matvecs added into the residual stream by weight,
+  a simdgroup's lanes dealt the column units of all k experts (one expert's 768 columns leave
+  20 of 32 lanes idle). Types without pair kernels take `matvec_id` per matrix, `swiglu` and
+  `moe_combine`. A per-layer sync cost ~0.35 ms; removing it took Qwen3-30B-A3B decode from
+  19.6 to 29.1 tok/s, and the fused kernels to 43.5 (llama.cpp 42). Experts stored as separate tensors (old
   Mixtral files) and prompts take the CPU-routed path: per layer and chunk, one router matmul
   and one sync; the CPU picks each token's top-k and sorts the (token, expert) pairs by expert.
   Then one `gather_rows` of every pair's input, each used expert's gate and up as matmuls over

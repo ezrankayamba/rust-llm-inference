@@ -3,6 +3,21 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: Metal MoE decode: two-row expert matvecs, fused with what follows them
+
+Qwen3-30B-A3B Q4_K_M, same commands and protocol as the entry below. tg48, tok/s:
+
+| | tok/s |
+|---|---|
+| before | 37.9 |
+| two-row `matvec_id` kernels; gate, up and SwiGLU of the chosen experts as one dispatch | 39.7 |
+| the experts' down matvecs and their weighted sum as one dispatch (`matvec_id_add`) | 43.5 |
+| llama.cpp | 42.0-42.3 |
+
+The last step gained more than a saved dispatch: an expert's down matrix has 768 columns, 12
+units of 64, so 20 of a simdgroup's 32 lanes had nothing to do; dealing all 8 experts' units
+over the lanes gives each three.
+
 ## 2026-11-16: Metal MoE prompts: experts side by side, and 600 MB of scratch that wasn't needed
 
 Qwen3-30B-A3B Q4_K_M (18.6 GB) on the 24 GB M4, every layer offloaded; alternating, rested.

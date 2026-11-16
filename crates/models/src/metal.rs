@@ -353,37 +353,64 @@ impl Metal {
         let e = &experts[0];
         let ff = e.gate.rows;
         let (xb, gate, up, tmp) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
-        for (m, stride, out) in [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)] {
+        let (g, u) = (&e.gate, &e.up);
+        if Batch::has_matvec_swiglu(g.ty) && g.ty == u.ty {
+            let (at, strides) = ([g.offset, u.offset], [gate_stride, up_stride]);
+            b.matvec_swiglu_id(g.ty, ff, g.cols, at, strides, ne, ids, xb, gate, ff, k);
+        } else {
+            for (m, stride, out) in [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)] {
+                b.matvec_id(
+                    m.ty, m.rows, m.cols, m.offset, stride, ne, ids, xb, 0, out, ff, k,
+                );
+            }
+            b.swiglu(gate, up, k * ff);
+        }
+        let d = &e.down;
+        let x = At(&s.x, 0);
+        // The chosen experts' outputs, weighted, into the residual stream: one dispatch where
+        // the type has the kernel, else a matvec per slot and the sum.
+        let fused = Batch::has_matvec_swiglu(d.ty);
+        if fused {
+            b.matvec_id_add(
+                d.ty,
+                d.rows,
+                d.cols,
+                d.offset,
+                down_stride,
+                ne,
+                ids,
+                w,
+                gate,
+                ff,
+                x,
+                k,
+            );
+        } else {
             b.matvec_id(
-                m.ty, m.rows, m.cols, m.offset, stride, ne, ids, xb, 0, out, ff, k,
+                d.ty,
+                d.rows,
+                d.cols,
+                d.offset,
+                down_stride,
+                ne,
+                ids,
+                gate,
+                ff,
+                tmp,
+                n_embd,
+                k,
             );
         }
-        b.swiglu(gate, up, k * ff);
-        let d = &e.down;
-        b.matvec_id(
-            d.ty,
-            d.rows,
-            d.cols,
-            d.offset,
-            down_stride,
-            ne,
-            ids,
-            gate,
-            ff,
-            tmp,
-            n_embd,
-            k,
-        );
         if let Some((_, e)) = shared {
             ffn(b, s, e, xb, At(&s.tmp, k * n_embd), 1);
         }
-        b.moe_combine(
-            At(&s.x, 0),
-            tmp,
-            w,
-            k + usize::from(shared.is_some()),
-            n_embd,
-        );
+        let n_shared = usize::from(shared.is_some());
+        if !fused {
+            b.moe_combine(x, tmp, w, k + n_shared, n_embd);
+        } else if n_shared == 1 {
+            let (src, w) = (At(&s.tmp, k * n_embd), At(w.0, w.1 + k));
+            b.moe_combine(x, src, w, 1, n_embd);
+        }
     }
 
     /// Queues an MoE FFN over `n` rows of `s.xb`, adding into `s.x`. Routing needs the router
