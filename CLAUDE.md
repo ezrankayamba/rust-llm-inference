@@ -147,6 +147,19 @@ Design points that span files:
   corrupts header fields and requires an error or a clean CPU run, never a panic. New tensors need
   a shape check in `Model::load`.
 - **CPU SIMD uses runtime feature detection**, and every kernel keeps a scalar/portable fallback.
+- **NEON row kernels are short of vector operations, and of sums.** The M4 runs four a cycle, so
+  a decode kernel is counted in operations per block: values that reach a vector register through
+  a general one, a multiplier broadcast again per use (LLVM does that to a lane of a 16-bit
+  product; `smull` avoids it), a multiply and an add where one fused instruction would do. A float
+  sum per row is a chain: blocks go into four sums in turn, indexed by a loop of constant length
+  (indexed by `block % 4`, or through a closure, the sums end up in memory and it is slower). Read
+  the disassembly (`objdump -d` on `bench_matvec`) before believing a change did what it says.
+  `smmla` costs as much per multiply as `sdot` there; the block kernel is ahead of the row kernel
+  only because its scale arithmetic is shared by more multiplies. Against llama.cpp on the M4 CPU
+  (`docs/benchmarks.md`, 2026-11-16): Qwen2.5-0.5B (Q5_0/Q8_0) prompts 2.2x ahead and decode level
+  on four threads; Llama-3.2-1B (K-quants) decode level on four threads and 16% behind on one,
+  prompts 11-19% behind (llama.cpp scales activations per 256, we per 32: three float operations
+  per 32 weights, row pair and token pair that it does not have).
 - **CUDA kernels keep a warp's reads adjacent.** Each of a warp's 32 lanes takes the next weight
   and the next value of x: `wt_*` decodes one weight per lane (the matmuls), `sb_*` 8 weights per
   lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that
