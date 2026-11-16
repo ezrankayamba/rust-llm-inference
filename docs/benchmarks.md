@@ -3,6 +3,33 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: Metal prompts: direct 16-weight decoders, a matmul that adds into its output
+
+Same protocol as the decode entry below (alternating, rested). pp512, tok/s:
+
+| model | before | after | llama.cpp |
+|---|---|---|---|
+| SmolLM2-135M | 7170 | 7710 | 8500-9200 |
+| Qwen2.5-0.5B | 2910 | 3146 | 3375 |
+| Llama-3.2-1B | 1306 | 1327 | 1418 |
+| Mistral-7B | 183 | 187.5 | 196.6 |
+
+Decode is unchanged (363, 184.6, 106.9, 21.7).
+
+- **Q4_0, Q5_0, Q8_0, F16 and F32 tiles decode their 16 weights directly**, a word at a time,
+  where they went through the 32-weight scalar decoders and an array. Q4_K_M files of small
+  models hold Q5_0 and Q8_0 matrices: Qwen2.5-0.5B 2910 -> 3086, SmolLM2 7170 -> 7607.
+- **`matmul_add`**: the output and down projections add into the residual stream, as decode's
+  matvecs do, saving a pass over n x n_embd per projection. A whole tile adds what is in y
+  after its last step (`acc * I + y`); seeding the sums with y under `if (p.add)` put the
+  matrices in memory and ran prompts 3x slower (Qwen2.5-0.5B: 828 tok/s).
+- The tile step is written out twice, with and without its second 32-column chunk, in place
+  of a test per step, and `add`, `axpy`, `swiglu` and the cache stores take four values a
+  thread. Together with the above: Llama-3.2-1B 1306 -> 1327.
+
+Where a 512-token prompt goes (skipping one kernel class at a time): the matmuls are 90% on
+Llama-3.2-1B and 80% on Qwen2.5-0.5B; on SmolLM2 they are 66%, attention 25%.
+
 ## 2026-11-16: Metal decode against llama.cpp: two-row matvecs, fewer stages per layer
 
 Same machine and builds as the entry below. The two engines alternate with 30-45 s of rest

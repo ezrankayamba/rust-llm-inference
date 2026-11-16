@@ -332,6 +332,7 @@ struct MatmulParams {
     row_bytes: u32,
     tok0: u32,
     n: u32,
+    add: u32,
 }
 #[repr(C)]
 struct IdParams {
@@ -914,10 +915,44 @@ impl Batch<'_> {
         y: At<'_>,
         n: usize,
     ) {
+        self.matmul_impl(ty, rows, cols, offset, x, y, n, false);
+    }
+
+    /// `Y += X W^T`: [`Batch::matmul`] adding into `y`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_add(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        n: usize,
+    ) {
+        self.matmul_impl(ty, rows, cols, offset, x, y, n, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_impl(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        n: usize,
+        add: bool,
+    ) {
         if n < MATMUL_MIN_TOKENS {
             for t in 0..n {
                 let (xt, yt) = (At(x.0, x.1 + t * cols), At(y.0, y.1 + t * rows));
-                self.matvec(ty, rows, cols, offset, xt, yt);
+                if add {
+                    self.matvec_add(ty, rows, cols, offset, xt, yt);
+                } else {
+                    self.matvec(ty, rows, cols, offset, xt, yt);
+                }
             }
             return;
         }
@@ -970,6 +1005,7 @@ impl Batch<'_> {
                     row_bytes: row_bytes as u32,
                     tok0: tok0 as u32,
                     n: end as u32,
+                    add: add as u32,
                 },
             );
             let grid = (
@@ -1129,7 +1165,12 @@ impl Batch<'_> {
                 m: n as u32,
             },
         );
-        self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
+        // Four values a thread.
+        self.dispatch(
+            self.gpu.other(kernel),
+            n.div_ceil(4 * ELT_THREADS),
+            ELT_THREADS,
+        );
     }
 
     /// Adds the length-`m` vector `b` to each of the `n / m` rows of `a`.
@@ -1292,7 +1333,11 @@ impl Batch<'_> {
         } else {
             "store_kv_f32"
         };
-        self.dispatch(self.gpu.other(kernel), n.div_ceil(ELT_THREADS), ELT_THREADS);
+        self.dispatch(
+            self.gpu.other(kernel),
+            n.div_ceil(4 * ELT_THREADS),
+            ELT_THREADS,
+        );
     }
 
     /// Attention of one query over `p.n_pos` cached positions, split into chunks of positions

@@ -159,16 +159,64 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
         for (&ty, &off) in TYPES.iter().zip(&offsets) {
             let mut got = vec![0.0; n * ROWS];
             gpu.matmul(ty, ROWS, COLS, off, &x, &mut got, n, half);
+            // The same product added into a buffer that holds something.
+            let base: Vec<f32> = (0..n * ROWS)
+                .map(|i| (i % 97) as f32 * 0.125 - 6.0)
+                .collect();
+            let (xb, added) = (gpu.upload(&x), gpu.upload(&base));
+            let mut batch = gpu.batch();
+            batch.half = half;
+            batch.matmul_add(ty, ROWS, COLS, off, (&xb).into(), (&added).into(), n);
+            batch.finish();
+            // SAFETY: the batch has finished.
+            let added = unsafe { added.as_slice() };
+            let tol = if half { 0.1 } else { 1e-3 };
             for t in 0..n {
-                let want = cpu_matvec(buf, ty, off, &x[t * COLS..(t + 1) * COLS]);
-                assert_close_to(
-                    ty,
-                    &format!("n={n} half={half} token {t}"),
-                    &got[t * ROWS..(t + 1) * ROWS],
-                    &want,
-                    if half { 0.1 } else { 1e-3 },
+                let (at, label) = (
+                    t * ROWS..(t + 1) * ROWS,
+                    format!("n={n} half={half} token {t}"),
                 );
+                let want = cpu_matvec(buf, ty, off, &x[t * COLS..(t + 1) * COLS]);
+                assert_close_to(ty, &label, &got[at.clone()], &want, tol);
+                let sum: Vec<f32> = want
+                    .iter()
+                    .zip(&base[at.clone()])
+                    .map(|(w, b)| w + b)
+                    .collect();
+                assert_close_to(ty, &format!("added, {label}"), &added[at], &sum, tol);
             }
+        }
+    }
+}
+
+/// Whole 64-row tiles beside an edge one: the fixture above has 37 rows, so only edge tiles.
+#[test]
+fn metal_matmul_add_over_whole_and_edge_tiles_matches_cpu() {
+    let (rows, cols, n) = (64 * 2 + 5, 256, 70);
+    let (mut mem, offsets) = fixture_of(rows, cols, &TYPES);
+    let buf = mem.bytes();
+    let gpu =
+        unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
+    let x: Vec<f32> = input(n).into_iter().take(n * cols).collect();
+    let base: Vec<f32> = (0..n * rows)
+        .map(|i| (i % 97) as f32 * 0.125 - 6.0)
+        .collect();
+    for (&ty, &off) in TYPES.iter().zip(&offsets) {
+        let (xb, added) = (gpu.upload(&x), gpu.upload(&base));
+        let mut batch = gpu.batch();
+        batch.matmul_add(ty, rows, cols, off, (&xb).into(), (&added).into(), n);
+        batch.finish();
+        // SAFETY: the batch has finished.
+        let added = unsafe { added.as_slice() };
+        for t in 0..n {
+            let at = t * rows..(t + 1) * rows;
+            let want = cpu_matvec_of(buf, ty, off, rows, &x[t * cols..(t + 1) * cols]);
+            let sum: Vec<f32> = want
+                .iter()
+                .zip(&base[at.clone()])
+                .map(|(w, b)| w + b)
+                .collect();
+            assert_close(ty, &format!("token {t}"), &added[at], &sum);
         }
     }
 }

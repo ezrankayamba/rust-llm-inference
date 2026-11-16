@@ -174,14 +174,9 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
-/// `resid += x W^T` for `n` rows. One token's matvec adds into `resid` itself.
-fn mm_add(b: &mut Batch<'_>, s: &Scratch, w: &Weight, x: At<'_>, resid: At<'_>, n: usize) {
-    if n == 1 {
-        b.matvec_add(w.ty, w.rows, w.cols, w.offset, x, resid);
-    } else {
-        mm(b, w, x, At(&s.tmp, 0), n);
-        b.add(resid, At(&s.tmp, 0), n * w.rows);
-    }
+/// `resid += x W^T` for `n` rows.
+fn mm_add(b: &mut Batch<'_>, w: &Weight, x: At<'_>, resid: At<'_>, n: usize) {
+    b.matmul_add(w.ty, w.rows, w.cols, w.offset, x, resid, n);
 }
 
 /// SwiGLU FFN of `n` rows of `x` into `out`.
@@ -288,7 +283,7 @@ impl Metal {
                 };
                 b.attention_batch(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), n, &p);
             }
-            mm_add(&mut b, s, &layer.wo, At(&s.att, 0), x_at, n);
+            mm_add(&mut b, &layer.wo, At(&s.att, 0), x_at, n);
             b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
             match &layer.ffn {
                 Ffn::Dense(e)
@@ -304,7 +299,7 @@ impl Metal {
                         At(&s.xb, 0),
                         At(&s.gate, 0),
                     );
-                    mm_add(&mut b, s, &e.down, At(&s.gate, 0), x_at, n);
+                    mm_add(&mut b, &e.down, At(&s.gate, 0), x_at, n);
                 }
                 Ffn::Dense(e) => {
                     ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);

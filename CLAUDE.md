@@ -86,8 +86,10 @@ Design points that span files:
   chunks of 256 cached positions that run in parallel and are merged (`attention_part_*` +
   `attention_merge`), so decode speed holds up at long context.
   head_dim not a multiple of 8 or above 256 falls back to one token at a time.
-  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 6.5-8%
-  behind on Mistral-7B and Llama-3.2-1B, 14% on Qwen2.5-0.5B, 22% on SmolLM2-135M; 16-token
+  The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
+  y after its last step; seeding the sums with y under a run-time test ran 3x slower).
+  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 5-7%
+  behind on Mistral-7B, Llama-3.2-1B and Qwen2.5-0.5B, 10-16% on SmolLM2-135M; 16-token
   prompts 1.3-1.45x behind; decode ahead by 2-11% on three of those and level on Llama-3.2-1B.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
   one before it. The encoder is concurrent; `Batch` puts a barrier before each dispatch unless

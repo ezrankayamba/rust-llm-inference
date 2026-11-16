@@ -421,54 +421,6 @@ MATVEC_ID(matvec_id_q6_k, chunk_q6_k)
 
 // ---- Batched matmul for prompt processing: Y[n][rows] = X[n][cols] . W^T ----
 
-inline void deq_f32(device const uchar* r, uint c, thread float* w) {
-    device const float* s = (device const float*)r + c * 32;
-    for (uint i = 0; i < 32; i++) w[i] = s[i];
-}
-
-inline void deq_f16(device const uchar* r, uint c, thread float* w) {
-    device const half* s = (device const half*)r + c * 32;
-    for (uint i = 0; i < 32; i++) w[i] = float(s[i]);
-}
-
-inline void deq_q4_0(device const uchar* r, uint c, thread float* w) {
-    device const uchar* b = r + c * 18;
-    float d = h(b);
-    for (uint j = 0; j < 16; j++) {
-        uchar q = b[2 + j];
-        w[j] = d * float(int(q & 15) - 8);
-        w[j + 16] = d * float(int(q >> 4) - 8);
-    }
-}
-
-inline void deq_q5_0(device const uchar* r, uint c, thread float* w) {
-    device const uchar* b = r + c * 22;
-    float d = h(b);
-    uint qh = uint(b[2]) | (uint(b[3]) << 8) | (uint(b[4]) << 16) | (uint(b[5]) << 24);
-    for (uint j = 0; j < 16; j++) {
-        uchar q = b[6 + j];
-        w[j] = d * float(int((q & 15) | (((qh >> j) << 4) & 0x10)) - 16);
-        w[j + 16] = d * float(int((q >> 4) | ((qh >> (j + 12)) & 0x10)) - 16);
-    }
-}
-
-inline void deq_q8_0(device const uchar* r, uint c, thread float* w) {
-    device const uchar* b = r + c * 34;
-    device const char* q = (device const char*)(b + 2);
-    float d = h(b);
-    for (uint i = 0; i < 32; i++) w[i] = d * float(q[i]);
-}
-
-inline void deq_q4_k(device const uchar* r, uint c, thread float* w) {
-    uint sub = c % 8;
-    device const uchar* b = r + (c / 8) * 144;
-    float sc, m;
-    scale_min_k4(sub, b + 4, sc, m);
-    float d = h(b) * sc, dm = h(b + 2) * m;
-    device const uchar* q = b + 16 + 32 * (sub / 2);
-    for (uint l = 0; l < 32; l++) w[l] = d * float((sub & 1) ? (q[l] >> 4) : (q[l] & 15)) - dm;
-}
-
 inline void deq_q5_k(device const uchar* r, uint c, thread float* w) {
     uint sub = c % 8;
     device const uchar* b = r + (c / 8) * 176;
@@ -480,20 +432,6 @@ inline void deq_q5_k(device const uchar* r, uint c, thread float* w) {
     for (uint l = 0; l < 32; l++) {
         uint v = ((sub & 1) ? (q[l] >> 4) : (q[l] & 15)) + (((qh[l] >> sub) & 1) << 4);
         w[l] = d * float(v) - dm;
-    }
-}
-
-inline void deq_q6_k(device const uchar* r, uint c, thread float* w) {
-    uint j = c % 8, n = j / 4, k = j % 4;
-    device const uchar* b = r + (c / 8) * 210;
-    device const uchar* ql = b + 64 * n + 32 * (k % 2);
-    device const uchar* qh = b + 128 + 32 * n;
-    device const char* sc = (device const char*)(b + 192) + 8 * n + 2 * k;
-    float d = h(b + 208);
-    for (uint l = 0; l < 32; l++) {
-        uint lo = k < 2 ? (ql[l] & 15) : (ql[l] >> 4);
-        int q = int(lo | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
-        w[l] = d * float(sc[l / 16]) * float(q);
     }
 }
 
@@ -526,17 +464,47 @@ inline void deq16_q6_k(device const uchar* r, uint c, uint o, thread float4* w) 
     }
 }
 
+inline void deq16_f32(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const packed_float4* s = (device const packed_float4*)(r + (c * 32 + o) * 4);
+    for (uint i = 0; i < 4; i++) w[i] = s[i];
+}
+
+inline void deq16_f16(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const packed_half4* s = (device const packed_half4*)(r + (c * 32 + o) * 2);
+    for (uint i = 0; i < 4; i++) w[i] = float4(half4(s[i]));
+}
+
+// A block's weights 0..16 are the low nibbles of its 16 bytes and 16..32 the high ones.
+inline void deq16_q4_0(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const uchar* b = r + c * 18;
+    float d = h(b);
+    for (uint i = 0; i < 4; i++)
+        w[i] = d * (unpack4((word4(b + 2 + 4 * i) >> (o / 4)) & 0x0F0F0F0Fu) - 8.0f);
+}
+
+inline void deq16_q5_0(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const uchar* b = r + c * 22;
+    float d = h(b);
+    uint qh = word4(b + 2) >> o;
+    for (uint i = 0; i < 4; i++) {
+        uint q = (word4(b + 6 + 4 * i) >> (o / 4)) & 0x0F0F0F0Fu;
+        w[i] = d * (unpack4(q | fifth4(qh >> (4 * i))) - 16.0f);
+    }
+}
+
+inline void deq16_q8_0(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const uchar* b = r + c * 34;
+    float d = h(b);
+    for (uint i = 0; i < 4; i++)
+        w[i] = d * float4(char4(*(device const packed_char4*)(b + 2 + o + 4 * i)));
+}
+
 #define DEQ16_VIA32(NAME, DEQ)                                                                \
 inline void NAME(device const uchar* r, uint c, uint o, thread float4* w) {                   \
     float t[32];                                                                              \
     DEQ(r, c, t);                                                                             \
     for (uint i = 0; i < 4; i++) w[i] = float4(t[o + 4 * i], t[o + 4 * i + 1], t[o + 4 * i + 2], t[o + 4 * i + 3]); \
 }
-DEQ16_VIA32(deq16_f32, deq_f32)
-DEQ16_VIA32(deq16_f16, deq_f16)
-DEQ16_VIA32(deq16_q4_0, deq_q4_0)
-DEQ16_VIA32(deq16_q5_0, deq_q5_0)
-DEQ16_VIA32(deq16_q8_0, deq_q8_0)
 DEQ16_VIA32(deq16_q5_k, deq_q5_k)
 
 // Tiled matmul on the simdgroup 8x8 matrix units. A threadgroup (4 simdgroups) computes a
@@ -557,39 +525,23 @@ struct MatmulParams {
     uint row_bytes;
     uint tok0;        // first token of this dispatch
     uint n;           // tokens in x
+    uint add;         // add into y instead of overwriting it
 };
 
-#define MATMUL(NAME, DEQ, T, M, MT, AB, BB)                                                   \
-kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
-                 device float* y [[buffer(2)]], constant MatmulParams& p [[buffer(3)]],      \
-                 uint2 tg [[threadgroup_position_in_grid]],                                   \
-                 uint tid [[thread_index_in_threadgroup]],                                    \
-                 uint sg [[simdgroup_index_in_threadgroup]]) {                                \
-    const uint TB = MT / 8, XU = MT / 8, SGR = MM_R / (8 * AB);                               \
-    threadgroup T sa[(MM_R + MT) * 64];                                                       \
-    threadgroup T* sb = sa + MM_R * 64;                                                       \
-    threadgroup float* sm = (threadgroup float*)sa; /* an edge tile's output */               \
-    uint r0 = tg.x * MM_R, t0 = p.tok0 + tg.y * MT;                                           \
-    uint rb = (sg % SGR) * AB, tb = (sg / SGR) * BB; /* in blocks of 8 */                     \
-    uint wr = tid / 2, wo = (tid % 2) * 16;                                                   \
-    uint xt = tid * XU / 16, xo = 4 * (tid * XU % 16);                                        \
-    bool row_ok = r0 + wr < p.rows, tok_ok = t0 + xt < p.n;                                   \
-    device const uchar* wrow = w + p.offset + ulong(row_ok ? r0 + wr : 0) * p.row_bytes;      \
-    device const float* xrow = x + ulong(tok_ok ? t0 + xt : 0) * p.cols + xo;                 \
-    simdgroup_float8x8 acc[AB * BB];                                                          \
-    for (uint i = 0; i < AB * BB; i++) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); \
-    for (uint c = 0; c < p.cols / 32; c += 2) {                                               \
-        /* A step is two 32-column chunks; the last has one when cols is an odd multiple. */ \
-        bool two = c + 1 < p.cols / 32;                                                       \
+// One step of a tile: TWO (a literal) says whether it has both 32-column chunks or, as the
+// last step of a matrix whose columns are an odd multiple of 32, only the first. A run-time
+// test here cost 3% of a prompt.
+#define MM_STEP(DEQ, T, M, AB, BB, TWO)                                                       \
+    {                                                                                         \
         float4 wv[8], xv[XU];                                                                 \
         DEQ(wrow, c, wo, wv);                                                                 \
-        if (two) {                                                                            \
+        if (TWO) {                                                                            \
             DEQ(wrow, c + 1, wo, wv + 4);                                                     \
         } else {                                                                              \
             for (uint i = 4; i < 8; i++) wv[i] = float4(0.0f);                                \
         }                                                                                     \
         for (uint i = 0; i < XU; i++) {                                                       \
-            bool in = two || xo + 4 * i < 32;                                                 \
+            bool in = TWO || xo + 4 * i < 32;                                                 \
             xv[i] = in ? float4(*(device const packed_float4*)(xrow + c * 32 + 4 * i))        \
                        : float4(0.0f);                                                        \
         }                                                                                     \
@@ -617,9 +569,48 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
                 for (uint i = 0; i < AB; i++)                                                 \
                     simdgroup_multiply_accumulate(acc[j * AB + i], b[j], a[i], acc[j * AB + i]); \
         }                                                                                     \
+    }
+
+#define MATMUL(NAME, DEQ, T, M, MT, AB, BB)                                                   \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant MatmulParams& p [[buffer(3)]],      \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint tid [[thread_index_in_threadgroup]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]]) {                                \
+    const uint TB = MT / 8, XU = MT / 8, SGR = MM_R / (8 * AB);                               \
+    threadgroup T sa[(MM_R + MT) * 64];                                                       \
+    threadgroup T* sb = sa + MM_R * 64;                                                       \
+    threadgroup float* sm = (threadgroup float*)sa; /* an edge tile's output */               \
+    uint r0 = tg.x * MM_R, t0 = p.tok0 + tg.y * MT;                                           \
+    uint rb = (sg % SGR) * AB, tb = (sg / SGR) * BB; /* in blocks of 8 */                     \
+    uint wr = tid / 2, wo = (tid % 2) * 16;                                                   \
+    uint xt = tid * XU / 16, xo = 4 * (tid * XU % 16);                                        \
+    bool row_ok = r0 + wr < p.rows, tok_ok = t0 + xt < p.n;                                   \
+    bool full = r0 + MM_R <= p.rows && t0 + MT <= p.n;                                        \
+    device const uchar* wrow = w + p.offset + ulong(row_ok ? r0 + wr : 0) * p.row_bytes;      \
+    device const float* xrow = x + ulong(tok_ok ? t0 + xt : 0) * p.cols + xo;                 \
+    device float* yp = y + ulong(t0 + 8 * tb) * p.rows + r0 + 8 * rb;                         \
+    simdgroup_float8x8 acc[AB * BB];                                                          \
+    for (uint i = 0; i < AB * BB; i++) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); \
+    uint nc = p.cols / 32;                                                                    \
+    for (uint c = 0; c + 1 < nc; c += 2) MM_STEP(DEQ, T, M, AB, BB, true)                     \
+    if (nc & 1) {                                                                             \
+        uint c = nc - 1;                                                                      \
+        MM_STEP(DEQ, T, M, AB, BB, false)                                                     \
     }                                                                                         \
-    if (r0 + MM_R <= p.rows && t0 + MT <= p.n) {                                              \
-        device float* yp = y + ulong(t0 + 8 * tb) * p.rows + r0 + 8 * rb;                     \
+    if (full && p.add) {                                                                      \
+        /* Adding into y. Seeding the sums with it instead put them in memory (3x slower). */ \
+        simdgroup_float8x8 one = simdgroup_float8x8(1.0f); /* the identity */                 \
+        for (uint j = 0; j < BB; j++)                                                         \
+            for (uint i = 0; i < AB; i++) {                                                   \
+                simdgroup_float8x8 old;                                                       \
+                simdgroup_load(old, yp + ulong(8 * j) * p.rows + 8 * i, p.rows);              \
+                simdgroup_multiply_accumulate(old, acc[j * AB + i], one, old);                \
+                simdgroup_store(old, yp + ulong(8 * j) * p.rows + 8 * i, p.rows);             \
+            }                                                                                 \
+        return;                                                                               \
+    }                                                                                         \
+    if (full) {                                                                               \
         for (uint j = 0; j < BB; j++)                                                         \
             for (uint i = 0; i < AB; i++)                                                     \
                 simdgroup_store(acc[j * AB + i], yp + ulong(8 * j) * p.rows + 8 * i, p.rows); \
@@ -634,7 +625,10 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
     for (uint e = tid; e < MM_R * MT; e += 128) {                                             \
         uint tt = e / MM_R, rr = e % MM_R;                                                    \
         uint row = r0 + rr, t = t0 + tt;                                                      \
-        if (row < p.rows && t < p.n) y[ulong(t) * p.rows + row] = sm[tt * MM_R + rr];         \
+        if (row < p.rows && t < p.n) {                                                        \
+            ulong at = ulong(t) * p.rows + row;                                               \
+            y[at] = p.add ? y[at] + sm[tt * MM_R + rr] : sm[tt * MM_R + rr];                  \
+        }                                                                                     \
     }                                                                                         \
 }
 
@@ -712,9 +706,17 @@ kernel void rmsnorm(device const float* x [[buffer(0)]], device float* out [[buf
 
 struct EltParams { uint n; float alpha; uint m; };
 
+// The elementwise kernels over whole buffers take four values a thread (ELT4: the vector
+// expression V while four remain, the scalar S for a tail).
+#define ELT4(V, S)                                                                            \
+    if (4 * i + 4 <= p.n) { V; }                                                              \
+    else for (uint e = 4 * i; e < p.n; e++) { S; }
+#define F4(P, I) (*(device packed_float4*)((P) + 4 * (I)))
+#define CF4(P, I) (*(device const packed_float4*)((P) + 4 * (I)))
+
 kernel void add(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                 constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) a[i] += b[i];
+    ELT4(F4(a, i) = float4(F4(a, i)) + float4(CF4(b, i)), a[e] += b[e])
 }
 
 // a[i] += b[i % m]: adds a length-m vector (a bias) to each of n/m rows.
@@ -798,15 +800,13 @@ kernel void scatter_axpy(device float* dst [[buffer(0)]], device const float* sr
 
 kernel void axpy(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
                  constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) a[i] += p.alpha * b[i];
+    ELT4(F4(a, i) = float4(F4(a, i)) + p.alpha * float4(CF4(b, i)), a[e] += p.alpha * b[e])
 }
 
 kernel void swiglu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                    constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) {
-        float v = g[i];
-        g[i] = v / (1.0f + exp(-v)) * u[i];
-    }
+    ELT4(float4 v = F4(g, i); F4(g, i) = v / (1.0f + exp(-v)) * float4(CF4(u, i)),
+         g[e] = g[e] / (1.0f + exp(-g[e])) * u[e])
 }
 
 struct RopeParams { uint n_heads; uint head_dim; uint rope_dim; uint pos; float theta; uint neox; uint has_ff; };
@@ -857,12 +857,12 @@ ROPE_STORE(rope_store_f16, half)
 // dst[i] = src[i] for n elements, converting to the cache type.
 kernel void store_kv_f32(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
                          constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) dst[i] = src[i];
+    ELT4(F4(dst, i) = CF4(src, i), dst[e] = src[e])
 }
 
 kernel void store_kv_f16(device const float* src [[buffer(0)]], device half* dst [[buffer(1)]],
                          constant EltParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) dst[i] = half(src[i]);
+    ELT4(*(device packed_half4*)(dst + 4 * i) = half4(float4(CF4(src, i))), dst[e] = half(src[e]))
 }
 
 struct AttnParams { uint n_head; uint n_kv; uint head_dim; uint n_pos; uint kv_dim; float scale; };
