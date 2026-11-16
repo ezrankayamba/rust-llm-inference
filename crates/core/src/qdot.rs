@@ -470,9 +470,9 @@ mod neon {
     /// Dot products of one encoded row with the activations of `N` tokens, into `out`. Each
     /// weight block is unpacked (and its scales decoded) once for all `N` tokens, and every
     /// token's arithmetic is the same whatever `N` is, so a matmul matches per-token matvecs
-    /// bit for bit. `false` for types without a NEON kernel. Only [`k_rows`] uses more than the
-    /// first of a token's sums: dealing the other types' blocks over four (indexed by block)
-    /// ran 5-12% slower.
+    /// bit for bit. `false` for types without a NEON kernel. The 32-weight types use only the
+    /// first of a token's sums: dealing their blocks over four (indexed by block) ran 5-12%
+    /// slower.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn dot_rows<const N: usize>(
         ty: GgmlType,
@@ -544,12 +544,30 @@ mod neon {
                 GgmlType::Q4_K => k_rows::<N, false>(row, acts, &mut acc, &mut extra),
                 GgmlType::Q5_K => k_rows::<N, true>(row, acts, &mut acc, &mut extra),
                 GgmlType::Q6_K => {
-                    let three = vdupq_n_u8(3);
                     let off = vdupq_n_s8(32);
+                    let (m6, m2) = (vdupq_n_u8(0x3f), vdupq_n_u8(0x30));
+                    // Chunk `k`'s weights from 16 bytes of low nibbles and of high bit pairs,
+                    // in two or three instructions: the shifts insert (`sli`) where they can.
+                    let w6 = |k: usize, l: uint8x16_t, h: uint8x16_t| {
+                        let w = match k {
+                            0 => vandq_u8(vsliq_n_u8::<4>(l, h), m6),
+                            1 => vandq_u8(vsliq_n_u8::<4>(l, vshrq_n_u8(h, 2)), m6),
+                            2 => vorrq_u8(vshrq_n_u8(l, 4), vandq_u8(h, m2)),
+                            _ => vsliq_n_u8::<4>(vshrq_n_u8(l, 4), vshrq_n_u8(h, 6)),
+                        };
+                        vsubq_s8(vreinterpretq_s8_u8(w), off)
+                    };
                     for i in 0..n_blocks {
                         let b = &row[i * bb..(i + 1) * bb];
                         let d = le16(b, 208);
-                        let sc = &b[192..208];
+                        // The 16 scales as i32, to load straight into every lane.
+                        let mut sc = [0i32; 16];
+                        let s8 = vld1q_s8(b.as_ptr().add(192) as *const i8);
+                        let (lo, hi) = (vmovl_s8(vget_low_s8(s8)), vmovl_high_s8(s8));
+                        vst1q_s32(sc.as_mut_ptr(), vmovl_s16(vget_low_s16(lo)));
+                        vst1q_s32(sc.as_mut_ptr().add(4), vmovl_high_s16(lo));
+                        vst1q_s32(sc.as_mut_ptr().add(8), vmovl_s16(vget_low_s16(hi)));
+                        vst1q_s32(sc.as_mut_ptr().add(12), vmovl_high_s16(hi));
                         for n in 0..2 {
                             let p = b.as_ptr();
                             let ql = [0, 1, 2, 3].map(|j| vld1q_u8(p.add(64 * n + 16 * j)));
@@ -563,28 +581,20 @@ mod neon {
                                 } else {
                                     (ql[2], ql[3])
                                 };
-                                let (l0, l1) = if k < 2 {
-                                    (vandq_u8(l0, m4), vandq_u8(l1, m4))
-                                } else {
-                                    (vshrq_n_u8(l0, 4), vshrq_n_u8(l1, 4))
-                                };
-                                let shift = vdupq_n_s8(-(2 * k as i8));
-                                let h0 = vshlq_n_u8(vandq_u8(vshlq_u8(qh[0], shift), three), 4);
-                                let h1 = vshlq_n_u8(vandq_u8(vshlq_u8(qh[1], shift), three), 4);
-                                let w0 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l0, h0)), off);
-                                let w1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(l1, h1)), off);
+                                let (w0, w1) = (w6(k, l0, qh[0]), w6(k, l1, qh[1]));
                                 let xb = i * (QK_K / QK) + 4 * n + k;
                                 // The two 16-element halves have their own i8 scales; apply them
                                 // in integer arithmetic (exact) before the one float multiply.
-                                let s0 = sc[8 * n + 2 * k] as i8 as i32;
-                                let s1 = sc[8 * n + 2 * k + 1] as i8 as i32;
+                                let s0 = vld1q_dup_s32(sc.as_ptr().add(8 * n + 2 * k));
+                                let s1 = vld1q_dup_s32(sc.as_ptr().add(8 * n + 2 * k + 1));
                                 for t in 0..N {
                                     let x = xq[t].add(xb * QK);
                                     let p0 = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(x));
                                     let p1 = vdotq_s32(vdupq_n_s32(0), w1, vld1q_s8(x.add(16)));
-                                    let s = vmlaq_n_s32(vmulq_n_s32(p0, s0), p1, s1);
-                                    let a = &mut acc[t][0];
-                                    *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][xb]);
+                                    let s = vmlaq_s32(vmulq_s32(p0, s0), p1, s1);
+                                    // Two sums in turn, so a chunk doesn't wait on the last.
+                                    let a = &mut acc[t][k % 2];
+                                    *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][xb]);
                                 }
                             }
                         }

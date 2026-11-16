@@ -3,6 +3,19 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON Q6_K decode kernel: fewer instructions per chunk
+
+The one-row Q6_K kernel is bound by instruction count, not by a chain (about 21 vector operations
+per 32 weights on four pipes). A chunk's weights now take two or three operations per 16 where they
+took five (`sli` inserts the high bits), and the 16 scales are widened to i32 once per super-block
+and loaded into lanes, where each was moved from a general register. `RAYON_NUM_THREADS=1
+bench_matvec`, Q6_K 5632 x 2048: 0.434 -> 0.380 (decode) -> 0.354 ms (scales). Precomputing a
+super-block's eight float scales per token as well was slower (0.404 ms), so that stays scalar.
+
+Llama-3.2-1B Q4_K_M, `bench --pp 0 --tg 64 --reps 3 --threads N`, alternated: one thread 31.7 ->
+35.2 tok/s (llama.cpp 45.5), four threads 82.7 -> 83.1 (85.3). Logits per token against the
+`--precise` reference 0.17, top-1 unchanged; `eval_quant` KL mean 0.0005, top-1 agreement 97.6%.
+
 ## 2026-11-16: NEON decode kernel for Q4_K/Q5_K in integers, on the Apple M4 CPU
 
 The one-row NEON kernel added each 32-weight chunk's dot product to one float sum, and subtracted
