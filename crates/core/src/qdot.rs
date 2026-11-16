@@ -362,14 +362,32 @@ mod neon {
         }
     }
 
-    /// Expands bits `[8*byte_lo .. 8*byte_lo + 16)` of `qh` to lanes holding 0x10 where set.
+    /// A Q5_0 block's 32 weights as i8, -16 to 15, in two halves. The four bytes of high bits
+    /// are loaded into every lane and spread by a table, staying in vector registers: moving
+    /// them over from general ones made this the slowest of the decoders.
     #[inline(always)]
-    unsafe fn high_bits(qh: u32, byte_lo: usize) -> uint8x16_t {
+    unsafe fn q5_0(b: &[u8]) -> (int8x16_t, int8x16_t) {
+        const BIT: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        const BYTES: [u8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        ];
+        assert!(b.len() >= 22);
+        // SAFETY: the block holds 22 bytes, as asserted.
         unsafe {
-            const MASK: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-            let b = qh.to_le_bytes();
-            let src = vcombine_u8(vdup_n_u8(b[byte_lo]), vdup_n_u8(b[byte_lo + 1]));
-            vandq_u8(vtstq_u8(src, vld1q_u8(MASK.as_ptr())), vdupq_n_u8(0x10))
+            let qh = vreinterpretq_u8_u32(vld1q_dup_u32(b.as_ptr().add(2) as *const u32));
+            let v = vld1q_u8(b.as_ptr().add(6));
+            let (bit, f0) = (vld1q_u8(BIT.as_ptr()), vdupq_n_u8(0xf0));
+            // 0xf0 where the high bit is clear: or-ed with the nibble, that is the weight
+            // less 16.
+            let high = |half: usize| {
+                let bytes = vqtbl1q_u8(qh, vld1q_u8(BYTES.as_ptr().add(16 * half)));
+                vbicq_u8(f0, vtstq_u8(bytes, bit))
+            };
+            (
+                vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v, vdupq_n_u8(0xf)), high(0))),
+                vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v, 4), high(1))),
+            )
         }
     }
 
@@ -524,15 +542,9 @@ mod neon {
                     }
                 }
                 GgmlType::Q5_0 => {
-                    let sixteen = vdupq_n_s8(16);
                     for i in 0..n_blocks {
                         let b = &row[i * bb..];
-                        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
-                        let v = vld1q_u8(b.as_ptr().add(6));
-                        let lo = vorrq_u8(vandq_u8(v, m4), high_bits(qh, 0));
-                        let hi = vorrq_u8(vshrq_n_u8(v, 4), high_bits(qh, 2));
-                        let lo = vsubq_s8(vreinterpretq_s8_u8(lo), sixteen);
-                        let hi = vsubq_s8(vreinterpretq_s8_u8(hi), sixteen);
+                        let (lo, hi) = q5_0(b);
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32x4(lo, hi, xq[t].add(i * QK));
@@ -752,14 +764,10 @@ mod neon {
                 }
                 T_Q5_0 => {
                     let b = &row[j * 22..];
-                    let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
-                    let v = vld1q_u8(b.as_ptr().add(6));
-                    let sixteen = vdupq_n_s8(16);
-                    let lo = vorrq_u8(vandq_u8(v, m4), high_bits(qh, 0));
-                    let hi = vorrq_u8(vshrq_n_u8(v, 4), high_bits(qh, 2));
+                    let (lo, hi) = q5_0(b);
                     Chunk {
-                        lo: vsubq_s8(s8(lo), sixteen),
-                        hi: vsubq_s8(s8(hi), sixteen),
+                        lo,
+                        hi,
                         d: le16(b, 0),
                         m: 0.0,
                         half_scales: [1, 1],

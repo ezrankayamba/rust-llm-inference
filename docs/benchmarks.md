@@ -3,6 +3,25 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON Q5_0 decoder kept in vector registers
+
+A Q5_0 block's 32 high bits were moved byte by byte from general registers into vector ones. `q5_0`
+loads the word into every lane, spreads its bytes with a table, and turns a clear bit into 0xf0
+(the nibble less 16), so there is no subtraction either. `RAYON_NUM_THREADS=1 bench_matvec`, Q5_0
+5632 x 2048: matvec 0.553 -> 0.354 ms, 64-token matmul 6.54 -> 5.80 ms.
+
+Qwen2.5-0.5B Q4_K_M (two thirds of what a token reads is Q5_0), `bench --pp 128 --tg 64 --reps 3
+--threads N`, alternated, tok/s:
+
+| Threads | pp128 before | after | tg64 before | after | llama.cpp tg64 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 249.9 | 268.6 | 51.7 | 67.1 | 79.7 |
+| 4 | 757.1 | 805.2 | 132.8 | 151.9 | 155.7 |
+
+Logits against the `--precise` reference unchanged (0.37, top-1 the same). Unrolling the Q8_0,
+Q4_0 and Q5_0 loops over two sums changed nothing (0.298 / 0.322 / 0.551 ms), so they are not
+waiting on their sums.
+
 ## 2026-11-16: NEON block kernel (prompts): token groups of 16
 
 `dot_block` decoded each row pair's weights once per group of 8 tokens; with 16 the decode is shared
