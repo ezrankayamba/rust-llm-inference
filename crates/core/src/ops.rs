@@ -55,14 +55,20 @@ pub struct Rope<'a> {
 impl Rope<'_> {
     pub fn apply(&self, x: &mut [f32], n_heads: usize, pos: usize) {
         let half = self.rope_dim / 2;
-        for h in 0..n_heads {
-            let head = &mut x[h * self.head_dim..(h + 1) * self.head_dim];
-            for i in 0..half {
+        // The angles are the same for every head: found per head, they were 3% of a CPU
+        // prompt on four threads, all of it on one.
+        let trig: Vec<(f32, f32)> = (0..half)
+            .map(|i| {
                 let mut freq = self.theta.powf(-2.0 * i as f32 / self.rope_dim as f32);
                 if let Some(ff) = self.freq_factors {
                     freq /= ff[i];
                 }
-                let (sin, cos) = (pos as f32 * freq).sin_cos();
+                (pos as f32 * freq).sin_cos()
+            })
+            .collect();
+        for h in 0..n_heads {
+            let head = &mut x[h * self.head_dim..(h + 1) * self.head_dim];
+            for (i, &(sin, cos)) in trig.iter().enumerate() {
                 let (a, b) = if self.neox {
                     (i, i + half)
                 } else {

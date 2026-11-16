@@ -3,6 +3,21 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: CPU prompts: the steps between matmuls, off the one thread
+
+`sample` of a four-thread prompt showed the workers waiting 6-8% of the time while the main thread
+ran the per-token steps of a layer. `Rope::apply` found each angle (`powf`, `sin_cos`) again for
+every head; it now finds them once per token. The norms and the rotation of a chunk's tokens run on
+the pool. Llama-3.2-1B Q4_K_M, `bench --pp 128 --tg 32 --reps 3 --threads 4`, alternated, tok/s:
+
+| | pp128 | tg32 |
+|---|---:|---:|
+| before | 317.7 | 83.7 |
+| angles once per token | 325.6 | 84.8 |
+| norms and rotation on the pool | 333.4 | 85.0 |
+
+One thread: 102.8 -> 103.8 and 38.4 -> 38.4. llama.cpp: 411.9 and 85.2 on four threads.
+
 ## 2026-11-16: NEON block kernel: K-quant scale decode inlined
 
 `k_scales` stayed a call from `rows2` (a `#[target_feature]` function is only inlined at the

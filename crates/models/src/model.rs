@@ -687,10 +687,12 @@ impl Model {
         let mut att = vec![0.0; n * q_dim];
         let mut tmp = vec![0.0; n * n_embd];
         let scale = 1.0 / (hd as f32).sqrt();
+        // The per-token steps between matmuls run on the pool too: left on one thread they
+        // were 7% of a four-thread prompt, with the other three waiting.
         let norm_rows = |out: &mut [f32], x: &[f32], w: &[f32]| {
-            for (o, r) in out.chunks_exact_mut(n_embd).zip(x.chunks_exact(n_embd)) {
-                ops::rmsnorm(o, r, w, c.rms_eps);
-            }
+            out.par_chunks_exact_mut(n_embd)
+                .zip(x.par_chunks_exact(n_embd))
+                .for_each(|(o, r)| ops::rmsnorm(o, r, w, c.rms_eps));
         };
 
         for (l, layer) in self.layers.iter().enumerate().skip(first) {
@@ -715,10 +717,13 @@ impl Model {
                     }
                 }
             }
-            for i in 0..n {
-                rope.apply(&mut q[i * q_dim..(i + 1) * q_dim], c.n_head, pos + i);
-                rope.apply(&mut k[i * kv_dim..(i + 1) * kv_dim], c.n_head_kv, pos + i);
-            }
+            q.par_chunks_exact_mut(q_dim)
+                .zip(k.par_chunks_exact_mut(kv_dim))
+                .enumerate()
+                .for_each(|(i, (q, k))| {
+                    rope.apply(q, c.n_head, pos + i);
+                    rope.apply(k, c.n_head_kv, pos + i);
+                });
             sess.k[l].push(&k);
             sess.v[l].push(&v);
 
