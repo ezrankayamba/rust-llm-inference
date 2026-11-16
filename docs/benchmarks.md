@@ -73,6 +73,15 @@ Decode is unchanged (363, 184.6, 106.9, 21.7).
   of a test per step, and `add`, `axpy`, `swiglu` and the cache stores take four values a
   thread. Together with the above: Llama-3.2-1B 1306 -> 1327.
 
+- Later the same day: a Q4_K tile step reads each word once for both of its chunks (they are
+  the low and high nibbles of the same bytes; `deq16_q4_k_x2`). Llama-3.2-1B pp16 672 -> 700,
+  pp512 1327 -> 1340; Mistral-7B pp512 187.5 -> 189. Short prompts against llama.cpp after
+  it (pp16 / pp32 / pp64): Llama-3.2-1B 700 / 950 / 1156 against 791 / 1097 / 1280, Mistral-7B
+  126.5 / 160 / 187 against 142 / 186 / 196, Qwen2.5-0.5B 1208 / 1787 / 2244 against
+  1422 / 2067 / 2793. A tile matmul over 8192x2048 Q4_K costs 0.13 ms plus 9.9 us a token
+  (`bench_metal`-style run over distinct matrices: 0.207, 0.277, 0.445 and 0.76 ms for 8, 16,
+  32 and 64 tokens); storing a thread's weights eight halves at a time changed nothing.
+
 Where a 512-token prompt goes (skipping one kernel class at a time): the matmuls are 90% on
 Llama-3.2-1B and 80% on Qwen2.5-0.5B; on SmolLM2 they are 66%, attention 25%.
 

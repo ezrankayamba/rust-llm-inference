@@ -574,16 +574,47 @@ struct MatmulParams {
     uint add;         // add into y instead of overwriting it
 };
 
+// A tile step's weights for one thread: 16 of chunk c and the same 16 of chunk c + 1 (c even).
+#define DEQ_X2(DEQ)                                                                           \
+inline void DEQ##_x2(device const uchar* r, uint c, uint o, thread float4* w) {               \
+    DEQ(r, c, o, w);                                                                          \
+    DEQ(r, c + 1, o, w + 4);                                                                  \
+}
+DEQ_X2(deq16_f32)
+DEQ_X2(deq16_f16)
+DEQ_X2(deq16_q4_0)
+DEQ_X2(deq16_q5_0)
+DEQ_X2(deq16_q8_0)
+DEQ_X2(deq16_q5_k)
+DEQ_X2(deq16_q6_k)
+
+// Q4_K's two chunks are the low and high nibbles of the same bytes: four loads for both.
+inline void deq16_q4_k_x2(device const uchar* r, uint c, uint o, thread float4* w) {
+    uint sub = c % 8;
+    device const uchar* b = r + (c / 8) * 144;
+    float sc0, m0, sc1, m1;
+    scale_min_k4(sub, b + 4, sc0, m0);
+    scale_min_k4(sub + 1, b + 4, sc1, m1);
+    float d = h(b), dmin = h(b + 2);
+    float d0 = d * sc0, dm0 = dmin * m0, d1 = d * sc1, dm1 = dmin * m1;
+    device const uchar* q = b + 16 + 32 * (sub / 2) + o;
+    for (uint i = 0; i < 4; i++) {
+        uint v = word4(q + 4 * i);
+        w[i] = d0 * unpack4(v & 0x0F0F0F0Fu) - dm0;
+        w[i + 4] = d1 * unpack4((v >> 4) & 0x0F0F0F0Fu) - dm1;
+    }
+}
+
 // One step of a tile: TWO (a literal) says whether it has both 32-column chunks or, as the
 // last step of a matrix whose columns are an odd multiple of 32, only the first. A run-time
 // test here cost 3% of a prompt.
 #define MM_STEP(DEQ, T, M, AB, BB, TWO)                                                       \
     {                                                                                         \
         float4 wv[8], xv[XU];                                                                 \
-        DEQ(wrow, c, wo, wv);                                                                 \
         if (TWO) {                                                                            \
-            DEQ(wrow, c + 1, wo, wv + 4);                                                     \
+            DEQ##_x2(wrow, c, wo, wv);                                                        \
         } else {                                                                              \
+            DEQ(wrow, c, wo, wv);                                                             \
             for (uint i = 4; i < 8; i++) wv[i] = float4(0.0f);                                \
         }                                                                                     \
         for (uint i = 0; i < XU; i++) {                                                       \
