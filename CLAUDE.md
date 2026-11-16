@@ -28,7 +28,9 @@ Workspace crates (dependencies flow downward only):
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel; every forward pass with CPU layers runs inside rli-models' own pool, `pool()` in `lib.rs`, so the calling thread is a worker rather than waiting on one per matvec), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
-  fallback; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
+  fallback; the NEON one-row Q4_K/Q5_K kernel (`k_rows`, decode) keeps a super-block in i32 with one float
+  multiply-add at its end, as the AVX2 one does, since a float add per 32 weights was a chain every block
+  waited on; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
   decode 8 weight rows at a time into an interleaved panel in L1, so one broadcast activation load serves
   all 8 rows (weights stay in the mapping; no repacked copy), or 16 rows with `vpdpbusd` where the CPU

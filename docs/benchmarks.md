@@ -3,6 +3,37 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-16: NEON decode kernel for Q4_K/Q5_K in integers, on the Apple M4 CPU
+
+The one-row NEON kernel added each 32-weight chunk's dot product to one float sum, and subtracted
+its min term from one scalar, so every chunk waited on the one before it. `k_rows` now does what the
+AVX2 kernel does: sub-block scale times activation ratio as an integer multiplier, i32 sums over a
+super-block (two, taken in turn), one float multiply-add per super-block, and the mins as two
+vectors. The block kernel's `k_scales` (14% of a one-thread prompt in `sample`) builds its scales
+with vectors instead of byte by byte, and the dense SwiGLU runs on the pool (4 threads, pp128:
+299.8 -> 309.6, alternated twice).
+
+`RAYON_NUM_THREADS=1 bench_matvec`, 5632 x 2048, ms per matvec: Q4_K 0.389 -> 0.227, Q5_K 0.474 ->
+0.355; Q4_0, Q5_0, Q8_0 and Q6_K unchanged (dealing their chunks over four sums indexed by block ran
+5-12% slower, so they keep one).
+
+`bench <model> --pp 128 --tg 64 --reps 2 --threads N` (CPU), before and after alternated with 15 s
+rests; llama.cpp (`-DGGML_BLAS=OFF`) `llama-bench -ngl 0 -t N -p 128 -n 64 -r 2`. Llama-3.2-1B
+Q4_K_M, tok/s:
+
+| Threads | pp128 before | after | llama.cpp | tg64 before | after | llama.cpp |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 85.0 | 96.4 | 116.3 | 23.4 | 31.8 | 45.5 |
+| 2 | 157.9 | 178.4 | 229.2 | 45.1 | 60.5 | 81.1 |
+| 4 | 273.4 | 310.7 | 411.4 | 71.2 | 82.9 | 85.3 |
+
+Qwen2.5-0.5B Q4_K_M (mostly Q5_0 and Q8_0), 4 threads: pp128 648.7 -> 665.9, tg64 130.6 -> 130.9.
+
+Still behind llama.cpp per core: 1.2x on prompts and 1.4x on decode with one thread. The model's
+other 40% of bytes are Q6_K, whose kernel is unchanged. Logits against the `--precise` reference
+(Llama-3.2-1B, 578-token prompt): 0.16 batched, 0.16 per token, top-1 unchanged; `eval_quant`
+KL mean 0.0005, top-1 agreement 99.2%.
+
 ## 2026-11-16: Metal MoE decode: two-row expert matvecs, fused with what follows them
 
 Qwen3-30B-A3B Q4_K_M, same commands and protocol as the entry below. tg48, tok/s:

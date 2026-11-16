@@ -13,6 +13,8 @@ use std::collections::HashMap;
 /// pass, which cost about as much as multiplying them by 64 tokens: 128 made prompts 21-24% faster
 /// than 64 there (no change on NEON), and 256 gained 2-6% on one model and lost as much on another.
 const CPU_CHUNK: usize = 128;
+/// Values of a SwiGLU activation per parallel task.
+const SWIGLU_CHUNK: usize = 1024;
 /// Tokens per [`Model::forward_batch`] call when a caller wants to stop between calls
 /// ([`Model::prompt_slice`]), unless an accelerator that runs every layer takes more. A multiple
 /// of the CPU's chunk size and a divisor of the GPU backends', so slicing a prompt moves no
@@ -569,7 +571,11 @@ impl Model {
         let mut up = vec![0.0; n * e.up.rows];
         self.matmul(&e.gate, x, &mut gate, n);
         self.matmul(&e.up, x, &mut up, n);
-        ops::swiglu(&mut gate, &up);
+        // An `exp` per value: left on one thread it was 4% of a prompt's single-threaded time,
+        // which is 15% of it on four.
+        gate.par_chunks_mut(SWIGLU_CHUNK)
+            .zip(up.par_chunks(SWIGLU_CHUNK))
+            .for_each(|(g, u)| ops::swiglu(g, u));
         self.matmul(&e.down, &gate, out, n);
     }
 

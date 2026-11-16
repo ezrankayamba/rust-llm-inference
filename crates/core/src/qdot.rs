@@ -25,10 +25,16 @@ const RATIO_MAX: f32 = 256.0;
 pub struct Q8Act {
     d: Vec<f32>,
     /// Each block's scale in parts of its group's: `d = unit * ratio`, 1 to [`RATIO_MAX`].
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // only the AVX2 kernel reads it
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )] // only the AVX2 and NEON kernels read it
     ratio: Vec<i16>,
     /// One per group of [`GROUP`] blocks: its largest block scale over [`RATIO_MAX`].
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // only the AVX2 kernel reads it
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     unit: Vec<f32>,
     /// `d * Σ q` per block: the block's (quantized) sum, for formats with a min/offset term.
     sum: Vec<f32>,
@@ -334,7 +340,7 @@ pub fn dot_row_q8_portable(ty: GgmlType, row: &[u8], a: &Q8Act) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::{Q8Act, QK, le16, scale_min_k4};
+    use super::{Q8Act, QK, le16, scales_mins_k4};
     use crate::quant::{GgmlType, QK_K};
     use std::arch::aarch64::*;
     use std::sync::OnceLock;
@@ -367,10 +373,106 @@ mod neon {
         }
     }
 
+    /// [`dot_rows`] for Q4_K (`FIVE` false) and Q5_K, as the AVX2 kernel does it. A super-block
+    /// stays in integers: each sub-block's 6-bit scale times its activations' ratio multiplies
+    /// that sub-block's dot product, the eight add up as i32, and one float multiply-add per
+    /// super-block puts on the weights' scale and the activation group's. The i32 sums can't
+    /// overflow: a lane of a Q4_K sub-block's dot product reaches 8 · 15 · 127, a multiplier
+    /// 63 · 256, and eight of those are 1.97e9. Q5_K's weights reach 31, so its two 16-weight
+    /// halves keep a sum each (4 · 31 · 127 a lane, 2.03e9 in all).
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    unsafe fn k_rows<const N: usize, const FIVE: bool>(
+        row: &[u8],
+        acts: &[Q8Act],
+        acc: &mut [[float32x4_t; 4]; N],
+        extra: &mut [[float32x4_t; 2]; N],
+    ) {
+        let (bb, ql_at) = if FIVE { (176, 48) } else { (144, 16) };
+        // SAFETY: per `dot_rows`, whose block count bounds every token's activations.
+        unsafe {
+            let m4 = vdupq_n_u8(0xf);
+            let sixteen = vdupq_n_u8(16);
+            let zero = vdupq_n_s32(0);
+            for (i, b) in row.chunks_exact(bb).enumerate() {
+                let (d, dmin) = (le16(b, 0), le16(b, 2));
+                let (sc, mn) = scales_mins_k4(&b[4..16]);
+                let sc = vreinterpretq_s16_u16(vmovl_u8(vcreate_u8(sc)));
+                let mn = vmovl_u8(vcreate_u8(mn));
+                let mins = [
+                    vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(mn))), dmin),
+                    vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(mn)), dmin),
+                ];
+                let xb = i * (QK_K / QK);
+                // Each token's eight multipliers, and its two sums.
+                let mut mult = [[0i32; 8]; N];
+                let mut sum = [[zero; 2]; N];
+                for t in 0..N {
+                    let xs = acts[t].sum.as_ptr().add(xb);
+                    extra[t][0] = vfmsq_f32(extra[t][0], mins[0], vld1q_f32(xs));
+                    extra[t][1] = vfmsq_f32(extra[t][1], mins[1], vld1q_f32(xs.add(4)));
+                    let m = vmulq_s16(sc, vld1q_s16(acts[t].ratio.as_ptr().add(xb)));
+                    vst1q_s32(mult[t].as_mut_ptr(), vmovl_s16(vget_low_s16(m)));
+                    vst1q_s32(mult[t].as_mut_ptr().add(4), vmovl_high_s16(m));
+                }
+                let (qh0, qh1) = if FIVE {
+                    (vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)))
+                } else {
+                    (vdupq_n_u8(0), vdupq_n_u8(0))
+                };
+                for g in 0..4 {
+                    let q0 = vld1q_u8(b.as_ptr().add(ql_at + 32 * g));
+                    let q1 = vld1q_u8(b.as_ptr().add(ql_at + 32 * g + 16));
+                    for half in 0..2 {
+                        let sub = 2 * g + half;
+                        let (mut w0, mut w1) = if half == 0 {
+                            (vandq_u8(q0, m4), vandq_u8(q1, m4))
+                        } else {
+                            (vshrq_n_u8(q0, 4), vshrq_n_u8(q1, 4))
+                        };
+                        if FIVE {
+                            let bit = vdupq_n_u8(1 << sub);
+                            w0 = vorrq_u8(w0, vandq_u8(vtstq_u8(qh0, bit), sixteen));
+                            w1 = vorrq_u8(w1, vandq_u8(vtstq_u8(qh1, bit), sixteen));
+                        }
+                        let (w0, w1) = (vreinterpretq_s8_u8(w0), vreinterpretq_s8_u8(w1));
+                        for t in 0..N {
+                            let x = acts[t].qs.as_ptr().add((xb + sub) * QK);
+                            let m = vld1q_dup_s32(mult[t].as_ptr().add(sub));
+                            if FIVE {
+                                let p0 = vdotq_s32(zero, w0, vld1q_s8(x));
+                                let p1 = vdotq_s32(zero, w1, vld1q_s8(x.add(16)));
+                                sum[t][0] = vaddq_s32(sum[t][0], vmulq_s32(p0, m));
+                                sum[t][1] = vaddq_s32(sum[t][1], vmulq_s32(p1, m));
+                            } else {
+                                // Sub-blocks in turn into the two sums, so neither waits on
+                                // the one before.
+                                let p = dot32x4(w0, w1, x);
+                                sum[t][half] = vaddq_s32(sum[t][half], vmulq_s32(p, m));
+                            }
+                        }
+                    }
+                }
+                for t in 0..N {
+                    let scale = vdupq_n_f32(d * acts[t].unit[i]);
+                    if FIVE {
+                        acc[t][0] = vfmaq_f32(acc[t][0], vcvtq_f32_s32(sum[t][0]), scale);
+                        acc[t][1] = vfmaq_f32(acc[t][1], vcvtq_f32_s32(sum[t][1]), scale);
+                    } else {
+                        let s = vaddq_s32(sum[t][0], sum[t][1]);
+                        acc[t][0] = vfmaq_f32(acc[t][0], vcvtq_f32_s32(s), scale);
+                    }
+                }
+            }
+        }
+    }
+
     /// Dot products of one encoded row with the activations of `N` tokens, into `out`. Each
     /// weight block is unpacked (and its scales decoded) once for all `N` tokens, and every
     /// token's arithmetic is the same whatever `N` is, so a matmul matches per-token matvecs
-    /// bit for bit. `false` for types without a NEON kernel.
+    /// bit for bit. `false` for types without a NEON kernel. Only [`k_rows`] uses more than the
+    /// first of a token's sums: dealing the other types' blocks over four (indexed by block)
+    /// ran 5-12% slower.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn dot_rows<const N: usize>(
         ty: GgmlType,
@@ -387,9 +489,10 @@ mod neon {
         let xq: [*const i8; N] = std::array::from_fn(|t| acts[t].qs.as_ptr());
         let ad: [&[f32]; N] = std::array::from_fn(|t| &acts[t].d[..]);
         let m4 = vdupq_n_u8(0xf);
-        let mut acc = [vdupq_n_f32(0.0); N];
-        // Scalar terms (the K-quant mins), kept apart from the vector accumulators.
-        let mut extra = [0f32; N];
+        let zero = vdupq_n_f32(0.0);
+        let mut acc = [[zero; 4]; N];
+        // The K-quant mins' terms.
+        let mut extra = [[zero; 2]; N];
         // SAFETY (all blocks below): every pointer offset stays inside `row` (n_blocks * bb bytes)
         // or each token's `qs` (n_blocks * block_size values), as asserted above.
         unsafe {
@@ -401,7 +504,8 @@ mod neon {
                         let d = le16(&row[i * bb..], 0);
                         for t in 0..N {
                             let s = dot32x4(w0, w1, xq[t].add(i * QK));
-                            acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(s), d * ad[t][i]);
+                            let a = &mut acc[t][0];
+                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
                         }
                     }
                 }
@@ -414,7 +518,8 @@ mod neon {
                         let d = le16(&row[i * bb..], 0);
                         for t in 0..N {
                             let s = dot32x4(lo, hi, xq[t].add(i * QK));
-                            acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(s), d * ad[t][i]);
+                            let a = &mut acc[t][0];
+                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
                         }
                     }
                 }
@@ -431,51 +536,13 @@ mod neon {
                         let d = le16(b, 0);
                         for t in 0..N {
                             let s = dot32x4(lo, hi, xq[t].add(i * QK));
-                            acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(s), d * ad[t][i]);
+                            let a = &mut acc[t][0];
+                            *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][i]);
                         }
                     }
                 }
-                GgmlType::Q4_K | GgmlType::Q5_K => {
-                    let five = ty == GgmlType::Q5_K;
-                    let ql_at = if five { 48 } else { 16 };
-                    let sixteen = vdupq_n_u8(16);
-                    for i in 0..n_blocks {
-                        let b = &row[i * bb..(i + 1) * bb];
-                        let (d, dmin) = (le16(b, 0), le16(b, 2));
-                        let scales = &b[4..16];
-                        let (qh0, qh1) = if five {
-                            (vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)))
-                        } else {
-                            (vdupq_n_u8(0), vdupq_n_u8(0))
-                        };
-                        for g in 0..4 {
-                            let q0 = vld1q_u8(b.as_ptr().add(ql_at + 32 * g));
-                            let q1 = vld1q_u8(b.as_ptr().add(ql_at + 32 * g + 16));
-                            for half in 0..2 {
-                                let sub = 2 * g + half;
-                                let (mut w0, mut w1) = if half == 0 {
-                                    (vandq_u8(q0, m4), vandq_u8(q1, m4))
-                                } else {
-                                    (vshrq_n_u8(q0, 4), vshrq_n_u8(q1, 4))
-                                };
-                                if five {
-                                    let bit = vdupq_n_u8(1 << sub);
-                                    w0 = vorrq_u8(w0, vandq_u8(vtstq_u8(qh0, bit), sixteen));
-                                    w1 = vorrq_u8(w1, vandq_u8(vtstq_u8(qh1, bit), sixteen));
-                                }
-                                let (w0, w1) = (vreinterpretq_s8_u8(w0), vreinterpretq_s8_u8(w1));
-                                let xb = i * (QK_K / QK) + sub;
-                                let (sc, m) = scale_min_k4(sub, scales);
-                                let (dsc, dm) = (d * sc, dmin * m);
-                                for t in 0..N {
-                                    let s = dot32x4(w0, w1, xq[t].add(xb * QK));
-                                    acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(s), dsc * ad[t][xb]);
-                                    extra[t] -= dm * acts[t].sum[xb];
-                                }
-                            }
-                        }
-                    }
-                }
+                GgmlType::Q4_K => k_rows::<N, false>(row, acts, &mut acc, &mut extra),
+                GgmlType::Q5_K => k_rows::<N, true>(row, acts, &mut acc, &mut extra),
                 GgmlType::Q6_K => {
                     let three = vdupq_n_u8(3);
                     let off = vdupq_n_s8(32);
@@ -516,7 +583,8 @@ mod neon {
                                     let p0 = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(x));
                                     let p1 = vdotq_s32(vdupq_n_s32(0), w1, vld1q_s8(x.add(16)));
                                     let s = vmlaq_n_s32(vmulq_n_s32(p0, s0), p1, s1);
-                                    acc[t] = vmlaq_n_f32(acc[t], vcvtq_f32_s32(s), d * ad[t][xb]);
+                                    let a = &mut acc[t][0];
+                                    *a = vmlaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][xb]);
                                 }
                             }
                         }
@@ -526,7 +594,11 @@ mod neon {
             }
         }
         for t in 0..N {
-            out[t] = vaddvq_f32(acc[t]) + extra[t];
+            let a = vaddq_f32(
+                vaddq_f32(acc[t][0], acc[t][1]),
+                vaddq_f32(acc[t][2], acc[t][3]),
+            );
+            out[t] = vaddvq_f32(a) + vaddvq_f32(vaddq_f32(extra[t][0], extra[t][1]));
         }
         true
     }
@@ -743,29 +815,45 @@ mod neon {
         }
     }
 
-    /// For the Q4_K/Q5_K block holding chunk `j` of both rows, each chunk's `[d, d, d, d]` and
-    /// `[m, m, m, m]`, with `r0` in the low lanes and `r1` in the high ones.
+    /// For the Q4_K/Q5_K block holding chunk `j` of both rows, each chunk's scale and min as
+    /// `[r0, r0, r1, r1]`, the lanes of an `smmla` result.
+    #[target_feature(enable = "neon")]
     #[inline]
     fn k_scales(
         block_bytes: usize,
         r0: &[u8],
         r1: &[u8],
         j: usize,
-    ) -> ([[f32; 4]; 8], [[f32; 4]; 8]) {
-        let (mut ds, mut ms) = ([[0.0; 4]; 8], [[0.0; 4]; 8]);
+    ) -> ([float32x4_t; 8], [float32x4_t; 8]) {
         let at = (j / 8) * block_bytes;
-        for (lane, row) in [r0, r1].into_iter().enumerate() {
-            let b = &row[at..at + block_bytes];
-            let (d, m) = (le16(b, 0), le16(b, 2));
-            for sub in 0..8 {
-                let (sc, mn) = scale_min_k4(sub, &b[4..16]);
-                ds[sub][2 * lane] = d * sc;
-                ds[sub][2 * lane + 1] = d * sc;
-                ms[sub][2 * lane] = m * mn;
-                ms[sub][2 * lane + 1] = m * mn;
+        // A row's eight scales and mins as floats, times its d and dmin.
+        let row = |r: &[u8]| {
+            let b = &r[at..at + block_bytes];
+            let (sc, mn) = scales_mins_k4(&b[4..16]);
+            let f = |v: u64, by: f32| {
+                let v = vmovl_u8(vcreate_u8(v));
+                [
+                    vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(v))), by),
+                    vmulq_n_f32(vcvtq_f32_u32(vmovl_high_u16(v)), by),
+                ]
+            };
+            (f(sc, le16(b, 0)), f(mn, le16(b, 2)))
+        };
+        let ((d0, m0), (d1, m1)) = (row(r0), row(r1));
+        // [a0, a1, a2, a3] and [b0, ..] to [a0, a0, b0, b0], [a1, a1, b1, b1], ...
+        let spread = |a: [float32x4_t; 2], b: [float32x4_t; 2]| {
+            let mut out = [vdupq_n_f32(0.0); 8];
+            for h in 0..2 {
+                let (al, ah) = (vzip1q_f32(a[h], a[h]), vzip2q_f32(a[h], a[h]));
+                let (bl, bh) = (vzip1q_f32(b[h], b[h]), vzip2q_f32(b[h], b[h]));
+                out[4 * h] = vcombine_f32(vget_low_f32(al), vget_low_f32(bl));
+                out[4 * h + 1] = vcombine_f32(vget_high_f32(al), vget_high_f32(bl));
+                out[4 * h + 2] = vcombine_f32(vget_low_f32(ah), vget_low_f32(bh));
+                out[4 * h + 3] = vcombine_f32(vget_high_f32(ah), vget_high_f32(bh));
             }
-        }
-        (ds, ms)
+            out
+        };
+        (spread(d0, d1), spread(m0, m1))
     }
 
     /// Rows `r0`, `r1` (type `T`) against token pairs `first..first + NP`; `out[p]` =
@@ -791,7 +879,7 @@ mod neon {
             let sums = acts.sum.as_ptr().add(first * n_chunks) as *const f32;
             let is_k = T == T_Q4_K || T == T_Q5_K;
             let block_bytes = if T == T_Q5_K { 176 } else { 144 };
-            let (mut k_d, mut k_m) = ([[0.0; 4]; 8], [[0.0; 4]; 8]);
+            let (mut k_d, mut k_m) = ([vdupq_n_f32(0.0); 8], [vdupq_n_f32(0.0); 8]);
             for j in 0..n_chunks {
                 if is_k && j.is_multiple_of(8) {
                     (k_d, k_m) = k_scales(block_bytes, r0, r1, j);
@@ -813,10 +901,7 @@ mod neon {
                     zip(c0.hi, c1.hi, true),
                 ];
                 let (vd, vm) = if is_k {
-                    (
-                        vld1q_f32(k_d[j % 8].as_ptr()),
-                        vld1q_f32(k_m[j % 8].as_ptr()),
-                    )
+                    (k_d[j % 8], k_m[j % 8])
                 } else {
                     (pair(c0.d, c1.d), pair(c0.m, c1.m))
                 };
