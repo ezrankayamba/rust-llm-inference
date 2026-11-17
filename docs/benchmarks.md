@@ -70,6 +70,24 @@ alternating, two rounds, tok/s:
 | Llama-3.2-1B | 463.8 | 513.0, 514.0 | 522.8, 510.7 |
 | Mistral-7B | 141.9 | 153.2, 153.1 | 150.4, 149.8 |
 
+## 2026-11-17: CUDA prompt attention: tiles read in 16-byte words, a step ahead
+
+`attn_scores` and `attn_pv` filled their shared-memory tiles a float at a time, each read followed
+by its store (16 + 16 a thread in `attn_scores`; 16 + 4 per 32 positions in `attn_pv`). Now a thread
+reads 4 `float4` per tile into registers before storing any, and `attn_pv` reads the next 32
+positions' tiles while the current ones are multiplied. `RLI_CUDA_PROF=1 bench --pp 512 --tg 0
+--reps 3` on the A100, us a launch (512 tokens):
+
+| Model | `attn_scores` before | after | `attn_pv` before | after |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B | 255.3 | 202.8 | 304.4 | 181.4 |
+| Mistral-7B | 354.9 | 227.9 | 365.0 | 245.4 |
+| Qwen3-30B-A3B | 333.7 | 208.7 | 339.6 | 224.9 |
+
+Logits of a 541-token prompt are bit-identical on all three and the CUDA tests pass. pp512 against
+llama.cpp, alternating with 8 s rests, two rounds, tok/s: Llama-3.2-1B 12502, 15333 against 14464,
+15784; Mistral-7B 3932, 3981 against 4638, 4919; Qwen3-30B-A3B 4043, 4142 against 4195, 4165.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).

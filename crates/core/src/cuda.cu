@@ -1731,15 +1731,27 @@ extern "C" __global__ void attn_scores(const float* q, const float* kc, float* s
     uint base = blockIdx.y * 32, t0 = blockIdx.z * tpt;
     uint t_end = min(t0 + tpt, n_tok);
     if (base >= n_pos + tok0 + t_end - 1) return;  // past what the tile's last token sees
-    for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
-        uint p = i / head_dim, d = i % head_dim;
-        ks[p * (head_dim + 1) + d] = base + p < n_pos + tok0 + t_end - 1
-            ? kc[(ulong)(base + p) * kv_dim + blockIdx.x * head_dim + d] : 0.0f;
+    // Both tiles in 16-byte reads (at most 4 each a thread), all issued before the first store.
+    uint n4 = head_dim / 4;
+    float4 kr[4], qr[4];
+    _Pragma("unroll")
+    for (uint j = 0; j < 4; j++) {
+        uint i = tid + j * blockDim.x, r = i / n4, d = 4 * (i % n4), t = t0 + r / g_n;
+        kr[j] = qr[j] = make_float4(0, 0, 0, 0);
+        if (i >= 32 * n4) continue;
+        if (base + r < n_pos + tok0 + t_end - 1)
+            kr[j] = *(const float4*)(kc + (ulong)(base + r) * kv_dim + blockIdx.x * head_dim + d);
+        if (t < n_tok)
+            qr[j] = *(const float4*)(
+                q + ((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d);
     }
-    for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
-        uint r = i / head_dim, d = i % head_dim, t = t0 + r / g_n;
-        qs[i] = t < n_tok
-            ? q[((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d] : 0.0f;
+    _Pragma("unroll")
+    for (uint j = 0; j < 4; j++) {
+        uint i = tid + j * blockDim.x, r = i / n4, d = 4 * (i % n4);
+        if (i >= 32 * n4) continue;
+        float* kd = ks + r * (head_dim + 1) + d;
+        kd[0] = kr[j].x, kd[1] = kr[j].y, kd[2] = kr[j].z, kd[3] = kr[j].w;
+        *(float4*)(qs + r * head_dim + d) = qr[j];
     }
     __syncthreads();
     uint p = tid % 32, rg = tid / 32;
@@ -1776,7 +1788,25 @@ extern "C" __global__ void attn_softmax(float* scores, uint n_head, uint n_pos, 
 
 // The weighted sums of V: one block of 2 head_dim threads per KV head (x) and tile of query
 // rows (y), walking the context 32 positions at a time. Thread (rows 4 rg.., values 4 dq..)
-// keeps 16 sums.
+// keeps 16 sums. A step's tiles are read into registers while the step before is multiplied,
+// so no step waits on memory: a thread takes 4 16-byte words of V and up to PV_S scores.
+#define PV_S 8
+#define PV_READ(BASE)                                                                          \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < 4; j++) {                                                             \
+        uint i = tid + j * blockDim.x, p = i / n4;                                             \
+        vr[j] = (BASE) + p < limit                                                             \
+            ? *(const float4*)(vc + (ulong)((BASE) + p) * kv_dim + blockIdx.x * head_dim       \
+                               + 4 * (i % n4))                                                 \
+            : make_float4(0, 0, 0, 0);                                                         \
+    }                                                                                          \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < PV_S; j++) {                                                          \
+        uint i = tid + j * blockDim.x, r = i / 32, p = i % 32, t = t0 + r / g_n;               \
+        sr[j] = i < 32 * 32 && t < n_tok && (BASE) + p < n_pos + tok0 + t                      \
+            ? scores[((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + (BASE) + p]  \
+            : 0.0f;                                                                            \
+    }
 extern "C" __global__ void attn_pv(const float* scores, const float* vc, float* out,
                                    uint n_head, uint n_kv, uint head_dim, uint n_pos,
                                    uint kv_dim, uint max_ctx, uint tok0, uint n_tok) {
@@ -1784,20 +1814,26 @@ extern "C" __global__ void attn_pv(const float* scores, const float* vc, float* 
     __shared__ float ps[32 * 32];
     uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = 32 / g_n, t0 = blockIdx.y * tpt;
     uint t_end = min(t0 + tpt, n_tok), limit = n_pos + tok0 + t_end - 1;
-    uint dq = tid % (head_dim / 4), rg = tid / (head_dim / 4);
+    uint n4 = head_dim / 4, dq = tid % n4, rg = tid / n4;
     float o[16];
     for (uint i = 0; i < 16; i++) o[i] = 0;
+    float4 vr[4];
+    float sr[PV_S];
+    PV_READ(0)
     for (uint base = 0; base < limit; base += 32) {
-        for (uint i = tid; i < 32 * head_dim; i += blockDim.x) {
-            uint p = i / head_dim, d = i % head_dim;
-            vs[i] = base + p < limit
-                ? vc[(ulong)(base + p) * kv_dim + blockIdx.x * head_dim + d] : 0.0f;
-        }
-        for (uint i = tid; i < 32 * 32; i += blockDim.x) {
+        _Pragma("unroll")
+        for (uint j = 0; j < 4; j++) *(float4*)(vs + 4 * (tid + j * blockDim.x)) = vr[j];
+        _Pragma("unroll")
+        for (uint j = 0; j < PV_S; j++)
+            if (tid + j * blockDim.x < 32 * 32) ps[tid + j * blockDim.x] = sr[j];
+        for (uint i = tid + PV_S * blockDim.x; i < 32 * 32; i += blockDim.x) {
             uint r = i / 32, p = i % 32, t = t0 + r / g_n;
             ps[i] = t < n_tok && base + p < n_pos + tok0 + t
                 ? scores[((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + base + p]
                 : 0.0f;
+        }
+        if (base + 32 < limit) {
+            PV_READ(base + 32)
         }
         __syncthreads();
         for (uint p = 0; p < 32; p++) {

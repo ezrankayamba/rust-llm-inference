@@ -169,7 +169,8 @@ Design points that span files:
   of 512 tokens (`BATCH_CHUNK`; a matrix is decoded once per chunk, so 512 beat 256 by 14-30%): a warp multiplies its weight row into a tile of 32 tokens, and
   causal attention runs as tiled products (`attn_scores`, `attn_softmax`, `attn_pv`: 32 positions
   of K or V against 32 query rows per block, so a cached row is read once per tile, not once
-  per head and token). Its scores need a row per head and token,
+  per head and token; a thread reads its share of a tile as 4 `float4` before storing any, and
+  `attn_pv` reads the next 32 positions while it multiplies these: 1.3-1.7x on those kernels). Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
   launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
   a KV head and 32 positions per block, scoring the query heads that share the KV head
@@ -235,7 +236,7 @@ Design points that span files:
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
   is 10-16% ahead on all three models; decode at 2048 positions is level on Llama-3.2-1B and 2%
   ahead on Mistral-7B (2026-11-17), and prompts
-  level on Llama-3.2-1B (within its noise), 1.4x behind on Mistral-7B and 1.1x on Qwen3-30B-A3B.
+  level on Llama-3.2-1B (within its noise), 1.2x behind on Mistral-7B and 1-4% on Qwen3-30B-A3B.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through
