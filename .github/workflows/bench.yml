@@ -65,14 +65,12 @@ jobs:
             target/release/examples/bench "$model" $PROFILE_RUN --threads 1
           perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
             | head -25 | cut -c1-160
-          # The hottest symbol's instructions, hottest first.
-          top=$(perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
-            | head -1 | sed 's/.*\[\.\] *//; s/ *$//')
-          echo "annotate: $top"
-          perf annotate -i "$RUNNER_TEMP/perf.data" --stdio --no-source "$top" \
+          # The hottest instructions of any symbol (naming one found no samples: perf wants
+          # the mangled name there).
+          perf annotate -i "$RUNNER_TEMP/perf.data" --stdio --no-source \
             > "$RUNNER_TEMP/annotate.txt" 2>&1 || true
-          head -5 "$RUNNER_TEMP/annotate.txt" | cut -c1-140
-          grep -E '^ +[0-9]+\.[0-9]+ ' "$RUNNER_TEMP/annotate.txt" | sort -rn | head -60 | cut -c1-140 || true
+          head -3 "$RUNNER_TEMP/annotate.txt" | cut -c1-140
+          grep -E '^ +[0-9]+\.[0-9]+ ' "$RUNNER_TEMP/annotate.txt" | sort -rn | head -70 | cut -c1-140 || true
           perf stat -e cycles,instructions,cache-misses -- \
             target/release/examples/bench "$model" --pp 0 --tg 128 --reps 1 --threads 1 2>&1 | tail -12
 
