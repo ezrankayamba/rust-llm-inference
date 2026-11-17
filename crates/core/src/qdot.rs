@@ -663,17 +663,31 @@ mod neon {
                         };
                         vsubq_s8(vreinterpretq_s8_u8(w), off)
                     };
+                    // A super-block stays in integers, as in `k_rows`: each 16-weight half's
+                    // i8 scale times its chunk's activation ratio multiplies that half's dot
+                    // product, and one float multiply-add per sum puts on `d` and the
+                    // activation group's scale. A lane of a half's product reaches
+                    // 4 · 32 · 127 and a multiplier 128 · 256, so a sum holds four halves
+                    // (2.13e9): the 16 go into four sums, which are added as floats.
+                    let zi = vdupq_n_s32(0);
                     for i in 0..n_blocks {
                         let b = &row[i * bb..(i + 1) * bb];
                         let d = le16(b, 208);
-                        // The 16 scales as i32, to load straight into every lane.
-                        let mut sc = [0i32; 16];
                         let s8 = vld1q_s8(b.as_ptr().add(192) as *const i8);
-                        let (lo, hi) = (vmovl_s8(vget_low_s8(s8)), vmovl_high_s8(s8));
-                        vst1q_s32(sc.as_mut_ptr(), vmovl_s16(vget_low_s16(lo)));
-                        vst1q_s32(sc.as_mut_ptr().add(4), vmovl_high_s16(lo));
-                        vst1q_s32(sc.as_mut_ptr().add(8), vmovl_s16(vget_low_s16(hi)));
-                        vst1q_s32(sc.as_mut_ptr().add(12), vmovl_high_s16(hi));
+                        let (slo, shi) = (vmovl_s8(vget_low_s8(s8)), vmovl_high_s8(s8));
+                        // Each token's 16 multipliers, and its four sums.
+                        let mut mult = [[zi; 4]; N];
+                        let mut sum = [[zi; 4]; N];
+                        for t in 0..N {
+                            let r = vld1q_s16(acts[t].ratio.as_ptr().add(i * (QK_K / QK)));
+                            let (rl, rh) = (vzip1q_s16(r, r), vzip2q_s16(r, r));
+                            mult[t] = [
+                                vmull_s16(vget_low_s16(slo), vget_low_s16(rl)),
+                                vmull_high_s16(slo, rl),
+                                vmull_s16(vget_low_s16(shi), vget_low_s16(rh)),
+                                vmull_high_s16(shi, rh),
+                            ];
+                        }
                         for n in 0..2 {
                             let p = b.as_ptr();
                             let ql = [0, 1, 2, 3].map(|j| vld1q_u8(p.add(64 * n + 16 * j)));
@@ -689,19 +703,27 @@ mod neon {
                                 };
                                 let (w0, w1) = (w6(k, l0, qh[0]), w6(k, l1, qh[1]));
                                 let xb = i * (QK_K / QK) + 4 * n + k;
-                                // The two 16-element halves have their own i8 scales; apply them
-                                // in integer arithmetic (exact) before the one float multiply.
-                                let s0 = vld1q_dup_s32(sc.as_ptr().add(8 * n + 2 * k));
-                                let s1 = vld1q_dup_s32(sc.as_ptr().add(8 * n + 2 * k + 1));
                                 for t in 0..N {
                                     let x = xq[t].add(xb * QK);
-                                    let p0 = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(x));
-                                    let p1 = vdotq_s32(vdupq_n_s32(0), w1, vld1q_s8(x.add(16)));
-                                    let s = vmlaq_s32(vmulq_s32(p0, s0), p1, s1);
-                                    // Two sums in turn, so a chunk doesn't wait on the last.
-                                    let a = &mut acc[t][k % 2];
-                                    *a = vfmaq_n_f32(*a, vcvtq_f32_s32(s), d * ad[t][xb]);
+                                    let p0 = vdotq_s32(zi, w0, vld1q_s8(x));
+                                    let p1 = vdotq_s32(zi, w1, vld1q_s8(x.add(16)));
+                                    // Halves 2k and 2k + 1 of this group of four chunks.
+                                    let m = mult[t][2 * n + k / 2];
+                                    let s = &mut sum[t];
+                                    if k % 2 == 0 {
+                                        s[0] = vmlaq_laneq_s32::<0>(s[0], p0, m);
+                                        s[1] = vmlaq_laneq_s32::<1>(s[1], p1, m);
+                                    } else {
+                                        s[2] = vmlaq_laneq_s32::<2>(s[2], p0, m);
+                                        s[3] = vmlaq_laneq_s32::<3>(s[3], p1, m);
+                                    }
                                 }
+                            }
+                        }
+                        for t in 0..N {
+                            let scale = vdupq_n_f32(d * acts[t].unit[i]);
+                            for k in 0..4 {
+                                acc[t][k] = vfmaq_f32(acc[t][k], vcvtq_f32_s32(sum[t][k]), scale);
                             }
                         }
                     }

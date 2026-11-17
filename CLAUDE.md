@@ -28,7 +28,7 @@ Workspace crates (dependencies flow downward only):
 - **rli-core** (`crates/core`): dtypes and GGUF block layouts (`quant.rs`, the f32 reference
   dequant/dot), `QMatrix` matvec (`matrix.rs`, rayon-parallel; every forward pass with CPU layers runs inside rli-models' own pool, `pool()` in `lib.rs`, so the calling thread is a worker rather than waiting on one per matvec), fast integer kernels over
   Q8-quantized activations (`qdot.rs`, NEON `dotprod` or AVX2 with runtime detection and a portable
-  fallback; the NEON one-row Q4_K/Q5_K kernel (`k_rows`, decode) keeps a super-block in i32 with one float
+  fallback; the NEON one-row Q4_K/Q5_K kernel (`k_rows`, decode) and the Q6_K arm of `dot_rows` keep a super-block in i32 with one float
   multiply-add at its end, as the AVX2 one does, since a float add per 32 weights was a chain every block
   waited on; on ARM, batches of 2+ tokens use `i8mm` `smmla` via inline asm when present, over activations
   laid out in token pairs once per matmul (`BlockActs`); on x86, batches of 8+ tokens (`BLOCK_MIN_TOKENS`)
@@ -167,7 +167,7 @@ Design points that span files:
   `smmla` costs as much per multiply as `sdot` there; the block kernel is ahead of the row kernel
   only because its scale arithmetic is shared by more multiplies. Against llama.cpp on the M4 CPU
   (`docs/benchmarks.md`, 2026-11-16): Qwen2.5-0.5B (Q5_0/Q8_0) prompts 2.2x ahead and decode level
-  on four threads; Llama-3.2-1B (K-quants) decode level on four threads and 16% behind on one,
+  on four threads; Llama-3.2-1B (K-quants) decode level on four threads and 12-14% behind on one,
   prompts 7% behind on one thread and 16% on four (2026-11-17; llama.cpp scales activations per 256, we per 32: three float operations
   per 32 weights, row pair and token pair that it does not have). `--coarse-acts` (`Model.coarse_acts`, off by
   default) quantizes prompt activations per 256 too and runs K-quants through `rows2_coarse`: ahead of

@@ -3,6 +3,22 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: NEON Q6_K row kernel with a super-block in integers
+
+One-thread decode on the M4 is 92% `dot_rows_q8` (`sample`), and the Q6_K output head is about
+30% of a Llama-3.2-1B token: its row kernel ran 34 weights/ns against Q4_K's 60. It did a float
+multiply-add per 32 weights; now each 16-weight half's i8 scale times its chunk's activation
+ratio multiplies the half's dot product in i32, as `k_rows` does for Q4_K, with four float
+multiply-adds per super-block (a sum holds four halves before it could overflow).
+
+`RAYON_NUM_THREADS=1 bench_matvec`, Q6_K matvec (5632 x 2048): 0.336 ms (28.1 GB/s) before,
+0.302, 0.302, 0.305 ms (31.0-31.3 GB/s) after. `bench --pp 0 --tg 96 --reps 3 --threads T`,
+Llama-3.2-1B Q4_K_M, 20 s rests, two rounds: one thread 38.3 tok/s before, 40.1 and 39.3 after
+(llama.cpp 45.5); four threads 84.6-84.9 before, 84.7 and 84.1 after (llama.cpp 84.9).
+
+`eval_quant models/Llama-3.2-1B-Instruct-Q4_K_M.gguf README.md --tokens 256`: KL mean 0.000732,
+max 0.0035, top-1 agreement 99.22% before; 0.000769, 0.0035, 98.44% after.
+
 ## 2026-11-17: the last layer of a prompt computes one row
 
 llama.cpp's Metal matmul kernel (`kernel_mul_mm`, Q4_K, 64 rows x 32 tokens), ported into our
