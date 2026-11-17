@@ -19,8 +19,19 @@ tok/s, both alternations:
 | Llama-3.2-1B Q4_K_M | 1 | 84.3, 84.7 | 86.4, 86.9 |
 | Llama-3.2-1B Q4_K_M | 2 | 161.7, 164.6 | 170.2, 167.1 |
 
-So 4-8% on Qwen and 2-5% on Llama-3.2-1B there, less than the Intel profile's shares; not yet
-measured on Intel. M4, Llama-3.2-1B pp128 on 4 threads: 331 tok/s, was 330.
+So 4-8% on Qwen and 2-5% on Llama-3.2-1B there, less than the Intel profile's shares. M4,
+Llama-3.2-1B pp128 on 4 threads: 331 tok/s, was 330.
+
+The quantizer was still 12% of that prompt on the Xeon (run 44073808388): a block's largest
+magnitude was one chain of 32 maxima. With eight running maxima (1df8566; `base=f84d3d3`, one
+thread, `RLI_AMX=1` on both sides), pp256 tok/s:
+
+| CPU (run) | Model | Before | After |
+|---|---|---:|---:|
+| Xeon 6975P-C (44074406644) | Qwen2.5-0.5B | 184.8, 184.7 | 191.0, 195.7 |
+| Xeon 6975P-C | Llama-3.2-1B | 79.5, 81.0 | 80.8, 83.3 |
+| Xeon Platinum 8573C (44074439768) | Qwen2.5-0.5B | 177.6, 177.9 | 183.1, 182.8 |
+| Xeon Platinum 8573C | Llama-3.2-1B | 75.5, 75.0 | 76.2, 76.9 |
 
 ## 2026-11-17: an Intel AMX block kernel, exact but slower (opt-in, `RLI_AMX=1`)
 
