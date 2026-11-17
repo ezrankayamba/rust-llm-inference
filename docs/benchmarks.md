@@ -40,8 +40,8 @@ batched; top-1 the same in every case):
 | Qwen2.5-0.5B Q4_K_M | 1 | 274.5 | 283.3 | 117.2 | 0.37 | 0.78 |
 | Qwen2.5-0.5B Q4_K_M | 4 | 864.8 | 882.3 | 372.7 | | |
 
-On x86 the flag only changes the quantization: the AVX2 kernels have no coarse path, so it costs
-accuracy there for nothing.
+On x86 only the AVX-512 VNNI block kernel has a coarse path (`run16_coarse`, added after these
+runs); with AVX2 alone the flag changes the quantization and nothing else.
 
 More threads, Llama-3.2-1B Q4_K_M (`--pp 128 --tg 32 --reps 3`; llama.cpp `-t N -p 128 -n 32 -r 3`).
 The M4 has 4 performance and 6 efficiency cores; rli defaults to one thread per logical core (10),

@@ -102,8 +102,8 @@ def ours_run(a, t, n, extra=()):
             "--temp", "0", "--gpu-layers", "0", "-t", str(t), *extra]
 
 
-def with_repack(f):
-    return lambda *args: f(*args, extra=["--repack"])
+def with_flag(f, flag):
+    return lambda *args: f(*args, extra=[flag])
 
 
 def llama_run(a, t, n):
@@ -153,8 +153,12 @@ def main():
     for t in (int(x) for x in a.threads.split(",")):
         engines = [("rli", ours_throughput, ours_run),
                    ("llama.cpp", llama_throughput, llama_run)]
+        flags = ["--coarse-acts"]
         if platform.machine() in ("x86_64", "AMD64"):  # the flag does nothing elsewhere
-            engines.insert(1, ("rli --repack", with_repack(ours_throughput), with_repack(ours_run)))
+            flags.insert(0, "--repack")
+        for i, f in enumerate(flags):
+            row = (f"rli {f}", with_flag(ours_throughput, f), with_flag(ours_run, f))
+            engines.insert(1 + i, row)
         for name, tp, run in engines:
             pp, tg = tp(a, t)
             first, rss, anon = cold(run, a, t)
