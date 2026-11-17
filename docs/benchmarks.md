@@ -47,6 +47,22 @@ after; Qwen3-30B-A3B 4172, 4151, 4212 and 4277, 4136 (± 314), 4168; Llama-3.2-1
 tell (12.9k-16.9k and 14.5k-18.1k). Decode unchanged (Mistral-7B 170.5-171.4 and 170.4-170.8).
 The CUDA tests pass there (152).
 
+x86 at 98206b5, the `Benchmark` workflow (`threads=1,2`, llama.cpp v0.9.0 native build; runs
+44143935896, 44143926384, 44143879584, 44143900412), Llama-3.2-1B Q4_K_M, prompt and decode tok/s:
+
+| CPU | Threads | rli | rli `--repack` | llama.cpp |
+|---|---:|---:|---:|---:|
+| EPYC 9V74 (Zen 4) | 1 | 52.0 / 21.8 | 52.4 / 27.0 | 45.2 / 23.1 |
+| EPYC 9V74 (Zen 4) | 2 | 99.3 / 38.2 | 98.4 / 36.8 | 88.8 / 36.3 |
+| Xeon 6975P-C (AMX) | 1 | 120.2 / 16.0, 124.9 / 16.0 | 122.2 / 14.8, 127.2 / 14.9 | 138.1 / 11.8, 141.4 / 11.8 |
+| Xeon 6975P-C (AMX) | 2 | 226.4 / 29.3, 233.9 / 30.3 | 223.5 / 27.9, 238.2 / 28.6 | 267.5 / 21.8, 276.5 / 22.0 |
+| Xeon 8573C (AMX) | 1 | 91.1 / 11.6 | 90.3 / 11.9 | 107.1 / 9.6 |
+| Xeon 8573C (AMX) | 2 | 176.9 / 22.9 | 174.3 / 23.3 | 210.2 / 18.9 |
+
+On the AMX Xeons prompts are now 1.13-1.19x behind (1.20-1.27x at 495d66f on the 6975P-C) and
+decode 1.2-1.4x ahead; on Zen 4 prompts are 12-15% ahead, and one-thread decode 6% behind
+without `--repack`. Qwen2.5-0.5B is 1.5-1.8x ahead in prompts and decode on all three.
+
 Tried on the way, on Llama-3.2-1B pp512 with Metal, none kept: the dispatch grid turned so that
 neighbouring threadgroups share weight rows, as llama.cpp's is (1346-1349 tok/s against
 1335-1338); weights copied into a Metal-allocated buffer instead of the wrapped mapping (1336-1341
