@@ -3,6 +3,23 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: x86 against llama.cpp at 58ff301 (run 44060706489)
+
+`Benchmark` workflow, `threads=1,2`, llama.cpp v0.9.0 built both ways. AMD EPYC 9V45 (AVX-512
+VNNI), 4 logical CPUs; prompt 256 tokens, decode 64, 3 reps. Prompt / decode tok/s:
+
+| Model | Threads | rli | rli `--repack` | llama.cpp native | llama.cpp AVX2 build |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B Q4_K_M | 1 | 262.9 / 56.2 | 263.3 / 59.0 | 187.9 / 55.4 | 118.7 / 51.2 |
+| Qwen2.5-0.5B Q4_K_M | 2 | 502.6 / 88.7 | 474.6 / 83.4 | 368.0 / 71.2 | 230.3 / 67.0 |
+| Llama-3.2-1B Q4_K_M | 1 | 124.1 / 33.4 | 124.4 / 35.0 | 147.9 / 35.2 | 69.6 / 34.5 |
+| Llama-3.2-1B Q4_K_M | 2 | 238.9 / 45.3 | 244.2 / 45.9 | 288.3 / 45.9 | 137.3 / 45.7 |
+
+(rli's numbers are from the tables beside the native build; beside the AVX2 build they were within
+2%.) Ahead or level everywhere except Llama-3.2-1B prompts against the native build, 16-17% behind,
+and its one-thread decode without `--repack`, 5% behind. First token 1.01 s against 1.63 s (Qwen)
+and 2.03 against 2.16 (Llama); peak RSS 454 against 580 MiB and 864 against 1331.
+
 ## 2026-11-17: `--coarse-acts`: one activation scale per 256 values for CPU prompts (opt-in)
 
 Off by default. `Q8Act::coarse` gives every block of a 256-value group the group's scale, as
@@ -38,6 +55,13 @@ llama.cpp to 4 here:
 
 So with each engine's defaults rli is ahead (458.7 against 403.5, 105.1 against 84.9); at equal
 thread counts its prompts are 13-18% behind without the flag and 1-7% with it.
+
+Mistral-7B-Instruct-v0.3 Q4_K_M (`--pp 64 --tg 16 --reps 2`; llama.cpp `-p 64 -n 16 -r 2`):
+
+| Threads | pp64 rli | rli `--coarse-acts` | llama.cpp | tg16 rli | llama.cpp |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 45.9 | 53.9 | 58.4 | 16.2 | 16.2 |
+| 10 | 67.8 | | 78.1 | 22.0 | 19.9 |
 
 ## 2026-11-16: CPU prompts: the steps between matmuls, off the one thread
 
