@@ -1145,7 +1145,11 @@ impl Batch<'_> {
         let split = can_few && (32..=48).contains(&(n - full));
         let mid = if split { full + 32 } else { full };
         let rest = n - mid;
-        let few = rest <= MATMUL_FEW_TOKENS && can_few;
+        // Where the 32-token tile is `MATMUL_K`, it takes over from the few-token kernel at 17
+        // tokens: 2.5-3.7% faster on Mistral-7B, 2% slower on Llama-3.2-1B.
+        let k_tile = half && matches!(ty, GgmlType::Q4_K | GgmlType::Q6_K);
+        let few_max = if k_tile { 16 } else { MATMUL_FEW_TOKENS };
+        let few = rest <= few_max && can_few;
         // (pipeline, rows and tokens of a threadgroup, its simdgroups)
         let rest_kernel = if few {
             let pair = &self.gpu.matmul_few;

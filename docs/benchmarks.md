@@ -1924,3 +1924,21 @@ turn, 20 s rests, 5 reps):
 
 Logits of a 193-token prompt (three 64-token tiles and a one-token rest) are within 0.008 of
 the CPU's `--precise` ones.
+
+## 2026-11-18: 17 to 24 tokens of Q4_K and Q6_K on the 32-token Metal tile
+
+A rest of 17 to 24 tokens took the few-token kernel (3 token blocks); for half Q4_K and Q6_K
+it now takes the 8 KB 32-token tile (`few_max` in `matmul_impl`). Faster on Mistral-7B, 2%
+slower on Llama-3.2-1B. The other lengths are here because they had not been run since
+3bb15f6; they do not change. Prompt tok/s (before = 3bb15f6; before, after, llama.cpp in
+turn, 20 s rests, 5 reps):
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 20 | 711.6 | 695.6 | 683.2 | 114.8 | 117.7 | 117.8 |
+| 24 | 848.2 | 832.3 | 824.4 | 136.5 | 141.6 | 141.6 |
+| 40 | 1121.6 | 1119.2 | 818.4 | 179.8 | 179.8 | 127.0 |
+| 48 | 1177.8 | 1178.4 | 973.6 | 181.4 | 181.3 | 151.3 |
+| 72 | 1265.4 | 1262.4 | 1026.3 | 194.9 | 196.9 | 152.3 |
+| 100 | 1309.7 | 1303.3 | 1101.4 | 193.4 | 194.1 | 158.8 |
+| 112 | 1363.7 | 1365.7 | 1232.4 | 199.4 | 199.2 | 177.2 |

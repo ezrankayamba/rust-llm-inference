@@ -79,7 +79,8 @@ Design points that span files:
   holds; whole 64-token tiles, then the smallest that fits the rest), 64 columns a step, each
   thread decoding 32 weights into registers before the barrier. Tiles are half precision with
   f32 sums for quantized weights (logits within ~0.01 of f32 tiles), f32 for F32/F16 weights
-  and under `precise`. A rest of up to 24 tokens (`MATMUL_FEW_TOKENS`) takes `matmul_few_*` instead,
+  and under `precise`. A rest of up to 24 tokens (`MATMUL_FEW_TOKENS`; 16 for half Q4_K and
+  Q6_K, whose 32-token tile is ahead on Mistral-7B from 17) takes `matmul_few_*` instead,
   llama.cpp's layout for few tokens: 16 rows by 8, 16 or 24 tokens, nothing staged in threadgroup
   memory (each lane puts the 16 weights it decodes into the matrix through its own two elements),
   the columns shared out among 8 simdgroups, f32. A tile's barrier per step is what few tokens
@@ -107,9 +108,8 @@ Design points that span files:
   The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
   y after its last step; seeding the sums with y under a run-time test ran 3x slower).
   Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
-  on Mistral-7B and Llama-3.2-1B, (2026-11-18) pp512 3-4% ahead, 56 to 200 tokens 1-16% ahead, 32 tokens level, 4 to 24
-  between 1% behind and 12% ahead except 24 tokens on Mistral-7B, 3.5% behind (40, 48, 72,
-  100 and 112 tokens were 1-35% ahead before the last tile change and not run again); decode
+  on Mistral-7B and Llama-3.2-1B, (2026-11-18) pp512 3-4% ahead, 40 to 200 tokens 1-42% ahead, 32 tokens level, 4 to 24
+  between 1% behind (4 tokens on Mistral-7B) and 12% ahead; decode
   (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
   matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
