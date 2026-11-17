@@ -7,6 +7,9 @@ on:
       base:
         description: Compare this engine at HEAD with this revision, instead of with llama.cpp
         default: ""
+      cpu_flag:
+        description: With base, fail at once unless /proc/cpuinfo has this flag (amx_int8); runners vary
+        default: ""
       profile:
         description: Profile decode with perf instead (first model only)
         type: boolean
@@ -69,7 +72,11 @@ jobs:
       THREADS: ${{ inputs.threads }}
       DEPTH: ${{ inputs.depth }}
       MODELS: ${{ inputs.models }}
+      CPU_FLAG: ${{ inputs.cpu_flag }}
     steps:
+      - run: |
+          lscpu | grep 'Model name'
+          [ -z "$CPU_FLAG" ] || grep -m1 '^flags' /proc/cpuinfo | grep -qw "$CPU_FLAG"
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
