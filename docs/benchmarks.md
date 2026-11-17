@@ -3,6 +3,34 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: the AVX-512 panel: what filling it cost (c521434)
+
+`bench_amx` on a Xeon 6975P-C (run 44077130823): a whole AMX step (load 16 rows' weights for a
+chunk, load 16 tokens' activations, `tdpbsud`, store) is 17.5 ns, 4.6 of it the multiply, and the
+activations' stride (32 to 8192 bytes) changes it by 1-2 ns. The block kernel spends about 107 ns
+on the same work, so neither kernel was waiting on multiplies. A diagnostic on branch `amx-parts`
+timed the pieces on a Xeon 8573C, ns per chunk of 16 rows:
+
+| Type | Decode 16 rows | Fill the panel (with decode) | AVX-512 loop, 16 tokens | AMX loop, 16 tokens |
+|---|---:|---:|---:|---:|
+| Q4_K | 70.2 | 150.6 | 41.5 | 59.2 |
+| Q5_K | 69.8 | 157.9 | 40.9 | 59.1 |
+| Q6_K | 53.9 | 152.3 | 53.2 | 77.1 |
+| Q5_0 | 47.7 | 141.9 | 40.0 | 59.1 |
+| Q8_0 | 43.4 | 144.4 | 45.7 | 51.8 |
+
+A fill costs what 3-4 groups of 16 tokens do, and the AMX loop's float step (`settle`) costs more
+than all of the AVX-512 loop. Filling with a transpose in registers (e11e230) measured nothing by
+itself (Q4_K matmul n=64 9.5-9.8 ms either way on two Xeons). Finding a Q4_K/Q5_K super-block's
+scales once, not per chunk (c521434; `base=e11e230`, one thread, AMD EPYC 9V74, runs 44080003922,
+44079986104 and 44079948936):
+
+| | Before | After |
+|---|---:|---:|
+| Q4_K matmul n=64, ms | 9.11-9.47 | 7.01-7.86 |
+| Llama-3.2-1B pp256, tok/s | 86.6-88.1 | 97.1-98.1 |
+| Qwen2.5-0.5B pp256, tok/s | 185.1-194.7 | 192.1-195.1 |
+
 ## 2026-11-17: x86 prompts: results written in place, rounding without a call (7559c77)
 
 A profile of a Qwen2.5-0.5B prompt on a Xeon 6975P-C (`Benchmark` workflow, `profile=true`,
