@@ -12,11 +12,13 @@ use std::time::Duration;
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
-                  [--threads N] [--repack]
+                  [--threads N] [--repack] [--coarse-acts]
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
 --repack copies Q4_K weights into a layout x86 decodes faster from, for about their size in
 extra memory.
+--coarse-acts quantizes CPU prompt activations with one scale per 256 values, not per 32: faster
+for K-quant models on ARM, less accurate.
 --threads defaults to one CPU thread per logical core.
 
 Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/completions,
@@ -35,6 +37,7 @@ struct Args {
     ctx: usize,
     gpu_layers: Option<usize>,
     repack: bool,
+    coarse_acts: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -46,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
         ctx: 4096,
         gpu_layers: None,
         repack: false,
+        coarse_acts: false,
     };
     let mut model = None;
     while let Some(flag) = it.next() {
@@ -59,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
                 a.gpu_layers = Some(val()?.parse().map_err(|_| "--gpu-layers: invalid value")?)
             }
             "--repack" => a.repack = true,
+            "--coarse-acts" => a.coarse_acts = true,
             "-t" | "--threads" => {
                 let n = val()?.parse().map_err(|_| "--threads: invalid value")?;
                 rli_models::set_threads(n)?
@@ -99,6 +104,7 @@ fn run(a: Args) -> Result<(), String> {
     {
         eprintln!("warning: {w}");
     }
+    engine.model.coarse_acts = a.coarse_acts;
     if a.repack {
         match engine.model.repack() {
             0 => eprintln!("warning: --repack does nothing here: it needs Q4_K weights and AVX2"),

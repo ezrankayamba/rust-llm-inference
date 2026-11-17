@@ -3,6 +3,29 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: `--coarse-acts`: one activation scale per 256 values for CPU prompts (opt-in)
+
+Off by default. `Q8Act::coarse` gives every block of a 256-value group the group's scale, as
+llama.cpp's Q8_K does, and the NEON block kernel then keeps a K-quant super-block in integers
+(`rows2_coarse`: a chunk's results times its 6-bit scale, and its min times the chunk's sum of
+activations, one `mla` each; the float scales once per super-block). Decode keeps a scale per 32.
+`RAYON_NUM_THREADS=1 bench_matvec`, 5632 x 2048, 64 tokens, ms, per-32 -> coarse: Q4_K 6.26 ->
+5.43, Q5_K 7.52 -> 6.78, Q6_K 7.82 -> 6.76; the other types are unchanged (same kernel).
+
+`bench <model> --pp 128 --tg 0 --reps 3 --threads N [--coarse-acts]`, M4 CPU, tok/s, and the
+largest logit difference from the `--precise` reference over a 578-token prompt (`dump_logits`,
+batched; top-1 the same in every case):
+
+| Model | Threads | per-32 | coarse | llama.cpp | logits per-32 | coarse |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 1 | 103.1 | 119.4 | 116.4 | 0.16 | 0.32 |
+| Llama-3.2-1B Q4_K_M | 4 | 328.9 | 376.4 | 411.9 | | |
+| Qwen2.5-0.5B Q4_K_M | 1 | 274.5 | 283.3 | 117.2 | 0.37 | 0.78 |
+| Qwen2.5-0.5B Q4_K_M | 4 | 864.8 | 882.3 | 372.7 | | |
+
+On x86 the flag only changes the quantization: the AVX2 kernels have no coarse path, so it costs
+accuracy there for nothing.
+
 ## 2026-11-16: CPU prompts: the steps between matmuls, off the one thread
 
 `sample` of a four-thread prompt showed the workers waiting 6-8% of the time while the main thread

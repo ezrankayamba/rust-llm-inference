@@ -159,7 +159,9 @@ Design points that span files:
   (`docs/benchmarks.md`, 2026-11-16): Qwen2.5-0.5B (Q5_0/Q8_0) prompts 2.2x ahead and decode level
   on four threads; Llama-3.2-1B (K-quants) decode level on four threads and 16% behind on one,
   prompts 11-19% behind (llama.cpp scales activations per 256, we per 32: three float operations
-  per 32 weights, row pair and token pair that it does not have).
+  per 32 weights, row pair and token pair that it does not have). `--coarse-acts` (`Model.coarse_acts`, off by
+  default) quantizes prompt activations per 256 too and runs K-quants through `rows2_coarse`: ahead of
+  llama.cpp on one thread, 9% behind on four, at about twice the logit error. It has no x86 kernel.
 - **CUDA kernels keep a warp's reads adjacent.** Each of a warp's 32 lanes takes the next weight
   and the next value of x: `wt_*` decodes one weight per lane (the matmuls), `sb_*` 8 weights per
   lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that

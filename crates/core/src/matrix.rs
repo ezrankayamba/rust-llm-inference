@@ -111,14 +111,26 @@ impl<'a> QMatrix<'a> {
     /// With quantized activations a token's result can differ from [`QMatrix::matvec_with`] by
     /// float rounding (the i8mm kernel sums in a different order); `precise` results match.
     pub fn matmul_with(&self, xs: &[f32], ys: &mut [f32], n: usize, precise: bool) {
+        self.matmul_impl(xs, ys, n, precise, false);
+    }
+
+    /// [`QMatrix::matmul_with`] over activations quantized with one scale per 256 values
+    /// ([`Q8Act::coarse`]): less accurate, and faster for K-quants on ARM.
+    pub fn matmul_coarse(&self, xs: &[f32], ys: &mut [f32], n: usize) {
+        self.matmul_impl(xs, ys, n, false, true);
+    }
+
+    fn matmul_impl(&self, xs: &[f32], ys: &mut [f32], n: usize, precise: bool, coarse: bool) {
         assert_eq!(xs.len(), n * self.cols);
         assert_eq!(ys.len(), n * self.rows);
         if n == 1 {
             return self.matvec_with(xs, ys, precise);
         }
         let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
-        let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty))
-            .then(|| xs.par_chunks_exact(cols).map(Q8Act::new).collect());
+        let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty)).then(|| {
+            let quantize = if coarse { Q8Act::coarse } else { Q8Act::new };
+            xs.par_chunks_exact(cols).map(quantize).collect()
+        });
         let block = acts
             .as_deref()
             .filter(|_| n >= qdot::BLOCK_MIN_TOKENS)

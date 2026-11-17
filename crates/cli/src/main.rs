@@ -23,6 +23,8 @@ usage: rli -m <model.gguf> [options]
                             GPU backend; 0 = CPU only)
       --repack              copy Q4_K weights into a layout x86 decodes faster from; costs
                             about their size in extra memory
+      --coarse-acts         CPU prompts: one activation scale per 256 values, not per 32;
+                            faster for K-quant models on ARM, less accurate
   -t, --threads <n>         CPU threads (default: one per logical core)
       --info               print model metadata and exit
 ";
@@ -36,6 +38,7 @@ struct Args {
     info: bool,
     gpu_layers: Option<usize>,
     repack: bool,
+    coarse_acts: bool,
     params: GenParams,
 }
 
@@ -51,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
         info: false,
         gpu_layers: None,
         repack: false,
+        coarse_acts: false,
         params: GenParams {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
@@ -85,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => s.seed = num(&flag, it.next())?,
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
             "--repack" => a.repack = true,
+            "--coarse-acts" => a.coarse_acts = true,
             "-t" | "--threads" => rli_models::set_threads(num(&flag, it.next())?)?,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -122,6 +127,7 @@ fn run(a: Args) -> Result<(), String> {
     {
         eprintln!("warning: {w}");
     }
+    engine.model.coarse_acts = a.coarse_acts;
     if a.repack {
         match engine.model.repack() {
             0 => eprintln!("warning: --repack does nothing here: it needs Q4_K weights and AVX2"),

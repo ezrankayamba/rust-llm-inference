@@ -171,6 +171,10 @@ pub struct Model {
     pub(crate) layers: Vec<Layer>,
     /// Keep activations in f32 for CPU matvecs (slow; used to validate against references).
     pub precise: bool,
+    /// Quantize the CPU layers' prompt activations with one scale per 256 values, as llama.cpp
+    /// does, instead of one per 32 (`--coarse-acts`): faster for K-quants on ARM (13% per
+    /// matmul on an M4), less accurate. Decode is not affected, nor is `precise`.
+    pub coarse_acts: bool,
     /// Interleaved copies of weights ([`Model::repack`]), by file offset and row count.
     packed: HashMap<(usize, usize), Vec<u8>>,
 }
@@ -465,6 +469,7 @@ impl Model {
             layers,
             accel: None,
             precise: false,
+            coarse_acts: false,
             packed: HashMap::new(),
         })
     }
@@ -561,6 +566,9 @@ impl Model {
     fn matmul(&self, w: &Weight, xs: &[f32], ys: &mut [f32], n: usize) {
         if n == 1 {
             return self.matvec(w, xs, ys);
+        }
+        if self.coarse_acts && !self.precise {
+            return self.mat(w).matmul_coarse(xs, ys, n);
         }
         self.mat(w).matmul_with(xs, ys, n, self.precise);
     }

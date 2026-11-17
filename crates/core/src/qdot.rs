@@ -39,10 +39,24 @@ pub struct Q8Act {
     /// `d * Σ q` per block: the block's (quantized) sum, for formats with a min/offset term.
     sum: Vec<f32>,
     qs: Vec<i8>,
+    /// Made by [`Q8Act::coarse`]: every block of a group has the group's scale.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // only the NEON kernel asks
+    coarse: bool,
 }
 
 impl Q8Act {
     pub fn new(x: &[f32]) -> Self {
+        Self::quantize(x, false)
+    }
+
+    /// One scale per [`GROUP`] blocks (256 values, llama.cpp's Q8_K) instead of one per block:
+    /// a quiet block next to a loud one is quantized more coarsely (KL from f32 1.4-6x higher on
+    /// real models), and the NEON block kernel can keep a K-quant super-block in integers.
+    pub fn coarse(x: &[f32]) -> Self {
+        Self::quantize(x, true)
+    }
+
+    fn quantize(x: &[f32], coarse: bool) -> Self {
         assert!(
             x.len().is_multiple_of(QK),
             "activation length must be a multiple of {QK}"
@@ -54,6 +68,7 @@ impl Q8Act {
             unit: Vec::with_capacity(n.div_ceil(GROUP)),
             sum: Vec::with_capacity(n),
             qs: vec![0; x.len()],
+            coarse,
         };
         let groups = x.chunks(QK * GROUP).zip(a.qs.chunks_mut(QK * GROUP));
         for (xg, qg) in groups {
@@ -67,7 +82,9 @@ impl Q8Act {
             a.unit.push(base / RATIO_MAX);
             for ((blk, qs), exact) in blocks.iter().zip(qg.as_chunks_mut::<QK>().0).zip(exact) {
                 // The smallest ratio whose scale still covers the block's largest value.
-                let mut r = if base != 0.0 {
+                let mut r = if coarse {
+                    RATIO_MAX
+                } else if base != 0.0 {
                     (exact / base * RATIO_MAX).ceil().clamp(1.0, RATIO_MAX)
                 } else {
                     1.0
@@ -721,6 +738,9 @@ mod neon {
         /// `[pair][chunk]`: `[t0, t1, t0, t1]`, the lanes of an `smmla` result.
         d: Vec<[f32; 4]>,
         sum: Vec<[f32; 4]>,
+        /// When every token is [`Q8Act::coarse`], `[pair][chunk]`: the chunk's sum of `qs`,
+        /// laid out as `d`. Empty otherwise.
+        isum: Vec<[i32; 4]>,
     }
 
     impl BlockActs {
@@ -737,7 +757,9 @@ mod neon {
                 qs: Vec::with_capacity(n_pairs * n_chunks * 2 * QK),
                 d: Vec::with_capacity(n_pairs * n_chunks),
                 sum: Vec::with_capacity(n_pairs * n_chunks),
+                isum: Vec::new(),
             };
+            let coarse = acts.iter().all(|a| a.coarse);
             for p in acts.chunks(2) {
                 let (a0, a1) = (&p[0], &p[p.len() - 1]);
                 assert_eq!(a0.qs.len(), a1.qs.len());
@@ -754,6 +776,14 @@ mod neon {
                 for j in 0..n_chunks {
                     b.d.push([a0.d[j], a1.d[j], a0.d[j], a1.d[j]]);
                     b.sum.push([a0.sum[j], a1.sum[j], a0.sum[j], a1.sum[j]]);
+                    if coarse {
+                        let sum = |a: &Q8Act| {
+                            let q = &a.qs[j * QK..(j + 1) * QK];
+                            q.iter().map(|&v| v as i32).sum::<i32>()
+                        };
+                        let (s0, s1) = (sum(a0), sum(a1));
+                        b.isum.push([s0, s1, s0, s1]);
+                    }
                 }
             }
             Some(b)
@@ -997,6 +1027,142 @@ mod neon {
         }
     }
 
+    /// [`k_scales`] as integers, not yet times the rows' `d` and `dmin`.
+    #[inline(always)]
+    fn k_scales_int(
+        block_bytes: usize,
+        r0: &[u8],
+        r1: &[u8],
+        block: usize,
+    ) -> ([int32x4_t; 8], [int32x4_t; 8]) {
+        let at = block * block_bytes;
+        // SAFETY: NEON is in every aarch64 target's baseline; the slices are bounds-checked.
+        unsafe {
+            let row = |r: &[u8]| {
+                let (sc, mn) = scales_mins_k4(&r[at + 4..at + 16]);
+                let wide = |v: u64| {
+                    let v = vmovl_u8(vcreate_u8(v));
+                    [vmovl_u16(vget_low_u16(v)), vmovl_high_u16(v)]
+                };
+                (wide(sc), wide(mn))
+            };
+            let ((s0, m0), (s1, m1)) = (row(r0), row(r1));
+            let spread = |a: [uint32x4_t; 2], b: [uint32x4_t; 2]| {
+                let mut out = [vdupq_n_s32(0); 8];
+                for h in 0..2 {
+                    let (al, ah) = (vzip1q_u32(a[h], a[h]), vzip2q_u32(a[h], a[h]));
+                    let (bl, bh) = (vzip1q_u32(b[h], b[h]), vzip2q_u32(b[h], b[h]));
+                    let join = |x, y| vreinterpretq_s32_u32(vcombine_u32(x, y));
+                    out[4 * h] = join(vget_low_u32(al), vget_low_u32(bl));
+                    out[4 * h + 1] = join(vget_high_u32(al), vget_high_u32(bl));
+                    out[4 * h + 2] = join(vget_low_u32(ah), vget_low_u32(bh));
+                    out[4 * h + 3] = join(vget_high_u32(ah), vget_high_u32(bh));
+                }
+                out
+            };
+            (spread(s0, s1), spread(m0, m1))
+        }
+    }
+
+    /// [`rows2`] for the K-quants when every block of an activation group has one scale
+    /// ([`Q8Act::coarse`]). A super-block then stays in integers: each chunk's four results are
+    /// multiplied by its 6-bit scale and added up (as are its mins times the chunk's sum of
+    /// activations), and the float scales go on once per super-block, not per chunk. The sums
+    /// stay far inside an i32: a Q5_K chunk reaches 32 · 31 · 127 · 63, and eight are 6.4e7; a
+    /// Q6_K chunk 32 · 32 · 127 · 127.
+    #[target_feature(enable = "neon,dotprod,i8mm")]
+    unsafe fn rows2_coarse<const T: u8, const NP: usize>(
+        r0: &[u8],
+        r1: &[u8],
+        acts: &BlockActs,
+        first: usize,
+        out: &mut [[f32; 4]; 8],
+    ) {
+        let n_chunks = acts.n_chunks;
+        let mut acc = [vdupq_n_f32(0.0); NP];
+        let pair = |a: f32, b: f32| vcombine_f32(vdup_n_f32(a), vdup_n_f32(b));
+        let block_bytes = match T {
+            T_Q4_K => 144,
+            T_Q5_K => 176,
+            _ => 210,
+        };
+        // SAFETY: `first + NP` pairs and `n_chunks` chunks are inside `acts`, per the caller,
+        // whose rows also hold `n_chunks` chunks, eight to a block.
+        unsafe {
+            let qs = acts.qs.as_ptr().add(first * n_chunks * 2 * QK);
+            let ds = acts.d.as_ptr().add(first * n_chunks) as *const f32;
+            let isum = acts.isum.as_ptr().add(first * n_chunks) as *const i32;
+            let zero = vdupq_n_s32(0);
+            for b in 0..n_chunks / 8 {
+                let (mut dots, mut mins) = ([zero; NP], [zero; NP]);
+                let (mut sc, mut mn) = ([zero; 8], [zero; 8]);
+                let at = b * block_bytes;
+                let (vd, vm) = if T == T_Q6_K {
+                    (
+                        pair(le16(r0, at + 208), le16(r1, at + 208)),
+                        vdupq_n_f32(0.0),
+                    )
+                } else {
+                    (sc, mn) = k_scales_int(block_bytes, r0, r1, b);
+                    (
+                        pair(le16(r0, at), le16(r1, at)),
+                        pair(le16(r0, at + 2), le16(r1, at + 2)),
+                    )
+                };
+                for sub in 0..8 {
+                    let j = 8 * b + sub;
+                    let (c0, c1) = (chunk::<T>(r0, j), chunk::<T>(r1, j));
+                    let zip = |a: int8x16_t, b: int8x16_t, hi: bool| {
+                        let (a, b) = (vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b));
+                        vreinterpretq_s8_s64(if hi {
+                            vzip2q_s64(a, b)
+                        } else {
+                            vzip1q_s64(a, b)
+                        })
+                    };
+                    let w = [
+                        zip(c0.lo, c1.lo, false),
+                        zip(c0.lo, c1.lo, true),
+                        zip(c0.hi, c1.hi, false),
+                        zip(c0.hi, c1.hi, true),
+                    ];
+                    let hs = |h: usize| {
+                        vcombine_s32(vdup_n_s32(c0.half_scales[h]), vdup_n_s32(c1.half_scales[h]))
+                    };
+                    for p in 0..NP {
+                        let at = p * n_chunks + j;
+                        let x = qs.add(at * 2 * QK);
+                        let x = |k: usize| vld1q_s8(x.add(16 * k));
+                        if T == T_Q6_K {
+                            let s0 = smmla(smmla(zero, w[0], x(0)), w[1], x(1));
+                            let s1 = smmla(smmla(zero, w[2], x(2)), w[3], x(3));
+                            dots[p] = vmlaq_s32(vmlaq_s32(dots[p], s0, hs(0)), s1, hs(1));
+                        } else {
+                            let s = smmla(
+                                smmla(smmla(smmla(zero, w[0], x(0)), w[1], x(1)), w[2], x(2)),
+                                w[3],
+                                x(3),
+                            );
+                            dots[p] = vmlaq_s32(dots[p], s, sc[sub]);
+                            mins[p] = vmlaq_s32(mins[p], mn[sub], vld1q_s32(isum.add(at * 4)));
+                        }
+                    }
+                }
+                for p in 0..NP {
+                    // The group's one activation scale, read from its first chunk.
+                    let ad = vld1q_f32(ds.add((p * n_chunks + 8 * b) * 4));
+                    acc[p] = vfmaq_f32(acc[p], vcvtq_f32_s32(dots[p]), vmulq_f32(vd, ad));
+                    if T != T_Q6_K {
+                        acc[p] = vfmsq_f32(acc[p], vcvtq_f32_s32(mins[p]), vmulq_f32(vm, ad));
+                    }
+                }
+            }
+            for p in 0..NP {
+                vst1q_f32(out[p].as_mut_ptr(), acc[p]);
+            }
+        }
+    }
+
     /// [`super::dot_block`]: rows in pairs and tokens in groups of up to 16, an odd last row
     /// paired with itself. A row pair's weights are decoded once per group, and 16 tokens of
     /// activations still fit L1 beside them; groups of 8 ran Q6_K 28% slower.
@@ -1042,8 +1208,32 @@ mod neon {
                         }
                     };
                 }
+                macro_rules! run_coarse {
+                    ($($t:ident),*) => {
+                        match (t, k.div_ceil(2)) {
+                            $(
+                                ($t, 1) => rows2_coarse::<$t, 1>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 2) => rows2_coarse::<$t, 2>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 3) => rows2_coarse::<$t, 3>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 4) => rows2_coarse::<$t, 4>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 5) => rows2_coarse::<$t, 5>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 6) => rows2_coarse::<$t, 6>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, 7) => rows2_coarse::<$t, 7>(r0, r1, acts, t0 / 2, &mut res),
+                                ($t, _) => rows2_coarse::<$t, 8>(r0, r1, acts, t0 / 2, &mut res),
+                            )*
+                            _ => unreachable!(),
+                        }
+                    };
+                }
+                let k_quant = matches!(t, T_Q4_K | T_Q5_K | T_Q6_K);
                 // SAFETY: sizes asserted above; features per this function's contract.
-                unsafe { run!(T_Q8_0, T_Q4_0, T_Q5_0, T_Q4_K, T_Q5_K, T_Q6_K) };
+                unsafe {
+                    if k_quant && !acts.isum.is_empty() {
+                        run_coarse!(T_Q4_K, T_Q5_K, T_Q6_K)
+                    } else {
+                        run!(T_Q8_0, T_Q4_0, T_Q5_0, T_Q4_K, T_Q5_K, T_Q6_K)
+                    }
+                };
                 for i in 0..k {
                     let (p, lane) = (i / 2, i % 2);
                     out[rp * nt + t0 + i] = res[p][lane];
@@ -2273,6 +2463,28 @@ mod tests {
     }
 
     #[test]
+    fn coarse_activations_have_one_scale_per_group_that_covers_it() {
+        let mut rng = Rng::new(7);
+        let x: Vec<f32> = rng
+            .vec(512)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v * (1 + i / 64) as f32)
+            .collect();
+        let a = Q8Act::coarse(&x);
+        for (g, d) in a.d.chunks(GROUP).enumerate() {
+            assert!(d.iter().all(|&v| v == d[0]), "group {g}: {d:?}");
+            let top = x[g * QK_K..(g + 1) * QK_K]
+                .iter()
+                .fold(0f32, |m, v| m.max(v.abs()));
+            assert!((d[0] * 127.0 - top).abs() <= 1e-6 * top, "group {g}");
+        }
+        for (i, (&q, &v)) in a.qs.iter().zip(&x).enumerate() {
+            assert!((q as f32 * a.d[i / QK] - v).abs() <= 0.5 * a.d[i / QK] * 1.0001);
+        }
+    }
+
+    #[test]
     fn multi_token_dots_equal_single_token_dots_exactly() {
         let mut rng = Rng::new(12);
         let n = 512;
@@ -2345,12 +2557,17 @@ mod tests {
         // Odd row and token counts exercise the self-paired last row and token, 11 tokens span
         // a full group of 8 plus a partial one, and 13 rows a full eight plus a partial one.
         let (n_rows, n_tok) = (13, 11);
-        for ty in INT_TYPES {
+        // Both ways of scaling activations: per block, and per group of blocks.
+        let both = INT_TYPES
+            .into_iter()
+            .flat_map(|ty| [(ty, false), (ty, true)]);
+        for (ty, coarse) in both {
+            let quantize = if coarse { Q8Act::coarse } else { Q8Act::new };
             let rows: Vec<u8> = (0..n_rows)
                 .flat_map(|_| random_row(ty, n, &mut rng))
                 .collect();
             let rb = ty.row_bytes(n);
-            let acts: Vec<Q8Act> = (0..n_tok).map(|_| Q8Act::new(&rng.vec(n))).collect();
+            let acts: Vec<Q8Act> = (0..n_tok).map(|_| quantize(&rng.vec(n))).collect();
             let mut out = vec![0.0; n_rows * n_tok];
             let Some(block) = BlockActs::new(ty, &acts) else {
                 continue; // no i8mm on this CPU, or no kernel for the type
@@ -2365,11 +2582,11 @@ mod tests {
                     let mut two = [0.0; 2];
                     let pair = BlockActs::new(ty, &pair).unwrap();
                     dot_block(ty, row, rb, &pair, &mut two);
-                    assert_eq!(got, two[0], "{ty:?} row {r} token {t} regrouped");
+                    assert_eq!(got, two[0], "{ty:?} {coarse} row {r} token {t} regrouped");
                     let (exact, scale) = exact_dot(ty, row, a);
                     assert!(
                         (got - exact).abs() <= 1e-4 * (1.0 + scale),
-                        "{ty:?} row {r} token {t}: {got} vs {exact}"
+                        "{ty:?} {coarse} row {r} token {t}: {got} vs {exact}"
                     );
                 }
             }

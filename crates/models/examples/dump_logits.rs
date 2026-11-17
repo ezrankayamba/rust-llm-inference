@@ -1,5 +1,6 @@
 //! Debug aid: tokenizes a prompt, runs it, and writes the last position's logits.
-//! usage: dump_logits <model.gguf> <prompt> <out.f32> [--precise] [--gpu-layers=N] [--per-token]
+//! usage: dump_logits <model.gguf> <prompt> <out.f32> [--precise] [--coarse-acts] [--gpu-layers=N]
+//!        [--per-token]
 //! Prints the token ids. `--precise` keeps CPU activations in f32 so results can be compared
 //! tightly with a reference; `--gpu-layers` offloads layers (metal/cuda builds); `--per-token`
 //! runs the prompt one token at a time, as decoding does, instead of batched.
@@ -10,6 +11,8 @@ fn main() {
     for flag in &a[4..] {
         if flag == "--precise" {
             engine.model.precise = true;
+        } else if flag == "--coarse-acts" {
+            engine.model.coarse_acts = true;
         } else if let Some(n) = flag.strip_prefix("--gpu-layers=") {
             rli_models::backend::attach(&mut engine.model, n.parse().expect("layer count"))
                 .expect("attach backend");

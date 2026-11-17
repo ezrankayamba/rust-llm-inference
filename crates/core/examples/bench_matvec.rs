@@ -1,4 +1,5 @@
-//! Matvec (decode) and 64-token matmul (prompt) throughput per weight type on a
+//! Matvec (decode) and 64-token matmul (prompt, also with one activation scale per 256 values:
+//! "coarse") throughput per weight type on a
 //! TinyLlama-FFN-sized matrix (5632 x 2048).
 //! usage: cargo run --release -p rli-core --example bench_matvec
 
@@ -49,14 +50,20 @@ fn main() {
             m.matmul_with(&xs, &mut ys, n, false);
         }
         let mm = t.elapsed().as_secs_f64() / 5.0;
+        let t = Instant::now();
+        for _ in 0..5 {
+            m.matmul_coarse(&xs, &mut ys, n);
+        }
+        let coarse = t.elapsed().as_secs_f64() / 5.0;
         println!(
-            "{:>5?}: matvec {:7.3} ms  {:6.1} GB/s  ({:.1} MB) | matmul n={n} {:7.2} ms  {:6.1} GOP/s",
+            "{:>5?}: matvec {:7.3} ms  {:6.1} GB/s  ({:.1} MB) | matmul n={n} {:7.2} ms  {:6.1} GOP/s | coarse {:7.2} ms",
             ty,
             secs * 1e3,
             data.len() as f64 / secs / 1e9,
             data.len() as f64 / 1e6,
             mm * 1e3,
-            2.0 * (rows * cols * n) as f64 / mm / 1e9
+            2.0 * (rows * cols * n) as f64 / mm / 1e9,
+            coarse * 1e3
         );
     }
 }
