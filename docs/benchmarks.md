@@ -119,6 +119,18 @@ two rounds), tok/s:
 Mistral-7B was 3520 this morning. What is left of its prompt: `gemm_f16` about 60%, `dequant`
 Q4_K 14%, attention 12%.
 
+## 2026-11-17: M4 CPU against llama.cpp at 401aeeb
+
+Llama-3.2-1B Q4_K_M, `bench --pp 256 --tg 64 --reps 3 --threads T` against `llama-bench -ngl 0 -t T
+-p 256 -n 64 -r 3` (v0.9.0, no BLAS, no Accelerate), alternating with 30 s rests, tok/s:
+
+| Threads | Prompt rli | llama.cpp | Decode rli | llama.cpp |
+|---:|---:|---:|---:|---:|
+| 1 | 100.9 | 114.7 | 38.3 | 45.5 |
+| 4 | 324.6 | 408.6 | 84.6 | 84.9 |
+
+With `--coarse-acts` the one-thread prompt is 116.4 tok/s.
+
 ## 2026-11-17: Metal prompts against llama.cpp by prompt length
 
 M4, `bench --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -ngl 99 -p N -n 0 -r 5`
