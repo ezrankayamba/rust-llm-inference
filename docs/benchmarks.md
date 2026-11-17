@@ -1744,3 +1744,29 @@ of its query heads, and splits long contexts into spans for threads. It was slow
 - Apple M4, attention step alone, fastest of 40-400 runs: decode at 2048 positions 60-75% slower
   with 4 threads; a 64-token prompt chunk at 2048 positions 33-60% slower with 4 threads. Only
   one-thread decode at 8192 positions was faster (about 28%, Llama-3.2-1B shape).
+
+## 2026-11-17: a few-token Metal matmul (`matmul_few_*`)
+
+llama.cpp does not run its tile kernel on 3 to 16 tokens: `kernel_mul_mv_mma_gen` stages nothing
+in threadgroup memory, so a step has no barrier. Ours padded those prompts into 8- and 16-token
+tiles. `matmul_few_*` takes that layout (16 rows by 8, 16 or 24 tokens a threadgroup, 8
+simdgroups sharing the columns, f32) for a rest of up to 24 tokens. M4, Metal, all layers,
+`bench <model> --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -p N -n 0 -r 5`,
+before, after and llama.cpp in turn with 20 s rests; prompt tok/s:
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 4 | 220.5 | 310.4 | 317.5 | 42.5 | 58.2 | 61.8 |
+| 8 | 443.8 | 606.4 | 603.6 | 84.5 | 112.9 | 115.8 |
+| 16 | 727.0 | 866.0 | 787.8 | 129.2 | 144.5 | 142.6 |
+| 20 | 624.4 | 721.3 | 684.7 | 104.6 | 115.2 | 117.6 |
+| 24 | 749.6 | 863.1 | 820.1 | 124.6 | 137.5 | 141.5 |
+| 64 | 1206.1 | 1206.2 | 1282.9 | 192.2 | 192.1 | 200.1 |
+| 88 | 1065.3 | 1106.4 | 1245.6 | 167.3 | 171.9 | 184.4 |
+| 512 | 1429.5 | 1429.8 | 1433.9 | 195.2 | 194.7 | 193.4 |
+
+Sizes tried: 8 simdgroups and 16 are level, 4 is 13-30% slower at 16 tokens; 8 rows a
+threadgroup instead of 16 is 14-18% slower at 16 tokens, 32 rows the same as 16; four token
+tiles (32 tokens) ran 800 and 127 tok/s where the 32-token tile kernel runs 992 and 164.
+Logits of a 12-token prompt are within 0.009 of the half-precision tiles', and under `--precise`
+within 3e-5 of the CPU's.

@@ -79,7 +79,12 @@ Design points that span files:
   holds; whole 64-token tiles, then the smallest that fits the rest), 64 columns a step, each
   thread decoding 32 weights into registers before the barrier. Tiles are half precision with
   f32 sums for quantized weights (logits within ~0.01 of f32 tiles), f32 for F32/F16 weights
-  and under `precise`. Causal `attention_batch` also runs on the matrix units with an online
+  and under `precise`. A rest of up to 24 tokens (`MATMUL_FEW_TOKENS`) takes `matmul_few_*` instead,
+  llama.cpp's layout for few tokens: 16 rows by 8, 16 or 24 tokens, nothing staged in threadgroup
+  memory (each lane puts the 16 weights it decodes into the matrix through its own two elements),
+  the columns shared out among 8 simdgroups, f32. A tile's barrier per step is what few tokens
+  can't pay for: 16-token prompts ran 1.12-1.2x faster, 4- and 8-token ones 1.35x; 32 tokens that
+  way were 20% slower than the 32-token tile. Causal `attention_batch` also runs on the matrix units with an online
   softmax: over an f16 cache, `attention_batch_staged_<head size>` (16, 32, 64, 96, 128) stages
   32 keys of K and V once for up to four query heads of a KV head; other head sizes and f32
   caches take the general kernel. Loop bounds in these kernels are compile-time constants:
@@ -91,7 +96,8 @@ Design points that span files:
   The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
   y after its last step; seeding the sums with y under a run-time test ran 3x slower).
   Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
-  on Mistral-7B and Llama-3.2-1B, 64-token prompts 4-6% behind, 16-token ones 8-9%; decode
+  on Mistral-7B and Llama-3.2-1B, 64-token prompts 4-6% behind and 88-token ones 7-11%, 16-token ones 1-10% ahead, others
+  from 4 to 24 tokens between 6% behind and 5% ahead; decode
   (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
   matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
