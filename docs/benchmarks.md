@@ -119,6 +119,24 @@ two rounds), tok/s:
 Mistral-7B was 3520 this morning. What is left of its prompt: `gemm_f16` about 60%, `dequant`
 Q4_K 14%, attention 12%.
 
+## 2026-11-17: Metal prompts against llama.cpp by prompt length
+
+M4, `bench --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -ngl 99 -p N -n 0 -r 5`
+(v0.9.0), alternating with 35 s rests, tok/s:
+
+| Model | Tokens | rli | llama.cpp |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 16 | 720.0 | 654.4 (± 94) |
+| Llama-3.2-1B Q4_K_M | 64 | 1169.1 | 1302.7 |
+| Llama-3.2-1B Q4_K_M | 512 | 1371.6 | 1464.2 |
+| Mistral-7B Q4_K_M | 16 | 128.0 | 146.0 |
+| Mistral-7B Q4_K_M | 64 | 190.7 | 204.7 |
+| Mistral-7B Q4_K_M | 512 | 196.0 | 200.4 |
+
+Per token we run 64 tokens as fast as 512 (one 64-token tile either way) and llama.cpp runs 512
+slower than 64, so the gap at 512 (2-7%) understates the matmul's: at 64 tokens, where attention
+is small, it is 7-11%.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
