@@ -8,7 +8,7 @@ on:
         description: Compare this engine at HEAD with this revision, instead of with llama.cpp
         default: ""
       cpu_flag:
-        description: With base, fail at once unless /proc/cpuinfo has this flag (amx_int8); runners vary
+        description: With base or profile, fail at once unless /proc/cpuinfo has this flag (amx_int8); runners vary
         default: ""
       profile:
         description: Profile decode with perf instead (first model only)
@@ -43,7 +43,12 @@ jobs:
     env:
       MODELS: ${{ inputs.models }}
       PROFILE_RUN: ${{ inputs.profile_run }}
+      CPU_FLAG: ${{ inputs.cpu_flag }}
+      RLI_AMX: "1" # the tile kernel is off without it
     steps:
+      - run: |
+          lscpu | grep 'Model name'
+          [ -z "$CPU_FLAG" ] || grep -m1 '^flags' /proc/cpuinfo | grep -qw "$CPU_FLAG"
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       - run: cargo build --release --locked -p rli-models --example bench
@@ -60,6 +65,11 @@ jobs:
             target/release/examples/bench "$model" $PROFILE_RUN --threads 1
           perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
             | head -25 | cut -c1-160
+          # The hottest symbol's instructions, hottest first.
+          top=$(perf report -i "$RUNNER_TEMP/perf.data" --stdio --no-children --sort symbol -q \
+            | head -1 | sed 's/.*\[\.\] //')
+          perf annotate -i "$RUNNER_TEMP/perf.data" --stdio -q -s "$top" 2>/dev/null \
+            | grep -E '^ +[0-9]+\.[0-9]+ ' | sort -rn | head -40 | cut -c1-140
           perf stat -e cycles,instructions,cache-misses -- \
             target/release/examples/bench "$model" --pp 0 --tg 128 --reps 1 --threads 1 2>&1 | tail -12
 
@@ -73,6 +83,7 @@ jobs:
       DEPTH: ${{ inputs.depth }}
       MODELS: ${{ inputs.models }}
       CPU_FLAG: ${{ inputs.cpu_flag }}
+      RLI_AMX: "1" # the tile kernel is off without it
     steps:
       - run: |
           lscpu | grep 'Model name'
