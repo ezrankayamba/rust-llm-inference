@@ -26,6 +26,19 @@ batched; top-1 the same in every case):
 On x86 the flag only changes the quantization: the AVX2 kernels have no coarse path, so it costs
 accuracy there for nothing.
 
+More threads, Llama-3.2-1B Q4_K_M (`--pp 128 --tg 32 --reps 3`; llama.cpp `-t N -p 128 -n 32 -r 3`).
+The M4 has 4 performance and 6 efficiency cores; rli defaults to one thread per logical core (10),
+llama.cpp to 4 here:
+
+| Threads | pp128 rli | rli `--coarse-acts` | llama.cpp | tg32 rli | llama.cpp |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 329.5 | 376.4 | 403.5 | 84.7 | 85.0 |
+| 6 | 385.3 | | 442.1 | 101.2 | 106.0 |
+| 10 | 458.7 | 523.5 | 529.1 | 105.1 | 96.1 |
+
+So with each engine's defaults rli is ahead (458.7 against 403.5, 105.1 against 84.9); at equal
+thread counts its prompts are 13-18% behind without the flag and 1-7% with it.
+
 ## 2026-11-16: CPU prompts: the steps between matmuls, off the one thread
 
 `sample` of a four-thread prompt showed the workers waiting 6-8% of the time while the main thread
