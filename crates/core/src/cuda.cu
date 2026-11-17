@@ -364,7 +364,6 @@ DEQUANT(dequant_q4_0, wt_q4_0)
 DEQUANT(dequant_q5_0, wt_q5_0)
 DEQUANT(dequant_q8_0, wt_q8_0)
 DEQUANT(dequant_q5_k, wt_q5_k)
-DEQUANT(dequant_q6_k, wt_q6_k)
 #endif
 
 // ---- Int8 matmul: activations quantized to int8, 4 products per dp4a ----
@@ -756,6 +755,36 @@ extern "C" __global__ void dequant_q4_k(const uchar* w, ulong w_off, unsigned sh
     o[5] = hi[1];
 }
 DEQUANT(dequant_q4_k_any, wt_q4_k)
+
+// Q6_K written out as f16, a warp per super-block: a lane takes 8 weights (8 bytes of low
+// bits and of high bits through `ld24`, as blocks of 210 bytes are aligned to nothing) and
+// stores them as one 16-byte word. A thread per weight took 5 byte loads and a 2-byte store
+// each, 280 us for a 4096x4096 matrix on an A100.
+extern "C" __global__ void dequant_q6_k(const uchar* w, ulong w_off, unsigned short* out,
+                                        uint rows, uint cols, uint row_bytes) {
+    uint lane = threadIdx.x % 32, nsb = cols / 256;
+    ulong chunk = (ulong)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    uint row = (uint)(chunk / nsb), sb = (uint)(chunk % nsb);
+    if (row >= rows) return;
+    const uchar* b = w + w_off + (ulong)row * row_bytes + (ulong)sb * 210;
+    // As wt_q6_k for weights 8 lane..: half n, quarter k of it, bytes m0.. of the quarter.
+    uint n = lane / 16, k = (lane % 16) / 4, m0 = 8 * (lane % 4);
+    ulong ql[3], qh[3];
+    ld24(b + 64 * n + 32 * (k % 2) + m0, ql);
+    ld24(b + 128 + 32 * n + m0, qh);
+    float sc = (float)((const signed char*)b)[192 + 8 * n + 2 * k + m0 / 16];
+    float d = h(b + 208);
+    U128 o;
+    #pragma unroll
+    for (uint t = 0; t < 8; t++) {
+        uint lb = (uint)(ql[0] >> 8 * t) & 255, hb = (uint)(qh[0] >> 8 * t) & 255;
+        uint lo = k < 2 ? (lb & 15) : (lb >> 4);
+        int q = (int)(lo | (((hb >> (2 * k)) & 3) << 4)) - 32;
+        uint v = f2h(d * sc * (float)q);
+        o.v[t / 2] = t % 2 ? o.v[t / 2] | (v << 16) : v;
+    }
+    *(U128*)(out + (ulong)row * cols + sb * 256 + 8 * lane) = o;
+}
 #endif
 
 // Grid rows, ids and strides as in MATVEC; x_stride counts values of x. With `add`, the result

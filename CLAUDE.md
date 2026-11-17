@@ -227,7 +227,8 @@ Design points that span files:
   compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
   under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
   own kernels (above).
-  Only Q4_K has a wide dequantizer; the int8 matmuls remain for chunks of 8-63 tokens.
+  Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
+  matmuls remain for chunks of 8-63 tokens. The 64x128 tile runs four warps of two row groups.
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode

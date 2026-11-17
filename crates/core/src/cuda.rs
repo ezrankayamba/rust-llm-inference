@@ -984,11 +984,13 @@ impl<'a> Batch<'a> {
             .iter()
             .find(|(t, _)| *t == ty)
             .expect("a kernel per supported type");
-        // The wide Q4_K kernel takes a warp per 4 super-blocks, the others one per 32 weights.
+        // The wide Q4_K kernel takes a warp per 4 super-blocks and Q6_K's one per super-block,
+        // the others one per 32 weights.
         let wide = ty == GgmlType::Q4_K && w_off.is_multiple_of(16);
         let (f, warps) = match (ty, wide) {
             (GgmlType::Q4_K, true) => (f, rows * (cols / 256).div_ceil(4)),
             (GgmlType::Q4_K, false) => (&gpu.dequant_q4_k_any, rows * cols / 32),
+            (GgmlType::Q6_K, _) => (f, rows * cols / 256),
             _ => (f, rows * cols / 32),
         };
         let mut l = self.call(f);

@@ -36,6 +36,12 @@ Mistral-7B, and the CUDA tests pass. Same protocol after the change:
 Decode 11-15% ahead; prompts 1.1-1.2x behind on Llama-3.2-1B (its numbers swing by 15% from run to
 run on both engines), 1.25x on Mistral-7B, 1.1x on Qwen3-30B-A3B.
 
+Where a Mistral-7B prompt of 512 tokens goes then (`RLI_CUDA_PROF=1`, 3 reps): `gemm_f16` 57%
+(504 us a launch for the 64x128 tile), `dequant` Q4_K 12.5% and Q6_K 5.8% (100 and 280 us a
+matrix), `attn_scores` + `attn_pv` + `attn_softmax` 16%. Q6_K had no wide dequantizer: with a warp
+per super-block, 8 weights a lane through `ld24` and one 16-byte store, a matrix takes 97 us, the
+logits are bit-identical and Mistral-7B pp512 is 3860-3917 tok/s (llama.cpp 4561-4908).
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
