@@ -135,39 +135,67 @@ impl<'a> QMatrix<'a> {
             .as_deref()
             .filter(|_| n >= qdot::BLOCK_MIN_TOKENS)
             .and_then(|a| qdot::BlockActs::new(ty, a));
-        // Computed as [row][token] so each task owns a contiguous slice, then transposed.
-        let mut yt = vec![0.0f32; rows * n];
-        yt.par_chunks_mut(ROWS_PER_TASK * n)
-            .zip(self.data.par_chunks(rb * ROWS_PER_TASK))
-            .for_each(|(out, rows)| {
-                // The whole block on the i8mm matrix instructions when the CPU has them.
-                if let Some(b) = &block {
-                    return qdot::dot_block(ty, rows, rb, b, out);
-                }
-                let Some(a) = &acts else {
-                    for (o, row) in out.chunks_exact_mut(n).zip(rows.chunks_exact(rb)) {
-                        for (t, v) in o.iter_mut().enumerate() {
-                            *v = dot_row(ty, row, &xs[t * cols..(t + 1) * cols]);
+        // A task computes its rows as [row][token] in a buffer that stays in L1, then writes
+        // them into `ys`, which is [token][row]. Transposing a whole [row][token] result
+        // afterwards read a value per cache line: 16% of a prompt on a Xeon 6975P.
+        let ys = Scatter(ys.as_mut_ptr());
+        self.data
+            .par_chunks(rb * ROWS_PER_TASK)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f32; ROWS_PER_TASK * n],
+                |buf, (task, rows_data)| {
+                    let n_rows = rows_data.len() / rb;
+                    let out = &mut buf[..n_rows * n];
+                    // The whole block on the i8mm matrix instructions when the CPU has them.
+                    if let Some(b) = &block {
+                        qdot::dot_block(ty, rows_data, rb, b, out);
+                    } else if let Some(a) = &acts {
+                        // `MAX_TOKENS` tokens per kernel call, so each weight block is unpacked
+                        // once per group. Tokens outside rows: a group's activations stay in
+                        // L1 while it meets every row, where the other way round each row
+                        // would cycle through them all.
+                        for (g, ac) in a.chunks(qdot::MAX_TOKENS).enumerate() {
+                            let t0 = g * qdot::MAX_TOKENS;
+                            for (r, row) in rows_data.chunks_exact(rb).enumerate() {
+                                let o = &mut out[r * n + t0..r * n + t0 + ac.len()];
+                                qdot::dot_rows_q8(ty, row, ac, o);
+                            }
+                        }
+                    } else {
+                        for (o, row) in out.chunks_exact_mut(n).zip(rows_data.chunks_exact(rb)) {
+                            for (t, v) in o.iter_mut().enumerate() {
+                                *v = dot_row(ty, row, &xs[t * cols..(t + 1) * cols]);
+                            }
                         }
                     }
-                    return;
-                };
-                // `MAX_TOKENS` tokens per kernel call, so each weight block is unpacked once per
-                // group. Tokens outside rows: a group's activations stay in L1 while it meets
-                // every row, where the other way round each row would cycle through them all.
-                for (g, ac) in a.chunks(qdot::MAX_TOKENS).enumerate() {
-                    let t0 = g * qdot::MAX_TOKENS;
-                    for (r, row) in rows.chunks_exact(rb).enumerate() {
-                        let o = &mut out[r * n + t0..r * n + t0 + ac.len()];
-                        qdot::dot_rows_q8(ty, row, ac, o);
+                    let r0 = task * ROWS_PER_TASK;
+                    for t in 0..n {
+                        for r in 0..n_rows {
+                            // SAFETY: `ys` holds `n * rows` values (asserted above) and
+                            // `r0 + r < rows`; no other task has these rows.
+                            unsafe { ys.put(t * rows + r0 + r, out[r * n + t]) };
+                        }
                     }
-                }
-            });
-        ys.par_chunks_mut(rows).enumerate().for_each(|(t, y)| {
-            for (v, col) in y.iter_mut().zip(yt.chunks_exact(n)) {
-                *v = col[t];
-            }
-        });
+                },
+            );
+    }
+}
+
+/// A slice that parallel tasks write disjoint elements of.
+struct Scatter(*mut f32);
+
+// SAFETY: tasks only write through it, each to elements no other task touches.
+unsafe impl Send for Scatter {}
+unsafe impl Sync for Scatter {}
+
+impl Scatter {
+    /// # Safety
+    /// `i` is inside the slice and no other thread reads or writes that element.
+    #[inline(always)]
+    unsafe fn put(&self, i: usize, v: f32) {
+        // SAFETY: the caller's guarantees.
+        unsafe { *self.0.add(i) = v };
     }
 }
 

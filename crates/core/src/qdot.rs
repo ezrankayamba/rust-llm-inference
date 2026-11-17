@@ -96,7 +96,7 @@ impl Q8Act {
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
                 let mut s = 0i32;
                 for (q, &v) in qs.iter_mut().zip(blk) {
-                    *q = (v * id).round() as i8;
+                    *q = round_i8(v * id);
                     s += *q as i32;
                 }
                 a.d.push(d);
@@ -106,6 +106,26 @@ impl Q8Act {
         }
         a
     }
+}
+
+/// `y.round() as i8` for `|y| < 128`. x86-64's baseline has no rounding instruction, so
+/// `round` is a call per value there (14% of a prompt on a Xeon 6975P); [`round_trunc`]
+/// vectorizes. NEON rounds in one instruction.
+#[inline(always)]
+fn round_i8(y: f32) -> i8 {
+    if cfg!(target_arch = "x86_64") {
+        round_trunc(y) as i8
+    } else {
+        y.round() as i8
+    }
+}
+
+/// `y.round()`, half away from zero, from a truncation: `y - trunc(y)` is exact.
+#[inline(always)]
+fn round_trunc(y: f32) -> i32 {
+    let t = y as i32;
+    let frac = y - t as f32;
+    t + (frac >= 0.5) as i32 - (frac <= -0.5) as i32
 }
 
 /// Whether `ty` has an integer kernel (half/full float rows use the f32 path).
@@ -2832,6 +2852,18 @@ mod tests {
                 }
                 assert_eq!(wide, narrow, "{ty:?} with {n_rows} rows");
             }
+        }
+    }
+
+    #[test]
+    fn round_trunc_equals_round() {
+        let mut rng = Rng::new(41);
+        let ties = (-255..=255).map(|i| i as f32 * 0.5);
+        let near = [0.49999997f32, 0.50000006, 126.99999, 127.00001, f32::NAN];
+        let near = near.into_iter().flat_map(|v| [v, -v]);
+        let random = rng.vec(4096).into_iter().map(|v| v * 127.0);
+        for y in ties.chain(near).chain(random) {
+            assert_eq!(round_trunc(y), y.round() as i32, "{y}");
         }
     }
 
