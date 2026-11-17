@@ -108,6 +108,7 @@ jobs:
           # The block kernels' exactness tests say when they skip for want of AVX-512 or AMX.
           cargo test --release --locked -p rli-core block_kernel -- --nocapture 2>&1 \
             | grep -E '^skipped|^test |panicked|assert'
+          cargo run -q --release --locked -p rli-core --example bench_amx
           run() { # label, target dir
             for t in ${THREADS//,/ }; do
               echo "== $1, kernels, $t threads"
