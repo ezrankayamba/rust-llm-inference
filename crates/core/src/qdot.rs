@@ -2007,22 +2007,9 @@ mod avx2 {
                     (w, d, 16.0 * d, [1, 1])
                 }
                 GgmlType::Q4_K | GgmlType::Q5_K => {
-                    let five = ty == GgmlType::Q5_K;
-                    let ql_at = if five { 48 } else { 16 };
                     let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
                     let sub = j % 8;
-                    let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * (sub / 2)).cast());
-                    let mut w = if sub.is_multiple_of(2) {
-                        _mm256_and_si256(q, m4)
-                    } else {
-                        high_nibbles(q)
-                    };
-                    if five {
-                        let qh = _mm256_loadu_si256(b.as_ptr().add(16).cast());
-                        let bit = _mm256_set1_epi8(1 << sub);
-                        let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
-                        w = _mm256_or_si256(w, _mm256_and_si256(set, _mm256_set1_epi8(16)));
-                    }
+                    let w = k_weights(ty == GgmlType::Q5_K, b, sub);
                     let (sc, mn) = scale_min_k4(sub, &b[4..16]);
                     (w, le16(b, 0) * sc, le16(b, 2) * mn, [1, 1])
                 }
@@ -2050,6 +2037,30 @@ mod avx2 {
                 }
                 _ => unreachable!("checked by BlockActs::new"),
             }
+        }
+    }
+
+    /// The 32 weights of sub-block `sub` of the Q4_K (Q5_K if `five`) super-block `b`, as u8.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn k_weights(five: bool, b: &[u8], sub: usize) -> __m256i {
+        let ql_at = if five { 48 } else { 16 };
+        let b = &b[..ql_at + 128];
+        // SAFETY: the reads end inside `b`, sliced above to the block's weights.
+        unsafe {
+            let q = _mm256_loadu_si256(b.as_ptr().add(ql_at + 32 * (sub / 2)).cast());
+            let mut w = if sub.is_multiple_of(2) {
+                _mm256_and_si256(q, _mm256_set1_epi8(0xf))
+            } else {
+                high_nibbles(q)
+            };
+            if five {
+                let qh = _mm256_loadu_si256(b.as_ptr().add(16).cast());
+                let bit = _mm256_set1_epi8(1 << sub);
+                let set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
+                w = _mm256_or_si256(w, _mm256_and_si256(set, _mm256_set1_epi8(16)));
+            }
+            w
         }
     }
 
@@ -2288,10 +2299,32 @@ mod avx2 {
             let flip = _mm256_set1_epi8(flip);
             let lanes0 = _mm512_setr_epi64(0, 1, 8, 9, 4, 5, 12, 13);
             let lanes1 = _mm512_setr_epi64(2, 3, 10, 11, 6, 7, 14, 15);
+            // Q4_K and Q5_K: a super-block's eight scales and mins for every row, found at its
+            // first chunk. Through `decode`, each chunk read both f16 and unpacked the 6-bit
+            // fields again, and that was half of what filling a panel cost (70 of 151 ns per
+            // chunk on a Xeon 8573C).
+            let k4 = matches!(ty, GgmlType::Q4_K | GgmlType::Q5_K);
+            let (bb, start) = (ty.block_bytes(), chunks.start);
+            let (mut sd, mut sm) = ([[0f32; 16]; 8], [[0f32; 16]; 8]);
             for j in chunks {
                 let mut w = [_mm256_setzero_si256(); 16];
-                let (mut d, mut m, mut hs) = ([0f32; 16], [0f32; 16], [[0i32; 16]; 2]);
+                let (mut d, mut m, mut hs) = ([0f32; 16], [0f32; 16], [[1i32; 16]; 2]);
+                let sub = j % 8;
                 for (r, row) in rows.iter().enumerate() {
+                    if k4 {
+                        let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                        if sub == 0 || j == start {
+                            let (dl, dmin) = (le16(b, 0), le16(b, 2));
+                            let (sc, mn) = scales_mins_k4(&b[4..16]);
+                            for s in 0..8 {
+                                sd[s][r] = dl * (sc >> (8 * s) & 0xff) as f32;
+                                sm[s][r] = dmin * (mn >> (8 * s) & 0xff) as f32;
+                            }
+                        }
+                        // SAFETY: `b` is a whole super-block.
+                        w[r] = unsafe { k_weights(ty == GgmlType::Q5_K, b, sub) };
+                        continue;
+                    }
                     // SAFETY: `j` is a chunk of the row, per the caller.
                     let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
                     w[r] = _mm256_xor_si256(rw, flip);
@@ -2299,6 +2332,9 @@ mod avx2 {
                     for h in 0..2 {
                         hs[h][r] = rh[h] as i32;
                     }
+                }
+                if k4 {
+                    (d, m) = (sd[sub], sm[sub]);
                 }
                 // Sixteen rows of eight i32 to eight vectors of sixteen: a transpose in
                 // registers. Going through memory an i32 at a time (128 stores, then loads
