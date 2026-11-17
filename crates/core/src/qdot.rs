@@ -1984,7 +1984,6 @@ mod avx2 {
     #[target_feature(enable = "avx2,f16c")]
     unsafe fn decode(ty: GgmlType, row: &[u8], j: usize) -> (__m256i, f32, f32, [i16; 2]) {
         let bb = ty.block_bytes();
-        let m4 = _mm256_set1_epi8(0xf);
         // SAFETY: the caller passes `j` below the row's chunk count, so every block read is in
         // `row` (sliced, so a bad `j` panics rather than reading out of bounds).
         unsafe {
@@ -2015,28 +2014,41 @@ mod avx2 {
                 }
                 GgmlType::Q6_K => {
                     let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
-                    let (n, k) = ((j % 8) / 4, j % 4);
-                    let p = b.as_ptr();
-                    let l = _mm256_loadu_si256(p.add(64 * n + 32 * (k % 2)).cast());
-                    let lo = if k < 2 {
-                        _mm256_and_si256(l, m4)
-                    } else {
-                        high_nibbles(l)
-                    };
-                    let qh = _mm256_loadu_si256(p.add(128 + 32 * n).cast());
-                    let shift = _mm_cvtsi32_si128(2 * k as i32);
-                    let hi = _mm256_and_si256(_mm256_srl_epi16(qh, shift), _mm256_set1_epi8(3));
-                    let w = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
-                    let w = _mm256_sub_epi8(w, _mm256_set1_epi8(32));
-                    let sc = &b[192..208];
-                    let hs = [
-                        sc[8 * n + 2 * k] as i8 as i16,
-                        sc[8 * n + 2 * k + 1] as i8 as i16,
-                    ];
+                    let (w, hs) = q6_weights(b, j % 8);
                     (w, le16(b, 208), 0.0, hs)
                 }
                 _ => unreachable!("checked by BlockActs::new"),
             }
+        }
+    }
+
+    /// The 32 weights of chunk `sub` (of 8) of the Q6_K super-block `b`, as i8, and the integer
+    /// scales of its two halves.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn q6_weights(b: &[u8], sub: usize) -> (__m256i, [i16; 2]) {
+        let b = &b[..210];
+        let (n, k) = (sub / 4, sub % 4);
+        // SAFETY: the reads end inside `b`, sliced above to a whole block.
+        unsafe {
+            let p = b.as_ptr();
+            let l = _mm256_loadu_si256(p.add(64 * n + 32 * (k % 2)).cast());
+            let lo = if k < 2 {
+                _mm256_and_si256(l, _mm256_set1_epi8(0xf))
+            } else {
+                high_nibbles(l)
+            };
+            let qh = _mm256_loadu_si256(p.add(128 + 32 * n).cast());
+            let shift = _mm_cvtsi32_si128(2 * k as i32);
+            let hi = _mm256_and_si256(_mm256_srl_epi16(qh, shift), _mm256_set1_epi8(3));
+            let w = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 4));
+            let w = _mm256_sub_epi8(w, _mm256_set1_epi8(32));
+            let sc = &b[192..208];
+            let hs = [
+                sc[8 * n + 2 * k] as i8 as i16,
+                sc[8 * n + 2 * k + 1] as i8 as i16,
+            ];
+            (w, hs)
         }
     }
 
@@ -2325,6 +2337,20 @@ mod avx2 {
                         w[r] = unsafe { k_weights(ty == GgmlType::Q5_K, b, sub) };
                         continue;
                     }
+                    if ty == GgmlType::Q6_K {
+                        // The same for Q6_K's one scale per super-block.
+                        let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                        if sub == 0 || j == start {
+                            sd[0][r] = le16(b, 208);
+                        }
+                        // SAFETY: `b` is a whole super-block.
+                        let (rw, rh) = unsafe { q6_weights(b, sub) };
+                        w[r] = _mm256_xor_si256(rw, flip);
+                        for h in 0..2 {
+                            hs[h][r] = rh[h] as i32;
+                        }
+                        continue;
+                    }
                     // SAFETY: `j` is a chunk of the row, per the caller.
                     let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
                     w[r] = _mm256_xor_si256(rw, flip);
@@ -2335,6 +2361,8 @@ mod avx2 {
                 }
                 if k4 {
                     (d, m) = (sd[sub], sm[sub]);
+                } else if ty == GgmlType::Q6_K {
+                    d = sd[0];
                 }
                 // Sixteen rows of eight i32 to eight vectors of sixteen: a transpose in
                 // registers. Going through memory an i32 at a time (128 stores, then loads
