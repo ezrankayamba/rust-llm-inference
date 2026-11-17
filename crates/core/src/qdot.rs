@@ -2286,29 +2286,52 @@ mod avx2 {
                 0x80u8 as i8
             };
             let flip = _mm256_set1_epi8(flip);
+            let lanes0 = _mm512_setr_epi64(0, 1, 8, 9, 4, 5, 12, 13);
+            let lanes1 = _mm512_setr_epi64(2, 3, 10, 11, 6, 7, 14, 15);
             for j in chunks {
-                let mut lanes = [[0i32; 16]; 8];
+                let mut w = [_mm256_setzero_si256(); 16];
                 let (mut d, mut m, mut hs) = ([0f32; 16], [0f32; 16], [[0i32; 16]; 2]);
                 for (r, row) in rows.iter().enumerate() {
                     // SAFETY: `j` is a chunk of the row, per the caller.
-                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
-                    let mut bytes = [0i32; 8];
-                    // SAFETY: 32 writable bytes.
-                    unsafe {
-                        _mm256_storeu_si256(bytes.as_mut_ptr().cast(), _mm256_xor_si256(w, flip))
-                    };
-                    for (k, v) in bytes.into_iter().enumerate() {
-                        lanes[k][r] = v;
-                    }
+                    let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                    w[r] = _mm256_xor_si256(rw, flip);
                     (d[r], m[r]) = (rd, rm);
                     for h in 0..2 {
                         hs[h][r] = rh[h] as i32;
                     }
                 }
-                // SAFETY: each source holds 64 bytes.
+                // Sixteen rows of eight i32 to eight vectors of sixteen: a transpose in
+                // registers. Going through memory an i32 at a time (128 stores, then loads
+                // that span 16 of them) made filling the panel most of this kernel's time.
+                // SAFETY: register operations, and `hs`, `d` and `m` hold 64 bytes each.
                 unsafe {
-                    for l in &lanes {
-                        self.w.push(_mm512_loadu_si512(l.as_ptr().cast()));
+                    // Rows r and r + 8 side by side, then 4x4 transposes in each 128 bits.
+                    let z: [__m512i; 8] = std::array::from_fn(|r| {
+                        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(w[r]), w[r + 8])
+                    });
+                    let t: [__m512i; 8] = std::array::from_fn(|i| {
+                        let (a, b) = (z[i & !1], z[i | 1]);
+                        if i & 1 == 0 {
+                            _mm512_unpacklo_epi32(a, b)
+                        } else {
+                            _mm512_unpackhi_epi32(a, b)
+                        }
+                    });
+                    // u[4g + c]: i32 `c` of each 128 bits of rows 4g..4g + 4 (and 8 more).
+                    let u: [__m512i; 8] = std::array::from_fn(|i| {
+                        let (g, c) = (4 * (i / 4), i % 4);
+                        let (a, b) = (t[g + c / 2], t[g + 2 + c / 2]);
+                        if c & 1 == 0 {
+                            _mm512_unpacklo_epi64(a, b)
+                        } else {
+                            _mm512_unpackhi_epi64(a, b)
+                        }
+                    });
+                    for lanes in [lanes0, lanes1] {
+                        for c in 0..4 {
+                            self.w
+                                .push(_mm512_permutex2var_epi64(u[c], lanes, u[4 + c]));
+                        }
                     }
                     self.d.push(_mm512_loadu_ps(d.as_ptr()));
                     self.m.push(_mm512_loadu_ps(m.as_ptr()));
