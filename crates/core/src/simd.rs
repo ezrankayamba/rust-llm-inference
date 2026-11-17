@@ -362,6 +362,45 @@ pub(crate) mod x86 {
         })
     }
 
+    /// Intel AMX int8 tiles (Sapphire Rapids onwards), on top of [`has_avx512_vnni`], and usable:
+    /// Linux hands a process the tile state only when asked. `RLI_NO_AMX=1` turns it off.
+    pub fn has_amx() -> bool {
+        static HAS: OnceLock<bool> = OnceLock::new();
+        *HAS.get_or_init(|| {
+            // CPUID 7.0 EDX: AMX-TILE is bit 24, AMX-INT8 bit 25.
+            has_avx512_vnni()
+                && std::env::var_os("RLI_NO_AMX").is_none()
+                && __cpuid_count(7, 0).edx >> 24 & 3 == 3
+                && tile_permission()
+        })
+    }
+
+    /// `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`: without it the first tile
+    /// instruction is a SIGILL. The grant is for the whole process.
+    #[cfg(target_os = "linux")]
+    fn tile_permission() -> bool {
+        let ret: i64;
+        // SAFETY: a system call that takes two integers and touches no memory of ours; the
+        // kernel clobbers rcx and r11.
+        unsafe {
+            std::arch::asm!(
+                "syscall",
+                inlateout("rax") 158i64 => ret,
+                in("rdi") 0x1023,
+                in("rsi") 18,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        ret == 0
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn tile_permission() -> bool {
+        false
+    }
+
     /// Whether rows should be prefetched ahead of the one-row kernel: Intel CPUs only. Measured
     /// on Xeon 6973P-C and 6975P-C (Granite Rapids), where decode over weights larger than the
     /// cache ran 1.7-1.8x faster with it; on EPYC 9V74 and 9V45 (Zen 4) it was 3-18% slower.

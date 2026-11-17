@@ -2147,7 +2147,7 @@ mod avx2 {
         // SAFETY: the caller's guarantees, plus the AVX-512 check for that kernel.
         unsafe {
             if crate::simd::x86::has_avx512_vnni() {
-                dot_block16(ty, rows, rb, acts, out)
+                dot_block16(ty, rows, rb, acts, out, crate::simd::x86::has_amx())
             } else {
                 dot_block8(ty, rows, rb, acts, out)
             }
@@ -2351,7 +2351,100 @@ mod avx2 {
         ex[t0..t0 + NT].copy_from_slice(&e);
     }
 
-    /// The AVX-512 VNNI block kernel: [`dot_block8`] with rows in sixteens.
+    /// Tile shapes for [`run_amx`]: tmm0 is 16 tokens by 16 rows of i32 sums, tmm1 16 tokens'
+    /// activations for a chunk (a half for Q6_K, whose integer scales are per half), and tmm2
+    /// those columns of the panel, four weights of each row to a tile row.
+    #[repr(C, align(64))]
+    struct TileCfg([u8; 64]);
+
+    impl TileCfg {
+        fn new(k: u8) -> Self {
+            let cols = if k == HALVES { QK / 2 } else { QK };
+            let mut c = [0u8; 64];
+            c[0] = 1; // palette
+            // Bytes per row from offset 16 (u16 each), rows from offset 48.
+            for (tile, (colsb, rows)) in [(64, 16), (cols, 16), (64, cols / 4)].iter().enumerate() {
+                c[16 + 2 * tile] = *colsb as u8;
+                c[48 + tile] = *rows as u8;
+            }
+            TileCfg(c)
+        }
+    }
+
+    /// [`run16`] for sixteen tokens on Intel AMX: one `tdpbsud` multiplies a chunk of the
+    /// panel's 16 rows into all 16 tokens, where `run16` takes 128 `vpdpbusd`. The tiles read
+    /// the panel and the activations where they lie (a token per tile row). The integer sums
+    /// are `run16`'s and the float steps are the same in the same order, so the two agree bit
+    /// for bit. The caller has loaded [`TileCfg`] for `K`.
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_amx<const K: u8>(
+        p: &Panel16,
+        j0: usize,
+        n: usize,
+        acts: &BlockActs,
+        t0: usize,
+        acc: &mut [__m512],
+        ex: &mut [__m512],
+    ) {
+        const NT: usize = 16;
+        let nc = acts.n_chunks;
+        let halves = if K == HALVES { 2 } else { 1 };
+        let mut sums = [[0i32; 16]; NT];
+        // SAFETY: tokens `t0..t0 + 16` and chunks `j0..j0 + n` are inside `acts`, and the panel
+        // holds `n` chunks, per the caller, who also checked for AMX and loaded the tile shapes.
+        unsafe {
+            let x = acts.qs.as_ptr().add((t0 * nc + j0) * QK);
+            for c in 0..n {
+                let at = |i: usize| (t0 + i) * nc + j0 + c;
+                let mut isum = [_mm512_setzero_si512(); NT];
+                for h in 0..halves {
+                    std::arch::asm!(
+                        "tilezero tmm0",
+                        "tileloadd tmm1, [{x} + {token}]",
+                        "tileloadd tmm2, [{w} + {line}]",
+                        "tdpbsud tmm0, tmm1, tmm2",
+                        "tilestored [{sums} + {line}], tmm0",
+                        x = in(reg) x.add(c * QK + h * QK / 2),
+                        token = in(reg) nc * QK,
+                        w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
+                        line = in(reg) 64usize,
+                        sums = in(reg) sums.as_mut_ptr(),
+                        out("tmm0") _,
+                        out("tmm1") _,
+                        out("tmm2") _,
+                        options(nostack),
+                    );
+                    for (i, s) in isum.iter_mut().enumerate() {
+                        let mut v = _mm512_loadu_si512(sums[i].as_ptr().cast());
+                        if K != OFFSET {
+                            let mut bias = *acts.bias.get_unchecked(2 * at(i) + h);
+                            if K == SIGNED {
+                                bias += *acts.bias.get_unchecked(2 * at(i) + 1);
+                            }
+                            v = _mm512_sub_epi32(v, _mm512_set1_epi32(bias));
+                        }
+                        if K == HALVES {
+                            v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
+                        }
+                        *s = _mm512_add_epi32(*s, v);
+                    }
+                }
+                for (i, s) in isum.iter().enumerate() {
+                    let xd = _mm512_set1_ps(*acts.d.get_unchecked(at(i)));
+                    let scale = _mm512_mul_ps(*p.d.get_unchecked(c), xd);
+                    acc[t0 + i] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*s), scale, acc[t0 + i]);
+                    if K == OFFSET {
+                        let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at(i)));
+                        ex[t0 + i] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, ex[t0 + i]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The AVX-512 VNNI block kernel: [`dot_block8`] with rows in sixteens, and with `amx`
+    /// (the caller checked [`crate::simd::x86::has_amx`]) tokens in sixteens on the tiles.
     #[target_feature(enable = "avx512f,avx512vnni,avx2,fma,f16c")]
     pub(super) unsafe fn dot_block16(
         ty: GgmlType,
@@ -2359,12 +2452,19 @@ mod avx2 {
         rb: usize,
         acts: &BlockActs,
         out: &mut [f32],
+        amx: bool,
     ) {
         let k = kind(ty).expect("checked by BlockActs::new");
         let (n_rows, nt, nc) = (rows.len() / rb, acts.n_tokens, acts.n_chunks);
         assert!(n_rows > 0 && out.len() == n_rows * nt && rows.len() == n_rows * rb);
         assert_eq!(rb / ty.block_bytes() * ty.block_size(), nc * QK);
         assert!(k == OFFSET || acts.bias.len() == 2 * nt * nc);
+        let amx = amx && nt >= 16;
+        if amx {
+            let cfg = TileCfg::new(k);
+            // SAFETY: the caller checked for AMX; `cfg` is the 64 bytes `ldtilecfg` reads.
+            unsafe { std::arch::asm!("ldtilecfg [{}]", in(reg) &cfg, options(nostack, readonly)) };
+        }
         let mut panel = Panel16 {
             w: Vec::with_capacity(8 * PANEL_CHUNKS),
             d: Vec::with_capacity(PANEL_CHUNKS),
@@ -2402,6 +2502,14 @@ mod avx2 {
                             }
                         };
                     }
+                    while amx && t + 16 <= nt {
+                        match k {
+                            SIGNED => run_amx::<SIGNED>(&panel, j0, n, acts, t, &mut acc, &mut ex),
+                            OFFSET => run_amx::<OFFSET>(&panel, j0, n, acts, t, &mut acc, &mut ex),
+                            _ => run_amx::<HALVES>(&panel, j0, n, acts, t, &mut acc, &mut ex),
+                        }
+                        t += 16;
+                    }
                     while t + 4 <= nt {
                         go!(4);
                         t += 4;
@@ -2420,6 +2528,11 @@ mod avx2 {
                     out[(r0 + r) * nt + t] = v;
                 }
             }
+        }
+        if amx {
+            // Back to the initial tile state, so a context switch has none to save.
+            // SAFETY: AMX, as above.
+            unsafe { std::arch::asm!("tilerelease", options(nostack, nomem)) };
         }
     }
 }
@@ -2617,10 +2730,41 @@ mod tests {
                 let (mut wide, mut narrow) = (vec![0.0; n_rows * n_tok], vec![0.0; n_rows * n_tok]);
                 // SAFETY: AVX-512 VNNI checked above, AVX2 by `BlockActs::new`.
                 unsafe {
-                    super::avx2::dot_block16(ty, &rows, rb, &block, &mut wide);
+                    super::avx2::dot_block16(ty, &rows, rb, &block, &mut wide, false);
                     super::avx2::dot_block8(ty, &rows, rb, &block, &mut narrow);
                 }
                 assert_eq!(wide, narrow, "{ty:?} with {n_rows} rows");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn amx_block_kernel_equals_avx512_block_kernel_exactly() {
+        if !crate::simd::x86::has_amx() {
+            eprintln!("skipped: no AMX on this CPU");
+            return;
+        }
+        let mut rng = Rng::new(37);
+        // 35 tokens: two tiles of 16, then the AVX-512 kernel's fours and ones.
+        let (n, n_tok) = (512, 35);
+        for ty in INT_TYPES {
+            let acts: Vec<Q8Act> = (0..n_tok).map(|_| Q8Act::new(&rng.vec(n))).collect();
+            let Some(block) = BlockActs::new(ty, &acts) else {
+                continue;
+            };
+            let rb = ty.row_bytes(n);
+            for n_rows in [1, 16, 35] {
+                let rows: Vec<u8> = (0..n_rows)
+                    .flat_map(|_| random_row(ty, n, &mut rng))
+                    .collect();
+                let (mut tiles, mut wide) = (vec![0.0; n_rows * n_tok], vec![0.0; n_rows * n_tok]);
+                // SAFETY: AMX checked above, which includes AVX-512 VNNI.
+                unsafe {
+                    super::avx2::dot_block16(ty, &rows, rb, &block, &mut tiles, true);
+                    super::avx2::dot_block16(ty, &rows, rb, &block, &mut wide, false);
+                }
+                assert_eq!(tiles, wide, "{ty:?} with {n_rows} rows");
             }
         }
     }
