@@ -1885,3 +1885,19 @@ run of 904 +- 179, run again twice):
 | 64 | 1249.1 | 1274.8 | 1283.5 | 189.1 | 198.4 | 199.4 |
 | 128 | 1351.2 | 1366.3 | 1397.0 | 202.4 | 204.6 | 200.7 |
 | 512 | 1425.8 | 1440.8 | 1421.9 | 194.2 | 192.6 | 191.7 |
+
+## 2026-11-18: llama.cpp's Q4_K and Q6_K decoders in the few-token Metal kernel
+
+`matmul_few_q4_k_*` and `_q6_k_*` decode through `ref_deq_*` (as `MATMUL_K32` does, here in
+f32) instead of `deq16_*`. `RLI_METAL_PROF_REPEAT=16`, Mistral-7B, 4 tokens, us per
+dispatch: Q4_K 299 -> 279 (llama.cpp's few-row kernel 263), Q6_K 381 -> 307 (291). `--precise`
+logits of a 12-token prompt stay within 3e-5 of the CPU's. Prompt tok/s (before = d0f0890;
+before, after, llama.cpp in turn, 20 s rests, 5 reps):
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 4 | 312.2 | 327.6 | 319.4 | 58.0 | 62.3 | 62.6 |
+| 8 | 600.3 | 662.9 | 593.9 | 112.6 | 121.1 | 115.9 |
+| 16 | 866.2 | 869.4 | 788.2 | 144.4 | 144.2 | 142.2 |
+| 24 | 860.9 | 848.8 | 824.2 | 137.3 | 136.5 | 141.5 |
+| 88 | 1218.6 | 1221.3 | 1237.3 | 185.3 | 185.2 | 183.8 |

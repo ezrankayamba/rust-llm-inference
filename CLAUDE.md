@@ -109,7 +109,8 @@ Design points that span files:
   Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
   on Mistral-7B and Llama-3.2-1B, (2026-11-18) 32, 64 and 512 tokens level (within 1%), 56 tokens 2% ahead and 2% behind,
   128 tokens 2% behind and 2% ahead (Llama-3.2-1B and Mistral-7B); 16, 40, 48, 72, 100, 112
-  and 200 tokens 1-35% ahead, 4 to 24 and 88 between 6% behind and 5% ahead; decode
+  and 200 tokens 1-35% ahead, 4, 8 and 88 between 1% behind and 12% ahead, 24 tokens 3% ahead
+  and 3.5% behind; decode
   (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
   matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the

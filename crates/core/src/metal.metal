@@ -747,7 +747,8 @@ MATMUL(matmul_h_q6_k_t64, deq16_q6_k, half, simdgroup_half8x8, 64, 4, 4)
 //   (`deq16_*`) in the same kernel a dispatch took 851 and 1060 us.
 // MATMUL staged 32 columns at a time (twice the barriers, 8 KB) took 931 us, so the 64-token
 // tile keeps 64-column steps; this tile is behind it from about 100 tokens (see metal.rs).
-inline void ref_deq_q4_k(device const uchar* xb, short il, thread half4x4& reg) {
+template <typename M4>
+inline void ref_deq_q4_k(device const uchar* xb, short il, thread M4& reg) {
     device const uchar* q = xb + 16;
     device const uchar* scales = xb + 4;
     short is = (il / 4) * 2;
@@ -766,7 +767,8 @@ inline void ref_deq_q4_k(device const uchar* xb, short il, thread half4x4& reg) 
     for (int i = 0; i < 16; ++i) reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
 }
 
-inline void ref_deq_q6_k(device const uchar* xb, short il, thread half4x4& reg) {
+template <typename M4>
+inline void ref_deq_q6_k(device const uchar* xb, short il, thread M4& reg) {
     const float d_all = float(*(device const half*)(xb + 208));
     device const ushort* ql = (device const ushort*)xb;
     device const ushort* qh = (device const ushort*)(xb + 128);
@@ -794,6 +796,18 @@ inline void ref_deq_q6_k(device const uchar* xb, short il, thread half4x4& reg) 
         reg[i][2] = dl2 * ((float)(q & 0xFF0000)) - ml;
         reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
     }
+}
+
+// The same decoders in f32 for `matmul_few_*`, taking a row, a 32-column chunk and 0 or 16.
+inline void deqf_q4_k(device const uchar* r, uint c, uint o, thread float4* w) {
+    float4x4 m;
+    ref_deq_q4_k(r + (c / 8) * 144, short(2 * (c % 8) + o / 16), m);
+    for (uint i = 0; i < 4; i++) w[i] = m[i];
+}
+inline void deqf_q6_k(device const uchar* r, uint c, uint o, thread float4* w) {
+    float4x4 m;
+    ref_deq_q6_k(r + (c / 8) * 210, short(2 * (c % 8) + o / 16), m);
+    for (uint i = 0; i < 4; i++) w[i] = m[i];
 }
 
 #define MATMUL_K32(NAME, DEQ, BS) \
@@ -991,9 +1005,9 @@ MATMUL_FEW_SHAPES(matmul_few_f16, deq16_f16)
 MATMUL_FEW_SHAPES(matmul_few_q4_0, deq16_q4_0)
 MATMUL_FEW_SHAPES(matmul_few_q5_0, deq16_q5_0)
 MATMUL_FEW_SHAPES(matmul_few_q8_0, deq16_q8_0)
-MATMUL_FEW_SHAPES(matmul_few_q4_k, deq16_q4_k)
+MATMUL_FEW_SHAPES(matmul_few_q4_k, deqf_q4_k)
 MATMUL_FEW_SHAPES(matmul_few_q5_k, deq16_q5_k)
-MATMUL_FEW_SHAPES(matmul_few_q6_k, deq16_q6_k)
+MATMUL_FEW_SHAPES(matmul_few_q6_k, deqf_q6_k)
 
 // ---- Elementwise / normalization / attention kernels for running whole layers on the GPU ----
 
