@@ -627,12 +627,12 @@ inline void deq16_q4_k_x2(device const uchar* r, uint c, uint o, thread float4* 
         for (uint i = 0; i < 8; i++) {                                                        \
             uint k = (i / 4) * 32 + wo + (i % 4) * 4;                                         \
             *(threadgroup vec<T, 4>*)(sa + ((k / 8) * 8 + wr / 8) * 64 + (wr % 8) * 8 + k % 8) = \
-                row_ok ? vec<T, 4>(wv[i]) : vec<T, 4>(T(0));                                  \
+                vec<T, 4>(wv[i]);                                                             \
         }                                                                                     \
         for (uint i = 0; i < XU; i++) {                                                       \
             uint k = xo + 4 * i;                                                              \
             *(threadgroup vec<T, 4>*)(sb + ((k / 8) * TB + xt / 8) * 64 + (xt % 8) * 8 + k % 8) = \
-                tok_ok ? vec<T, 4>(xv[i]) : vec<T, 4>(T(0));                                  \
+                vec<T, 4>(xv[i]);                                                             \
         }                                                                                     \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
         for (uint k = 0; k < 8; k++) {                                                        \
@@ -833,7 +833,7 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
             const short lx = (tiitg / NL0) % 8; \
             const short ly = i % 8; \
             const short ib = 8 * sx + sy; \
-            *(sa + 64 * ib + 8 * ly + lx) = row_ok ? temp_a[i / 4][i % 4] : half(0); \
+            *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4]; \
         } \
         { \
             const short sx = (tiitg % NL1); \
@@ -841,7 +841,7 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
             const short ly = (tiitg / NL1) % 8; \
             const short ib = 4 * sx + sy; \
             *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = \
-                tok_ok ? (half2x4)(*((device float2x4*)yv)) : half2x4(0.0h); \
+                (half2x4)(*((device float2x4*)yv)); \
         } \
         il = (il + 2 < nl) ? il + 2 : il % 2; \
         xb = (il < 2) ? xb + BS : xb; \

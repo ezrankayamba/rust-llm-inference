@@ -353,6 +353,18 @@ pub fn profiling() -> bool {
     *PROFILE.get_or_init(|| std::env::var_os("RLI_METAL_PROF").is_some())
 }
 
+/// `RLI_METAL_PROF_REPEAT=N`: while profiling, each dispatch runs N times over in its command
+/// buffer and its time is divided by N. A dispatch that follows an idle GPU is 10-40% slower
+/// than one in sequence, by an amount that differs between kernels, so this is the number to
+/// compare two kernels by. Results are then wrong wherever a kernel adds into its output.
+fn profile_repeat() -> u32 {
+    static REPEAT: OnceLock<u32> = OnceLock::new();
+    *REPEAT.get_or_init(|| {
+        let n = std::env::var("RLI_METAL_PROF_REPEAT").ok();
+        n.and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+    })
+}
+
 impl Drop for Gpu {
     fn drop(&mut self) {
         let times = std::mem::take(&mut *PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner()));
@@ -861,21 +873,22 @@ impl Batch<'_> {
                 .memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
         self.enc.borrow().setComputePipelineState(pipeline);
+        let size = |width, height| MTLSize {
+            width,
+            height,
+            depth: 1,
+        };
+        let (grid, group) = (size(groups.0, groups.1), size(threads, 1));
         self.enc
             .borrow()
-            .dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: groups.0,
-                    height: groups.1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            .dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         if profiling() {
+            let repeat = profile_repeat();
+            for _ in 1..repeat {
+                let enc = self.enc.borrow();
+                enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+            }
             // Run this dispatch alone and time it on the GPU's clock.
             let (cmd, enc) = self.gpu.encoder();
             self.enc.replace(enc).endEncoding();
@@ -887,7 +900,7 @@ impl Batch<'_> {
             let name = name.map_or("?", |(_, n)| n.as_str()).to_string();
             let mut times = PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner());
             let e = times.entry(name).or_insert((0.0, 0));
-            e.0 += cmd.GPUEndTime() - cmd.GPUStartTime();
+            e.0 += (cmd.GPUEndTime() - cmd.GPUStartTime()) / f64::from(repeat);
             e.1 += 1;
         }
     }

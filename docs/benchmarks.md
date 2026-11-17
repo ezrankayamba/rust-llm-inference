@@ -1859,3 +1859,29 @@ in turn, 20 s rests, 5 reps):
 That tile as the whole tile at every length: 64 tokens 1247 against 1200 (Llama-3.2-1B) and
 191.5 against 190.9 (Mistral-7B); 100 tokens level and 2% slower; 128 tokens level and 4%
 slower; 192 and 512 tokens 3-6% slower. Hence 49 to 64 only.
+
+## 2026-11-18: Metal tiles stage out-of-range rows without a test
+
+Both tile kernels staged `row_ok ? weight : 0` and `tok_ok ? x : 0`. Rows and tokens past
+the end already read row or token 0, and an edge tile writes only what is in range, so the
+tests are gone. `RLI_METAL_PROF=1 RLI_METAL_PROF_REPEAT=16`, Mistral-7B, us per dispatch:
+
+| | before | after | llama.cpp |
+|---|---|---|---|
+| 32 tokens, Q4_K (`MATMUL_K32`) | 815 | 788 | 786 |
+| 32 tokens, Q6_K | 937 | 890 | 880 |
+| 128 tokens, Q4_K (`matmul_h_q4_k_t64`) | 2875 | 2818-2855 | |
+| 128 tokens, Q6_K | 3222 | 3139-3165 | |
+
+Tried on the way: the grid turned as llama.cpp's is (tokens on x): 821-823 against 815;
+the add-into-y path skipped: no change. Prompt tok/s (before = 451b0da; before, after,
+llama.cpp in turn, 20 s rests, 5 reps; the 32-token Llama-3.2-1B "after" was one disturbed
+run of 904 +- 179, run again twice):
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 32 | 1061.9 | 1092.6, 1094.5 | 1092.7 | 180.2 | 186.4 | 187.1 |
+| 56 | 1124.6 | 1144.4 | 1126.2 | 169.0 | 171.2 | 174.8 |
+| 64 | 1249.1 | 1274.8 | 1283.5 | 189.1 | 198.4 | 199.4 |
+| 128 | 1351.2 | 1366.3 | 1397.0 | 202.4 | 204.6 | 200.7 |
+| 512 | 1425.8 | 1440.8 | 1421.9 | 194.2 | 192.6 | 191.7 |
