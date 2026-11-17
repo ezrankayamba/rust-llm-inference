@@ -1149,6 +1149,7 @@ impl Batch<'_> {
             largest,
             MATMUL_THREADS / 32,
         );
+        let free = self.free;
         for (tok0, end, (pipeline, tile_rows, tile_tokens, groups)) in
             [(0, full, full_kernel), (full, n, rest_kernel)]
         {
@@ -1175,7 +1176,11 @@ impl Batch<'_> {
             );
             let grid = (rows.div_ceil(tile_rows), (end - tok0).div_ceil(tile_tokens));
             self.dispatch2(pipeline, grid, 32 * groups);
+            // The rest writes other rows of y, so it runs beside the whole tiles, on weights
+            // they have just read.
+            self.free = true;
         }
+        self.free = free;
     }
 
     /// Routes one token's MoE layer on the GPU: from the `n_expert` router logits, writes the

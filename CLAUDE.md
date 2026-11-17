@@ -84,7 +84,9 @@ Design points that span files:
   memory (each lane puts the 16 weights it decodes into the matrix through its own two elements),
   the columns shared out among 8 simdgroups, f32. A tile's barrier per step is what few tokens
   can't pay for: 16-token prompts ran 1.12-1.2x faster, 4- and 8-token ones 1.35x; 32 tokens that
-  way were 20% slower than the 32-token tile. Causal `attention_batch` also runs on the matrix units with an online
+  way were 20% slower than the 32-token tile. A matmul's dispatches (whole tiles, then the rest)
+  have no barrier between them: they write different rows, and the rest runs on weights the
+  tiles have just read (72- and 88-token prompts 6-9% faster for it). Causal `attention_batch` also runs on the matrix units with an online
   softmax: over an f16 cache, `attention_batch_staged_<head size>` (16, 32, 64, 96, 128) stages
   32 keys of K and V once for up to four query heads of a KV head; other head sizes and f32
   caches take the general kernel. Loop bounds in these kernels are compile-time constants:

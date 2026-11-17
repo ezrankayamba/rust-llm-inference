@@ -1770,3 +1770,23 @@ threadgroup instead of 16 is 14-18% slower at 16 tokens, 32 rows the same as 16;
 tiles (32 tokens) ran 800 and 127 tok/s where the 32-token tile kernel runs 992 and 164.
 Logits of a 12-token prompt are within 0.009 of the half-precision tiles', and under `--precise`
 within 3e-5 of the CPU's.
+
+## 2026-11-17: a Metal matmul's rest runs beside its whole tiles
+
+The rest of a matmul (after whole 64-token tiles) writes other rows of the output, so its
+dispatch no longer waits for the tiles'. It then reads weights the tiles have just read. Same
+runs as above (before, after, llama.cpp in turn, 20 s rests, 5 reps);
+"before" is a962da6, so the 72- to 200-token rows include the few-token kernel on their rest
+(88 tokens: 1066 at a962da6, 1106 with the few-token kernel, 1204 with this).
+
+| Tokens | Llama-3.2-1B a962da6 | now | llama.cpp | Mistral-7B a962da6 | now | llama.cpp |
+|---|---|---|---|---|---|---|
+| 40 | 768.4 | 767.4 | 815.8 | 122.5 | 122.6 | 123.2 |
+| 72 | 1054.0 | 1192.4 | 1004.3 | 168.9 | 187.6 | 152.3 |
+| 88 | 1066.4 | 1204.1 | 1236.0 | 167.2 | 183.2 | 184.2 |
+| 100 | 981.0 | 1063.0 | 1099.7 | 151.5 | 160.1 | 159.0 |
+| 200 | 1330.8 | 1403.6 | 1278.7 | 191.9 | 198.8 | 179.9 |
+
+llama.cpp's own switches, on its 64-token Llama-3.2-1B prompt (1276-1286 tok/s): no residency
+sets 1281-1284, no fusion 1280, no graph reordering 1250, no concurrency 1241, private buffers
+1235. None of them is the 6% it has on us there.
