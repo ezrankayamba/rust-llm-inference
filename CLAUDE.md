@@ -105,6 +105,9 @@ Design points that span files:
   still take a row and a chunk per lane. Kernels avoid arrays and
   vectors indexed by a loop: the compiler keeps them in memory. `Batch::start` submits a
   token's first layer while the rest is encoded.
+- **`RLI_METAL_PROF=1` times every Metal dispatch** alone in its own command buffer and prints
+  the totals per kernel when the device is dropped. A prompt is 90-97% the half-precision matmul
+  tiles (`matmul_h_*_t64`), so that kernel is the whole of the prompt gap to llama.cpp.
 - **Benchmark the two engines alternately with rests** (30-45 s): the second of two back-to-back
   runs is slower by several percent from heat alone, and anything else using the GPU (an
   animated wallpaper) shows up as noise.

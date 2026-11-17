@@ -133,6 +133,10 @@ M4, `bench --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -ngl 99
 | Mistral-7B Q4_K_M | 64 | 190.7 | 204.7 |
 | Mistral-7B Q4_K_M | 512 | 196.0 | 200.4 |
 
+`RLI_METAL_PROF=1` (each dispatch alone in a command buffer, timed on the GPU's clock) says
+where a prompt goes: `matmul_h_q4_k_t64` 74-80% and `matmul_h_q6_k_t64` 15-18% at both lengths on
+both models, attention 1.2-1.4% at 64 tokens and 4.4-5% at 512, everything else under 4%.
+
 Per token we run 64 tokens as fast as 512 (one 64-token tile either way) and llama.cpp runs 512
 slower than 64, so the gap at 512 (2-7%) understates the matmul's: at 64 tokens, where attention
 is small, it is 7-11%.

@@ -13,8 +13,11 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("metal.metal");
 const MATVEC_ROWS_PER_TG: usize = 4;
@@ -328,7 +331,36 @@ pub struct Gpu {
     matmul_half: Vec<(GgmlType, Vec<Pipeline>)>,
     matvec_id: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
+    /// Each pipeline's address and kernel name, for the profile.
+    kernels: Vec<(usize, String)>,
     name: String,
+}
+
+static PROFILE: OnceLock<bool> = OnceLock::new();
+static PROFILE_TIMES: Mutex<BTreeMap<String, (f64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Whether `RLI_METAL_PROF` is set: every dispatch then runs alone in its own command buffer
+/// and is timed, and the totals per kernel are printed when the device is dropped. A kernel
+/// run alone has the GPU to itself, so the shares are a guide, not the cost within a pass.
+pub fn profiling() -> bool {
+    *PROFILE.get_or_init(|| std::env::var_os("RLI_METAL_PROF").is_some())
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let times = std::mem::take(&mut *PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut rows: Vec<_> = times.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let total: f64 = rows.iter().map(|r| r.1.0).sum();
+        for (name, (t, n)) in rows {
+            eprintln!(
+                "{name:28} {:9.2} ms {:5.1}% {n:7} dispatches {:8.1} us each",
+                t * 1e3,
+                t / total * 100.0,
+                t / n as f64 * 1e6
+            );
+        }
+    }
 }
 
 // SAFETY: Metal devices, queues and pipeline states are documented as thread-safe.
@@ -563,13 +595,18 @@ impl Gpu {
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
             .map_err(|e| format!("Metal shader compile failed: {e}"))?;
+        let kernels = RefCell::new(Vec::new());
         let pipeline = |name: &str| -> Result<Pipeline, String> {
             let f = library
                 .newFunctionWithName(&NSString::from_str(name))
                 .ok_or_else(|| format!("missing kernel {name}"))?;
-            device
+            let p = device
                 .newComputePipelineStateWithFunction_error(&f)
-                .map_err(|e| format!("pipeline {name}: {e}"))
+                .map_err(|e| format!("pipeline {name}: {e}"))?;
+            kernels
+                .borrow_mut()
+                .push((Retained::as_ptr(&p) as usize, name.to_string()));
+            Ok(p)
         };
         let matvec = MATVEC_KERNELS
             .iter()
@@ -611,6 +648,7 @@ impl Gpu {
             matmul_half,
             matvec_id,
             other,
+            kernels: kernels.into_inner(),
             name,
         })
     }
@@ -665,8 +703,8 @@ impl Gpu {
             half: false,
             free: false,
             gpu: self,
-            cmd,
-            enc,
+            cmd: RefCell::new(cmd),
+            enc: RefCell::new(enc),
             ended: false,
             started: Vec::new(),
         }
@@ -743,8 +781,9 @@ pub struct Batch<'a> {
     /// they may run at the same time as the dispatch before them.
     pub free: bool,
     gpu: &'a Gpu,
-    cmd: CommandBuffer,
-    enc: Encoder,
+    /// In cells so that a profiled dispatch can submit them and start anew.
+    cmd: RefCell<CommandBuffer>,
+    enc: RefCell<Encoder>,
     ended: bool,
     /// Command buffers already submitted by [`Batch::start`].
     started: Vec<CommandBuffer>,
@@ -755,7 +794,7 @@ pub struct Batch<'a> {
 impl Drop for Batch<'_> {
     fn drop(&mut self) {
         if !self.ended {
-            self.enc.endEncoding();
+            self.enc.get_mut().endEncoding();
         }
     }
 }
@@ -765,19 +804,24 @@ impl Batch<'_> {
         // SAFETY: binding a live buffer at an in-bounds byte offset.
         unsafe {
             self.enc
+                .borrow()
                 .setBuffer_offset_atIndex(Some(&at.0.buf), at.1 * 4, index)
         };
     }
 
     fn bind_kv(&self, index: usize, kv: &KvBuf) {
         // SAFETY: binding a live buffer at offset 0.
-        unsafe { self.enc.setBuffer_offset_atIndex(Some(&kv.buf), 0, index) };
+        unsafe {
+            self.enc
+                .borrow()
+                .setBuffer_offset_atIndex(Some(&kv.buf), 0, index)
+        };
     }
 
     fn params<T>(&self, index: usize, p: &T) {
         // SAFETY: setBytes copies `size_of::<T>()` bytes immediately.
         unsafe {
-            self.enc.setBytes_length_atIndex(
+            self.enc.borrow().setBytes_length_atIndex(
                 NonNull::from(p).cast(),
                 std::mem::size_of::<T>(),
                 index,
@@ -791,21 +835,40 @@ impl Batch<'_> {
 
     fn dispatch2(&self, pipeline: &Pipeline, groups: (usize, usize), threads: usize) {
         if !self.free {
-            self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            self.enc
+                .borrow()
+                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
-        self.enc.setComputePipelineState(pipeline);
-        self.enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: groups.0,
-                height: groups.1,
-                depth: 1,
-            },
-            MTLSize {
-                width: threads,
-                height: 1,
-                depth: 1,
-            },
-        );
+        self.enc.borrow().setComputePipelineState(pipeline);
+        self.enc
+            .borrow()
+            .dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: groups.0,
+                    height: groups.1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        if profiling() {
+            // Run this dispatch alone and time it on the GPU's clock.
+            let (cmd, enc) = self.gpu.encoder();
+            self.enc.replace(enc).endEncoding();
+            let cmd = self.cmd.replace(cmd);
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            let at = Retained::as_ptr(pipeline) as usize;
+            let name = self.gpu.kernels.iter().find(|(p, _)| *p == at);
+            let name = name.map_or("?", |(_, n)| n.as_str()).to_string();
+            let mut times = PROFILE_TIMES.lock().unwrap_or_else(|p| p.into_inner());
+            let e = times.entry(name).or_insert((0.0, 0));
+            e.0 += cmd.GPUEndTime() - cmd.GPUStartTime();
+            e.1 += 1;
+        }
     }
 
     /// `y = W x`, `W` being `rows x cols` of `ty` at byte `offset` of the model mapping.
@@ -889,9 +952,9 @@ impl Batch<'_> {
                 (p, if swiglu_kernel(ty).is_some() { 2 } else { 1 })
             }
         };
-        self.enc.setComputePipelineState(pipeline);
+        self.enc.borrow().setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+        unsafe { self.enc.borrow().setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.bind(4, bias); // `y` again when there is none
@@ -937,8 +1000,8 @@ impl Batch<'_> {
         let (ubuf, up) = self.gpu.weight_buf(up, rows * row_bytes);
         // SAFETY: weight buffers bound read-only at offset 0; the kernel adds the offsets.
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(gbuf), 0, 0);
-            self.enc.setBuffer_offset_atIndex(Some(ubuf), 0, 1);
+            self.enc.borrow().setBuffer_offset_atIndex(Some(gbuf), 0, 0);
+            self.enc.borrow().setBuffer_offset_atIndex(Some(ubuf), 0, 1);
         }
         self.bind(2, x);
         self.bind(3, y);
@@ -1049,9 +1112,9 @@ impl Batch<'_> {
                 continue;
             }
             let pipeline = &tiles[tile];
-            self.enc.setComputePipelineState(pipeline);
+            self.enc.borrow().setComputePipelineState(pipeline);
             // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset`.
-            unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+            unsafe { self.enc.borrow().setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
             self.bind(1, x);
             self.bind(2, y);
             self.params(
@@ -1154,9 +1217,9 @@ impl Batch<'_> {
             .find(|(t, _)| *t == ty)
             .expect("unsupported type for Metal")
             .1;
-        self.enc.setComputePipelineState(pipeline);
+        self.enc.borrow().setComputePipelineState(pipeline);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+        unsafe { self.enc.borrow().setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.params(
@@ -1206,7 +1269,7 @@ impl Batch<'_> {
         let span = (n_expert - 1) * expert_stride + rows * row_bytes;
         let (wbuf, offset) = self.gpu.weight_buf(offset, span);
         // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset` itself.
-        unsafe { self.enc.setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
+        unsafe { self.enc.borrow().setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
         self.bind(1, x);
         self.bind(2, y);
         self.params(
@@ -1257,8 +1320,8 @@ impl Batch<'_> {
         let (ubuf, up) = self.gpu.weight_buf(up, span(up_stride));
         // SAFETY: weight buffers bound read-only at offset 0; the kernel adds the offsets.
         unsafe {
-            self.enc.setBuffer_offset_atIndex(Some(gbuf), 0, 0);
-            self.enc.setBuffer_offset_atIndex(Some(ubuf), 0, 1);
+            self.enc.borrow().setBuffer_offset_atIndex(Some(gbuf), 0, 0);
+            self.enc.borrow().setBuffer_offset_atIndex(Some(ubuf), 0, 1);
         }
         self.bind(2, x);
         self.bind(3, y);
@@ -1507,6 +1570,7 @@ impl Batch<'_> {
         // SAFETY: binding a live buffer at an in-bounds byte offset.
         unsafe {
             self.enc
+                .borrow()
                 .setBuffer_offset_atIndex(Some(&dst.buf), off * dst.elem(), 3)
         };
         let kernel = if dst.half {
@@ -1529,6 +1593,7 @@ impl Batch<'_> {
         // SAFETY: binding a live buffer at an in-bounds byte offset.
         unsafe {
             self.enc
+                .borrow()
                 .setBuffer_offset_atIndex(Some(&dst.buf), off * dst.elem(), 1)
         };
         self.params(
@@ -1646,21 +1711,22 @@ impl Batch<'_> {
     /// on it while the caller queues the rest (about 0.1 ms of a decoded token otherwise spent
     /// with the GPU idle).
     pub fn start(&mut self) {
-        self.enc.endEncoding();
-        self.cmd.commit();
+        self.enc.get_mut().endEncoding();
+        self.cmd.get_mut().commit();
         let (cmd, enc) = self.gpu.encoder();
-        self.started.push(std::mem::replace(&mut self.cmd, cmd));
-        self.enc = enc;
+        self.started.push(self.cmd.replace(cmd));
+        *self.enc.get_mut() = enc;
     }
 
     /// Submits the recorded work and waits for it.
     pub fn finish(mut self) {
-        self.enc.endEncoding();
+        self.enc.get_mut().endEncoding();
         self.ended = true;
-        self.cmd.commit();
-        self.cmd.waitUntilCompleted();
+        let last = self.cmd.get_mut();
+        last.commit();
+        last.waitUntilCompleted();
         // The queue runs command buffers in order, so the earlier ones are done too.
-        for cmd in self.started.iter().chain([&self.cmd]) {
+        for cmd in self.started.iter().chain([&*last]) {
             if let Some(e) = cmd.error() {
                 panic!("Metal command failed: {e}");
             }
