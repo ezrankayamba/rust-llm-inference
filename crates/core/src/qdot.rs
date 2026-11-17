@@ -2351,9 +2351,9 @@ mod avx2 {
         ex[t0..t0 + NT].copy_from_slice(&e);
     }
 
-    /// Tile shapes for [`run_amx`]: tmm0 is 16 tokens by 16 rows of i32 sums, tmm1 16 tokens'
-    /// activations for a chunk (a half for Q6_K, whose integer scales are per half), and tmm2
-    /// those columns of the panel, four weights of each row to a tile row.
+    /// Tile shapes for [`run_amx`]: tmm0 and tmm3 are 16 tokens by 16 rows of i32 sums, tmm1
+    /// and tmm4 16 tokens' activations for a chunk (a half for Q6_K, whose integer scales are
+    /// per half), and tmm2 those columns of the panel, four weights of each row to a tile row.
     #[repr(C, align(64))]
     struct TileCfg([u8; 64]);
 
@@ -2363,7 +2363,8 @@ mod avx2 {
             let mut c = [0u8; 64];
             c[0] = 1; // palette
             // Bytes per row from offset 16 (u16 each), rows from offset 48.
-            for (tile, (colsb, rows)) in [(64, 16), (cols, 16), (64, cols / 4)].iter().enumerate() {
+            let shapes = [(64, 16), (cols, 16), (64, cols / 4), (64, 16), (cols, 16)];
+            for (tile, (colsb, rows)) in shapes.iter().enumerate() {
                 c[16 + 2 * tile] = *colsb as u8;
                 c[48 + tile] = *rows as u8;
             }
@@ -2371,14 +2372,22 @@ mod avx2 {
         }
     }
 
-    /// [`run16`] for sixteen tokens on Intel AMX: one `tdpbsud` multiplies a chunk of the
-    /// panel's 16 rows into all 16 tokens, where `run16` takes 128 `vpdpbusd`. The tiles read
-    /// the panel and the activations where they lie (a token per tile row). The integer sums
-    /// are `run16`'s and the float steps are the same in the same order, so the two agree bit
-    /// for bit. The caller has loaded [`TileCfg`] for `K`.
+    /// A tile of sums: a row per token, an i32 per weight row.
+    type Sums = [[i32; 16]; 16];
+
+    /// [`run16`] for `G` groups of sixteen tokens on Intel AMX: one `tdpbsud` multiplies a
+    /// chunk of the panel's 16 rows into 16 tokens, where `run16` takes 128 `vpdpbusd`. The
+    /// tiles read the panel and the activations where they lie (a token per tile row). The
+    /// integer sums are `run16`'s and the float steps are the same in the same order, so the
+    /// two agree bit for bit. The caller has loaded [`TileCfg`] for `K`.
+    ///
+    /// Tile loads and stores are slow, so two groups share a load of the weights, and a
+    /// step's sums are read only after the next step's tiles are under way (two buffers in
+    /// turn): read straight after the store, they held everything up, and this kernel was
+    /// slower than `run16`.
     #[target_feature(enable = "avx512f,avx512vnni")]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run_amx<const K: u8>(
+    unsafe fn run_amx<const K: u8, const G: usize>(
         p: &Panel16,
         j0: usize,
         n: usize,
@@ -2387,56 +2396,129 @@ mod avx2 {
         acc: &mut [__m512],
         ex: &mut [__m512],
     ) {
-        const NT: usize = 16;
         let nc = acts.n_chunks;
         let halves = if K == HALVES { 2 } else { 1 };
-        let mut sums = [[0i32; 16]; NT];
-        // SAFETY: tokens `t0..t0 + 16` and chunks `j0..j0 + n` are inside `acts`, and the panel
-        // holds `n` chunks, per the caller, who also checked for AMX and loaded the tile shapes.
+        let mut bufs = [[[[0i32; 16]; 16]; G]; 2];
+        let mut isum = [[_mm512_setzero_si512(); 16]; G];
+        // SAFETY: tokens `t0..t0 + 16 * G` and chunks `j0..j0 + n` are inside `acts`, and the
+        // panel holds `n` chunks, per the caller, who also checked for AMX and loaded the tile
+        // shapes.
         unsafe {
             let x = acts.qs.as_ptr().add((t0 * nc + j0) * QK);
-            for c in 0..n {
-                let at = |i: usize| (t0 + i) * nc + j0 + c;
-                let mut isum = [_mm512_setzero_si512(); NT];
-                for h in 0..halves {
+            for step in 0..n * halves {
+                let (c, h) = (step / halves, step % halves);
+                let x = x.add(c * QK + h * QK / 2);
+                let sums: *mut Sums = bufs[step % 2].as_mut_ptr();
+                std::arch::asm!(
+                    "tileloadd tmm2, [{w} + {line}]",
+                    "tilezero tmm0",
+                    "tileloadd tmm1, [{x} + {token}]",
+                    "tdpbsud tmm0, tmm1, tmm2",
+                    "tilestored [{sums} + {line}], tmm0",
+                    w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
+                    x = in(reg) x,
+                    token = in(reg) nc * QK,
+                    line = in(reg) 64usize,
+                    sums = in(reg) sums,
+                    out("tmm0") _,
+                    out("tmm1") _,
+                    out("tmm2") _,
+                    options(nostack),
+                );
+                if G == 2 {
                     std::arch::asm!(
-                        "tilezero tmm0",
-                        "tileloadd tmm1, [{x} + {token}]",
-                        "tileloadd tmm2, [{w} + {line}]",
-                        "tdpbsud tmm0, tmm1, tmm2",
-                        "tilestored [{sums} + {line}], tmm0",
-                        x = in(reg) x.add(c * QK + h * QK / 2),
+                        "tilezero tmm3",
+                        "tileloadd tmm4, [{x} + {token}]",
+                        "tdpbsud tmm3, tmm4, tmm2",
+                        "tilestored [{sums} + {line}], tmm3",
+                        x = in(reg) x.add(16 * nc * QK),
                         token = in(reg) nc * QK,
-                        w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
                         line = in(reg) 64usize,
-                        sums = in(reg) sums.as_mut_ptr(),
-                        out("tmm0") _,
-                        out("tmm1") _,
-                        out("tmm2") _,
+                        sums = in(reg) sums.add(1),
+                        out("tmm3") _,
+                        out("tmm4") _,
                         options(nostack),
                     );
-                    for (i, s) in isum.iter_mut().enumerate() {
-                        let mut v = _mm512_loadu_si512(sums[i].as_ptr().cast());
-                        if K != OFFSET {
-                            let mut bias = *acts.bias.get_unchecked(2 * at(i) + h);
-                            if K == SIGNED {
-                                bias += *acts.bias.get_unchecked(2 * at(i) + 1);
-                            }
-                            v = _mm512_sub_epi32(v, _mm512_set1_epi32(bias));
-                        }
-                        if K == HALVES {
-                            v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
-                        }
-                        *s = _mm512_add_epi32(*s, v);
-                    }
                 }
-                for (i, s) in isum.iter().enumerate() {
-                    let xd = _mm512_set1_ps(*acts.d.get_unchecked(at(i)));
-                    let scale = _mm512_mul_ps(*p.d.get_unchecked(c), xd);
-                    acc[t0 + i] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*s), scale, acc[t0 + i]);
-                    if K == OFFSET {
-                        let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at(i)));
-                        ex[t0 + i] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, ex[t0 + i]);
+                if step > 0 {
+                    let last = step - 1;
+                    let (c, h) = (last / halves, last % halves);
+                    settle::<K, G>(
+                        p,
+                        j0 + c,
+                        c,
+                        h,
+                        acts,
+                        t0,
+                        &bufs[last % 2],
+                        &mut isum,
+                        acc,
+                        ex,
+                    );
+                }
+            }
+            let last = n * halves - 1;
+            let (c, h) = (last / halves, last % halves);
+            settle::<K, G>(
+                p,
+                j0 + c,
+                c,
+                h,
+                acts,
+                t0,
+                &bufs[last % 2],
+                &mut isum,
+                acc,
+                ex,
+            );
+        }
+    }
+
+    /// [`run_amx`]'s arithmetic on one step's sums: chunk `c` of the panel (chunk `j` of the
+    /// row), half `h` of it for Q6_K. The float steps come with a chunk's last half.
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn settle<const K: u8, const G: usize>(
+        p: &Panel16,
+        j: usize,
+        c: usize,
+        h: usize,
+        acts: &BlockActs,
+        t0: usize,
+        sums: &[Sums; G],
+        isum: &mut [[__m512i; 16]; G],
+        acc: &mut [__m512],
+        ex: &mut [__m512],
+    ) {
+        let nc = acts.n_chunks;
+        let done = K != HALVES || h == 1;
+        // SAFETY: as in `run_amx`.
+        unsafe {
+            for (g, (sums, isum)) in sums.iter().zip(isum).enumerate() {
+                for (i, (row, s)) in sums.iter().zip(isum).enumerate() {
+                    let t = t0 + 16 * g + i;
+                    let at = t * nc + j;
+                    let mut v = _mm512_loadu_si512(row.as_ptr().cast());
+                    if K != OFFSET {
+                        let mut bias = *acts.bias.get_unchecked(2 * at + h);
+                        if K == SIGNED {
+                            bias += *acts.bias.get_unchecked(2 * at + 1);
+                        }
+                        v = _mm512_sub_epi32(v, _mm512_set1_epi32(bias));
+                    }
+                    if K == HALVES {
+                        v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
+                    }
+                    *s = _mm512_add_epi32(*s, v);
+                    if done {
+                        let xd = _mm512_set1_ps(*acts.d.get_unchecked(at));
+                        let scale = _mm512_mul_ps(*p.d.get_unchecked(c), xd);
+                        acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*s), scale, acc[t]);
+                        if K == OFFSET {
+                            let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at));
+                            ex[t] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, ex[t]);
+                        }
+                        *s = _mm512_setzero_si512();
                     }
                 }
             }
@@ -2502,12 +2584,27 @@ mod avx2 {
                             }
                         };
                     }
-                    while amx && t + 16 <= nt {
-                        match k {
-                            SIGNED => run_amx::<SIGNED>(&panel, j0, n, acts, t, &mut acc, &mut ex),
-                            OFFSET => run_amx::<OFFSET>(&panel, j0, n, acts, t, &mut acc, &mut ex),
-                            _ => run_amx::<HALVES>(&panel, j0, n, acts, t, &mut acc, &mut ex),
-                        }
+                    macro_rules! tiles {
+                        ($g:literal) => {
+                            match k {
+                                SIGNED => {
+                                    run_amx::<SIGNED, $g>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                OFFSET => {
+                                    run_amx::<OFFSET, $g>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                                _ => {
+                                    run_amx::<HALVES, $g>(&panel, j0, n, acts, t, &mut acc, &mut ex)
+                                }
+                            }
+                        };
+                    }
+                    while amx && t + 32 <= nt {
+                        tiles!(2);
+                        t += 32;
+                    }
+                    if amx && t + 16 <= nt {
+                        tiles!(1);
                         t += 16;
                     }
                     while t + 4 <= nt {
@@ -2746,8 +2843,8 @@ mod tests {
             return;
         }
         let mut rng = Rng::new(37);
-        // 35 tokens: two tiles of 16, then the AVX-512 kernel's fours and ones.
-        let (n, n_tok) = (512, 35);
+        // 51 tokens: a pair of tiles, a single one, then the AVX-512 kernel's ones.
+        let (n, n_tok) = (512, 51);
         for ty in INT_TYPES {
             let acts: Vec<Q8Act> = (0..n_tok).map(|_| Q8Act::new(&rng.vec(n))).collect();
             let Some(block) = BlockActs::new(ty, &acts) else {
