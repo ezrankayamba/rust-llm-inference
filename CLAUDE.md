@@ -230,13 +230,14 @@ Design points that span files:
   under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
   own kernels (above).
   Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
-  matmuls remain for chunks of 8-63 tokens. The 64x128 tile runs four warps of two row groups.
+  matmuls remain for chunks of 8-63 tokens. The 64x128 tile runs four warps of four row groups
+  (a read of the token tile feeds four products); it does not wait on global memory.
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
   is 10-16% ahead on all three models; decode at 2048 positions is level on Llama-3.2-1B and 2%
   ahead on Mistral-7B (2026-11-17), and prompts
-  level on Llama-3.2-1B (within its noise), 1.2x behind on Mistral-7B and 1-4% on Qwen3-30B-A3B.
+  level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

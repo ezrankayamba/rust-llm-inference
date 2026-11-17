@@ -88,6 +88,37 @@ Logits of a 541-token prompt are bit-identical on all three and the CUDA tests p
 llama.cpp, alternating with 8 s rests, two rounds, tok/s: Llama-3.2-1B 12502, 15333 against 14464,
 15784; Mistral-7B 3932, 3981 against 4638, 4919; Qwen3-30B-A3B 4043, 4142 against 4195, 4165.
 
+## 2026-11-17: the 64x128 f16 GEMM tile on four warps of four row groups
+
+A warp of `gemm_f16_64x128` now holds all 64 rows' weights for a step (four groups of 16) and
+takes a quarter of the tokens, so each read of the token tile from shared memory feeds four
+`mma.sync`, where it fed two. `bench_cuda` on the A100, f16 GEMM of 512 tokens, us:
+
+| Tile (rows, tokens, warps, row groups) | 4096x4096 | 14336x4096 | 4096x14336 |
+|---|---:|---:|---:|
+| 64, 128, 8, 1 (to 9aac7c3) | 203.1 | 596.6 | 717.5 |
+| 64, 128, 4, 2 (9aac7c3) | 181.7 | 552.4 | 631.5 |
+| 64, 128, 4, 4 (now) | 168.9 | 512.4 | 597.1 |
+| 64, 128, 2, 4 | 181.2 | 546.9 | 613.1 |
+| 128, 128, 8, 4 | 300.6 | 770.3 | 1020.7 |
+| 64, 64, 2, 4 | 195.5 | 686.6 | 682.2 |
+| 64, 64, 4, 4 | 222.3 | 773.6 | 763.7 |
+
+The register cap (80, 128, 168) made no difference to any of them, and issuing a step's reads of
+both tiles before the first store did nothing either (120.3 us both ways at 256 tokens): the
+kernel does not wait on global memory. Logits of a 541-token prompt are bit-identical on all three
+models and the CUDA tests pass. pp512 against llama.cpp (`--reps 5`, alternating with 8 s rests,
+two rounds), tok/s:
+
+| Model | rli | llama.cpp |
+|---|---:|---:|
+| Llama-3.2-1B | 13923, 16784 | 15380, 16617 |
+| Mistral-7B | 4230, 4138 | 4853, 4957 |
+| Qwen3-30B-A3B | 4258, 4270 | 4232, 4237 |
+
+Mistral-7B was 3520 this morning. What is left of its prompt: `gemm_f16` about 60%, `dequant`
+Q4_K 14%, attention 12%.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).

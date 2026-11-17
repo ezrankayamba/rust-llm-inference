@@ -1127,8 +1127,9 @@ extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong 
 }
 
 GEMM_F16(gemm_f16_64x64, 64, 64, 8, 1)
-// Four warps of two row groups each: 8-12% faster on an A100 than eight warps of one.
-GEMM_F16(gemm_f16_64x128, 64, 128, 4, 2)
+// Four warps of four row groups each, so a read of the token tile feeds four products: 14-20%
+// faster on an A100 than eight warps of one group, 5-7% than four of two.
+GEMM_F16(gemm_f16_64x128, 64, 128, 4, 4)
 
 // Eight bytes at any address, as two aligned reads (so up to 8 bytes past the end are read;
 // the weights end in slack for that).
