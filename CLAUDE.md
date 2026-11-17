@@ -88,12 +88,12 @@ Design points that span files:
   have no barrier between them: they write different rows, and the rest runs on weights the
   tiles have just read (72- and 88-token prompts 6-9% faster for it). A rest of 32 to 48 tokens
   is a 32-token tile and the few-token kernel, not a padded 64-token tile (40 tokens 1.3x
-  faster; 56 as 32 and 24 was 4% slower on Mistral-7B). The half 32-token tile of Q4_K and
-  Q6_K is llama.cpp's kernel in its own terms (`MATMUL_K32`): 32-column steps, 8 KB of
-  threadgroup memory where ours stages 12, decoders that mask quants in place. **A tile's
+  faster; 56 as 32 and 24 was 4% slower on Mistral-7B). The half 32- and 64-token tiles of Q4_K
+  and Q6_K are llama.cpp's kernel in its own terms (`MATMUL_K`; its tile is 32 tokens, ours
+  also 64): 32-column steps, 8 KB of threadgroup memory where `MATMUL` stages 12 and 16,
+  decoders that mask quants in place. **A tile's
   speed depends on the threadgroup memory it declares** (the same kernel: 811 us a dispatch
-  with 8 KB, 844 with 14; ours with 12 KB more, +16%), so count it. 49 to 64 tokens run on
-  that tile too; from about 100 the 64-token tile is ahead. A tile stages rows and tokens
+  with 8 KB, 844 with 14; ours with 12 KB more, +16%), so count it. A tile stages rows and tokens
   past the end as a repeat of row or token 0, not as zeros under a test (their results are
   never written): the test per staged value was 3.5-5% of the 32-token tile. Causal `attention_batch` also runs on the matrix units with an online
   softmax: over an f16 cache, `attention_batch_staged_<head size>` (16, 32, 64, 96, 128) stages
@@ -107,10 +107,9 @@ Design points that span files:
   The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
   y after its last step; seeding the sums with y under a run-time test ran 3x slower).
   Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
-  on Mistral-7B and Llama-3.2-1B, (2026-11-18) 32, 64 and 512 tokens level (within 1%), 56 tokens 2% ahead and 2% behind,
-  128 tokens 2% behind and 2% ahead (Llama-3.2-1B and Mistral-7B); 16, 40, 48, 72, 100, 112
-  and 200 tokens 1-35% ahead, 4, 8 and 88 between 1% behind and 12% ahead, 24 tokens 3% ahead
-  and 3.5% behind; decode
+  on Mistral-7B and Llama-3.2-1B, (2026-11-18) pp512 3-4% ahead, 56 to 200 tokens 1-16% ahead, 32 tokens level, 4 to 24
+  between 1% behind and 12% ahead except 24 tokens on Mistral-7B, 3.5% behind (40, 48, 72,
+  100 and 112 tokens were 1-35% ahead before the last tile change and not run again); decode
   (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
   matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the

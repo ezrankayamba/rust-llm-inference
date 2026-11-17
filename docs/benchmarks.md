@@ -1901,3 +1901,26 @@ before, after, llama.cpp in turn, 20 s rests, 5 reps):
 | 16 | 866.2 | 869.4 | 788.2 | 144.4 | 144.2 | 142.2 |
 | 24 | 860.9 | 848.8 | 824.2 | 137.3 | 136.5 | 141.5 |
 | 88 | 1218.6 | 1221.3 | 1237.3 | 185.3 | 185.2 | 183.8 |
+
+## 2026-11-18: the 8 KB tile at 64 tokens (`MATMUL_K` with MT = 64)
+
+The 32-token tile's layout with four token blocks a simdgroup, not two: still 32-column
+steps and 8 KB (an edge tile's output goes through it 32 tokens at a time), llama.cpp-style
+decoders. It replaces `MATMUL`'s 64-token half tile (16 KB) for Q4_K and Q6_K.
+`RLI_METAL_PROF_REPEAT=16`, Mistral-7B, 128 tokens, us per dispatch: Q4_K 2818-2855 -> 2684,
+Q6_K 3139-3165 -> 2803. With it, 49 to 64 tokens as 32-token tiles (the rule of 451b0da) lost:
+64 tokens 198.6 against 204.4 and 56 tokens 170.5 against 179.4 on Mistral-7B, level on
+Llama-3.2-1B; the rule is gone. Prompt tok/s (before = fc8b3fd; before, after, llama.cpp in
+turn, 20 s rests, 5 reps):
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 56 | 1144.3 | 1131.5 | 1092.5 | 171.6 | 179.7 | 175.2 |
+| 64 | 1285.2 | 1289.6 | 1282.2 | 198.8 | 204.4 | 199.5 |
+| 88 | 1221.4 | 1255.2 | 1230.6 | 185.1 | 187.1 | 183.8 |
+| 128 | 1370.5 | 1426.9 | 1399.8 | 202.4 | 212.8 | 201.3 |
+| 200 | 1427.0 | 1457.5 | 1278.9 | 201.2 | 206.8 | 178.7 |
+| 512 | 1441.9 | 1468.3 | 1425.9 | 195.1 | 198.8 | 191.8 |
+
+Logits of a 193-token prompt (three 64-token tiles and a one-token rest) are within 0.008 of
+the CPU's `--precise` ones.

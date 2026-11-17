@@ -147,8 +147,8 @@ fn metal_matmul_matches_cpu_matvec_per_token_for_every_supported_type() {
         unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
     // 1: a matvec; 2, 5, 12, 16 and 20: the few-token kernel (one to three 8-token tiles, always
     // f32); 30, 64: the 32- and 64-token tiles; 40: a 32-token tile, then the few-token kernel;
-    // 56, 60 and (half, Q4_K and Q6_K) 64: 32-token tiles and what is left; 70: a 64-token tile,
-    // then the few-token kernel.
+    // 56 and 60: a 64-token tile with tokens to spare; 70: a 64-token tile, then the few-token
+    // kernel.
     // Half tiles round every weight and activation to f16: about 5e-4 of each product, where
     // the fixture's products reach 10 to 40 (random K-quant scales) and 512 of them cancel to
     // sums near 1; the largest error seen was 0.05. A misplaced tile would be off by whole

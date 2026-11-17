@@ -1134,25 +1134,15 @@ impl Batch<'_> {
             .find(|(t, _)| *t == ty)
             .expect("unsupported type for Metal")
             .1;
-        // Whole tiles (of 64 tokens, but see `pair32`), a 32-token one if the few-token kernel can take what it leaves,
+        // Whole 64-token tiles, a 32-token one if the few-token kernel can take what it leaves,
         // then the rest: the few-token kernel if it is short enough, else the smallest tile
         // that holds it.
-        // 49 to 64 tokens of the types whose half 32-token tile is `MATMUL_K32` take that as
-        // their whole tile (64 tokens are two side by side): 4-6% faster than one 64-token tile on Llama-3.2-1B, level on
-        // Mistral-7B, and slower from 100 tokens.
-        let pair32 =
-            half && (49..=64).contains(&n) && matches!(ty, GgmlType::Q4_K | GgmlType::Q6_K);
-        let whole = if pair32 {
-            2
-        } else {
-            MATMUL_TILE_TOKENS.len() - 1
-        };
-        let largest = MATMUL_TILE_TOKENS[whole];
+        let largest = MATMUL_TILE_TOKENS[MATMUL_TILE_TOKENS.len() - 1];
         let full = n / largest * largest;
         let can_few = cols.is_multiple_of(64);
         // 40 tokens ran 1.3x faster that way than padded into a 64-token tile; 56 (32 and 24)
         // 4% slower on Mistral-7B.
-        let split = can_few && (32..=48).contains(&(n - full)) && !pair32;
+        let split = can_few && (32..=48).contains(&(n - full));
         let mid = if split { full + 32 } else { full };
         let rest = n - mid;
         let few = rest <= MATMUL_FEW_TOKENS && can_few;
@@ -1173,7 +1163,7 @@ impl Batch<'_> {
             (&tiles[tile], MATMUL_TILE_ROWS, tokens, MATMUL_THREADS / 32)
         };
         let full_kernel = (
-            &tiles[whole],
+            &tiles[MATMUL_TILE_TOKENS.len() - 1],
             MATMUL_TILE_ROWS,
             largest,
             MATMUL_THREADS / 32,
