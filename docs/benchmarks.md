@@ -1807,3 +1807,20 @@ products whatever it holds. Before (fcfd8a1), after, llama.cpp in turn, 20 s res
 
 A rest of 56 as 32 and 24 ran 1087 against 1051 on Llama-3.2-1B and 161.8 against 168.1 on
 Mistral-7B, so 49 to 63 stay in one 64-token tile.
+
+### Looked for and not found: the one-tile gap (32, 56 and 64 tokens)
+
+At 32 tokens both engines run one 32-token tile per 64 rows and llama.cpp is 10-14% ahead
+(1095 against 990 tok/s on Llama-3.2-1B, 187.6 against 164.6 on Mistral-7B). None of these
+accounts for it:
+
+- llama.cpp's `kernel_mul_mm` for Q4_K ported into this harness in place of
+  `matmul_h_q4_k_t32`: 1000 against 980 and 166.7 against 163.3 (2%).
+- Its graph for that prompt is the same work: 225 matmuls a pass on Mistral-7B, ours 219 and
+  the last layer's single-row matvecs.
+- Its thread count (the number of command buffers a pass is split into): 186.6-187.1 from 1 to 8.
+- A session reused across repetitions here instead of a fresh one: under 1.3%.
+- 28 or 32 tokens as a 16- or 8-token tile beside the few-token kernel: 5-22% slower than the
+  32-token tile.
+- A per-kernel profile (`RLI_METAL_PROF=1`) of the 32-token Mistral-7B prompt is 96% the two
+  tile kernels, Q6_K 17% slower per weight than Q4_K.
