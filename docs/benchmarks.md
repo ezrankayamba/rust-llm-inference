@@ -1824,3 +1824,38 @@ accounts for it:
   32-token tile.
 - A per-kernel profile (`RLI_METAL_PROF=1`) of the 32-token Mistral-7B prompt is 96% the two
   tile kernels, Q6_K 17% slower per weight than Q4_K.
+
+## 2026-11-18: the one-tile Metal gap: llama.cpp's 32-token tile, and threadgroup memory
+
+Found by timing every op inside llama.cpp (a local patch to `ggml_metal_graph_compute` that
+encodes each node in its own command buffer, as `RLI_METAL_PROF` does here, optionally 16 times
+over). Mistral-7B, 32 tokens, us per matmul dispatch:
+
+| | Q4_K alone | Q4_K repeated 16x | Q6_K repeated 16x |
+|---|---|---|---|
+| llama.cpp `kernel_mul_mm` in llama.cpp | 1060 | 772 | 873 |
+| our `matmul_h_*_t32` (12 KB staged) | 961 | 871 | 1139 |
+| ... declaring 4 KB more / 12 KB more | | 876 / 1010 | |
+| ... staged 32 columns at a time (8 KB, twice the barriers) | | 931 | |
+| llama.cpp's kernel ported here, 14 KB declared | 954 | 844 | |
+| ... 8 KB (edge output shares the staging) | | 811 | 942 |
+| ... 8 KB, our `deq16_*` decoders | | 851 | 1060 |
+
+So alone ours was the faster kernel and in sequence the slower one, which is why the earlier
+port "ran as fast as ours". `MATMUL_K32` is the 8 KB port, for Q4_K and Q6_K half tiles of 32
+tokens; 49 to 64 tokens use it too. Prompt tok/s (before = 815c673; before, after, llama.cpp
+in turn, 20 s rests, 5 reps):
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 32 | 985.8 | 1055.9 | 1091.6 | 163.8 | 180.0 | 187.0 |
+| 40 | 1012.0 | 1066.2 | 814.9 | 160.9 | 170.5 | 126.3 |
+| 48 | 1086.7 | 1126.5 | 960.2 | 166.9 | 175.6 | 150.5 |
+| 56 | 1051.1 | 1128.5 | 1127.3 | 168.2 | 169.3 | 175.1 |
+| 64 | 1208.1 | 1248.8 | 1282.6 | 192.1 | 192.3 | 196.3 |
+| 88 | 1205.8 | 1204.7 | 1243.0 | 183.0 | 183.0 | 183.7 |
+| 512 | 1426.7 | 1426.7 | 1426.2 | 194.8 | 193.1 | 192.2 |
+
+That tile as the whole tile at every length: 64 tokens 1247 against 1200 (Llama-3.2-1B) and
+191.5 against 190.9 (Mistral-7B); 100 tokens level and 2% slower; 128 tokens level and 4%
+slower; 192 and 512 tokens 3-6% slower. Hence 49 to 64 only.

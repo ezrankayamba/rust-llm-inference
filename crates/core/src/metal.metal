@@ -728,9 +728,175 @@ MATMUL_TILES(matmul_q6_k, deq16_q6_k, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_h_q4_0, deq16_q4_0, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q5_0, deq16_q5_0, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q8_0, deq16_q8_0, half, simdgroup_half8x8)
-MATMUL_TILES(matmul_h_q4_k, deq16_q4_k, half, simdgroup_half8x8)
+MATMUL(matmul_h_q4_k_t8, deq16_q4_k, half, simdgroup_half8x8, 8, 2, 1)
+MATMUL(matmul_h_q4_k_t16, deq16_q4_k, half, simdgroup_half8x8, 16, 2, 2)
+MATMUL(matmul_h_q4_k_t64, deq16_q4_k, half, simdgroup_half8x8, 64, 4, 4)
 MATMUL_TILES(matmul_h_q5_k, deq16_q5_k, half, simdgroup_half8x8)
-MATMUL_TILES(matmul_h_q6_k, deq16_q6_k, half, simdgroup_half8x8)
+MATMUL(matmul_h_q6_k_t8, deq16_q6_k, half, simdgroup_half8x8, 8, 2, 1)
+MATMUL(matmul_h_q6_k_t16, deq16_q6_k, half, simdgroup_half8x8, 16, 2, 2)
+MATMUL(matmul_h_q6_k_t64, deq16_q6_k, half, simdgroup_half8x8, 64, 4, 4)
+
+// The half 32-token tile of Q4_K and Q6_K is llama.cpp's `kernel_mul_mm`, kept in its own terms
+// (16-bit indices, a block pointer that steps, 16 weights decoded per thread and 32-column step,
+// `il` being the 16-weight chunk of a 256-weight block): timed with every dispatch repeated 16
+// times in its command buffer (Mistral-7B, 32 tokens), a Q4_K dispatch took 811 us where
+// MATMUL's 32-token tile took 871, and a Q6_K one 942 against 1139. What makes it faster:
+// - 8 KB of threadgroup memory, not 12: the same kernel with 14 KB declared took 844 us, and
+//   MATMUL's with 12 KB more, 1010. So the edge tile's output shares the staging memory.
+// - Its decoders mask the quants where they lie and put the shift into the scale. With ours
+//   (`deq16_*`) in the same kernel a dispatch took 851 and 1060 us.
+// MATMUL staged 32 columns at a time (twice the barriers, 8 KB) took 931 us, so the 64-token
+// tile keeps 64-column steps; this tile is behind it from about 100 tokens (see metal.rs).
+inline void ref_deq_q4_k(device const uchar* xb, short il, thread half4x4& reg) {
+    device const uchar* q = xb + 16;
+    device const uchar* scales = xb + 4;
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    short k = il / 2, j = is;
+    uchar2 sc = j < 4 ? uchar2(uchar(scales[j + k] & 63), uchar(scales[j + 4 + k] & 63))
+                      : uchar2(uchar((scales[j + 4 + k] & 0xF) | ((scales[j - 4 + k] & 0xc0) >> 2)),
+                               uchar((scales[j + 4 + k] >> 4) | ((scales[j + k] & 0xc0) >> 2)));
+    float d0 = float(*(device const half*)xb);
+    const float d = il < 2 ? d0 : d0 / 16.h;
+    const float mn = float(*(device const half*)(xb + 2));
+    const float dl = d * sc[0];
+    const float ml = mn * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
+}
+
+inline void ref_deq_q6_k(device const uchar* xb, short il, thread half4x4& reg) {
+    const float d_all = float(*(device const half*)(xb + 208));
+    device const ushort* ql = (device const ushort*)xb;
+    device const ushort* qh = (device const ushort*)(xb + 128);
+    device const char* scales = (device const char*)(xb + 192);
+    ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+    qh = qh + 16 * (il / 8) + 8 * (il & 1);
+    float sc = scales[(il % 2) + 2 * ((il / 2))];
+    il = (il / 2) & 3;
+    const uint kmask1 = il > 1 ? (il > 2 ? 0xC0C0C0C0 : 0x30303030) : (il > 0 ? 0x0C0C0C0C : 0x03030303);
+    const uint kmask2 = il > 1 ? 0xF0F0F0F0 : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uchar shr_h = il > 2 ? 2 : 0;
+    const uchar shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+    const uchar shr_l = il > 1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint low = (ql[2 * i] | (uint)(ql[2 * i + 1] << 16)) & kmask2;
+        const uint high = (qh[2 * i] | (uint)(qh[2 * i + 1] << 16)) & kmask1;
+        const uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 * ((half)(q & 0xFF)) - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00)) - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000)) - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
+#define MATMUL_K32(NAME, DEQ, BS) \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]], \
+                 device float* y [[buffer(2)]], constant MatmulParams& p [[buffer(3)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], \
+                 ushort tiitg [[thread_index_in_threadgroup]], \
+                 ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float sm[64 * 32]; \
+    threadgroup half* sa = (threadgroup half*)sm; \
+    threadgroup half* sb = sa + 2048; \
+    const uint MT = 32, AB = 4, BB = 2; \
+    uint tid = tiitg, sg = sgitg; \
+    uint r0 = tg.x * 64, t0 = p.tok0 + tg.y * 32; \
+    uint rb = (sg % 2) * 4, tb = (sg / 2) * 2; \
+    const short NL0 = 2, NL1 = 4, nl = 16; \
+    uint lr0 = tiitg / NL0, lr1 = tiitg / NL1; \
+    bool row_ok = r0 + lr0 < p.rows, tok_ok = t0 + lr1 < p.n; \
+    bool full = r0 + 64 <= p.rows && t0 + 32 <= p.n; \
+    const short il0 = tiitg % NL0; \
+    short il = il0; \
+    device const uchar* xb = w + p.offset + ulong(row_ok ? r0 + lr0 : 0) * p.row_bytes; \
+    const short iy = 8 * (tiitg % NL1); \
+    device const float* yv = x + ulong(tok_ok ? t0 + lr1 : 0) * p.cols + iy; \
+    device float* yp = y + ulong(t0 + 8 * tb) * p.rows + r0 + 8 * rb; \
+    simdgroup_half8x8 ma[4]; \
+    simdgroup_half8x8 mb[2]; \
+    simdgroup_float8x8 acc[8]; \
+    for (short i = 0; i < 8; i++) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.f); \
+    for (uint loop_k = 0; loop_k < p.cols; loop_k += 32) { \
+        half4x4 temp_a; \
+        DEQ(xb, il, temp_a); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        _Pragma("clang loop unroll(full)") for (short i = 0; i < 16; i++) { \
+            const short sx = 2 * il0 + i / 8; \
+            const short sy = (tiitg / NL0) / 8; \
+            const short lx = (tiitg / NL0) % 8; \
+            const short ly = i % 8; \
+            const short ib = 8 * sx + sy; \
+            *(sa + 64 * ib + 8 * ly + lx) = row_ok ? temp_a[i / 4][i % 4] : half(0); \
+        } \
+        { \
+            const short sx = (tiitg % NL1); \
+            const short sy = (tiitg / NL1) / 8; \
+            const short ly = (tiitg / NL1) % 8; \
+            const short ib = 4 * sx + sy; \
+            *(threadgroup half2x4*)(sb + 64 * ib + 8 * ly) = \
+                tok_ok ? (half2x4)(*((device float2x4*)yv)) : half2x4(0.0h); \
+        } \
+        il = (il + 2 < nl) ? il + 2 : il % 2; \
+        xb = (il < 2) ? xb + BS : xb; \
+        yv += 32; \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        threadgroup const half* lsma = (sa + 4 * 64 * (sgitg % 2)); \
+        threadgroup const half* lsmb = (sb + 2 * 64 * (sgitg / 2)); \
+        _Pragma("clang loop unroll(full)") for (short ik = 0; ik < 4; ik++) { \
+            simdgroup_barrier(mem_flags::mem_none); \
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 4; i++) \
+                simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false); \
+            simdgroup_barrier(mem_flags::mem_none); \
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; i++) \
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false); \
+            simdgroup_barrier(mem_flags::mem_none); \
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 8; i++) \
+                simdgroup_multiply_accumulate(acc[i], mb[i / 4], ma[i % 4], acc[i]); \
+            lsma += 8 * 64; \
+            lsmb += 4 * 64; \
+        } \
+    } \
+    if (full && p.add) { \
+        simdgroup_float8x8 one = simdgroup_float8x8(1.0f); \
+        for (uint j = 0; j < BB; j++) \
+            for (uint i = 0; i < AB; i++) { \
+                simdgroup_float8x8 old; \
+                simdgroup_load(old, yp + ulong(8 * j) * p.rows + 8 * i, p.rows); \
+                simdgroup_multiply_accumulate(old, acc[j * AB + i], one, old); \
+                simdgroup_store(old, yp + ulong(8 * j) * p.rows + 8 * i, p.rows); \
+            } \
+        return; \
+    } \
+    if (full) { \
+        for (uint j = 0; j < BB; j++) \
+            for (uint i = 0; i < AB; i++) \
+                simdgroup_store(acc[j * AB + i], yp + ulong(8 * j) * p.rows + 8 * i, p.rows); \
+        return; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint j = 0; j < BB; j++) \
+        for (uint i = 0; i < AB; i++) \
+            simdgroup_store(acc[j * AB + i], sm + 8 * (tb + j) * MM_R + 8 * (rb + i), MM_R); \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint e = tid; e < MM_R * MT; e += 128) { \
+        uint tt = e / MM_R, rr = e % MM_R; \
+        uint row = r0 + rr, t = t0 + tt; \
+        if (row < p.rows && t < p.n) { \
+            ulong at = ulong(t) * p.rows + row; \
+            y[at] = p.add ? y[at] + sm[tt * MM_R + rr] : sm[tt * MM_R + rr]; \
+        } \
+    } \
+}
+
+MATMUL_K32(matmul_h_q4_k_t32, ref_deq_q4_k, 144)
+MATMUL_K32(matmul_h_q6_k_t32, ref_deq_q6_k, 210)
 
 // Up to 24 tokens, with nothing staged in threadgroup memory (the layout of llama.cpp's
 // `kernel_mul_mv_mma_gen`): a lane decodes 16 weights of a 64-column chunk once and puts them

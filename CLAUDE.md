@@ -88,7 +88,12 @@ Design points that span files:
   have no barrier between them: they write different rows, and the rest runs on weights the
   tiles have just read (72- and 88-token prompts 6-9% faster for it). A rest of 32 to 48 tokens
   is a 32-token tile and the few-token kernel, not a padded 64-token tile (40 tokens 1.3x
-  faster; 56 as 32 and 24 was 4% slower on Mistral-7B). Causal `attention_batch` also runs on the matrix units with an online
+  faster; 56 as 32 and 24 was 4% slower on Mistral-7B). The half 32-token tile of Q4_K and
+  Q6_K is llama.cpp's kernel in its own terms (`MATMUL_K32`): 32-column steps, 8 KB of
+  threadgroup memory where ours stages 12, decoders that mask quants in place. **A tile's
+  speed depends on the threadgroup memory it declares** (the same kernel: 811 us a dispatch
+  with 8 KB, 844 with 14; ours with 12 KB more, +16%), so count it. 49 to 64 tokens run on
+  that tile too; from about 100 the 64-token tile is ahead. Causal `attention_batch` also runs on the matrix units with an online
   softmax: over an f16 cache, `attention_batch_staged_<head size>` (16, 32, 64, 96, 128) stages
   32 keys of K and V once for up to four query heads of a KV head; other head sizes and f32
   caches take the general kernel. Loop bounds in these kernels are compile-time constants:
@@ -100,9 +105,8 @@ Design points that span files:
   The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
   y after its last step; seeding the sums with y under a run-time test ran 3x slower).
   Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
-  on Mistral-7B and Llama-3.2-1B, 64-token prompts 4-6% behind, 32-token ones 10-12% and 56-token ones 4-7% (one tile each,
-  where llama.cpp runs two or more of 32 tokens side by side); 16, 40, 48, 72, 100, 112 and
-  200 tokens 1-28% ahead, 4 to 24 and 88 between 6% behind and 5% ahead; decode
+  on Mistral-7B and Llama-3.2-1B, 32-, 56- and 64-token prompts 2-4% behind (0-3% on 56 and 64 for Llama-3.2-1B); 16, 40,
+  48, 72, 100, 112 and 200 tokens 1-35% ahead, 4 to 24 and 88 between 6% behind and 5% ahead; decode
   (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
   matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
@@ -118,7 +122,10 @@ Design points that span files:
   vectors indexed by a loop: the compiler keeps them in memory. `Batch::start` submits a
   token's first layer while the rest is encoded.
 - **`RLI_METAL_PROF=1` times every Metal dispatch** alone in its own command buffer and prints
-  the totals per kernel when the device is dropped. A prompt is 90-97% the half-precision matmul
+  the totals per kernel when the device is dropped. Alone is not how they run: a dispatch after
+  an idle gap is 10-40% slower than in sequence, by an amount that differs per kernel
+  (llama.cpp's tile: 1060 us alone, 772 repeated; ours 961 and 871). To compare two kernels,
+  repeat each dispatch in its command buffer and divide. A prompt is 90-97% the half-precision matmul
   tiles (`matmul_h_*_t64`), so that kernel is the whole of the prompt gap to llama.cpp. A
   128-token tile on 256 threads was 5% slower than the 64-token one, which is 11% ahead of 32.
 - **Benchmark the two engines alternately with rests** (30-45 s): the second of two back-to-back
