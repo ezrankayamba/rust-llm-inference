@@ -76,7 +76,7 @@ impl Q8Act {
             let blocks = xg.as_chunks::<QK>().0;
             let mut exact = [0f32; GROUP];
             for (e, blk) in exact.iter_mut().zip(blocks) {
-                *e = blk.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+                *e = max_abs(blk) / 127.0;
             }
             let base = exact.iter().fold(0f32, |m, &e| m.max(e));
             a.unit.push(base / RATIO_MAX);
@@ -106,6 +106,23 @@ impl Q8Act {
         }
         a
     }
+}
+
+/// The largest magnitude in a block. Eight running maxima, because one is a chain through
+/// all 32 values that the compiler may not reorder (12% of a prompt on a Xeon 6975P, with
+/// the rest of the quantizer).
+#[inline(always)]
+fn max_abs(blk: &[f32; QK]) -> f32 {
+    let mut m = [0f32; 8];
+    for c in blk.as_chunks::<8>().0 {
+        for (m, v) in m.iter_mut().zip(c) {
+            let a = v.abs();
+            if a > *m {
+                *m = a;
+            }
+        }
+    }
+    m.iter().fold(0f32, |m, &v| if v > m { v } else { m })
 }
 
 /// `y.round() as i8` for `|y| < 128`. x86-64's baseline has no rounding instruction, so
