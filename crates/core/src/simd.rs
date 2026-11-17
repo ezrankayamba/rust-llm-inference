@@ -363,14 +363,14 @@ pub(crate) mod x86 {
     }
 
     /// Intel AMX int8 tiles (Sapphire Rapids onwards), on top of [`has_avx512_vnni`], and usable:
-    /// Linux hands a process the tile state only when asked. Only with `RLI_AMX=1` for now: the
-    /// tile kernel is exact but 12% slower than the AVX-512 one on Xeon 8573C and 6975P-C.
+    /// Linux hands a process the tile state only when asked. `RLI_AMX=0` turns the tile kernel
+    /// off (it gives the AVX-512 one's results exactly, 5% sooner on a Xeon 6975P-C).
     pub fn has_amx() -> bool {
         static HAS: OnceLock<bool> = OnceLock::new();
         *HAS.get_or_init(|| {
             // CPUID 7.0 EDX: AMX-TILE is bit 24, AMX-INT8 bit 25.
             has_avx512_vnni()
-                && std::env::var_os("RLI_AMX").is_some_and(|v| v == "1")
+                && std::env::var_os("RLI_AMX").is_none_or(|v| v != "0")
                 && __cpuid_count(7, 0).edx >> 24 & 3 == 3
                 && tile_permission()
         })

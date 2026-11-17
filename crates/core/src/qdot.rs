@@ -2560,10 +2560,10 @@ mod avx2 {
     /// integer sums are `run16`'s and the float steps are the same in the same order, so the
     /// two agree bit for bit. The caller has loaded [`TileCfg`] for `K`.
     ///
-    /// Tile loads and stores are slow, so two groups share a load of the weights, and a
-    /// step's sums are read only after the next step's tiles are under way (two buffers in
-    /// turn): read straight after the store, they held everything up, and this kernel was
-    /// slower than `run16`.
+    /// Tile loads and stores are slow, so two groups share a load of the weights. Every step's
+    /// sums are stored, and [`settle`] does the arithmetic on them afterwards: done per step,
+    /// with each token's float sums in memory, it took more time than the tiles (27.8 of
+    /// 52.4 ns per chunk of Q4_K on a Xeon 8573C, where `run16` took 37.7 in all).
     #[target_feature(enable = "avx512f,avx512vnni")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_amx<const K: u8, const G: usize>(
@@ -2577,128 +2577,117 @@ mod avx2 {
     ) {
         let nc = acts.n_chunks;
         let halves = if K == HALVES { 2 } else { 1 };
-        let mut bufs = [[[[0i32; 16]; 16]; G]; 2];
-        let mut isum = [[_mm512_setzero_si512(); 16]; G];
+        // Chunks between float passes: their sums (1 KB a group and step) stay in L1.
+        const PASS: usize = 8;
+        let mut bufs = [std::mem::MaybeUninit::<[Sums; G]>::uninit(); 2 * PASS];
         // SAFETY: tokens `t0..t0 + 16 * G` and chunks `j0..j0 + n` are inside `acts`, and the
         // panel holds `n` chunks, per the caller, who also checked for AMX and loaded the tile
-        // shapes.
+        // shapes. A tile store writes all of a `Sums`, so `settle` reads only what was written.
         unsafe {
-            let x = acts.qs.as_ptr().add((t0 * nc + j0) * QK);
-            for step in 0..n * halves {
-                let (c, h) = (step / halves, step % halves);
-                let x = x.add(c * QK + h * QK / 2);
-                let sums: *mut Sums = bufs[step % 2].as_mut_ptr();
-                std::arch::asm!(
-                    "tileloadd tmm2, [{w} + {line}]",
-                    "tilezero tmm0",
-                    "tileloadd tmm1, [{x} + {token}]",
-                    "tdpbsud tmm0, tmm1, tmm2",
-                    "tilestored [{sums} + {line}], tmm0",
-                    w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
-                    x = in(reg) x,
-                    token = in(reg) nc * QK,
-                    line = in(reg) 64usize,
-                    sums = in(reg) sums,
-                    out("tmm0") _,
-                    out("tmm1") _,
-                    out("tmm2") _,
-                    options(nostack),
-                );
-                if G == 2 {
+            for c0 in (0..n).step_by(PASS) {
+                let nb = PASS.min(n - c0);
+                let x = acts.qs.as_ptr().add((t0 * nc + j0) * QK);
+                for (step, buf) in bufs.iter_mut().enumerate().take(nb * halves) {
+                    let (c, h) = (c0 + step / halves, step % halves);
+                    let x = x.add(c * QK + h * QK / 2);
+                    let sums: *mut Sums = buf.as_mut_ptr().cast();
                     std::arch::asm!(
-                        "tilezero tmm3",
-                        "tileloadd tmm4, [{x} + {token}]",
-                        "tdpbsud tmm3, tmm4, tmm2",
-                        "tilestored [{sums} + {line}], tmm3",
-                        x = in(reg) x.add(16 * nc * QK),
+                        "tileloadd tmm2, [{w} + {line}]",
+                        "tilezero tmm0",
+                        "tileloadd tmm1, [{x} + {token}]",
+                        "tdpbsud tmm0, tmm1, tmm2",
+                        "tilestored [{sums} + {line}], tmm0",
+                        w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
+                        x = in(reg) x,
                         token = in(reg) nc * QK,
                         line = in(reg) 64usize,
-                        sums = in(reg) sums.add(1),
-                        out("tmm3") _,
-                        out("tmm4") _,
+                        sums = in(reg) sums,
+                        out("tmm0") _,
+                        out("tmm1") _,
+                        out("tmm2") _,
                         options(nostack),
                     );
+                    if G == 2 {
+                        std::arch::asm!(
+                            "tilezero tmm3",
+                            "tileloadd tmm4, [{x} + {token}]",
+                            "tdpbsud tmm3, tmm4, tmm2",
+                            "tilestored [{sums} + {line}], tmm3",
+                            x = in(reg) x.add(16 * nc * QK),
+                            token = in(reg) nc * QK,
+                            line = in(reg) 64usize,
+                            sums = in(reg) sums.add(1),
+                            out("tmm3") _,
+                            out("tmm4") _,
+                            options(nostack),
+                        );
+                    }
                 }
-                if step > 0 {
-                    let last = step - 1;
-                    let (c, h) = (last / halves, last % halves);
-                    settle::<K, G>(
-                        p,
-                        j0 + c,
-                        c,
-                        h,
-                        acts,
-                        t0,
-                        &bufs[last % 2],
-                        &mut isum,
-                        acc,
-                        ex,
-                    );
-                }
+                let sums = std::slice::from_raw_parts(bufs.as_ptr().cast(), nb * halves);
+                settle::<K, G>(p, j0, c0, acts, t0, sums, acc, ex);
             }
-            let last = n * halves - 1;
-            let (c, h) = (last / halves, last % halves);
-            settle::<K, G>(
-                p,
-                j0 + c,
-                c,
-                h,
-                acts,
-                t0,
-                &bufs[last % 2],
-                &mut isum,
-                acc,
-                ex,
-            );
         }
     }
 
-    /// [`run_amx`]'s arithmetic on one step's sums: chunk `c` of the panel (chunk `j` of the
-    /// row), half `h` of it for Q6_K. The float steps come with a chunk's last half.
+    /// [`run_amx`]'s arithmetic on its sums for the panel's chunks from `c0` (a `[Sums; G]` per
+    /// chunk, or per half chunk for Q6_K), a group of 16 tokens at a time with their float sums in registers, as
+    /// [`run16`] keeps its four.
     #[target_feature(enable = "avx512f,avx512vnni")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn settle<const K: u8, const G: usize>(
         p: &Panel16,
-        j: usize,
-        c: usize,
-        h: usize,
+        j0: usize,
+        c0: usize,
         acts: &BlockActs,
         t0: usize,
-        sums: &[Sums; G],
-        isum: &mut [[__m512i; 16]; G],
+        sums: &[[Sums; G]],
         acc: &mut [__m512],
         ex: &mut [__m512],
     ) {
         let nc = acts.n_chunks;
-        let done = K != HALVES || h == 1;
+        let halves = if K == HALVES { 2 } else { 1 };
+        let n = sums.len() / halves;
         // SAFETY: as in `run_amx`.
         unsafe {
-            for (g, (sums, isum)) in sums.iter().zip(isum).enumerate() {
-                for (i, (row, s)) in sums.iter().zip(isum).enumerate() {
-                    let t = t0 + 16 * g + i;
-                    let at = t * nc + j;
-                    let mut v = _mm512_loadu_si512(row.as_ptr().cast());
-                    if K != OFFSET {
-                        let mut bias = *acts.bias.get_unchecked(2 * at + h);
-                        if K == SIGNED {
-                            bias += *acts.bias.get_unchecked(2 * at + 1);
+            for g in 0..G {
+                let tg = t0 + 16 * g;
+                let mut a: [__m512; 16] = std::array::from_fn(|i| acc[tg + i]);
+                for c in 0..n {
+                    let d = *p.d.get_unchecked(c0 + c);
+                    for (i, a) in a.iter_mut().enumerate() {
+                        let at = (tg + i) * nc + j0 + c0 + c;
+                        let mut s = _mm512_setzero_si512();
+                        for h in 0..halves {
+                            let row = &sums.get_unchecked(c * halves + h)[g][i];
+                            let mut v = _mm512_loadu_si512(row.as_ptr().cast());
+                            if K != OFFSET {
+                                let mut bias = *acts.bias.get_unchecked(2 * at + h);
+                                if K == SIGNED {
+                                    bias += *acts.bias.get_unchecked(2 * at + 1);
+                                }
+                                v = _mm512_sub_epi32(v, _mm512_set1_epi32(bias));
+                            }
+                            if K == HALVES {
+                                v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c0 + c)[h]);
+                            }
+                            s = _mm512_add_epi32(s, v);
                         }
-                        v = _mm512_sub_epi32(v, _mm512_set1_epi32(bias));
-                    }
-                    if K == HALVES {
-                        v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
-                    }
-                    *s = _mm512_add_epi32(*s, v);
-                    if done {
                         let xd = _mm512_set1_ps(*acts.d.get_unchecked(at));
-                        let scale = _mm512_mul_ps(*p.d.get_unchecked(c), xd);
-                        acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*s), scale, acc[t]);
-                        if K == OFFSET {
-                            let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at));
-                            ex[t] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, ex[t]);
-                        }
-                        *s = _mm512_setzero_si512();
+                        *a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(s), _mm512_mul_ps(d, xd), *a);
                     }
+                }
+                acc[tg..tg + 16].copy_from_slice(&a);
+                if K == OFFSET {
+                    let mut e: [__m512; 16] = std::array::from_fn(|i| ex[tg + i]);
+                    for c in 0..n {
+                        let m = *p.m.get_unchecked(c0 + c);
+                        for (i, e) in e.iter_mut().enumerate() {
+                            let at = (tg + i) * nc + j0 + c0 + c;
+                            let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at));
+                            *e = _mm512_fnmadd_ps(m, xs, *e);
+                        }
+                    }
+                    ex[tg..tg + 16].copy_from_slice(&e);
                 }
             }
         }

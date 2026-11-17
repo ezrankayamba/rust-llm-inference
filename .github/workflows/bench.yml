@@ -44,7 +44,6 @@ jobs:
       MODELS: ${{ inputs.models }}
       PROFILE_RUN: ${{ inputs.profile_run }}
       CPU_FLAG: ${{ inputs.cpu_flag }}
-      RLI_AMX: "1" # the tile kernel is off without it
     steps:
       - run: |
           lscpu | grep 'Model name'
@@ -84,7 +83,6 @@ jobs:
       DEPTH: ${{ inputs.depth }}
       MODELS: ${{ inputs.models }}
       CPU_FLAG: ${{ inputs.cpu_flag }}
-      RLI_AMX: "1" # the tile kernel is off without it
     steps:
       - run: |
           lscpu | grep 'Model name'
@@ -126,6 +124,10 @@ jobs:
           for i in 1 2; do
             run base "$RUNNER_TEMP/base/target/release"
             run head target/release
+            # The same build on AVX-512, where the tile kernel would run.
+            if grep -qw amx_int8 /proc/cpuinfo; then
+              RLI_AMX=0 run "head without AMX" target/release
+            fi
           done
 
   compare:

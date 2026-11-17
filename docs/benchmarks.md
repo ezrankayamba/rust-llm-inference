@@ -137,6 +137,32 @@ Per token we run 64 tokens as fast as 512 (one 64-token tile either way) and lla
 slower than 64, so the gap at 512 (2-7%) understates the matmul's: at 64 tokens, where attention
 is small, it is 7-11%.
 
+## 2026-11-17: the AMX kernel's float arithmetic after its tile loop: on by default
+
+`time_parts` (branch `parts-1117`, run 44112265695, an AMX Xeon), ns per chunk of 16 rows of Q4_K:
+decode 54.2, panel fill 51.9, the AVX-512 loop 37.7 per 16 tokens, the AMX loop 52.4, of which
+its arithmetic alone (`settle` on sums that stay put) 27.8. On an EPYC (run 44111663158): fill
+72.2, AVX-512 loop 59.9. So the fill is 13-15% of a 128-token chunk, and a repacked copy of the
+weights could save no more than that.
+
+`settle` ran after every tile step, each token's float sums read from and written to memory.
+Now `run_amx` stores the integer sums of 8 chunks (16 KB for two groups of tokens, so they stay
+in L1) and `settle` then runs them through with 16 tokens' sums in registers, as `run16` holds
+its four. Bit-equal to AVX-512 still (`amx_block_kernel_equals_avx512_block_kernel_exactly`
+passes on the runner). Xeon 6975P-C, `Benchmark` with `base`, pp256 tok/s, two rounds:
+
+| Run | Model, threads | before | after | after, `RLI_AMX=0` |
+|---|---|---:|---:|---:|
+| 44113113405 (settle after the whole panel) | Llama-3.2-1B, 1 | 92.5, 94.5 | 103.1, 102.6 | |
+| 44114046932 (every 8 chunks, against that) | Llama-3.2-1B, 1 | 98.1, 98.3 | 110.7, 110.9 | |
+| 44114997185 (against main) | Llama-3.2-1B, 1 | 94.7, 93.1 | 118.6, 117.7 | 112.4, 111.2 |
+| 44114997185 | Llama-3.2-1B, 2 | 177.9, 167.8 | 223.8, 219.2 | 212.3, 209.0 |
+| 44114997185 | Qwen2.5-0.5B, 1 | 203.3, 206.5 | 232.2, 230.2 | 218.5, 222.4 |
+| 44114997185 | Qwen2.5-0.5B, 2 | 379.2, 373.5 | 422.5, 412.5 | 400.9, 403.8 |
+
+("before" ran the old tile kernel, `RLI_AMX=1`.) The tile kernel is 4-6% ahead of AVX-512 now,
+so it runs wherever the CPU has AMX; `RLI_AMX=0` turns it off.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
