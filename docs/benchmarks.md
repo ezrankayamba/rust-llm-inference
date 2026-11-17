@@ -186,6 +186,23 @@ decode tok/s:
 Prompts are level on AVX2 and 3-16% ahead with AVX-512. One-thread decode on Zen 4 and Zen 5 is
 0-12% behind without `--repack` (26.3 against 29.9 on the 9V74) and ahead or level with it.
 
+## 2026-11-17: Xeons with AMX against llama.cpp, the tile kernel on (33a0b92)
+
+`Benchmark` with `cpu_flag=amx_int8`, `threads=1,2`, llama.cpp's native build (its AMX path).
+Prompt / decode tok/s:
+
+| CPU (run) | Model | Threads | rli | llama.cpp |
+|---|---|---:|---:|---:|
+| Xeon 6973P-C (44122568841) | Llama-3.2-1B | 1 | 111.4 / 15.5 | 129.0 / 12.0 |
+| Xeon 6973P-C | Llama-3.2-1B | 2 | 202.5 / 27.0 | 256.3 / 22.5 |
+| Xeon 6973P-C | Qwen2.5-0.5B | 1 | 218.3 / 30.5 | 139.7 / 19.6 |
+| Xeon 6973P-C | Qwen2.5-0.5B | 2 | 395.8 / 53.4 | 276.7 / 36.9 |
+| Xeon 6975P-C (44122670519) | Llama-3.2-1B | 1 | 119.1 / 16.3 | 142.6 / 12.3 |
+| Xeon 6975P-C | Llama-3.2-1B | 2 | 218.6 / 29.5 | 278.5 / 21.9 |
+
+K-quant prompts are 1.16-1.2x behind on one thread (1.27-1.35x this morning, 1.8x before that)
+and 1.27x on two; decode is 1.2-1.35x ahead, and peak memory 862 MiB against 1661.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
