@@ -2095,28 +2095,83 @@ mod avx2 {
             self.d.clear();
             self.m.clear();
             self.hs.clear();
+            // As in [`Panel16::fill`]: a K-quant super-block's scales found once, and the rows
+            // transposed in registers.
+            let k4 = matches!(ty, GgmlType::Q4_K | GgmlType::Q5_K);
+            let (bb, start) = (ty.block_bytes(), chunks.start);
+            let (mut sd, mut sm) = ([[0f32; 8]; 8], [[0f32; 8]; 8]);
             for j in chunks {
-                let mut lanes = [[0i32; 8]; 8];
-                let (mut d, mut m, mut hs) = ([0f32; 8], [0f32; 8], [[0i16; 16]; 2]);
+                let mut w = [_mm256_setzero_si256(); 8];
+                let (mut d, mut m, mut hs) = ([0f32; 8], [0f32; 8], [[1i16; 16]; 2]);
+                let sub = j % 8;
                 for (r, row) in rows.iter().enumerate() {
-                    // SAFETY: `j` is a chunk of the row, per the caller.
-                    let (w, rd, rm, rh) = unsafe { decode(ty, row, j) };
-                    let mut bytes = [0i32; 8];
-                    // SAFETY: 32 writable bytes.
-                    unsafe { _mm256_storeu_si256(bytes.as_mut_ptr().cast(), w) };
-                    for (k, v) in bytes.into_iter().enumerate() {
-                        lanes[k][r] = v;
+                    if k4 {
+                        let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                        if sub == 0 || j == start {
+                            let (dl, dmin) = (le16(b, 0), le16(b, 2));
+                            let (sc, mn) = scales_mins_k4(&b[4..16]);
+                            for s in 0..8 {
+                                sd[s][r] = dl * (sc >> (8 * s) & 0xff) as f32;
+                                sm[s][r] = dmin * (mn >> (8 * s) & 0xff) as f32;
+                            }
+                        }
+                        // SAFETY: `b` is a whole super-block.
+                        w[r] = unsafe { k_weights(ty == GgmlType::Q5_K, b, sub) };
+                        continue;
                     }
-                    (d[r], m[r]) = (rd, rm);
+                    let rh = if ty == GgmlType::Q6_K {
+                        let b = &row[(j / 8) * bb..(j / 8 + 1) * bb];
+                        if sub == 0 || j == start {
+                            sd[0][r] = le16(b, 208);
+                        }
+                        // SAFETY: `b` is a whole super-block.
+                        let (rw, rh) = unsafe { q6_weights(b, sub) };
+                        w[r] = rw;
+                        rh
+                    } else {
+                        // SAFETY: `j` is a chunk of the row, per the caller.
+                        let (rw, rd, rm, rh) = unsafe { decode(ty, row, j) };
+                        w[r] = rw;
+                        (d[r], m[r]) = (rd, rm);
+                        rh
+                    };
                     for h in 0..2 {
                         hs[h][2 * r] = rh[h];
                         hs[h][2 * r + 1] = rh[h];
                     }
                 }
-                // SAFETY: each source holds 32 bytes.
+                if k4 {
+                    (d, m) = (sd[sub], sm[sub]);
+                } else if ty == GgmlType::Q6_K {
+                    d = sd[0];
+                }
+                // SAFETY: register operations, and `d`, `m` and `hs` hold 32 bytes each.
                 unsafe {
-                    for l in &lanes {
-                        self.w.push(_mm256_loadu_si256(l.as_ptr().cast()));
+                    let t: [__m256i; 8] = std::array::from_fn(|i| {
+                        let (a, b) = (w[i & !1], w[i | 1]);
+                        if i & 1 == 0 {
+                            _mm256_unpacklo_epi32(a, b)
+                        } else {
+                            _mm256_unpackhi_epi32(a, b)
+                        }
+                    });
+                    // u[4g + c]: i32 `c` of each 128 bits of rows 4g..4g + 4.
+                    let u: [__m256i; 8] = std::array::from_fn(|i| {
+                        let (g, c) = (4 * (i / 4), i % 4);
+                        let (a, b) = (t[g + c / 2], t[g + 2 + c / 2]);
+                        if c & 1 == 0 {
+                            _mm256_unpacklo_epi64(a, b)
+                        } else {
+                            _mm256_unpackhi_epi64(a, b)
+                        }
+                    });
+                    for c in 0..4 {
+                        self.w
+                            .push(_mm256_permute2x128_si256::<0x20>(u[c], u[4 + c]));
+                    }
+                    for c in 0..4 {
+                        self.w
+                            .push(_mm256_permute2x128_si256::<0x31>(u[c], u[4 + c]));
                     }
                     self.d.push(_mm256_loadu_ps(d.as_ptr()));
                     self.m.push(_mm256_loadu_ps(m.as_ptr()));
