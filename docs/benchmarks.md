@@ -3,6 +3,59 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: the last layer of a prompt computes one row
+
+llama.cpp's Metal matmul kernel (`kernel_mul_mm`, Q4_K, 64 rows x 32 tokens), ported into our
+harness in place of our 32-token tile, ran a 512-token Llama-3.2-1B prompt at 1207 tok/s against
+our own tile's 1206, with identical logits: its lead was not in the kernel. It was in the graph:
+with one output, llama.cpp takes the output row after the last layer's attention, so that
+layer's FFN runs on one token. We ran every layer in full.
+
+Now, in the last layer, rows whose output nothing reads get their keys and values only (CPU and
+Metal; a batch that returns no logits stops there), and the row the logits come from goes through
+the decode kernels. On CUDA those rows also keep their queries and attention, which the kernels
+take together with the keys, and skip the output projection and the FFN.
+
+Metal, M4, `bench --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -p N -n 0 -r 5`
+(v0.9.0), alternating with 35 s rests, two rounds, tok/s (before: the table of the next section):
+
+| Model | Tokens | before | after | llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 512 | 1336-1372 | 1414.0, 1421.7 | 1423.3, 1420.5 |
+| Llama-3.2-1B Q4_K_M | 64 | 1146-1169 | 1206.0, 1200.3 | 1277.9, 1283.6 |
+| Llama-3.2-1B Q4_K_M | 16 | 696-720 | 723.9, 728.0 | 786.4, 785.7 |
+| Mistral-7B Q4_K_M | 512 | 196.0 | 196.0, 194.3 | 194.5, 192.2 |
+| Mistral-7B Q4_K_M | 64 | 186.7-190.7 | 190.0, 191.4 | 198.8, 200.0 |
+| Mistral-7B Q4_K_M | 16 | 128.0 | 129.2, 129.1 | 142.0, 142.0 |
+
+Logits of a 500-token prompt moved by 0.003 (the last row is now computed by the f32 decode
+kernels, not half tiles). Level at 512 tokens; 4-6% behind at 64 and 8-9% at 16, where the output
+head (`matvec4_q6_k`, 2.1 ms on Llama-3.2-1B) is 4% and 9% of a pass.
+
+M4 CPU, Llama-3.2-1B Q4_K_M, `bench --pp 256 --tg 0 --reps 3 --threads T` against
+`llama-bench -p 256 -n 0 -r 3 -t T` (built without BLAS, Accelerate or Metal), 30 s rests, two
+rounds, tok/s:
+
+| Threads | before | after | after, `--coarse-acts` | llama.cpp |
+|---:|---:|---:|---:|---:|
+| 1 | 100.9 | 107.3, 107.5 | 123.8, 123.7 | 115.6, 115.7 |
+| 4 | 324.6 | 345.1, 345.2 | 392.4, 392.0 | 409.3, 407.9 |
+
+CUDA, A100, `bench --pp 512 --tg 128 --reps 5 --gpu-layers 999`, the two builds alternating,
+three rounds, pp512 tok/s: Mistral-7B 4191, 4190, 4161 before and 4108 (± 260), 4243, 4239
+after; Qwen3-30B-A3B 4172, 4151, 4212 and 4277, 4136 (± 314), 4168; Llama-3.2-1B too noisy to
+tell (12.9k-16.9k and 14.5k-18.1k). Decode unchanged (Mistral-7B 170.5-171.4 and 170.4-170.8).
+The CUDA tests pass there (152).
+
+Tried on the way, on Llama-3.2-1B pp512 with Metal, none kept: the dispatch grid turned so that
+neighbouring threadgroups share weight rows, as llama.cpp's is (1346-1349 tok/s against
+1335-1338); weights copied into a Metal-allocated buffer instead of the wrapped mapping (1336-1341
+against 1336-1337); the weight tile stored transposed and loaded plainly (1316-1339); a session
+whose KV buffers had been used before (64 tokens: 1212-1215 against 1204-1209). The port of
+llama.cpp's kernel gained 3% from declaring 6 KB of threadgroup memory instead of 14 KB (1246
+against 1207), but our tile staging 32 columns a step to halve its 16 KB was far slower (1161-1171):
+the extra barriers cost more.
+
 ## 2026-11-17: CUDA against llama.cpp again, and a 128-thread f16 GEMM tile
 
 A100-PCIE-40GB (EPYC 7F72 host), llama.cpp v0.9.0 `-ngl 99 -p 512 -n 128 -r 3`, ours

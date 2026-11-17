@@ -254,7 +254,7 @@ fn ffn(
     }
 }
 
-/// Queues the MoE FFN of `n` tokens over `s.xb`, adding into `s.x`. The experts are picked on
+/// Queues the MoE FFN of `n` tokens over `s.xb`, adding into the rows at `x`. The experts are picked on
 /// the GPU, so nothing waits, and every token's k chosen ones run as one id-indexed matvec per
 /// matrix: in int8 where the matrix has that kernel and `int8` is set, over `s.xq`, which holds
 /// `s.xb` quantized if `quantized`.
@@ -263,6 +263,7 @@ fn moe(
     c: &crate::config::Config,
     b: &mut Batch<'_>,
     s: &Scratch,
+    x: At<'_>,
     router: &Weight,
     experts: &[Expert],
     shared: Option<&(Weight, Expert)>,
@@ -433,11 +434,11 @@ fn moe(
         );
     }
     let w_stride = k + usize::from(shared.is_some());
-    b.moe_combine(At(&s.x, 0), tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
+    b.moe_combine(x, tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
     if let Some((_, e)) = shared {
         let out = At(&s.tmp, n * k * n_embd);
         ffn(b, s, e, out, n, false, false, false);
-        b.moe_combine(At(&s.x, 0), out, At(&s.route_w, k), w_stride, 1, n_embd, n);
+        b.moe_combine(x, out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
 }
 
@@ -469,7 +470,6 @@ impl Cuda {
         // product in f32.
         let int8 = !model.precise;
 
-        let x_at = At(&s.x, 0);
         let rope = RopeArgs {
             n_tok: n,
             n_heads: c.n_head,
@@ -486,13 +486,28 @@ impl Cuda {
             for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
                 let (k_at, v_at) = (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim));
                 let (xb, eps) = (At(&s.xb, 0), c.rms_eps);
+                // After the last layer of the model only the row the logits come from is read:
+                // there the rows before `lo` get their keys and values (and, since the kernels
+                // take queries and keys together, their attention), but no output projection
+                // and no FFN, which are nine tenths of a layer.
+                let m = if self.covers_all && l + 1 == self.layers.len() {
+                    usize::from(want_logits)
+                } else {
+                    n
+                };
+                let lo = n - m;
+                let x_at = At(&s.x, lo * n_embd);
+                // With no row to finish, the queries are left as they were: nothing reads
+                // what the rotation and the attention below make of them.
                 let qkv = [&layer.wq, &layer.wk, &layer.wv];
                 let outs = [At(&s.q, 0), k_at, v_at];
+                let skip = usize::from(m == 0);
+                let (qkv, outs) = (&qkv[skip..], &outs[skip..]);
                 // A kernel whose result feeds int8 matrices quantizes it on the way out.
-                let quant = wants_q(b, &qkv, int8);
+                let quant = wants_q(b, qkv, int8);
                 let xq = quant.then_some(&s.xq);
-                b.rmsnorm(x_at, xb, &g.attn_norm, n, n_embd, eps, xq);
-                mm_each(b, s, &qkv, xb, &outs, n, int8, quant);
+                b.rmsnorm(At(&s.x, 0), xb, &g.attn_norm, n, n_embd, eps, xq);
+                mm_each(b, s, qkv, xb, outs, n, int8, quant);
                 for (t, bias, len) in [
                     (At(&s.q, 0), &g.bq, c.q_dim()),
                     (k_at, &g.bk, kv_dim),
@@ -526,10 +541,18 @@ impl Cuda {
                     max_ctx: kv.max_ctx as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                 };
-                let quant = wants_q(b, &[&layer.wo], int8) && hd.is_multiple_of(32);
+                if m == 0 {
+                    break;
+                }
+                // The attention's quantized copy starts at row 0, so it serves only when the
+                // output projection takes every row.
+                let quant = lo == 0 && wants_q(b, &[&layer.wo], int8) && hd.is_multiple_of(32);
                 let xq = quant.then_some(&s.xq);
                 b.attention(&s.q, &kv.k[l], &kv.v[l], &s.att, &kv.scores, &p, xq);
-                mm_add(b, s, &layer.wo, At(&s.att, 0), x_at, n, int8, quant);
+                // From here on the layer's rows are the `m` from `lo`.
+                let n = m;
+                let att = At(&s.att, lo * c.q_dim());
+                mm_add(b, s, &layer.wo, att, x_at, n, int8, quant);
                 let quant = match &layer.ffn {
                     Ffn::Dense(e) => wants_q(b, &[&e.gate, &e.up], int8),
                     Ffn::Moe { experts, .. } => {
@@ -548,7 +571,9 @@ impl Cuda {
                     } => {
                         if let Some(strides) = g.expert_strides {
                             let shared = shared.as_ref();
-                            moe(c, b, s, router, experts, shared, strides, n, int8, quant);
+                            moe(
+                                c, b, s, x_at, router, experts, shared, strides, n, int8, quant,
+                            );
                             continue;
                         }
                         assert_eq!(n, 1, "CPU-routed MoE layers run one token at a time");

@@ -659,8 +659,10 @@ impl Model {
                 return Some(logits);
             }
         }
+        let n_chunks = tokens.len().div_ceil(CPU_CHUNK);
         for (i, chunk) in xs.chunks_mut(CPU_CHUNK * n_embd).enumerate() {
-            self.cpu_layers(sess, chunk, pos + i * CPU_CHUNK, first_cpu_layer);
+            let tail = usize::from(want_logits && i + 1 == n_chunks);
+            self.cpu_layers(sess, chunk, pos + i * CPU_CHUNK, first_cpu_layer, tail);
         }
         sess.tokens.extend_from_slice(tokens);
         if !want_logits {
@@ -675,8 +677,17 @@ impl Model {
 
     /// Runs layers `first..` on the CPU for the token rows in `xs` (positions `pos..`, in
     /// place), appending to their KV cache. Rows are processed together, so each weight matrix
-    /// is read once per call; one row is the decode case.
-    fn cpu_layers(&self, sess: &mut Session, xs: &mut [f32], pos: usize, first: usize) {
+    /// is read once per call; one row is the decode case. Only the last `tail` rows (0 or 1)
+    /// are needed after the last layer, which then computes just its keys and values for the
+    /// others: a prompt saves most of a layer.
+    fn cpu_layers(
+        &self,
+        sess: &mut Session,
+        xs: &mut [f32],
+        pos: usize,
+        first: usize,
+        tail: usize,
+    ) {
         let c = &self.cfg;
         let (hd, kv_dim, q_dim, n_embd) = (c.head_dim, c.kv_dim(), c.q_dim(), c.n_embd);
         let n = xs.len() / n_embd;
@@ -704,20 +715,30 @@ impl Model {
         };
 
         for (l, layer) in self.layers.iter().enumerate().skip(first) {
+            // The rows whose queries, attention and FFN this layer computes: `lo..`.
+            let m = if l + 1 == self.layers.len() { tail } else { n };
+            let lo = n - m;
+            let (q, att, tmp) = (
+                &mut q[..m * q_dim],
+                &mut att[..m * q_dim],
+                &mut tmp[..m * n_embd],
+            );
             norm_rows(&mut xb, xs, &layer.attn_norm);
-            self.matmul(&layer.wq, &xb, &mut q, n);
+            if m > 0 {
+                self.matmul(&layer.wq, &xb[lo * n_embd..], q, m);
+            }
             self.matmul(&layer.wk, &xb, &mut k, n);
             self.matmul(&layer.wv, &xb, &mut v, n);
             for (t, b, dim) in [
-                (&mut q, &layer.bq, q_dim),
-                (&mut k, &layer.bk, kv_dim),
-                (&mut v, &layer.bv, kv_dim),
+                (&mut *q, &layer.bq, q_dim),
+                (&mut k[..], &layer.bk, kv_dim),
+                (&mut v[..], &layer.bv, kv_dim),
             ] {
                 if let Some(b) = b {
                     t.chunks_exact_mut(dim).for_each(|r| ops::add_assign(r, b));
                 }
             }
-            for (t, norm) in [(&mut q, &layer.q_norm), (&mut k, &layer.k_norm)] {
+            for (t, norm) in [(&mut *q, &layer.q_norm), (&mut k[..], &layer.k_norm)] {
                 if let Some(w) = norm {
                     for h in t.chunks_exact_mut(hd) {
                         let src = h.to_vec();
@@ -726,14 +747,16 @@ impl Model {
                 }
             }
             q.par_chunks_exact_mut(q_dim)
-                .zip(k.par_chunks_exact_mut(kv_dim))
                 .enumerate()
-                .for_each(|(i, (q, k))| {
-                    rope.apply(q, c.n_head, pos + i);
-                    rope.apply(k, c.n_head_kv, pos + i);
-                });
+                .for_each(|(i, q)| rope.apply(q, c.n_head, pos + lo + i));
+            k.par_chunks_exact_mut(kv_dim)
+                .enumerate()
+                .for_each(|(i, k)| rope.apply(k, c.n_head_kv, pos + i));
             sess.k[l].push(&k);
             sess.v[l].push(&v);
+            if m == 0 {
+                break;
+            }
 
             // Causal attention, parallel over (token, head): token i sees positions 0..=pos + i.
             let (kc, vc) = (&sess.k[l], &sess.v[l]);
@@ -741,7 +764,7 @@ impl Model {
                 .zip(q.par_chunks(hd))
                 .enumerate()
                 .for_each_init(Vec::new, |scores, (j, (out, qh))| {
-                    let (i, h) = (j / c.n_head, j % c.n_head);
+                    let (i, h) = (lo + j / c.n_head, j % c.n_head);
                     let n_pos = pos + i + 1;
                     let off = (h / group) * hd;
                     scores.resize(n_pos, 0.0);
@@ -750,19 +773,21 @@ impl Model {
                     ops::softmax(scores);
                     vc.weighted_sum(off, kv_dim, scores, out);
                 });
-            self.matmul(&layer.wo, &att, &mut tmp, n);
-            ops::add_assign(xs, &tmp);
+            let xs = &mut xs[lo * n_embd..];
+            self.matmul(&layer.wo, att, tmp, m);
+            ops::add_assign(xs, tmp);
 
-            norm_rows(&mut xb, xs, &layer.ffn_norm);
+            let xb = &mut xb[..m * n_embd];
+            norm_rows(xb, xs, &layer.ffn_norm);
             match &layer.ffn {
-                Ffn::Dense(e) => self.ffn(e, &xb, &mut tmp, n),
+                Ffn::Dense(e) => self.ffn(e, xb, tmp, m),
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
-                } => self.moe(router, experts, shared.as_ref(), &xb, &mut tmp, n),
+                } => self.moe(router, experts, shared.as_ref(), xb, tmp, m),
             }
-            ops::add_assign(xs, &tmp);
+            ops::add_assign(xs, tmp);
         }
     }
 

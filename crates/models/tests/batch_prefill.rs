@@ -590,3 +590,37 @@ fn generate_releases_a_partial_match_when_cancelled() {
     assert_eq!(streamed, full.text);
     assert_eq!(out.finish, Finish::Cancelled);
 }
+
+/// A batch that returns no logits computes only keys and values in the last layer; the tokens
+/// after it must still see the same cache.
+#[test]
+fn prefill_in_two_batches_matches_one_batch() {
+    let prompt = prompt();
+    for moe in [false, true] {
+        let path = model_path("llama", 4, 2, moe);
+        let layers = if rli_models::backend::HAS_GPU {
+            vec![0, LAYERS, 1]
+        } else {
+            vec![0]
+        };
+        for gpu_layers in layers {
+            let m = load(&path, gpu_layers);
+            let whole = run(&m, &prompt, true);
+            let mut s = m.new_session(1024);
+            let (head, rest) = prompt.split_at(prompt.len() / 2);
+            assert!(m.forward_batch(&mut s, head, false).is_none());
+            let after_prompt = m.forward_batch(&mut s, rest, true).expect("logits");
+            let next = m.forward(&mut s, 7, true).expect("logits");
+            for (what, a, b) in [
+                ("prompt", &after_prompt, &whole.0),
+                ("next", &next, &whole.1),
+            ] {
+                let d = max_diff(a, b);
+                assert!(
+                    d < 1e-4,
+                    "moe {moe}, {gpu_layers} GPU layers: {what} logits: max diff {d}"
+                );
+            }
+        }
+    }
+}

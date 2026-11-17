@@ -200,9 +200,8 @@ impl Metal {
         assert!(pos + n <= kv.cap, "KV cache not reserved");
         let c = &model.cfg;
         let (hd, kv_dim, n_embd) = (c.head_dim, c.kv_dim(), c.n_embd);
-        let x_at = At(&s.x, 0);
-        let rope = |n_heads| RopeArgs {
-            n_tokens: n,
+        let rope = |n_heads, n_tokens, pos| RopeArgs {
+            n_tokens,
             n_heads,
             head_dim: hd,
             rope_dim: c.rope_dim,
@@ -218,59 +217,83 @@ impl Metal {
                 b.start(); // a token's first layer runs while the others are queued
             }
             let (k_at, v_at) = (At(&s.k, 0), At(&s.v, 0));
-            b.rmsnorm(x_at, At(&s.xb, 0), &g.attn_norm, n, n_embd, c.rms_eps);
+            // The rows whose queries, attention and FFN this layer computes, `lo..`: all of
+            // them, but after the last layer of the model only the row the logits come from
+            // is read, so there the others get just their keys and values.
+            let m = if self.covers_all && l + 1 == self.layers.len() {
+                usize::from(want_logits)
+            } else {
+                n
+            };
+            let lo = n - m;
+            let x_at = At(&s.x, lo * n_embd);
+            b.rmsnorm(
+                At(&s.x, 0),
+                At(&s.xb, 0),
+                &g.attn_norm,
+                n,
+                n_embd,
+                c.rms_eps,
+            );
             // Q, K and V read the same input and write different buffers, so they (and their
             // biases, which one token's matvec adds itself) run together.
             let qkv = [
-                (&layer.wq, At(&s.q, 0), &g.bq),
-                (&layer.wk, k_at, &g.bk),
-                (&layer.wv, v_at, &g.bv),
+                (&layer.wk, k_at, &g.bk, n, 0),
+                (&layer.wv, v_at, &g.bv, n, 0),
+                (&layer.wq, At(&s.q, 0), &g.bq, m, lo),
             ];
-            for (i, (w, out, bias)) in qkv.iter().enumerate() {
+            let qkv = &qkv[..if m == 0 { 2 } else { 3 }];
+            for (i, &(w, out, bias, rows, at)) in qkv.iter().enumerate() {
                 b.free = i > 0;
+                let x = At(&s.xb, at * n_embd);
                 match bias {
-                    Some(bias) if n == 1 => {
-                        let x = At(&s.xb, 0);
-                        b.matvec_bias(w.ty, w.rows, w.cols, w.offset, x, *out, bias.into());
+                    Some(bias) if rows == 1 => {
+                        b.matvec_bias(w.ty, w.rows, w.cols, w.offset, x, out, bias.into());
                     }
-                    _ => mm(&mut b, w, At(&s.xb, 0), *out, n),
+                    _ => mm(&mut b, w, x, out, rows),
                 }
             }
             b.free = false;
-            if n > 1 {
-                for (w, out, bias) in &qkv {
-                    if let Some(bias) = bias {
-                        b.add_bcast(*out, bias.into(), w.rows, n * w.rows);
-                        b.free = true; // the first waits for the matmuls
-                    }
+            for &(w, out, bias, rows, _) in qkv {
+                if let Some(bias) = bias.as_ref().filter(|_| rows > 1) {
+                    b.add_bcast(out, bias.into(), w.rows, rows * w.rows);
+                    b.free = true; // the first waits for the matmuls
                 }
-                b.free = false;
             }
-            if let Some(w) = &g.q_norm {
-                b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, c.rms_eps);
+            b.free = false;
+            if let Some(w) = g.q_norm.as_ref().filter(|_| m > 0) {
+                b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, m * c.n_head, hd, c.rms_eps);
             }
             if let Some(w) = &g.k_norm {
                 b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, c.rms_eps);
             }
             // Three dispatches that touch different buffers, so they run together; rotating K
             // straight into the cache saves a fourth that would have to wait for them.
-            b.rope(At(&s.q, 0), &rope(c.n_head));
-            b.free = true;
+            if m > 0 {
+                b.rope(At(&s.q, 0), &rope(c.n_head, m, pos + lo));
+                b.free = true;
+            }
             b.store_kv(v_at, &kv.v[l], pos * kv_dim, n * kv_dim);
+            b.free = true;
             if c.rope_dim == hd {
-                b.rope_store(k_at, &kv.k[l], pos * kv_dim, &rope(c.n_head_kv));
+                b.rope_store(k_at, &kv.k[l], pos * kv_dim, &rope(c.n_head_kv, n, pos));
                 b.free = false;
             } else {
-                b.rope(k_at, &rope(c.n_head_kv));
+                b.rope(k_at, &rope(c.n_head_kv, n, pos));
                 b.free = false;
                 b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
             }
+            if m == 0 {
+                break;
+            }
+            // From here on the layer's rows are the `m` from `lo`.
+            let n = m;
             if n == 1 {
                 let p = AttnParams {
                     n_head: c.n_head as u32,
                     n_kv: c.n_head_kv as u32,
                     head_dim: hd as u32,
-                    n_pos: (pos + 1) as u32,
+                    n_pos: (pos + lo + 1) as u32,
                     kv_dim: kv_dim as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                 };
@@ -313,10 +336,17 @@ impl Metal {
                     experts,
                     shared,
                 } => match g.expert_strides {
-                    Some(strides) if n == 1 => {
-                        self.moe_decode(model, &mut b, s, router, experts, shared.as_ref(), strides)
-                    }
-                    _ => b = self.moe(model, b, s, router, experts, shared.as_ref(), n),
+                    Some(strides) if n == 1 => self.moe_decode(
+                        model,
+                        &mut b,
+                        s,
+                        x_at,
+                        router,
+                        experts,
+                        shared.as_ref(),
+                        strides,
+                    ),
+                    _ => b = self.moe(model, b, s, x_at, router, experts, shared.as_ref(), n),
                 },
             }
         }
@@ -328,7 +358,7 @@ impl Metal {
         b.finish();
     }
 
-    /// Queues one token's MoE FFN over `s.xb`, adding into `s.x`, routed on the GPU so the
+    /// Queues one token's MoE FFN over `s.xb`, adding into the row at `x`, routed on the GPU so the
     /// batch needn't wait: the k chosen experts run as one id-indexed matvec per matrix.
     #[allow(clippy::too_many_arguments)]
     fn moe_decode(
@@ -336,6 +366,7 @@ impl Metal {
         model: &Model,
         b: &mut Batch<'_>,
         s: &Scratch,
+        x: At<'_>,
         router: &Weight,
         experts: &[Expert],
         shared: Option<&(Weight, Expert)>,
@@ -366,7 +397,6 @@ impl Metal {
             b.swiglu(gate, up, k * ff);
         }
         let d = &e.down;
-        let x = At(&s.x, 0);
         // The chosen experts' outputs, weighted, into the residual stream: one dispatch where
         // the type has the kernel, else a matvec per slot and the sum.
         let fused = Batch::has_matvec_swiglu(d.ty);
@@ -413,7 +443,7 @@ impl Metal {
         }
     }
 
-    /// Queues an MoE FFN over `n` rows of `s.xb`, adding into `s.x`. Routing needs the router
+    /// Queues an MoE FFN over `n` rows of `s.xb`, adding into the rows at `x`. Routing needs the router
     /// output on the CPU, so this waits for `b` once and returns a fresh batch to continue in.
     #[allow(clippy::too_many_arguments)]
     fn moe<'g>(
@@ -421,6 +451,7 @@ impl Metal {
         model: &Model,
         b: Batch<'g>,
         s: &Scratch,
+        x: At<'_>,
         router: &Weight,
         experts: &[Expert],
         shared: Option<&(Weight, Expert)>,
@@ -508,11 +539,11 @@ impl Metal {
         }
         b.free = false;
         let (ids, w) = (At(&s.route, r), At(&s.route, 2 * r));
-        b.moe_combine_rows(At(&s.x, 0), At(&s.tmp, 0), ids, w, n, n_embd, k);
+        b.moe_combine_rows(x, At(&s.tmp, 0), ids, w, n, n_embd, k);
         if let Some((_, e)) = shared {
             ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
             let (i, w) = (At(&s.route, pairs), At(&s.route, 2 * r + pairs));
-            b.scatter_axpy(At(&s.x, 0), At(&s.tmp, 0), i, w, n, n_embd);
+            b.scatter_axpy(x, At(&s.tmp, 0), i, w, n, n_embd);
         }
         b
     }

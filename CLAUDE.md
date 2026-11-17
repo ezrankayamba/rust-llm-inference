@@ -90,9 +90,10 @@ Design points that span files:
   head_dim not a multiple of 8 or above 256 falls back to one token at a time.
   The output and down projections add into the residual stream (`matmul_add`: a whole tile adds
   y after its last step; seeding the sums with y under a run-time test ran 3x slower).
-  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-16): pp512 5-7%
-  behind on Mistral-7B, Llama-3.2-1B and Qwen2.5-0.5B, 10-16% on SmolLM2-135M; 16-token
-  prompts 1.3-1.45x behind; decode ahead by 2-11% on three of those and level on Llama-3.2-1B.
+  Against llama.cpp's Metal backend on the M4 (`docs/benchmarks.md`, 2026-11-17): pp512 level
+  on Mistral-7B and Llama-3.2-1B, 64-token prompts 4-6% behind, 16-token ones 8-9%; decode
+  (2026-11-16) ahead by 2-11% on three of four models and level on Llama-3.2-1B. llama.cpp's
+  matmul kernel, ported into this harness, ran exactly as fast as ours: don't look there.
 - **Metal decode is weight streaming plus 5-9 us for every dispatch that must wait** for the
   one before it. The encoder is concurrent; `Batch` puts a barrier before each dispatch unless
   `Batch.free` says it reads nothing the ones just before it write (Q, K and V; RoPE and the
@@ -116,6 +117,11 @@ Design points that span files:
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
   route each row, then run each used expert once over the rows that picked it.
+- **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
+  they get their keys and values only, and a batch that returns no logits stops there
+  (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep
+  their queries and attention, which its kernels take with the keys). llama.cpp does the same
+  for the FFN; it was 5% of a 16-layer prompt.
 - **MoE on Metal.** Decode routes on the GPU, with no sync: `moe_topk` (one simdgroup) writes
   the k expert ids and weights, then two dispatches (expert id read from the buffer, experts
   at a fixed stride in the stacked tensor): `matvec_swiglu_id` is the k experts' gate, up and
@@ -162,7 +168,7 @@ Design points that span files:
   only because its scale arithmetic is shared by more multiplies. Against llama.cpp on the M4 CPU
   (`docs/benchmarks.md`, 2026-11-16): Qwen2.5-0.5B (Q5_0/Q8_0) prompts 2.2x ahead and decode level
   on four threads; Llama-3.2-1B (K-quants) decode level on four threads and 16% behind on one,
-  prompts 11-19% behind (llama.cpp scales activations per 256, we per 32: three float operations
+  prompts 7% behind on one thread and 16% on four (2026-11-17; llama.cpp scales activations per 256, we per 32: three float operations
   per 32 weights, row pair and token pair that it does not have). `--coarse-acts` (`Model.coarse_acts`, off by
   default) quantizes prompt activations per 256 too and runs K-quants through `rows2_coarse`: ahead of
   llama.cpp on one thread, 9% behind on four, at about twice the logit error. It has no x86 kernel: an AVX-512 one gained nothing on a Xeon 6975P. An Intel AMX block kernel (`run_amx`, tiles through inline asm, bit-equal to the AVX-512 one) runs where the CPU has it (`RLI_AMX=0` turns it off): it stores 8 chunks' integer sums, then `settle` does their float arithmetic with 16 tokens' sums in registers (done per chunk with the sums in memory it was 12% slower than AVX-512; now 5% faster on a Xeon 6975P-C). llama.cpp's AMX path, on weights it repacks at load and one activation scale per 256, keeps its K-quant prompts about 1.2x ahead on Sapphire Rapids and later Xeons; a prompt chunk here is 13% panel fill, the rest token loop, so repacking alone would not close that. GitHub runners are mostly AMD: the `Benchmark` workflow's `cpu_flag=amx_int8` stops a run at once on anything else.
