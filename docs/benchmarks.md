@@ -163,6 +163,29 @@ passes on the runner). Xeon 6975P-C, `Benchmark` with `base`, pp256 tok/s, two r
 ("before" ran the old tile kernel, `RLI_AMX=1`.) The tile kernel is 4-6% ahead of AVX-512 now,
 so it runs wherever the CPU has AMX; `RLI_AMX=0` turns it off.
 
+## 2026-11-17: x86 against llama.cpp at e92dfcd, four CPUs without AMX
+
+`Benchmark` workflow, `threads=1,2`, Llama-3.2-1B Q4_K_M, llama.cpp's native build. Prompt /
+decode tok/s:
+
+| CPU (run) | Threads | rli | rli `--repack` | llama.cpp |
+|---|---:|---:|---:|---:|
+| EPYC 7763, AVX2 (44117045976) | 1 | 49.3 / 17.9 | 49.2 / 19.5 | 49.3 / 17.3 |
+| EPYC 7763 | 2 | 96.5 / 30.9 | 96.7 / 33.5 | 96.6 / 31.9 |
+| EPYC 7763 (44117084833) | 1 | 49.3 / 18.5 | 48.9 / 19.7 | 49.0 / 17.9 |
+| EPYC 7763 | 2 | 96.8 / 33.6 | 96.7 / 35.0 | 96.6 / 32.3 |
+| Xeon 8370C, AVX-512 (44117026280) | 1 | 67.8 / 12.5 | 68.0 / 11.9 | 61.3 / 12.4 |
+| Xeon 8370C | 2 | 129.9 / 23.8 | 129.6 / 21.0 | 120.9 / 23.2 |
+| EPYC 9V74, AVX-512 (44117007792) | 1 | 97.0 / 26.3 | 96.3 / 31.8 | 83.5 / 29.9 |
+| EPYC 9V74 | 2 | 188.0 / 41.9 | 186.0 / 41.6 | 164.3 / 40.5 |
+| EPYC 9V45, AVX-512 (44117063465) | 1 | 170.1 / 34.5 | 167.4 / 36.6 | 156.0 / 37.4 |
+| EPYC 9V45 | 2 | 312.9 / 57.4 | 326.3 / 56.3 | 312.1 / 52.4 |
+| EPYC 9V45 (44117103784) | 1 | 169.8 / 34.5 | 168.4 / 36.3 | 149.8 / 34.9 |
+| EPYC 9V45 | 2 | 310.3 / 53.2 | 312.6 / 53.4 | 303.3 / 50.5 |
+
+Prompts are level on AVX2 and 3-16% ahead with AVX-512. One-thread decode on Zen 4 and Zen 5 is
+0-12% behind without `--repack` (26.3 against 29.9 on the 9V74) and ahead or level with it.
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
