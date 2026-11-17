@@ -1121,12 +1121,18 @@ impl Batch<'_> {
             .find(|(t, _)| *t == ty)
             .expect("unsupported type for Metal")
             .1;
-        // Whole 64-token tiles, then the rest: the few-token kernel if it is short enough,
-        // else the smallest tile that holds it.
+        // Whole 64-token tiles, a 32-token one if the few-token kernel can take what it leaves,
+        // then the rest: the few-token kernel if it is short enough, else the smallest tile
+        // that holds it.
         let largest = MATMUL_TILE_TOKENS[MATMUL_TILE_TOKENS.len() - 1];
         let full = n / largest * largest;
-        let rest = n - full;
-        let few = rest <= MATMUL_FEW_TOKENS && cols.is_multiple_of(64);
+        let can_few = cols.is_multiple_of(64);
+        // 40 tokens ran 1.3x faster that way than padded into a 64-token tile; 56 (32 and 24)
+        // 4% slower on Mistral-7B.
+        let split = can_few && (32..=48).contains(&(n - full));
+        let mid = if split { full + 32 } else { full };
+        let rest = n - mid;
+        let few = rest <= MATMUL_FEW_TOKENS && can_few;
         // (pipeline, rows and tokens of a threadgroup, its simdgroups)
         let rest_kernel = if few {
             let pair = &self.gpu.matmul_few;
@@ -1149,10 +1155,13 @@ impl Batch<'_> {
             largest,
             MATMUL_THREADS / 32,
         );
+        let mid_kernel = (&tiles[2], MATMUL_TILE_ROWS, 32, MATMUL_THREADS / 32);
         let free = self.free;
-        for (tok0, end, (pipeline, tile_rows, tile_tokens, groups)) in
-            [(0, full, full_kernel), (full, n, rest_kernel)]
-        {
+        for (tok0, end, (pipeline, tile_rows, tile_tokens, groups)) in [
+            (0, full, full_kernel),
+            (full, mid, mid_kernel),
+            (mid, n, rest_kernel),
+        ] {
             if tok0 == end {
                 continue;
             }

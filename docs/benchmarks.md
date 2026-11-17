@@ -1790,3 +1790,20 @@ runs as above (before, after, llama.cpp in turn, 20 s rests, 5 reps);
 llama.cpp's own switches, on its 64-token Llama-3.2-1B prompt (1276-1286 tok/s): no residency
 sets 1281-1284, no fusion 1280, no graph reordering 1250, no concurrency 1241, private buffers
 1235. None of them is the 6% it has on us there.
+
+## 2026-11-17: a Metal matmul's rest of 32 to 48 tokens as a 32-token tile and the few-token kernel
+
+Such a rest was padded into a 64-token tile, which costs its weight decode and 64 tokens of
+products whatever it holds. Before (fcfd8a1), after, llama.cpp in turn, 20 s rests, 5 reps:
+
+| Tokens | Llama-3.2-1B before | after | llama.cpp | Mistral-7B before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| 32 | 983.1 | 990.3 | 1095.2 | 164.8 | 164.6 | 187.6 |
+| 40 | 769.0 | 1012.7 | 806.4 | 122.7 | 162.0 | 127.0 |
+| 48 | 919.8 | 1092.4 | 972.8 | 146.8 | 163.3 | 151.3 |
+| 56 | 1052.2 | 1052.9 | 1126.4 | 168.3 | 168.4 | 175.2 |
+| 100 | 1062.3 | 1215.4 | 1101.5 | 159.5 | 181.3 | 159.1 |
+| 112 | 1185.2 | 1287.1 | 1230.1 | 178.4 | 188.4 | 177.5 |
+
+A rest of 56 as 32 and 24 ran 1087 against 1051 on Llama-3.2-1B and 161.8 against 168.1 on
+Mistral-7B, so 49 to 63 stay in one 64-token tile.
