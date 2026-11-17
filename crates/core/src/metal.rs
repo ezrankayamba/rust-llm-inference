@@ -100,6 +100,11 @@ const MATMUL_MIN_TOKENS: usize = 2;
 const MATMUL_TILE_ROWS: usize = 64;
 const MATMUL_TILE_TOKENS: [usize; 4] = [8, 16, 32, 64];
 const MATMUL_THREADS: usize = 128;
+/// Up to this many tokens take `matmul_few_*` (where the columns are a multiple of 64): tiles of
+/// 16 rows by 8, 16 or 24 tokens, the columns shared out among [`FEW_SIMDGROUPS`] simdgroups.
+const MATMUL_FEW_TOKENS: usize = 24;
+const FEW_ROWS: usize = 16;
+const FEW_SIMDGROUPS: usize = 8;
 /// Query heads per threadgroup of `attention_batch_staged_*` (`AG_HEADS` in metal.metal), and
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
@@ -329,6 +334,8 @@ pub struct Gpu {
     matmul: Vec<(GgmlType, Vec<Pipeline>)>,
     /// `matmul_h_*`: the same with half-precision tiles, for the quantized types.
     matmul_half: Vec<(GgmlType, Vec<Pipeline>)>,
+    /// `matmul_few_*`, for up to 8, 16 and 24 tokens.
+    matmul_few: Vec<(GgmlType, [Pipeline; 3])>,
     matvec_id: Vec<(GgmlType, Pipeline)>,
     other: Vec<(&'static str, Pipeline)>,
     /// Each pipeline's address and kernel name, for the profile.
@@ -417,6 +424,7 @@ struct MatmulParams {
     tok0: u32,
     n: u32,
     add: u32,
+    nsg: u32,
 }
 #[repr(C)]
 struct IdParams {
@@ -627,6 +635,18 @@ impl Gpu {
             .filter(|(t, _)| !matches!(t, GgmlType::F32 | GgmlType::F16))
             .map(|&(t, n)| Ok((t, tiles(&n.replace("matmul_", "matmul_h_"))?)))
             .collect::<Result<_, String>>()?;
+        let matmul_few = MATMUL_KERNELS
+            .iter()
+            .map(|&(t, n)| {
+                let name = n.replace("matmul_", "matmul_few_");
+                let few = [
+                    pipeline(&format!("{name}_r1"))?,
+                    pipeline(&format!("{name}_r2"))?,
+                    pipeline(&format!("{name}_r3"))?,
+                ];
+                Ok((t, few))
+            })
+            .collect::<Result<_, String>>()?;
         let matvec_id = MATVEC_ID_KERNELS
             .iter()
             .map(|&(t, n)| Ok((t, pipeline(n)?)))
@@ -646,6 +666,7 @@ impl Gpu {
             matvec,
             matmul,
             matmul_half,
+            matmul_few,
             matvec_id,
             other,
             kernels: kernels.into_inner(),
@@ -1100,18 +1121,40 @@ impl Batch<'_> {
             .find(|(t, _)| *t == ty)
             .expect("unsupported type for Metal")
             .1;
-        // Whole 64-token tiles, then the smallest tile that holds the rest.
+        // Whole 64-token tiles, then the rest: the few-token kernel if it is short enough,
+        // else the smallest tile that holds it.
         let largest = MATMUL_TILE_TOKENS[MATMUL_TILE_TOKENS.len() - 1];
         let full = n / largest * largest;
-        let rest = MATMUL_TILE_TOKENS
-            .iter()
-            .position(|&t| t >= n - full)
-            .expect("the rest is under the largest tile");
-        for (tok0, end, tile) in [(0, full, MATMUL_TILE_TOKENS.len() - 1), (full, n, rest)] {
+        let rest = n - full;
+        let few = rest <= MATMUL_FEW_TOKENS && cols.is_multiple_of(64);
+        // (pipeline, rows and tokens of a threadgroup, its simdgroups)
+        let rest_kernel = if few {
+            let pair = &self.gpu.matmul_few;
+            let pair = &pair.iter().find(|(t, _)| *t == ty).expect("as above").1;
+            let groups = FEW_SIMDGROUPS.min(cols / 64);
+            // No rest (a multiple of 64 tokens): this kernel is then not run.
+            let rt = rest.div_ceil(8).max(1);
+            (&pair[rt - 1], FEW_ROWS, 8 * rt, groups)
+        } else {
+            let tile = MATMUL_TILE_TOKENS
+                .iter()
+                .position(|&t| t >= rest)
+                .expect("the rest is under the largest tile");
+            let tokens = MATMUL_TILE_TOKENS[tile];
+            (&tiles[tile], MATMUL_TILE_ROWS, tokens, MATMUL_THREADS / 32)
+        };
+        let full_kernel = (
+            &tiles[MATMUL_TILE_TOKENS.len() - 1],
+            MATMUL_TILE_ROWS,
+            largest,
+            MATMUL_THREADS / 32,
+        );
+        for (tok0, end, (pipeline, tile_rows, tile_tokens, groups)) in
+            [(0, full, full_kernel), (full, n, rest_kernel)]
+        {
             if tok0 == end {
                 continue;
             }
-            let pipeline = &tiles[tile];
             self.enc.borrow().setComputePipelineState(pipeline);
             // SAFETY: weights buffer bound read-only at offset 0; the kernel adds `offset`.
             unsafe { self.enc.borrow().setBuffer_offset_atIndex(Some(wbuf), 0, 0) };
@@ -1127,13 +1170,11 @@ impl Batch<'_> {
                     tok0: tok0 as u32,
                     n: end as u32,
                     add: add as u32,
+                    nsg: groups as u32,
                 },
             );
-            let grid = (
-                rows.div_ceil(MATMUL_TILE_ROWS),
-                (end - tok0).div_ceil(MATMUL_TILE_TOKENS[tile]),
-            );
-            self.dispatch2(pipeline, grid, MATMUL_THREADS);
+            let grid = (rows.div_ceil(tile_rows), (end - tok0).div_ceil(tile_tokens));
+            self.dispatch2(pipeline, grid, 32 * groups);
         }
     }
 

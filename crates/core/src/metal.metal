@@ -572,6 +572,7 @@ struct MatmulParams {
     uint tok0;        // first token of this dispatch
     uint n;           // tokens in x
     uint add;         // add into y instead of overwriting it
+    uint nsg;         // matmul_few: simdgroups per threadgroup
 };
 
 // A tile step's weights for one thread: 16 of chunk c and the same 16 of chunk c + 1 (c even).
@@ -730,6 +731,103 @@ MATMUL_TILES(matmul_h_q8_0, deq16_q8_0, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q4_k, deq16_q4_k, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q5_k, deq16_q5_k, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q6_k, deq16_q6_k, half, simdgroup_half8x8)
+
+// Up to 24 tokens, with nothing staged in threadgroup memory (the layout of llama.cpp's
+// `kernel_mul_mv_mma_gen`): a lane decodes 16 weights of a 64-column chunk once and puts them
+// into the weight matrix through its own two elements, so a step has no barrier, which is what
+// a tile of few tokens spends its time on. A threadgroup takes 16 rows and 8 * RT tokens; its
+// simdgroups share out the chunks and their sums are added at the end. Lane l holds row
+// `few_fm(l)` and columns `few_fn(l)` and the next of an 8x8 simdgroup matrix. f32 throughout.
+// Four token tiles (32 tokens) ran 20% slower than the 32-token tile kernel.
+inline uint few_fm(uint l) { return ((l / 4) & 4) + ((l / 2) % 4); }
+inline uint few_fn(uint l) { return ((l / 4) & 2) * 2 + (l % 2) * 2; }
+// Unrolled, the arrays below are registers.
+#define FEW_UNROLL _Pragma("clang loop unroll(full)") for
+constant uint FEW_NT = 2;       // 8-row tiles per threadgroup
+constant uint FEW_NSG_MAX = 8;  // FEW_SIMDGROUPS in metal.rs
+
+#define MATMUL_FEW(NAME, DEQ, RT)                                                             \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant MatmulParams& p [[buffer(3)]],      \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint lane [[thread_index_in_simdgroup]],                                     \
+                 uint sg [[simdgroup_index_in_threadgroup]]) {                                \
+    threadgroup float red[FEW_NSG_MAX * RT * FEW_NT * 64];                                    \
+    uint fm = few_fm(lane), fn = few_fn(lane);                                                \
+    uint r0 = tg.x * 8 * FEW_NT, t0 = p.tok0 + tg.y * 8 * RT;                                 \
+    /* Rows and tokens past the end repeat the last one; their results are not written. */    \
+    device const uchar* wr[FEW_NT];                                                           \
+    FEW_UNROLL (uint t = 0; t < FEW_NT; t++)                                                  \
+        wr[t] = w + p.offset + ulong(min(r0 + 8 * t + fm, p.rows - 1)) * p.row_bytes;         \
+    device const packed_float4* xr[RT][2];                                                    \
+    FEW_UNROLL (uint rt = 0; rt < RT; rt++)                                                   \
+        FEW_UNROLL (uint e = 0; e < 2; e++)                                                   \
+            xr[rt][e] = (device const packed_float4*)(x                                       \
+                + ulong(min(t0 + 8 * rt + fn + e, p.n - 1)) * p.cols + 16 * (fm / 2) + 8 * (fm % 2)); \
+    simdgroup_float8x8 mc[RT][FEW_NT];                                                        \
+    FEW_UNROLL (uint rt = 0; rt < RT; rt++)                                                   \
+        FEW_UNROLL (uint t = 0; t < FEW_NT; t++)                                              \
+            mc[rt][t] = make_filled_simdgroup_matrix<float, 8>(0.0f);                         \
+    uint nch = p.cols / 64;                                                                   \
+    for (uint g = sg; g < nch; g += p.nsg) {                                                  \
+        /* Step k of matrix column j is chunk value 16 * (j / 2) + 8 * (j % 2) + k. */        \
+        simdgroup_float8x8 mb[RT][8];                                                         \
+        FEW_UNROLL (uint rt = 0; rt < RT; rt++) {                                             \
+            float4 a0 = float4(xr[rt][0][16 * g]), a1 = float4(xr[rt][0][16 * g + 1]);        \
+            float4 b0 = float4(xr[rt][1][16 * g]), b1 = float4(xr[rt][1][16 * g + 1]);        \
+            FEW_UNROLL (uint k = 0; k < 4; k++) {                                             \
+                mb[rt][k].thread_elements()[0] = a0[k];                                       \
+                mb[rt][k].thread_elements()[1] = b0[k];                                       \
+                mb[rt][k + 4].thread_elements()[0] = a1[k];                                   \
+                mb[rt][k + 4].thread_elements()[1] = b1[k];                                   \
+            }                                                                                 \
+        }                                                                                     \
+        uint ci = 4 * g + fn / 2; /* in 16 weights */                                         \
+        FEW_UNROLL (uint t = 0; t < FEW_NT; t++) {                                            \
+            float4 wv[4];                                                                     \
+            DEQ(wr[t], ci / 2, (ci % 2) * 16, wv);                                            \
+            FEW_UNROLL (uint k = 0; k < 8; k++) {                                             \
+                simdgroup_float8x8 ma;                                                        \
+                ma.thread_elements()[0] = wv[k / 4][k % 4];                                   \
+                ma.thread_elements()[1] = wv[k / 4 + 2][k % 4];                               \
+                FEW_UNROLL (uint rt = 0; rt < RT; rt++)                                       \
+                    simdgroup_multiply_accumulate(mc[rt][t], ma, mb[rt][k], mc[rt][t]);       \
+            }                                                                                 \
+        }                                                                                     \
+    }                                                                                         \
+    FEW_UNROLL (uint rt = 0; rt < RT; rt++)                                                   \
+        FEW_UNROLL (uint t = 0; t < FEW_NT; t++) {                                            \
+            uint at = ((sg * RT + rt) * FEW_NT + t) * 64 + 2 * lane;                          \
+            red[at] = mc[rt][t].thread_elements()[0];                                         \
+            red[at + 1] = mc[rt][t].thread_elements()[1];                                     \
+        }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+    for (uint idx = sg * 32 + lane; idx < RT * FEW_NT * 64; idx += p.nsg * 32) {              \
+        float sum = 0.0f;                                                                     \
+        for (uint i = 0; i < p.nsg; i++) sum += red[i * (RT * FEW_NT * 64) + idx];            \
+        uint rt = idx / (FEW_NT * 64), t = (idx / 64) % FEW_NT, l = (idx % 64) / 2;           \
+        uint row = r0 + 8 * t + few_fm(l), tok = t0 + 8 * rt + few_fn(l) + idx % 2;           \
+        if (row < p.rows && tok < p.n) {                                                      \
+            ulong at = ulong(tok) * p.rows + row;                                             \
+            y[at] = p.add ? y[at] + sum : sum;                                                \
+        }                                                                                     \
+    }                                                                                         \
+}
+
+// matmul_few_<type>_r<8-token tiles>.
+#define MATMUL_FEW_SHAPES(NAME, DEQ)                                                          \
+MATMUL_FEW(NAME##_r1, DEQ, 1)                                                                 \
+MATMUL_FEW(NAME##_r2, DEQ, 2)                                                                 \
+MATMUL_FEW(NAME##_r3, DEQ, 3)
+
+MATMUL_FEW_SHAPES(matmul_few_f32, deq16_f32)
+MATMUL_FEW_SHAPES(matmul_few_f16, deq16_f16)
+MATMUL_FEW_SHAPES(matmul_few_q4_0, deq16_q4_0)
+MATMUL_FEW_SHAPES(matmul_few_q5_0, deq16_q5_0)
+MATMUL_FEW_SHAPES(matmul_few_q8_0, deq16_q8_0)
+MATMUL_FEW_SHAPES(matmul_few_q4_k, deq16_q4_k)
+MATMUL_FEW_SHAPES(matmul_few_q5_k, deq16_q5_k)
+MATMUL_FEW_SHAPES(matmul_few_q6_k, deq16_q6_k)
 
 // ---- Elementwise / normalization / attention kernels for running whole layers on the GPU ----
 
