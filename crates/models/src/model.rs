@@ -173,7 +173,7 @@ pub struct Model {
     pub precise: bool,
     /// Quantize the CPU layers' prompt activations with one scale per 256 values, as llama.cpp
     /// does, instead of one per 32 (`--coarse-acts`): faster for K-quants on ARM (13% per
-    /// matmul on an M4) and with AVX-512 VNNI, less accurate. Decode is not affected, nor is `precise`.
+    /// matmul on an M4), less accurate. Decode is not affected, nor is `precise`.
     pub coarse_acts: bool,
     /// Interleaved copies of weights ([`Model::repack`]), by file offset and row count.
     packed: HashMap<(usize, usize), Vec<u8>>,

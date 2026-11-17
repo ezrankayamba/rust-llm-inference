@@ -161,7 +161,7 @@ Design points that span files:
   prompts 11-19% behind (llama.cpp scales activations per 256, we per 32: three float operations
   per 32 weights, row pair and token pair that it does not have). `--coarse-acts` (`Model.coarse_acts`, off by
   default) quantizes prompt activations per 256 too and runs K-quants through `rows2_coarse`: ahead of
-  llama.cpp on one thread, 9% behind on four, at about twice the logit error. On x86 only the AVX-512 kernel has a coarse path (`run16_coarse`).
+  llama.cpp on one thread, 9% behind on four, at about twice the logit error. It has no x86 kernel: an AVX-512 one gained nothing on a Xeon 6975P.
 - **CUDA kernels keep a warp's reads adjacent.** Each of a warp's 32 lanes takes the next weight
   and the next value of x: `wt_*` decodes one weight per lane (the matmuls), `sb_*` 8 weights per
   lane, 256 per step, so a block's scales are decoded once (the quantized matvecs). Lanes that

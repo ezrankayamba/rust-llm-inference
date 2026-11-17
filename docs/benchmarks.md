@@ -3,6 +3,24 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: x86 on an Intel Xeon 6975P-C, and an AVX-512 coarse path that did nothing (run 44063716638)
+
+Same workflow at ebd2672, which gave `run16` a variant for `--coarse-acts` (a chunk's sum times the
+rows' scale, a group's times the activations' once). The runner was an Intel Xeon 6975P-C (AVX-512
+VNNI, AMX), 4 logical CPUs. Prompt / decode tok/s:
+
+| Model | Threads | rli | rli `--coarse-acts` | llama.cpp native | llama.cpp AVX2 build |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B Q4_K_M | 1 | 163.0 / 32.1 | 164.5 / 31.5 | 137.5 / 20.7 | 92.1 / 15.3 |
+| Qwen2.5-0.5B Q4_K_M | 2 | 301.9 / 56.4 | 304.6 / 56.6 | 272.2 / 40.1 | 178.9 / 26.5 |
+| Llama-3.2-1B Q4_K_M | 1 | 78.6 / 15.8 | 77.7 / 16.1 | 144.2 / 12.4 | 61.0 / 14.9 |
+| Llama-3.2-1B Q4_K_M | 2 | 156.0 / 29.5 | 152.7 / 29.7 | 285.9 / 22.8 | 120.7 / 24.5 |
+
+The coarse path changed nothing (77.7 against 78.6), so it was removed again; it was never measured
+on AMD. On this CPU Llama-3.2-1B prompts are 1.8x behind llama.cpp's native build, against 1.2x on
+the EPYC 9V45 below: llama.cpp is as fast on both (144 and 148), rli is not (79 and 124). Decode is
+ahead on both models, and Qwen prompts are.
+
 ## 2026-11-17: x86 against llama.cpp at 58ff301 (run 44060706489)
 
 `Benchmark` workflow, `threads=1,2`, llama.cpp v0.9.0 built both ways. AMD EPYC 9V45 (AVX-512
@@ -40,8 +58,8 @@ batched; top-1 the same in every case):
 | Qwen2.5-0.5B Q4_K_M | 1 | 274.5 | 283.3 | 117.2 | 0.37 | 0.78 |
 | Qwen2.5-0.5B Q4_K_M | 4 | 864.8 | 882.3 | 372.7 | | |
 
-On x86 only the AVX-512 VNNI block kernel has a coarse path (`run16_coarse`, added after these
-runs); with AVX2 alone the flag changes the quantization and nothing else.
+On x86 the flag only changes the quantization: the kernels there have no coarse path (one for
+AVX-512 was tried and removed, see the x86 entry of this date), so it costs accuracy for nothing.
 
 More threads, Llama-3.2-1B Q4_K_M (`--pp 128 --tg 32 --reps 3`; llama.cpp `-t N -p 128 -n 32 -r 3`).
 The M4 has 4 performance and 6 efficiency cores; rli defaults to one thread per logical core (10),

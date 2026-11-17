@@ -40,10 +40,7 @@ pub struct Q8Act {
     sum: Vec<f32>,
     qs: Vec<i8>,
     /// Made by [`Q8Act::coarse`]: every block of a group has the group's scale.
-    #[cfg_attr(
-        not(any(target_arch = "x86_64", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // only the NEON kernel asks
     coarse: bool,
 }
 
@@ -1893,8 +1890,6 @@ mod avx2 {
         /// For the AVX-512 kernel (empty without it): 128 times the sum of each half chunk's
         /// 16 values, which is what biasing signed weights by 128 adds to a half's products.
         bias: Vec<i32>,
-        /// Every token is [`Q8Act::coarse`]: a group of chunks has one scale.
-        coarse: bool,
     }
 
     impl BlockActs {
@@ -1911,7 +1906,6 @@ mod avx2 {
                 d: Vec::with_capacity(acts.len() * n_chunks),
                 sum: Vec::with_capacity(acts.len() * n_chunks),
                 bias: Vec::new(),
-                coarse: acts.iter().all(|a| a.coarse),
             };
             for a in acts {
                 assert!(a.d.len() == n_chunks && a.qs.len() == n_chunks * QK);
@@ -2357,89 +2351,6 @@ mod avx2 {
         ex[t0..t0 + NT].copy_from_slice(&e);
     }
 
-    /// [`run16`] when a group of chunks shares one activation scale ([`Q8Act::coarse`]). A
-    /// chunk's sum is multiplied by the rows' scale alone, the group's by the activations' once,
-    /// which spares every chunk and token a broadcast and a multiply; chunks without an integer
-    /// scale per half also keep one sum, not two. Not bit-equal to [`run16`].
-    #[target_feature(enable = "avx512f,avx512vnni")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn run16_coarse<const K: u8, const NT: usize>(
-        p: &Panel16,
-        j0: usize,
-        n: usize,
-        acts: &BlockActs,
-        t0: usize,
-        acc: &mut [__m512],
-        ex: &mut [__m512],
-    ) {
-        let nc = acts.n_chunks;
-        let zero = _mm512_setzero_si512();
-        let mut a: [__m512; NT] = std::array::from_fn(|i| acc[t0 + i]);
-        let mut e: [__m512; NT] = std::array::from_fn(|i| ex[t0 + i]);
-        // SAFETY: tokens `t0..t0 + NT` and chunks `j0..j0 + n` are inside `acts`, and the panel
-        // holds `n` chunks, per the caller.
-        unsafe {
-            let x: [*const i8; NT] =
-                std::array::from_fn(|i| acts.qs.as_ptr().add(((t0 + i) * nc + j0) * QK));
-            // The group's chunks, each times its rows' scale.
-            let mut group = [_mm512_setzero_ps(); NT];
-            for c in 0..n {
-                let at = |i: usize| (t0 + i) * nc + j0 + c;
-                let mut isum = [zero; NT];
-                if K == HALVES {
-                    for h in 0..2 {
-                        let mut half = [zero; NT];
-                        for k in 4 * h..4 * h + 4 {
-                            let w = *p.w.get_unchecked(8 * c + k);
-                            for i in 0..NT {
-                                let g = x[i].add(c * QK + 4 * k).cast::<i32>().read_unaligned();
-                                half[i] = _mm512_dpbusd_epi32(half[i], w, _mm512_set1_epi32(g));
-                            }
-                        }
-                        for i in 0..NT {
-                            let bias = *acts.bias.get_unchecked(2 * at(i) + h);
-                            let v = _mm512_sub_epi32(half[i], _mm512_set1_epi32(bias));
-                            let v = _mm512_mullo_epi32(v, p.hs.get_unchecked(c)[h]);
-                            isum[i] = _mm512_add_epi32(isum[i], v);
-                        }
-                    }
-                } else {
-                    for k in 0..8 {
-                        let w = *p.w.get_unchecked(8 * c + k);
-                        for i in 0..NT {
-                            let g = x[i].add(c * QK + 4 * k).cast::<i32>().read_unaligned();
-                            isum[i] = _mm512_dpbusd_epi32(isum[i], w, _mm512_set1_epi32(g));
-                        }
-                    }
-                    if K == SIGNED {
-                        for (i, v) in isum.iter_mut().enumerate() {
-                            let bias = *acts.bias.get_unchecked(2 * at(i))
-                                + *acts.bias.get_unchecked(2 * at(i) + 1);
-                            *v = _mm512_sub_epi32(*v, _mm512_set1_epi32(bias));
-                        }
-                    }
-                }
-                let last = (j0 + c) % GROUP == GROUP - 1 || c == n - 1;
-                for i in 0..NT {
-                    let d = *p.d.get_unchecked(c);
-                    group[i] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(isum[i]), d, group[i]);
-                    if K == OFFSET {
-                        let xs = _mm512_set1_ps(*acts.sum.get_unchecked(at(i)));
-                        e[i] = _mm512_fnmadd_ps(*p.m.get_unchecked(c), xs, e[i]);
-                    }
-                    if last {
-                        // Every chunk of the group has this chunk's activation scale.
-                        let xd = _mm512_set1_ps(*acts.d.get_unchecked(at(i)));
-                        a[i] = _mm512_fmadd_ps(group[i], xd, a[i]);
-                        group[i] = _mm512_setzero_ps();
-                    }
-                }
-            }
-        }
-        acc[t0..t0 + NT].copy_from_slice(&a);
-        ex[t0..t0 + NT].copy_from_slice(&e);
-    }
-
     /// The AVX-512 VNNI block kernel: [`dot_block8`] with rows in sixteens.
     #[target_feature(enable = "avx512f,avx512vnni,avx2,fma,f16c")]
     pub(super) unsafe fn dot_block16(
@@ -2478,25 +2389,16 @@ mod avx2 {
                     let mut t = 0;
                     macro_rules! go {
                         ($nt:literal) => {
-                            match (k, acts.coarse) {
-                                (SIGNED, false) => {
+                            match k {
+                                SIGNED => {
                                     run16::<SIGNED, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
                                 }
-                                (OFFSET, false) => {
+                                OFFSET => {
                                     run16::<OFFSET, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
                                 }
-                                (_, false) => {
+                                _ => {
                                     run16::<HALVES, $nt>(&panel, j0, n, acts, t, &mut acc, &mut ex)
                                 }
-                                (SIGNED, true) => run16_coarse::<SIGNED, $nt>(
-                                    &panel, j0, n, acts, t, &mut acc, &mut ex,
-                                ),
-                                (OFFSET, true) => run16_coarse::<OFFSET, $nt>(
-                                    &panel, j0, n, acts, t, &mut acc, &mut ex,
-                                ),
-                                (_, true) => run16_coarse::<HALVES, $nt>(
-                                    &panel, j0, n, acts, t, &mut acc, &mut ex,
-                                ),
                             }
                         };
                     }
