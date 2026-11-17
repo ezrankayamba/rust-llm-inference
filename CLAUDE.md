@@ -107,7 +107,8 @@ Design points that span files:
   token's first layer while the rest is encoded.
 - **`RLI_METAL_PROF=1` times every Metal dispatch** alone in its own command buffer and prints
   the totals per kernel when the device is dropped. A prompt is 90-97% the half-precision matmul
-  tiles (`matmul_h_*_t64`), so that kernel is the whole of the prompt gap to llama.cpp.
+  tiles (`matmul_h_*_t64`), so that kernel is the whole of the prompt gap to llama.cpp. A
+  128-token tile on 256 threads was 5% slower than the 64-token one, which is 11% ahead of 32.
 - **Benchmark the two engines alternately with rests** (30-45 s): the second of two back-to-back
   runs is slower by several percent from heat alone, and anything else using the GPU (an
   animated wallpaper) shows up as noise.
