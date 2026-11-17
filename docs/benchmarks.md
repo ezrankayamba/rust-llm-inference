@@ -3,6 +3,42 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: x86 prompts: results written in place, rounding without a call (7559c77)
+
+A profile of a Qwen2.5-0.5B prompt on a Xeon 6975P-C (`Benchmark` workflow, `profile=true`,
+`profile_run="--pp 256 --tg 0 --reps 3"`, run 44072280829) had the block kernel at 42% and its
+weight decode at 10%; transposing each matmul's [row][token] result took 16%, and quantizing
+activations 14% (`roundf` is a call per value on x86-64's baseline). Tasks now write their rows into
+the output, and x86 rounds from a truncation. Run 44072998317 (`base=6f3e480`, AMD EPYC 9V74), pp256
+tok/s, both alternations:
+
+| Model | Threads | Before | After |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B Q4_K_M | 1 | 178.1, 175.7 | 188.8, 185.4 |
+| Qwen2.5-0.5B Q4_K_M | 2 | 335.2, 336.9 | 364.3, 351.5 |
+| Llama-3.2-1B Q4_K_M | 1 | 84.3, 84.7 | 86.4, 86.9 |
+| Llama-3.2-1B Q4_K_M | 2 | 161.7, 164.6 | 170.2, 167.1 |
+
+So 4-8% on Qwen and 2-5% on Llama-3.2-1B there, less than the Intel profile's shares; not yet
+measured on Intel. M4, Llama-3.2-1B pp128 on 4 threads: 331 tok/s, was 330.
+
+## 2026-11-17: an Intel AMX block kernel, exact but slower (opt-in, `RLI_AMX=1`)
+
+llama.cpp's lead on Xeon prompts (below) is its AMX kernels. `run_amx` multiplies a chunk of 16
+weight rows into 16 tokens with one `tdpbsud`, on the AVX-512 kernel's panel and float steps. It
+agrees with that kernel bit for bit on a Xeon Platinum 8573C and a 6975P-C, and is slower
+(`base=4e08472`, `cpu_flag=amx_int8`, one thread, 6975P-C unless noted):
+
+| | AVX-512 | AMX, c6f7bdd (run 44069875416, 8573C) | AMX, e80d25a (run 44071369144) |
+|---|---:|---:|---:|
+| Q4_K matmul n=64, ms | 8.58-8.85 | 9.96 (base 8.65) | 9.70 |
+| Q6_K matmul n=64, ms | 9.59-9.73 | 12.32 (base 9.72) | 11.88-12.49 |
+| Llama-3.2-1B pp256, tok/s | 79.4-80.6 | 70.6 (base 83.1) | 68.6-70.7 |
+
+e80d25a shares a weight tile between two groups of tokens and reads a step's sums after the next
+step's tiles are issued, as llama.cpp does; it changed little, so the cost is elsewhere and not yet
+found. Off unless `RLI_AMX=1`.
+
 ## 2026-11-17: x86 on an Intel Xeon 6975P-C, and an AVX-512 coarse path that did nothing (run 44063716638)
 
 Same workflow at ebd2672, which gave `run16` a variant for `--coarse-acts` (a chunk's sum times the
