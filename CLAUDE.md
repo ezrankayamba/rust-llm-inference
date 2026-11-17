@@ -174,7 +174,8 @@ Design points that span files:
   launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
   a KV head and 32 positions per block, scoring the query heads that share the KV head
   together, and `attention_merge` combines the blocks (decode at 2048 positions: Mistral-7B
-  71 -> 107 tok/s); under 128 the second launch costs more than it saves. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
+  71 -> 107 tok/s). A thread of either issues all its reads of K, V or the parts before its
+  first barrier, since K, softmax, then V was three waits on memory in a row (142 -> 153 tok/s); under 128 the second launch costs more than it saves. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
   `moe_topk` takes a warp per token, then every token's k experts run as grid rows of one launch
   per matrix (each matvec kernel takes an expert id per row, `Batch::matvec_id`), so a (token,
   expert) pair decodes its expert's weights again. Chunks of 64+ tokens (`MOE_GROUP_TOKENS`)
@@ -232,7 +233,8 @@ Design points that span files:
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
-  is 10-16% ahead on all three models; decode at 2048 positions is 6-11% behind, and prompts
+  is 10-16% ahead on all three models; decode at 2048 positions is level on Llama-3.2-1B and 2%
+  ahead on Mistral-7B (2026-11-17), and prompts
   level on Llama-3.2-1B (within its noise), 1.4x behind on Mistral-7B and 1.1x on Qwen3-30B-A3B.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per

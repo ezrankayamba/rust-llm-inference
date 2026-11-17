@@ -1566,6 +1566,8 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
 #define AP_T 256
 #define AP_G 8   // AP_T / 32: a warp per query head in the softmax
 #define AP_B 8   // reads issued together
+#define AP_V 16  // values of V a thread reads at the start
+#define AP_M 32  // values of the parts a merging thread reads at the start
 #define AP_PARTS 2048
 
 extern "C" __global__ void attention_part(const float* q, const float* kc, const float* vc,
@@ -1579,25 +1581,31 @@ extern "C" __global__ void attention_part(const float* q, const float* kc, const
     uint g_n = n_head / n_kv, h0 = blockIdx.x * g_n;
     uint base = blockIdx.y * 32, cnt = min(32u, n_pos - base);
     ulong kv_off = (ulong)base * kv_dim + blockIdx.x * head_dim;
+    // The block's reads of K and V are all issued here, before anything waits on one: a read
+    // that is used at once makes the thread wait out the memory latency, and K, the scores'
+    // softmax and V were three such waits in a row. For K, 8 threads per position (the lane)
+    // take every 8th group of 4 values of its row (head_dim <= AP_T: at most AP_B groups).
+    // For V, `np` threads per output value take every np-th position.
+    uint n4 = head_dim / 4;
+    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
+    const float4* k = (const float4*)(kc + kv_off + (ulong)min(lane, cnt - 1) * kv_dim);
+    float4 kk[AP_B];
+    for (uint j = 0; j < AP_B; j++)
+        if (warp + 8 * j < n4) kk[j] = k[warp + 8 * j];
+    float vv[AP_V];
+    for (uint j = 0; j < AP_V; j++)
+        if (pt + j * np < cnt) vv[j] = vc[kv_off + (ulong)(pt + j * np) * kv_dim + d];
     for (uint i = tid; i < g_n * head_dim; i += AP_T) qs[i] = q[(ulong)h0 * head_dim + i];
     __syncthreads();
-    // Scores: 8 threads per position (the lane), each taking every 8th group of 4 values of
-    // its K row against four query heads. All of a batch's reads are issued before the first
-    // is used: a read that is used at once makes the thread wait out the memory latency.
-    uint n4 = head_dim / 4;
+    // Scores, against four query heads at a time.
     for (uint g0 = 0; g0 < g_n; g0 += 4) {
         float s[4] = {0, 0, 0, 0};
         if (lane < cnt) {
-            const float4* k = (const float4*)(kc + kv_off + (ulong)lane * kv_dim);
-            for (uint j0 = warp; j0 < n4; j0 += 8 * AP_B) {
-                float4 kk[AP_B];
-                for (uint j = 0; j < AP_B; j++) kk[j] = k[min(j0 + 8 * j, n4 - 1)];
-                for (uint j = 0; j < AP_B && j0 + 8 * j < n4; j++) {
-                    for (uint i = 0; i < 4 && g0 + i < g_n; i++) {
-                        const float* qg = qs + (g0 + i) * head_dim + 4 * (j0 + 8 * j);
-                        s[i] += qg[0] * kk[j].x + qg[1] * kk[j].y + qg[2] * kk[j].z
-                            + qg[3] * kk[j].w;
-                    }
+            for (uint j = 0; j < AP_B && warp + 8 * j < n4; j++) {
+                for (uint i = 0; i < 4 && g0 + i < g_n; i++) {
+                    const float* qg = qs + (g0 + i) * head_dim + 4 * (warp + 8 * j);
+                    s[i] += qg[0] * kk[j].x + qg[1] * kk[j].y + qg[2] * kk[j].z
+                        + qg[3] * kk[j].w;
                 }
             }
         }
@@ -1619,12 +1627,13 @@ extern "C" __global__ void attention_part(const float* q, const float* kc, const
         }
     }
     __syncthreads();
-    // The weighted sum of V: `np` threads per output value, each over every np-th position.
-    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
+    // The weighted sum of V.
     for (uint g0 = 0; g0 < g_n; g0 += 4) {
         float o[4] = {0, 0, 0, 0};
         if (pt < np) {
-            for (uint p0 = pt; p0 < cnt; p0 += np * AP_B) {
+            for (uint j = 0; j < AP_V && pt + j * np < cnt; j++)
+                for (uint i = 0; i < 4; i++) o[i] += ev[(g0 + i) % AP_G * 32 + pt + j * np] * vv[j];
+            for (uint p0 = pt + AP_V * np; p0 < cnt; p0 += np * AP_B) {
                 float v[AP_B];
                 for (uint j = 0; j < AP_B; j++)
                     v[j] = vc[kv_off + (ulong)min(p0 + j * np, cnt - 1) * kv_dim + d];
@@ -1659,21 +1668,34 @@ extern "C" __global__ void attention_merge(const float* parts, float* out, uint 
     __shared__ float pa[AP_T];
     uint tid = threadIdx.x, stride = head_dim + 2;
     const float* part = parts + (ulong)blockIdx.x * n_parts * stride;
-    float mx = NEG_INF;
-    for (uint c = tid; c < n_parts; c += AP_T) mx = fmaxf(mx, part[c * stride + head_dim]);
+    // As in `attention_part`, a thread's first reads are issued before it waits on any.
+    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
+    uint c1 = min(tid, n_parts - 1);
+    float m0 = part[c1 * stride + head_dim], s0 = part[c1 * stride + head_dim + 1];
+    float vv[AP_M];
+    for (uint j = 0; j < AP_M; j++)
+        if (pt + j * np < n_parts) vv[j] = part[(pt + j * np) * stride + d];
+    float mx = tid < n_parts ? m0 : NEG_INF;
+    for (uint c = tid + AP_T; c < n_parts; c += AP_T)
+        mx = fmaxf(mx, part[c * stride + head_dim]);
     mx = block_max(mx, red);
     float sum = 0;
-    for (uint c = tid; c < n_parts; c += AP_T) {
+    if (tid < n_parts) {
+        float f = expf(m0 - mx);
+        wf[tid] = f;
+        sum = s0 * f;
+    }
+    for (uint c = tid + AP_T; c < n_parts; c += AP_T) {
         float f = expf(part[c * stride + head_dim] - mx);
         wf[c] = f;
         sum += part[c * stride + head_dim + 1] * f;
     }
     sum = block_sum(sum, red);  // its __syncthreads also orders the wf[] writes
     // `np` threads per output value, each over every np-th part.
-    uint np = AP_T / head_dim, d = tid % head_dim, pt = tid / head_dim;
     float o = 0;
     if (pt < np) {
-        for (uint c0 = pt; c0 < n_parts; c0 += np * AP_B) {
+        for (uint j = 0; j < AP_M && pt + j * np < n_parts; j++) o += vv[j] * wf[pt + j * np];
+        for (uint c0 = pt + AP_M * np; c0 < n_parts; c0 += np * AP_B) {
             float v[AP_B];
             for (uint j = 0; j < AP_B; j++)
                 v[j] = part[min(c0 + j * np, n_parts - 1) * stride + d];

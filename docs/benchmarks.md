@@ -42,6 +42,34 @@ matrix), `attn_scores` + `attn_pv` + `attn_softmax` 16%. Q6_K had no wide dequan
 per super-block, 8 weights a lane through `ld24` and one 16-byte store, a matrix takes 97 us, the
 logits are bit-identical and Mistral-7B pp512 is 3860-3917 tok/s (llama.cpp 4561-4908).
 
+## 2026-11-17: CUDA decode at long context: every read of a block issued first
+
+Decode at 2048 positions cost 39 us a layer more than at depth 0 on Mistral-7B (llama.cpp: 6).
+`RLI_CUDA_PROF=1 bench --pp 0 --tg 64 --depth D --reps 1` on the A100, us a launch:
+
+| Model, depth | `attention_part` before | after | `attention_merge` before | after |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B, 192 | 21.2 | 16.5 | 13.9 | 13.9 |
+| Llama-3.2-1B, 1024 | 24.4 | 20.9 | 14.8 | 12.7 |
+| Llama-3.2-1B, 2048 | 35.0 | 26.0 | 16.0 | 12.3 |
+| Mistral-7B, 192 | 23.3 | 15.5 | 13.0 | 11.7 |
+| Mistral-7B, 1024 | 29.4 | 25.3 | 15.6 | 12.2 |
+| Mistral-7B, 2048 | 45.7 | 33.4 | 19.3 | 13.1 |
+
+(A trivial launch is about 11 us under the profiler.) `attention_part` read K, computed the
+softmax, then read V in one or two rounds: three or four waits on memory in a row. Now a thread
+issues its reads of K and V before the first barrier, and `attention_merge` its parts likewise;
+reads that were clamped to a valid address and thrown away are skipped (6 of a thread's 8 reads of
+K with heads of 64). Halving the kernel's shared memory changed nothing. Per-token logits of a
+541-token prompt are bit-identical on both models and the CUDA tests pass.
+`bench --pp 0 --tg 128 --depth 2048 --reps 3` against `llama-bench -p 0 -n 128 -d 2048 -r 3`,
+alternating, two rounds, tok/s:
+
+| Model | before | after | llama.cpp |
+|---|---:|---:|---:|
+| Llama-3.2-1B | 463.8 | 513.0, 514.0 | 522.8, 510.7 |
+| Mistral-7B | 141.9 | 153.2, 153.1 | 150.4, 149.8 |
+
 ## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
 
 `Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
