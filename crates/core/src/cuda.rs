@@ -65,7 +65,7 @@ const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
 const MMA_REGS: usize = 80;
 /// Rows, tokens and threads of a block of the f16 GEMM's kernels, and the columns they take
 /// at a time (`GE_K` in cuda.cu).
-const GEMM_TILES: [(usize, usize, u32); 2] = [(64, 64, 256), (64, 128, 256)];
+const GEMM_TILES: [(usize, usize, u32); 2] = [(64, 64, 256), (64, 128, 128)];
 const GEMM_COLS: usize = 64;
 /// Fewest blocks the GEMM's larger tile is used for.
 const GEMM_BLOCKS_MIN: usize = 256;

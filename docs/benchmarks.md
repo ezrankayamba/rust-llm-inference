@@ -3,6 +3,61 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-17: CUDA against llama.cpp again, and a 128-thread f16 GEMM tile
+
+A100-PCIE-40GB (EPYC 7F72 host), llama.cpp v0.9.0 `-ngl 99 -p 512 -n 128 -r 3`, ours
+`bench --pp 512 --tg 128 --reps 3 --gpu-layers 999`, alternating with 8 s rests, two rounds each.
+At 3f55afd, tok/s:
+
+| Model | pp512 rli | llama.cpp | tg128 rli | llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 10872, 12077 | 16262, 14499 | 592.1, 586.5 | 526.4, 536.2 |
+| Mistral-7B Q4_K_M | 3537, 3507 | 4908, 4759 | 172.1, 171.8 | 155.9, 155.5 |
+| Qwen3-30B-A3B Q4_K_M | 3922, 3911 | 4242, 4073 | 193.6, 194.4 | 171.0, 171.5 |
+
+Decode at 2048 positions (`--pp 0 --tg 128 --depth 2048`): Llama-3.2-1B 463.8 against 513.8,
+Mistral-7B 141.9 against 150.7.
+
+`gemm_f16_64x128` now runs four warps of two row groups each (128 threads a block) where it ran
+eight warps of one. `bench_cuda`, f16 GEMM of 512 tokens, us: 4096x4096 203.1 -> 181.9, 14336x4096
+596.6 -> 552.4, 4096x14336 717.5 -> 631.8. Blocks of 128 rows (208.8 / 553.5 / 728.0), 256 tokens
+(260.2 / 770.5 / 909.1) and 128 rows by 64 tokens (264.8 / 671.7 / 911.6) were no better, a
+register cap of 96 or more was 40% slower (285.7 for 4096x4096), and a GEMM that decodes Q4_K on
+the way into shared memory, with no dequantized copy, lost to dequantizing first (296.7 us against
+45.4 + 203.1). Logits of a 541-token prompt are bit-identical before and after on Llama-3.2-1B and
+Mistral-7B, and the CUDA tests pass. Same protocol after the change:
+
+| Model | pp512 rli | llama.cpp | tg128 rli | llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 14244, 12399 | 16443, 14962 | 610.7, 607.4 | 522.8, 531.0 |
+| Mistral-7B Q4_K_M | 3780, 3620 | 4561, 4657 | 172.8, 172.0 | 155.5, 155.4 |
+| Qwen3-30B-A3B Q4_K_M | 3762, 3936 | 4239, 4241 | 193.7, 197.0 | 171.3, 170.8 |
+
+Decode 11-15% ahead; prompts 1.1-1.2x behind on Llama-3.2-1B (its numbers swing by 15% from run to
+run on both engines), 1.25x on Mistral-7B, 1.1x on Qwen3-30B-A3B.
+
+## 2026-11-17: x86 against llama.cpp after the panel fixes (3f55afd)
+
+`Benchmark` workflow, `threads=1,2`. The AVX2 panel got the AVX-512 one's changes (3f55afd).
+Prompt / decode tok/s, rli against llama.cpp's native build:
+
+| CPU (run) | Model | Threads | rli | llama.cpp |
+|---|---|---:|---:|---:|
+| EPYC 7763, AVX2 (44080708394, at c521434) | Llama-3.2-1B | 1 | 45.8 / 18.2 | 48.9 / 17.9 |
+| EPYC 7763 (44080708394) | Llama-3.2-1B | 2 | 89.0 / 33.1 | 96.0 / 31.8 |
+| EPYC 7763 (44085078793, at 3f55afd) | Llama-3.2-1B | 1 | 49.0 / 18.3 | 48.9 / 17.5 |
+| EPYC 7763 (44085078793) | Llama-3.2-1B | 2 | 94.4 / 32.7 | 95.5 / 31.9 |
+| EPYC 7763 (44085078793) | Qwen2.5-0.5B | 1 | 114.1 / 32.6 | 77.9 / 28.7 |
+| EPYC 7763 (44085078793) | Qwen2.5-0.5B | 2 | 200.3 / 58.6 | 153.6 / 50.7 |
+| Xeon with AMX (44085060758, at 3f55afd) | Llama-3.2-1B | 1 | 109.0 / 16.0 | 138.6 / 11.8 |
+| Xeon with AMX (44085060758) | Llama-3.2-1B | 2 | 209.7 / 30.6 | 282.7 / 22.8 |
+| Xeon with AMX (44085060758) | Qwen2.5-0.5B | 1 | 221.0 / 32.2 | 136.4 / 20.8 |
+| Xeon with AMX (44085060758) | Qwen2.5-0.5B | 2 | 403.1 / 57.7 | 264.9 / 35.3 |
+
+On the Xeon (rli on AVX-512; `RLI_AMX` unset) Llama-3.2-1B prompts are 1.27-1.35x behind, where
+they were 1.8x this morning (78.6 against 144.2). Against llama.cpp's AVX2 build there: 111.5
+against 61.1.
+
 ## 2026-11-17: the AVX-512 panel: what filling it cost (c521434)
 
 `bench_amx` on a Xeon 6975P-C (run 44077130823): a whole AMX step (load 16 rows' weights for a
