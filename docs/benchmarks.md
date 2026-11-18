@@ -2552,3 +2552,16 @@ Tried and dropped the same day:
   2952 -> 3025, 3021; 96: 3303, 3379 -> 3358, 3295; 160: 3570, 3520 -> 3519, 3552.
 - The MoE grouping thresholds again, `--reps 100` (gate/up from 20 and down from 12 / both
   from 8 / down from 8): 16 tokens 783 / 753 / 783; 12: 668 / 601 / 677; 8: 529 / 421 / 521.
+
+Where a 16-token Qwen3-30B-A3B prompt goes (20.1 ms; launches skipped by kernel name,
+`--reps 200`): without the experts' int8 gate and up matvecs 10.0 ms, without the tensor-core
+matmuls (Q/K/V/O and the grouped down) 13.1, without both 4.3, of which attention 0.95,
+`rmsnorm` 0.45, the router 0.45, `moe_topk` 0.3, the rest 0.2 or less each, and 0.9 with every
+launch skipped. So half the prompt is two launches a layer of 128 (token, expert) matvecs.
+
+Tried for them and dropped: `mvq_q4_k_grp`, the int8 matvec over pairs grouped by expert, a
+row's weights read and decoded once for up to 4 (or 2) of the expert's tokens. Same logits
+path as before (a prompt differs by the usual MoE noise). With 4 tokens a pass, old / new
+tok/s: 4 tokens 374 / 306; 8: 530 / 463; 12: 682 / 611; 16: 784 / 734. With 2: 8 tokens 529 /
+497; 16: 786 / 779, and 126.7 us a launch where the plain matvec takes 125. Reading a third
+less weight did not make the launch any shorter: the matvec is not waiting on its weights.
