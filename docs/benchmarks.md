@@ -2532,3 +2532,23 @@ skipped 4.3 ms, and of that `attn_pv_h` 0.76, `swiglu` 0.55, `rmsnorm` 0.46, `at
 0.38, `attn_scores_h` 0.29, `rope` 0.27, `to_f16_zero` 0.18; with those skipped too 0.9 ms
 (embeddings up, hidden states down). The matmuls are 39.5 ms, which is also what the
 per-matrix times above add up to, for llama.cpp's as for ours.
+
+## 2026-11-19: f16 written by the producing kernel in MoE layers too (CUDA)
+
+`moe` took its chunk through `to_f16` twice a layer: the normalized input for the grouped
+gate and up stacks (20+ tokens), and the SwiGLU result for the grouped down (12+). `rmsnorm`
+and `swiglu` now write both (and `rmsnorm` no longer quantizes for stacks that read f16).
+Qwen3-30B-A3B, `bench --pp N --tg 0 --reps 1600/N --gpu-layers 999`, the build before and this
+one in turn twice: 16 tokens 777, 777 -> 790, 789 tok/s; 24: 1050, 1056 -> 1064, 1078; 32: 1325,
+1296 -> 1309, 1314; 64: 1875, 1930 -> 1879, 1932; 192: 3348, 3468 -> 3511, 3567. Logits against
+`--precise` differ from run to run on this model as before (100-, 60- and 40-character
+prompts, two runs each: 0.18, 0.19 / 0.93, 0.69 / 1.59, 1.69 before; 0.18, 0.75 / 0.78, 0.78 /
+1.68, 1.51 after). CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each). Against
+llama.cpp (two rounds, ours / llama.cpp): 8 tokens 519 / 548; 16: 778 / 861; 24: 1062 / 1026.
+
+Tried and dropped the same day:
+- `gemm_*_dense96`, the in-block kernel with 96 tokens a block, for chunks of 65 to 96 and
+  the like (Mistral-7B, in turn twice, tok/s): 72 tokens 2788, 2783 -> 2807, 2825; 80: 3015,
+  2952 -> 3025, 3021; 96: 3303, 3379 -> 3358, 3295; 160: 3570, 3520 -> 3519, 3552.
+- The MoE grouping thresholds again, `--reps 100` (gate/up from 20 and down from 12 / both
+  from 8 / down from 8): 16 tokens 783 / 753 / 783; 12: 668 / 601 / 677; 8: 529 / 421 / 521.

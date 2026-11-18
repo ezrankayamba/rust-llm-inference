@@ -370,7 +370,7 @@ fn ffn(
 /// Queues the MoE FFN of `n` tokens over `s.xb`, adding into the rows at `x`. The experts are picked on
 /// the GPU, so nothing waits, and every token's k chosen ones run as one id-indexed matvec per
 /// matrix: in int8 where the matrix has that kernel and `int8` is set, over `s.xq`, which holds
-/// `s.xb` quantized if `quantized`.
+/// `s.xb` quantized, or `s.xh` as f16, as `fed` says.
 #[allow(clippy::too_many_arguments)]
 fn moe(
     c: &crate::config::Config,
@@ -383,7 +383,7 @@ fn moe(
     [gate_stride, up_stride, down_stride]: [usize; 3],
     n: usize,
     int8: bool,
-    quantized: bool,
+    fed: Fed,
 ) {
     let (ne, k, n_embd) = (experts.len(), c.n_expert_used, c.n_embd);
     let (xb, ids) = (At(&s.xb, 0), &s.route_ids);
@@ -413,9 +413,6 @@ fn moe(
     let e = &experts[0];
     let ff = e.gate.rows;
     let (gate, up, tmp) = (At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
-    if !quantized && wants_q(b, &[&e.gate, &e.up], int8) {
-        b.quantize(xb, n * n_embd, &s.xq);
-    }
     // In decode, stacks of one type and stride run as one launch. Over a prompt chunk that was
     // 1.5% slower than two.
     // A long chunk's (token, expert) pairs are grouped by expert, whose weights are then
@@ -433,7 +430,11 @@ fn moe(
     let half = |b: &Batch<'_>, m: &Weight, stride| {
         grouped && int8 && b.has_gemm_id(m.ty, m.cols, m.offset, stride)
     };
-    if half(b, &e.gate, gate_stride) || half(b, &e.up, up_stride) {
+    let halves = [half(b, &e.gate, gate_stride), half(b, &e.up, up_stride)];
+    if halves != [true; 2] && fed != Fed::Q && wants_q(b, &[&e.gate, &e.up], int8) {
+        b.quantize(xb, n * n_embd, &s.xq);
+    }
+    if halves != [false; 2] && fed != Fed::Half {
         b.to_f16(xb, n * n_embd, &s.xh);
     }
     let paired = n < MMQ_MIN_TOKENS
@@ -488,8 +489,7 @@ fn moe(
     }
     let (ty, at) = (d.ty, d.offset);
     if down_half {
-        b.swiglu(gate, up, n * k * ff, None, None);
-        b.to_f16(gate, n * k * ff, &s.xh);
+        b.swiglu(gate, up, n * k * ff, None, Some(&s.xh));
         b.gemm_id(
             ty,
             n_embd,
@@ -701,14 +701,20 @@ impl Cuda {
                 let f = match &layer.ffn {
                     Ffn::Dense(e) => fed(b, &[&e.gate, &e.up], n, int8),
                     Ffn::Moe { experts, .. } => {
+                        // As `moe` will read it: grouped stacks take f16.
                         let e = &experts[0];
-                        match g.expert_strides.is_some() && wants_q(b, &[&e.gate, &e.up], int8) {
-                            true => Fed::Q,
-                            false => Fed::No,
+                        let half = |m: &Weight, stride| {
+                            n >= MOE_GROUP_TOKENS
+                                && int8
+                                && b.has_gemm_id(m.ty, m.cols, m.offset, stride)
+                        };
+                        match g.expert_strides {
+                            Some([gs, us, _]) if half(&e.gate, gs) && half(&e.up, us) => Fed::Half,
+                            Some(_) if wants_q(b, &[&e.gate, &e.up], int8) => Fed::Q,
+                            _ => Fed::No,
                         }
                     }
                 };
-                let quant = f == Fed::Q;
                 b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, f.q(s), f.half(s));
                 match &layer.ffn {
                     Ffn::Dense(e) => ffn(b, s, e, x_at, n, int8, f, true),
@@ -719,9 +725,7 @@ impl Cuda {
                     } => {
                         if let Some(strides) = g.expert_strides {
                             let shared = shared.as_ref();
-                            moe(
-                                c, b, s, x_at, router, experts, shared, strides, n, int8, quant,
-                            );
+                            moe(c, b, s, x_at, router, experts, shared, strides, n, int8, f);
                             continue;
                         }
                         assert_eq!(n, 1, "CPU-routed MoE layers run one token at a time");
