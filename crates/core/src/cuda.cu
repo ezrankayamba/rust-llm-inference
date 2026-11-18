@@ -1216,7 +1216,8 @@ __device__ inline ulong ld8(const uchar* p) {
 
 // The decoders of GEMM_ID. A step is 64 columns: quarter j of the super-block at b, of which
 // a thread decodes 16 weights of one row, columns 8 dp.. (lo) and 32 + 8 dp.. (hi), as f16.
-// *_hdr reads what a super-block's four steps share, *_load a step's bytes, *_dec decodes.
+// *_hdr reads what a super-block's four steps share, *_load a step's bytes (`first` in the
+// block's first step; `raw` is kept from step to step), *_dec decodes.
 //
 // Q4_K: the quarter is 32 bytes, the low nibbles one sub-block and the high ones the next.
 // The row must lie at a multiple of 16 bytes.
@@ -1227,7 +1228,7 @@ __device__ inline void gq4_k_hdr(const uchar* b, ulong* hdr) {
     hdr[2] = __float_as_uint(h_bits((uint)hdr[0] & 0xFFFF)) |
              ((ulong)__float_as_uint(h_bits((uint)(hdr[0] >> 16) & 0xFFFF)) << 32);
 }
-__device__ inline void gq4_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
+__device__ inline void gq4_k_load(const uchar* b, uint j, bool first, uint dp, ulong* raw) {
     raw[0] = *(const ulong*)(b + 16 + 32 * j + 8 * dp);
 }
 // The scales and offsets of sub-blocks 2j (sa, ma) and 2j + 1 (sc, mc), from gq4_k_hdr's words.
@@ -1267,7 +1268,9 @@ __device__ inline void gq6_k_hdr(const uchar* b, ulong* hdr) {
     hdr[1] = ld8(b + 200);
     hdr[2] = ld8(b + 208);
 }
-__device__ inline void gq6_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
+__device__ inline void gq6_k_load(const uchar* b, uint j, bool first, uint dp, ulong* raw) {
+    // Quarters 2n and 2n + 1 are the two nibbles of the same bytes: read once for both.
+    if (j % 2 && !first) return;
     uint n = j / 2;
     raw[0] = ld8(b + 64 * n + 8 * dp);
     raw[1] = ld8(b + 64 * n + 32 + 8 * dp);
@@ -1330,7 +1333,7 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
             uint j = ks % 4;                                                                   \
             const uchar* b = wr + (ulong)(ks / 4) * SB_BYTES;                                  \
             if (j == 0 || ks == kb) HDR(b, hdr);                                               \
-            LOAD(b, j, dp, raw);                                                               \
+            LOAD(b, j, ks == kb, dp, raw);                                                     \
             V128 v[2];                                                                         \
             _Pragma("unroll")                                                                  \
             for (uint p = 0; p < 2; p++)                                                       \

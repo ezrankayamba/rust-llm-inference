@@ -317,7 +317,7 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
   `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 128,
-  5% ahead at 32, 5% behind at 48, 11-15% behind at 96 and 192; Llama-3.2-1B level or ahead at 8 to 128;
+  5% ahead at 32, 4% behind at 48, 11% at 96, 7% at 192; Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 5-15% behind at 8 to 32 (the down projection is grouped by expert from
   12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16) and ahead from 48); Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,

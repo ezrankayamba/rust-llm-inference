@@ -2357,3 +2357,19 @@ Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mist
 638 / 518; 16: 1203 / 1293; 24: 1750 / 1753; 32: 2195 / 2094. Llama-3.2-1B 8: 1886 / 1945;
 16: 3748 / 3827; 24: 5206 / 5032; 32: 6771 / 6504. Qwen3-30B-A3B 8: 504 / 546; 16: 718 /
 850; 24: 908 / 1014; 32: 1126 / 1191.
+
+## 2026-11-18: Q6_K bytes read once per two steps in the in-block CUDA matmul
+
+`RLI_CUDA_PROF=1` on Mistral-7B prompts of 96 and 192 tokens: `gemm_q6_k_dense` took 241 and
+345 us a launch where `gemm_q4_k_dense` took 165 and 245 (46% more; llama.cpp's Q6_K matmul
+is 13% slower than its Q4_K one). Steps 2n and 2n + 1 of a Q6_K super-block are the two
+nibbles of the same 96 bytes, which `gq6_k_load` read in each; it now reads in the first
+only (`GEMM_ID` keeps `raw` between steps; the MoE expert kernels are the same macro).
+`RLI_DENSE=1 bench_cuda` with Q6_K shapes, us a matmul, 14336x4096 by 48 / 64 / 96 / 128
+tokens: 168.0 / 178.9 / 309.3 / 332.6 -> 150.7 / 162.0 / 278.1 / 300.6 (llama.cpp 162.2 at 64,
+207.5 at 96, 259.9 at 128); 4096x4096: 52.8 / 56.2 / 91.7 / 100.0 -> 47.7 / 51.5 / 82.9 / 90.7.
+CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 48:
+2512 / 2617; 96: 2990 / 3370; 192: 3597 / 3868. Qwen3-30B-A3B 48: 1502 / 1401; 96: 2260 /
+1688; 192: 3303 / 2736.
