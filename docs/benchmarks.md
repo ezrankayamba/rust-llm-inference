@@ -2117,3 +2117,10 @@ against 59.2 / 170.2 / 169.3, so only the 16-token kernel has them. More parts t
 
 Mistral-7B's runs on this host spread by 10-30% within a run; Llama-3.2-1B's by under 1%.
 The CUDA tests pass (152).
+
+Tried and dropped: reading the next step's weights while the 16-token kernel multiplies the
+current ones (16 more registers a lane): 41.2 / 113.3 / 105.3 us against 34.1 / 91.3 / 94.8.
+Both engines' short-prompt figures on this host rise with the number of repetitions (the
+GPU's clocks): Mistral-7B at 16 tokens is 642 / 828 / 924 / 1047 tok/s here and 979 / 1083 /
+1175 / 1289 for llama.cpp over 3 / 8 / 20 / 60 repetitions, so the table's Mistral-7B rows
+overstate the gap (19% at 60 repetitions, not 40%).
