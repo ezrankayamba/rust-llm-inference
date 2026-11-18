@@ -1528,6 +1528,146 @@ GEMM_DIRECT(gemm_q6_k_direct, 210, gq6_k_hdr, dq6_k_load, dq6_k_dec, 0, GEMM_DEN
 GEMM_DIRECT(gemm_q4_k_direct_id, 144, gq4_k_hdr, dq4_k_load, dq4_k_dec, 1, , 0, 1)
 GEMM_DIRECT(gemm_q6_k_direct_id, 210, gq6_k_hdr, dq6_k_load, dq6_k_dec, 1, , 0, 1)
 
+// attn_scores and attn_pv (below, in the other compile) on f16 tensor cores, with f32 sums:
+// the same grids and tiles of 32 query rows by 32 positions, staged as f16. head_dim a
+// multiple of 32, at most 128. Not under `precise`.
+//
+// Scores: a warp takes 16 query rows by 8 positions; Q is the product's rows, K its columns.
+#define AT_S 68  // words between staged rows of head_dim / 2: a warp's reads in 32 banks
+extern "C" __global__ void attn_scores_h(const float* q, const float* kc, float* scores,
+                                         uint n_head, uint n_kv, uint head_dim, uint n_pos,
+                                         uint kv_dim, uint max_ctx, float scale, uint tok0,
+                                         uint n_tok) {
+    __shared__ uint kt[32 * AT_S];
+    __shared__ uint qt[32 * AT_S];
+    uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = 32 / g_n;
+    uint base = blockIdx.y * 32, t0 = blockIdx.z * tpt;
+    uint t_end = min(t0 + tpt, n_tok);
+    if (base >= n_pos + tok0 + t_end - 1) return;
+    uint n4 = head_dim / 4;
+    float4 kr[4], qr[4];
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        uint i = tid + j * blockDim.x, r = i / n4, d = 4 * (i % n4), t = t0 + r / g_n;
+        kr[j] = qr[j] = make_float4(0, 0, 0, 0);
+        if (i >= 32 * n4) continue;
+        if (base + r < n_pos + tok0 + t_end - 1)
+            kr[j] = *(const float4*)(kc + (ulong)(base + r) * kv_dim + blockIdx.x * head_dim + d);
+        if (t < n_tok)
+            qr[j] = *(const float4*)(
+                q + ((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d);
+    }
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        uint i = tid + j * blockDim.x, r = i / n4, w = 2 * (i % n4);
+        if (i >= 32 * n4) continue;
+        kt[r * AT_S + w] = f2h(kr[j].x) | ((uint)f2h(kr[j].y) << 16);
+        kt[r * AT_S + w + 1] = f2h(kr[j].z) | ((uint)f2h(kr[j].w) << 16);
+        qt[r * AT_S + w] = f2h(qr[j].x) | ((uint)f2h(qr[j].y) << 16);
+        qt[r * AT_S + w + 1] = f2h(qr[j].z) | ((uint)f2h(qr[j].w) << 16);
+    }
+    __syncthreads();
+    uint lane = tid % 32, warp = tid / 32, gi = lane / 4, gj = lane % 4;
+    uint rg = warp % 2, oc = warp / 2;
+    float c[4] = {0, 0, 0, 0};
+    for (uint k = 0; k < head_dim / 16; k++) {
+        const uint* ap = qt + (16 * rg + gi) * AT_S + 8 * k + gj;
+        const uint* bp = kt + (8 * oc + gi) * AT_S + 8 * k + gj;
+        uint a[4] = {ap[0], ap[8 * AT_S], ap[4], ap[8 * AT_S + 4]};
+        mma16_f16(a, bp[0], bp[4], c);
+    }
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        uint r = 16 * rg + gi + 8 * (j / 2), p = 8 * oc + 2 * gj + j % 2, t = t0 + r / g_n;
+        if (t < n_tok && base + p < n_pos + tok0 + t)
+            scores[((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + base + p] =
+                c[j] * scale;
+    }
+}
+
+// The weighted sums of V: 256 threads a block; a warp takes 16 query rows by head_dim / 4
+// values, the scores its product's rows and V, staged with a row per value, its columns.
+#define AV_S 20  // words between staged rows of 16
+#define PVH_R 64  // query rows a block
+#define PVH_READ(BASE)                                                                         \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < 4; j++) {                                                             \
+        uint i = tid + j * blockDim.x, p = i / n4;                                             \
+        vr[j] = i < 32 * n4 && (BASE) + p < limit                                              \
+            ? *(const float4*)(vc + (ulong)((BASE) + p) * kv_dim + blockIdx.x * head_dim       \
+                               + 4 * (i % n4))                                                 \
+            : make_float4(0, 0, 0, 0);                                                         \
+    }                                                                                          \
+    _Pragma("unroll")                                                                          \
+    for (uint j = 0; j < PVH_R / 16; j++) {                                                    \
+        uint i = tid + j * blockDim.x, r = i / 16, t = t0 + r / g_n;                           \
+        const float* sc =                                                                      \
+            scores + ((ulong)t * n_head + blockIdx.x * g_n + r % g_n) * max_ctx + (BASE);      \
+        _Pragma("unroll")                                                                      \
+        for (uint e = 0; e < 2; e++) {                                                         \
+            uint p = 2 * (i % 16) + e;                                                         \
+            sr[j][e] = t < n_tok && (BASE) + p < n_pos + tok0 + t ? sc[p] : 0.0f;              \
+        }                                                                                      \
+    }
+extern "C" __global__ void attn_pv_h(const float* scores, const float* vc, float* out,
+                                     uint n_head, uint n_kv, uint head_dim, uint n_pos,
+                                     uint kv_dim, uint max_ctx, uint tok0, uint n_tok) {
+    __shared__ uint vt[128 * AV_S];
+    __shared__ uint ps[PVH_R * AV_S];
+    uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = PVH_R / g_n, t0 = blockIdx.y * tpt;
+    uint t_end = min(t0 + tpt, n_tok), limit = n_pos + tok0 + t_end - 1;
+    uint n4 = head_dim / 4, no = head_dim * PVH_R / 1024;
+    uint lane = tid % 32, warp = tid / 32, gi = lane / 4, gj = lane % 4;
+    uint rg = warp % (PVH_R / 16), o0 = (warp / (PVH_R / 16)) * no;
+    float c[PVH_R / 8][4];
+    #pragma unroll
+    for (uint o = 0; o < PVH_R / 8; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;
+    float4 vr[4];
+    float sr[PVH_R / 16][2];
+    PVH_READ(0)
+    for (uint base = 0; base < limit; base += 32) {
+        unsigned short* vh = (unsigned short*)vt;
+        #pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            uint i = tid + j * blockDim.x, p = i / n4, d = 4 * (i % n4);
+            if (i >= 32 * n4) continue;
+            vh[d * 2 * AV_S + p] = f2h(vr[j].x);
+            vh[(d + 1) * 2 * AV_S + p] = f2h(vr[j].y);
+            vh[(d + 2) * 2 * AV_S + p] = f2h(vr[j].z);
+            vh[(d + 3) * 2 * AV_S + p] = f2h(vr[j].w);
+        }
+        #pragma unroll
+        for (uint j = 0; j < PVH_R / 16; j++) {
+            uint i = tid + j * blockDim.x;
+            ps[i / 16 * AV_S + i % 16] = f2h(sr[j][0]) | ((uint)f2h(sr[j][1]) << 16);
+        }
+        // The next step's tiles, read while this one is multiplied.
+        if (base + 32 < limit) {
+            PVH_READ(base + 32)
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint kh = 0; kh < 2; kh++) {
+            const uint* ap = ps + (16 * rg + gi) * AV_S + 8 * kh + gj;
+            uint a[4] = {ap[0], ap[8 * AV_S], ap[4], ap[8 * AV_S + 4]};
+            #pragma unroll
+            for (uint o = 0; o < PVH_R / 8; o++) {
+                if (o >= no) continue;
+                const uint* bp = vt + (8 * (o0 + o) + gi) * AV_S + 8 * kh + gj;
+                mma16_f16(a, bp[0], bp[4], c[o]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint j = 0; j < PVH_R / 2; j++) {
+        uint o = j / 4, r = 16 * rg + gi + 8 * (j / 2 % 2), t = t0 + r / g_n;
+        if (o >= no || t >= n_tok) continue;
+        uint d = 8 * (o0 + o) + 2 * gj + j % 2;
+        out[((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d] = c[o][j % 4];
+    }
+}
+
 #else  // the rest of the file is not part of the tensor-core compile
 
 // Block-wide reductions for blockDim.x <= 1024 (a multiple of 32).

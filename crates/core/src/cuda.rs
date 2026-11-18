@@ -185,6 +185,8 @@ pub struct AttnParams {
     pub kv_dim: u32,
     pub max_ctx: u32,
     pub scale: f32,
+    /// Several tokens' scores and sums may run on f16 tensor cores (not under `precise`).
+    pub half: bool,
 }
 
 /// Rotary embedding settings for [`Batch::rope`].
@@ -243,6 +245,8 @@ pub struct Gpu {
     /// For Q4_K over few tokens: blocks of 128 rows by 32 tokens.
     gemm_direct: Vec<(GgmlType, CudaFunction)>,
     gemm_direct_id: Vec<(GgmlType, CudaFunction)>,
+    /// `attn_scores_h` and `attn_pv_h`.
+    attn_half: Option<(CudaFunction, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -297,6 +301,7 @@ impl Gpu {
         let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
         let (mut gemm_dense, mut gemm_direct) = (Vec::new(), Vec::new());
         let mut gemm_direct_id = Vec::new();
+        let mut attn_half = None;
         let mut gemm_dense128 = Vec::new();
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
@@ -336,6 +341,8 @@ impl Gpu {
                 let n = format!("{n}_id");
                 gemm_direct_id.push((t, module.load_function(&n).map_err(err(&n))?));
             }
+            let f = |n| module.load_function(n).map_err(err(n));
+            attn_half = Some((f("attn_scores_h")?, f("attn_pv_h")?));
             for tt in MMA_FEW {
                 for (t, n) in MMQ_KERNELS {
                     let n = format!("{}_t{tt}", n.replace("mmq", "mma"));
@@ -455,6 +462,7 @@ impl Gpu {
             gemm_dense128,
             gemm_direct,
             gemm_direct_id,
+            attn_half,
             gemm_id,
             other,
             zero_id,
@@ -866,6 +874,10 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if self.attn_half.as_ref().is_some_and(|h| eq(&h.0)) {
+            "attn_scores_h".to_string()
+        } else if self.attn_half.as_ref().is_some_and(|h| eq(&h.1)) {
+            "attn_pv_h".to_string()
         } else if let Some((t, _)) = self.gemm_direct_id.iter().find(|(_, g)| eq(g)) {
             format!("gemm direct by expert {t:?}")
         } else if let Some((t, _)) = self.gemm_direct.iter().find(|(_, g)| eq(g)) {
@@ -2223,7 +2235,13 @@ impl<'a> Batch<'a> {
                     seen.div_ceil(32),
                     (n as usize).div_ceil((32 / g_n) as usize),
                 );
-                let mut l = self.call(self.gpu.other("attn_scores"));
+                let gpu: &'a Gpu = self.gpu;
+                // f16 tensor cores where there are any, unless the session is precise.
+                let half = gpu
+                    .attn_half
+                    .as_ref()
+                    .filter(|_| p.half && p.head_dim.is_multiple_of(32));
+                let mut l = self.call(half.map_or(gpu.other("attn_scores"), |h| &h.0));
                 l.arg(&q.0)
                     .arg(&k.0)
                     .arg(&scores.0)
@@ -2249,7 +2267,7 @@ impl<'a> Batch<'a> {
                     .arg(&p.max_ctx)
                     .arg(&tok0);
                 self.launch(l, grid2(p.n_head as usize, n as usize, 256));
-                let mut l = self.call(self.gpu.other("attn_pv"));
+                let mut l = self.call(half.map_or(gpu.other("attn_pv"), |h| &h.1));
                 l.arg(&scores.0)
                     .arg(&v.0)
                     .arg(&out.0)
@@ -2261,7 +2279,12 @@ impl<'a> Batch<'a> {
                     .arg(&p.max_ctx)
                     .arg(&tok0)
                     .arg(&n);
-                self.launch(l, grid2(p.n_kv as usize, rows, 2 * p.head_dim));
+                // The tensor-core kernel takes 64 query rows a block.
+                let (rows, threads) = match half {
+                    Some(_) => ((n as usize).div_ceil((64 / g_n) as usize), 256),
+                    None => (rows, 2 * p.head_dim),
+                };
+                self.launch(l, grid2(p.n_kv as usize, rows, threads));
             }
             if let Some(quant) = quant {
                 self.quantize(At(out, 0), q_len, quant);
@@ -2657,6 +2680,7 @@ mod tests {
                 kv_dim: kv_dim as u32,
                 max_ctx: max_ctx as u32,
                 scale: 0.5,
+                half: false,
             };
             let mut b = gpu.batch();
             b.attention(&q, &k, &v, &one, &scores, &p, None);
@@ -2674,6 +2698,70 @@ mod tests {
             assert!(want.iter().any(|w| w.abs() > 0.01), "degenerate reference");
             assert!(
                 err < 1e-5,
+                "{n_head}/{n_kv} heads of {head_dim}: max difference {err}"
+            );
+        }
+    }
+
+    /// The f16 tensor-core attention kernels against the f32 ones: several tiles of query
+    /// rows (32 for the scores, 64 for the sums) and of positions, the last ones partly
+    /// filled, and 1, 4 and 8 query heads per KV head. Needs an NVIDIA GPU.
+    #[test]
+    fn half_attention_matches_f32_attention() {
+        for (n_head, n_kv, head_dim, n_pos, n_tok) in [
+            (8, 2, 64, 40, 70),
+            (16, 2, 128, 100, 37),
+            (4, 4, 96, 10, 50),
+        ] {
+            let mut seed = 11u32;
+            let mut rand = |n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (seed >> 8) as f32 / 8388608.0 - 1.0
+                    })
+                    .collect()
+            };
+            let gpu = Gpu::new(&[0; 256], &[(0, 256)]).expect("CUDA device");
+            if gpu.attn_half.is_none() {
+                return;
+            }
+            let (max_ctx, kv_dim) = (n_pos + n_tok, n_kv * head_dim);
+            let q_len = n_tok * n_head * head_dim;
+            let q = gpu.upload(&rand(q_len));
+            let (k, v) = (
+                gpu.upload(&rand(max_ctx * kv_dim)),
+                gpu.upload(&rand(max_ctx * kv_dim)),
+            );
+            let (full, half) = (gpu.alloc(q_len), gpu.alloc(q_len));
+            let scores = gpu.alloc(n_tok * Batch::attention_scratch(n_head, head_dim, max_ctx));
+            let mut p = AttnParams {
+                n_head: n_head as u32,
+                n_kv: n_kv as u32,
+                head_dim: head_dim as u32,
+                n_tok: n_tok as u32,
+                n_pos: n_pos as u32,
+                kv_dim: kv_dim as u32,
+                max_ctx: max_ctx as u32,
+                scale: 0.5,
+                half: false,
+            };
+            let mut b = gpu.batch();
+            b.attention(&q, &k, &v, &full, &scores, &p, None);
+            p.half = true;
+            b.attention(&q, &k, &v, &half, &scores, &p, None);
+            b.finish();
+            let (mut got, mut want) = (vec![0f32; q_len], vec![0f32; q_len]);
+            gpu.read(&half, &mut got);
+            gpu.read(&full, &mut want);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(want.iter().any(|w| w.abs() > 0.01), "degenerate reference");
+            assert!(
+                err < 5e-3,
                 "{n_head}/{n_kv} heads of {head_dim}: max difference {err}"
             );
         }

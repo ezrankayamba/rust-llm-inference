@@ -2441,3 +2441,33 @@ For the record of where one-thread decode on Zen 4 stands (table of 2026-11-17 a
 tok/s against llama.cpp's 23.1 by default, 27.0 with `--repack`. llama.cpp's figure is with
 its own repacked copy of the Q4_K weights (553 MiB peak against our 91, 549 with `--repack`),
 so at equal memory we are 17% ahead, and 6% behind for a sixth of the memory.
+
+## 2026-11-18: prompt attention on f16 tensor cores (CUDA)
+
+Mistral-7B prompts of 160 to 512 tokens were 3-19% behind llama.cpp (ours / llama.cpp, tok/s,
+two rounds in turn: 160: 3391 / 3726; 224: 3370 / 4177; 256: 3857 / 4237; 320: 3961 / 4252;
+384: 4382 / 4633; 512: 4744 / 4899), though llama.cpp's own matmul there is no faster than
+ours (`test-backend-ops perf`, Q4_K 14336x4096 by 72 / 160 / 192 / 224 / 256 / 384 / 512
+tokens: 156.4 / 296.5 / 340.0 / 378.9 / 418.2 / 606.4 / 797.8 us; 4096x4096: 52.7 / 90.4 /
+107.2 / 120.8 / 141.4 / 195.1 / 254.4; Q6_K 14336x4096: 190.0 / 357.9 / 385.8 / 434.1 / 469.1 /
+678.9 / 892.7; ours at 192 tokens 312.5 and 100.3). At 192 tokens a layer's seven matmuls
+come to about 1450 us of llama.cpp's 1530 and 1350 of our 1635: the rest of a layer cost us
+285 us and llama.cpp 80. `RLI_CUDA_PROF=1` at 512 tokens: `attn_pv` 252 us a layer,
+`attn_scores` 234, `attn_softmax` 67, `swiglu` 110, 14% of the prompt in attention.
+
+`attn_scores_h` and `attn_pv_h` are those two on f16 `mma.sync` with f32 sums, the tiles
+staged as f16 (V with a row per value, since the product wants it packed along positions);
+not under `precise`, head sizes a multiple of 32. At 512 tokens `attn_scores` 234 -> 74 us a
+launch and `attn_pv` 252 -> 152; reading the next step's tiles while this one is multiplied
+144; 64 query rows a block, so V is staged half as often, 124 (256 tokens: 94 -> 52). `bench
+--pp N --tg 0 --gpu-layers 999`, f32 kernels and these in turn (with the 32-row sums),
+Mistral-7B tok/s: 64 tokens 2981, 2969 -> 3025, 3062; 192: 3715, 3738 -> 3695, 3807; 256: 3771,
+3701 -> 3837, 3941; 512: 4720, 4779 -> 5045, 5073. Logits of a 900-character prompt against
+`--precise`: 0.083 -> 0.063, top-1 the same. CUDA tests pass with and without
+`RLI_CUDA_NO_MMA=1` (153 each, with the new `half_attention_matches_f32_attention`).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 64:
+3026 / 2931; 128: 3678 / 3460; 192: 3754 / 3920; 256: 3895 / 4297; 384: 4683 / 4595; 512: 5155 /
+4947. Llama-3.2-1B 64: 10630 / 8740; 128: 10362 / 9992; 192: 15435 / 12671; 256: 15003 / 14992;
+384: 17442 / 16135; 512: 20631 / 17701. Qwen3-30B-A3B 64: 1912 / 1529; 128: 2770 / 1770; 192:
+3420 / 2724; 256: 3804 / 2915; 384: 4680 / 3860; 512: 5007 / 4255.

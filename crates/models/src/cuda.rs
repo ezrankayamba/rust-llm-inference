@@ -608,6 +608,7 @@ impl Cuda {
                     kv_dim: kv_dim as u32,
                     max_ctx: kv.max_ctx as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
+                    half: int8,
                 };
                 if m == 0 {
                     break;

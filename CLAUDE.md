@@ -202,7 +202,13 @@ Design points that span files:
   causal attention runs as tiled products (`attn_scores`, `attn_softmax`, `attn_pv`: 32 positions
   of K or V against 32 query rows per block, so a cached row is read once per tile, not once
   per head and token; a thread reads its share of a tile as 4 `float4` before storing any, and
-  `attn_pv` reads the next 32 positions while it multiplies these: 1.3-1.7x on those kernels). Its scores need a row per head and token,
+  `attn_pv` reads the next 32 positions while it multiplies these: 1.3-1.7x on those kernels).
+  Outside `precise`, scores and sums run on f16 tensor cores (`attn_scores_h`, `attn_pv_h`,
+  the second compile; head sizes a multiple of 32; `attn_pv_h` takes 64 query rows a block
+  and stages V with a row per value): 2-3x on those kernels, Mistral-7B pp512 +7%.
+  **Past 128 tokens llama.cpp's matmul is no faster than ours; what a layer spends outside
+  its matmuls is** (attention, `swiglu`, the f16 conversions: 285 us against 80 at 192
+  tokens before this). Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
   launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
   a KV head and 32 positions per block, scoring the query heads that share the KV head
@@ -319,7 +325,8 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
   `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 96,
-  5% ahead at 32 and 128, 2% behind at 48, 7% at 72, 6% at 192; Llama-3.2-1B level or ahead at 8 to 128;
+  5% ahead at 32 and 128, 2% behind at 48, 7% at 72, 4% at 192, 9% at 256, level at 384,
+  4% ahead at 512; Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 4% behind at 8 tokens, 11% at 16, level at 24 and ahead from 32 (the down
   projection is grouped by expert from 12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16; up to
   4 pairs an expert, `GEMM_DIRECT_ID_PAIRS`, the grouped matmuls run `gemm_*_direct_id`,

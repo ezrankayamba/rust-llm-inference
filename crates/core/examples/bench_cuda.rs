@@ -225,6 +225,7 @@ fn main() {
                 kv_dim: kv_dim as u32,
                 max_ctx: max_ctx as u32,
                 scale: 0.1,
+                half: false,
             };
             let run = || {
                 let mut b = gpu.batch();
