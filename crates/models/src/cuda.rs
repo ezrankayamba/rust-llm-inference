@@ -171,9 +171,55 @@ fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
     int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset))
 }
 
+/// What the kernel that produced a matmul's input wrote besides the f32: nothing, the int8
+/// activations in `Scratch::xq`, or f16 in `Scratch::xh`. Whatever is missing, the matmul
+/// makes with a launch of its own.
+#[derive(Clone, Copy, PartialEq)]
+enum Fed {
+    No,
+    Q,
+    Half,
+}
+
+impl Fed {
+    fn q(self, s: &Scratch) -> Option<&GpuQ> {
+        (self == Fed::Q).then_some(&s.xq)
+    }
+
+    fn half(self, s: &Scratch) -> Option<&GpuHalf> {
+        (self == Fed::Half).then_some(&s.xh)
+    }
+}
+
+/// What [`mm_each`] will read the input of `ws` as, for `n` tokens.
+fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
+    let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
+    let dense = |w: &&&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
+    let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
+    if int8 && (rest.is_empty() || (!rest.iter().any(|w| float(w)) && b.has_gemm(ws[0].cols, n))) {
+        Fed::Half
+    } else if wants_q(b, ws, int8) {
+        Fed::Q
+    } else {
+        Fed::No
+    }
+}
+
+/// [`fed`] for [`mm_add`].
+fn fed_add(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> Fed {
+    let dense = int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
+    let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
+    let q = n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm);
+    if !dense && q && wants_q(b, &[w], int8) {
+        Fed::Q
+    } else {
+        fed(b, &[w], n, int8)
+    }
+}
+
 /// Each of `ws` applied to the `n` tokens at `x`, into the matching `ys`. With `int8`, the
 /// matrices that have an int8 kernel run over `s.xq`: `x` quantized, by the kernel that
-/// produced it (`quantized`) or else here.
+/// produced it (`fed`) or else here.
 #[allow(clippy::too_many_arguments)]
 fn mm_each(
     b: &mut Batch<'_>,
@@ -183,7 +229,7 @@ fn mm_each(
     ys: &[At<'_>],
     n: usize,
     int8: bool,
-    quantized: bool,
+    fed: Fed,
 ) {
     // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
     // are. F32 and F16 weights are the reference path and keep f32 activations.
@@ -194,7 +240,8 @@ fn mm_each(
     let (half, rest): (Vec<_>, Vec<_>) = ws.iter().zip(ys).partition(|(w, _)| dense(w));
     if !half.is_empty() {
         let zs: Vec<_> = half.iter().map(|&(w, &y)| (y, n * w.rows)).collect();
-        b.to_f16_zero(x, n * ws[0].cols, &s.xh, &zs);
+        let convert = if fed == Fed::Half { 0 } else { n * ws[0].cols };
+        b.to_f16_zero(x, convert, &s.xh, &zs);
         for &(w, &y) in &half {
             b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, y, n, true);
         }
@@ -205,14 +252,16 @@ fn mm_each(
     let (ws, ys): (Vec<&Weight>, Vec<At<'_>>) = rest.into_iter().map(|(&w, &y)| (w, y)).unzip();
     let (ws, ys) = (&ws[..], &ys[..]);
     if int8 && !ws.iter().any(float) && b.has_gemm(ws[0].cols, n) {
-        b.to_f16(x, n * ws[0].cols, &s.xh);
+        if fed != Fed::Half {
+            b.to_f16(x, n * ws[0].cols, &s.xh);
+        }
         for (w, &y) in ws.iter().zip(ys) {
             b.dequant(w.ty, w.rows, w.cols, w.offset, &s.wh);
             b.gemm(w.rows, w.cols, &s.wh, &s.xh, y, n);
         }
         return;
     }
-    if !quantized && wants_q(b, ws, int8) {
+    if fed != Fed::Q && wants_q(b, ws, int8) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
     // Where the int8 matmul adds its parts into y, one launch zeroes every result first
@@ -250,16 +299,18 @@ fn mm_add(
     x: At<'_>,
     n: usize,
     int8: bool,
-    quantized: bool,
+    fed: Fed,
 ) {
     if int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n) {
-        b.to_f16(src, n * w.cols, &s.xh);
+        if fed != Fed::Half {
+            b.to_f16(src, n * w.cols, &s.xh);
+        }
         b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, x, n, true);
         return;
     }
     let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
     if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], int8) {
-        if !quantized {
+        if fed != Fed::Q {
             b.quantize(src, n * w.cols, &s.xq);
         }
         b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, x, n, true);
@@ -268,12 +319,14 @@ fn mm_add(
         && b.has_gemm_add(w.rows, w.cols, n)
     {
         // As in `mm_each`, by the kernel that adds.
-        b.to_f16(src, n * w.cols, &s.xh);
+        if fed != Fed::Half {
+            b.to_f16(src, n * w.cols, &s.xh);
+        }
         b.dequant(w.ty, w.rows, w.cols, w.offset, &s.wh);
         b.gemm_add(w.rows, w.cols, &s.wh, &s.xh, x, n);
     } else {
         let tmp = At(&s.tmp, 0);
-        mm_each(b, s, &[w], src, &[tmp], n, int8, quantized);
+        mm_each(b, s, &[w], src, &[tmp], n, int8, fed);
         b.add(x, tmp, n * w.rows);
     }
 }
@@ -288,22 +341,25 @@ fn ffn(
     out: At<'_>,
     n: usize,
     int8: bool,
-    quantized: bool,
+    fed: Fed,
     add: bool,
 ) {
     let (g, u, ff) = (&e.gate, &e.up, e.gate.rows);
     let (xb, gate, up) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.gate, n * ff));
     // One token's gate and up are one launch when they are alike.
     if n == 1 && wants_q(b, &[g], int8) && wants_q(b, &[u], int8) && g.ty == u.ty {
-        if !quantized {
+        if fed != Fed::Q {
             b.quantize(xb, g.cols, &s.xq);
         }
         b.matvec_q_pair(g.ty, ff, g.cols, [g.offset, u.offset], &s.xq, gate);
     } else {
-        mm_each(b, s, &[g, u], xb, &[gate, up], n, int8, quantized);
+        mm_each(b, s, &[g, u], xb, &[gate, up], n, int8, fed);
     }
-    let q = wants_q(b, &[&e.down], int8);
-    b.swiglu(gate, up, n * ff, q.then_some(&s.xq));
+    let q = match add {
+        true => fed_add(b, &e.down, n, int8),
+        false => self::fed(b, &[&e.down], n, int8),
+    };
+    b.swiglu(gate, up, n * ff, q.q(s), q.half(s));
     if add {
         mm_add(b, s, &e.down, gate, out, n, int8, q);
     } else {
@@ -432,7 +488,7 @@ fn moe(
     }
     let (ty, at) = (d.ty, d.offset);
     if down_half {
-        b.swiglu(gate, up, n * k * ff, None);
+        b.swiglu(gate, up, n * k * ff, None, None);
         b.to_f16(gate, n * k * ff, &s.xh);
         b.gemm_id(
             ty,
@@ -448,7 +504,7 @@ fn moe(
             n * k,
         );
     } else if wants_q(b, &[d], int8) {
-        b.swiglu(gate, up, n * k * ff, Some(&s.xq));
+        b.swiglu(gate, up, n * k * ff, Some(&s.xq), None);
         let xq = &s.xq;
         if grouped {
             b.matmul_q_id(
@@ -484,7 +540,7 @@ fn moe(
             );
         }
     } else {
-        b.swiglu(gate, up, n * k * ff, None);
+        b.swiglu(gate, up, n * k * ff, None, None);
         b.matvec_id(
             ty,
             n_embd,
@@ -505,7 +561,7 @@ fn moe(
     b.moe_combine(x, tmp, At(&s.route_w, 0), w_stride, k, n_embd, n);
     if let Some((_, e)) = shared {
         let out = At(&s.tmp, n * k * n_embd);
-        ffn(b, s, e, out, n, false, false, false);
+        ffn(b, s, e, out, n, false, Fed::No, false);
         b.moe_combine(x, out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
 }
@@ -572,10 +628,18 @@ impl Cuda {
                 let skip = usize::from(m == 0);
                 let (qkv, outs) = (&qkv[skip..], &outs[skip..]);
                 // A kernel whose result feeds int8 matrices quantizes it on the way out.
-                let quant = wants_q(b, qkv, int8);
-                let xq = quant.then_some(&s.xq);
-                b.rmsnorm(At(&s.x, 0), xb, &g.attn_norm, n, n_embd, eps, xq);
-                mm_each(b, s, qkv, xb, outs, n, int8, quant);
+                let f = fed(b, qkv, n, int8);
+                b.rmsnorm(
+                    At(&s.x, 0),
+                    xb,
+                    &g.attn_norm,
+                    n,
+                    n_embd,
+                    eps,
+                    f.q(s),
+                    f.half(s),
+                );
+                mm_each(b, s, qkv, xb, outs, n, int8, f);
                 for (t, bias, len) in [
                     (At(&s.q, 0), &g.bq, c.q_dim()),
                     (k_at, &g.bk, kv_dim),
@@ -591,10 +655,19 @@ impl Cuda {
                     }
                     (wq, wk) => {
                         if let Some(w) = wq {
-                            b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, n * c.n_head, hd, eps, None);
+                            b.rmsnorm(
+                                At(&s.q, 0),
+                                At(&s.q, 0),
+                                w,
+                                n * c.n_head,
+                                hd,
+                                eps,
+                                None,
+                                None,
+                            );
                         }
                         if let Some(w) = wk {
-                            b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None);
+                            b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None, None);
                         }
                         b.rope(At(&s.q, 0), k_at, &rope);
                     }
@@ -615,24 +688,30 @@ impl Cuda {
                 }
                 // The attention's quantized copy starts at row 0, so it serves only when the
                 // output projection takes every row.
-                let quant = lo == 0 && wants_q(b, &[&layer.wo], int8) && hd.is_multiple_of(32);
-                let xq = quant.then_some(&s.xq);
-                b.attention(&s.q, &kv.k[l], &kv.v[l], &s.att, &kv.scores, &p, xq);
+                let f = match lo == 0 && hd.is_multiple_of(32) {
+                    true => fed_add(b, &layer.wo, m, int8),
+                    false => Fed::No,
+                };
+                let (k, v) = (&kv.k[l], &kv.v[l]);
+                b.attention(&s.q, k, v, &s.att, &kv.scores, &p, f.q(s), f.half(s));
                 // From here on the layer's rows are the `m` from `lo`.
                 let n = m;
                 let att = At(&s.att, lo * c.q_dim());
-                mm_add(b, s, &layer.wo, att, x_at, n, int8, quant);
-                let quant = match &layer.ffn {
-                    Ffn::Dense(e) => wants_q(b, &[&e.gate, &e.up], int8),
+                mm_add(b, s, &layer.wo, att, x_at, n, int8, f);
+                let f = match &layer.ffn {
+                    Ffn::Dense(e) => fed(b, &[&e.gate, &e.up], n, int8),
                     Ffn::Moe { experts, .. } => {
                         let e = &experts[0];
-                        g.expert_strides.is_some() && wants_q(b, &[&e.gate, &e.up], int8)
+                        match g.expert_strides.is_some() && wants_q(b, &[&e.gate, &e.up], int8) {
+                            true => Fed::Q,
+                            false => Fed::No,
+                        }
                     }
                 };
-                let xq = quant.then_some(&s.xq);
-                b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, xq);
+                let quant = f == Fed::Q;
+                b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, f.q(s), f.half(s));
                 match &layer.ffn {
-                    Ffn::Dense(e) => ffn(b, s, e, x_at, n, int8, quant, true),
+                    Ffn::Dense(e) => ffn(b, s, e, x_at, n, int8, f, true),
                     Ffn::Moe {
                         router,
                         experts,
@@ -665,11 +744,11 @@ impl Cuda {
                             1.0
                         };
                         for &e in chosen {
-                            ffn(b, s, &experts[e], At(&s.tmp, 0), 1, false, false, false);
+                            ffn(b, s, &experts[e], At(&s.tmp, 0), 1, false, Fed::No, false);
                             b.axpy(x_at, At(&s.tmp, 0), probs[e] / norm, n_embd);
                         }
                         if let Some((_, e)) = shared {
-                            ffn(b, s, e, At(&s.tmp, 0), 1, false, false, false);
+                            ffn(b, s, e, At(&s.tmp, 0), 1, false, Fed::No, false);
                             let gate = 1.0 / (1.0 + (-shared_gate[0]).exp());
                             b.axpy(x_at, At(&s.tmp, 0), gate, n_embd);
                         }
@@ -679,10 +758,18 @@ impl Cuda {
             if want_logits {
                 let last = At(&s.x, (n - 1) * n_embd);
                 let (xb, out) = (At(&s.xb, 0), [&model.output]);
-                let quant = wants_q(b, &out, int8);
-                let xq = quant.then_some(&s.xq);
-                b.rmsnorm(last, xb, &self.output_norm, 1, n_embd, c.rms_eps, xq);
-                mm_each(b, s, &out, xb, &[At(&s.logits, 0)], 1, int8, quant);
+                let f = fed(b, &out, 1, int8);
+                b.rmsnorm(
+                    last,
+                    xb,
+                    &self.output_norm,
+                    1,
+                    n_embd,
+                    c.rms_eps,
+                    f.q(s),
+                    f.half(s),
+                );
+                mm_each(b, s, &out, xb, &[At(&s.logits, 0)], 1, int8, f);
             }
         };
         // One token's launches are replayed as a graph, which costs less per launch and leaves

@@ -208,7 +208,9 @@ Design points that span files:
   and stages V with a row per value): 2-3x on those kernels, Mistral-7B pp512 +7%.
   **Past 128 tokens llama.cpp's matmul is no faster than ours; what a layer spends outside
   its matmuls is** (attention, `swiglu`, the f16 conversions: 285 us against 80 at 192
-  tokens before this). Its scores need a row per head and token,
+  tokens before this). The kernel that makes a matmul's input writes it in the form the
+  matmul reads (`Fed` in rli-models' cuda.rs: int8 or f16, `quant` 1 or 2 in `rmsnorm` and
+  `swiglu`), so a long prompt has no `to_f16` or `quant_x` launches. Its scores need a row per head and token,
   capped at 128 MB per session (`SCORE_BUDGET`); past that a chunk's attention takes several
   launches. Decode past 128 cached positions splits the context instead: `attention_part` takes
   a KV head and 32 positions per block, scoring the query heads that share the KV head
@@ -325,8 +327,8 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
   `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 96,
-  5% ahead at 32 and 128, 2% behind at 48, 7% at 72, 4% at 192, 9% at 256, level at 384,
-  4% ahead at 512; Llama-3.2-1B level or ahead at 8 to 128;
+  5% ahead at 32 and 128, 2% behind at 48, 7% at 72, 9% at 160, level at 192, 13% behind
+  at 224, 5% at 256, level at 320, 6% ahead at 384, 11% at 512 (2026-11-19); Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 4% behind at 8 tokens, 11% at 16, level at 24 and ahead from 32 (the down
   projection is grouped by expert from 12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16; up to
   4 pairs an expert, `GEMM_DIRECT_ID_PAIRS`, the grouped matmuls run `gemm_*_direct_id`,

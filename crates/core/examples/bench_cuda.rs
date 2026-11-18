@@ -231,7 +231,16 @@ fn main() {
                 let mut b = gpu.batch();
                 for _ in 0..16 {
                     for l in 0..16 {
-                        b.attention(&q, &kv[2 * l], &kv[2 * l + 1], &out, &scores, &p, None);
+                        b.attention(
+                            &q,
+                            &kv[2 * l],
+                            &kv[2 * l + 1],
+                            &out,
+                            &scores,
+                            &p,
+                            None,
+                            None,
+                        );
                     }
                 }
                 b.finish();

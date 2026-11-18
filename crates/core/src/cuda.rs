@@ -1945,7 +1945,8 @@ impl<'a> Batch<'a> {
         self.launch(l, grid(len.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
-    /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
+    /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias), and
+    /// into `quant` quantized, or into `half` as f16 (as [`Batch::to_f16`] would), if given.
     #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm(
         &mut self,
@@ -1956,10 +1957,12 @@ impl<'a> Batch<'a> {
         n: usize,
         eps: f32,
         quant: Option<&GpuQ>,
+        half: Option<&GpuHalf>,
     ) {
         assert!(x.1 + rows * n <= x.0.len() && out.1 + rows * n <= out.0.len());
+        let (quant, mode) = Self::half_out(quant, half, rows * n);
         let (x_off, o_off, n_u) = (x.1 as u64, out.1 as u64, n as u32);
-        let (q, quant) = self.quant_out(quant, rows * n, n);
+        let (q, _) = self.quant_out(quant, rows * n, n);
         let mut a = self.call(self.gpu.other("rmsnorm"));
         a.arg(&x.0.0)
             .arg(&x_off)
@@ -1967,15 +1970,32 @@ impl<'a> Batch<'a> {
             .arg(&o_off)
             .arg(&w.0)
             .arg(&n_u)
-            .arg(&eps)
-            .arg(&q.q)
-            .arg(&q.d)
-            .arg(&q.s)
-            .arg(&quant);
+            .arg(&eps);
+        match half {
+            Some(h) => a.arg(&h.0),
+            None => a.arg(&q.q),
+        };
+        a.arg(&q.d).arg(&q.s).arg(&mode);
         // A thread per value where the block can hold them: with fewer, each thread reads
         // several values in turn and waits out the memory latency for every one.
         let threads = (n.next_multiple_of(32) as u32).min(REDUCE_THREADS);
         self.launch(a, grid(rows, threads));
+    }
+
+    /// The mode a kernel that writes its `n` results quantized (1) or as f16 (2) takes, and
+    /// `quant` if that is the one it writes: `half` comes first.
+    fn half_out<'c>(
+        quant: Option<&'c GpuQ>,
+        half: Option<&GpuHalf>,
+        n: usize,
+    ) -> (Option<&'c GpuQ>, u32) {
+        match half {
+            Some(h) => {
+                assert!(h.0.len() >= n);
+                (None, 2)
+            }
+            None => (quant, quant.is_some() as u32),
+        }
     }
 
     /// The buffers and flag a kernel takes for quantizing its `n` results (rows of `row`, a
@@ -2039,21 +2059,30 @@ impl<'a> Batch<'a> {
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
-    /// `gate = silu(gate) * up`, quantized into `quant` as well when given.
-    pub fn swiglu(&mut self, gate: At<'_>, up: At<'_>, n: usize, quant: Option<&GpuQ>) {
+    /// `gate = silu(gate) * up`; `quant` and `half` as for [`Batch::rmsnorm`].
+    pub fn swiglu(
+        &mut self,
+        gate: At<'_>,
+        up: At<'_>,
+        n: usize,
+        quant: Option<&GpuQ>,
+        half: Option<&GpuHalf>,
+    ) {
         assert!(gate.1 + n <= gate.0.len() && up.1 + n <= up.0.len());
         let (g_off, u_off, n_u) = (gate.1 as u64, up.1 as u64, n as u32);
-        let (q, quant) = self.quant_out(quant, n, n);
+        let (quant, mode) = Self::half_out(quant, half, n);
+        let (q, _) = self.quant_out(quant, n, n);
         let mut l = self.call(self.gpu.other("swiglu"));
         l.arg(&gate.0.0)
             .arg(&g_off)
             .arg(&up.0.0)
             .arg(&u_off)
-            .arg(&n_u)
-            .arg(&q.q)
-            .arg(&q.d)
-            .arg(&q.s)
-            .arg(&quant);
+            .arg(&n_u);
+        match half {
+            Some(h) => l.arg(&h.0),
+            None => l.arg(&q.q),
+        };
+        l.arg(&q.d).arg(&q.s).arg(&mode);
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
@@ -2207,6 +2236,7 @@ impl<'a> Batch<'a> {
         scores: &GpuBuf,
         p: &AttnParams,
         quant: Option<&GpuQ>,
+        half_out: Option<&GpuHalf>,
     ) {
         let per_launch = (scores.len() / (p.n_head * p.max_ctx) as usize).min(p.n_tok as usize);
         assert!(per_launch > 0, "attention scores scratch too small");
@@ -2215,6 +2245,9 @@ impl<'a> Batch<'a> {
         assert!(q.len() >= q_len && out.len() >= q_len);
         assert!(p.n_pos + p.n_tok - 1 <= p.max_ctx);
         assert!(k.len() >= ((p.n_pos + p.n_tok - 1) * p.kv_dim) as usize && v.len() >= k.len());
+        // Only the tensor-core kernel writes f16 itself.
+        let (quant, _) = Self::half_out(quant, half_out, q_len);
+        let mut converted = half_out.is_none();
         let (xq, quant_u) = self.quant_out(quant, q_len, p.head_dim as usize);
         if p.n_tok == 1
             && p.n_pos > ATTN_PART_MIN
@@ -2223,7 +2256,11 @@ impl<'a> Batch<'a> {
             && p.head_dim.is_multiple_of(4)
             && p.n_pos as usize <= ATTN_PART * ATTN_PART_MAX
         {
-            return self.attention_decode(q, k, v, out, scores, p, quant);
+            self.attention_decode(q, k, v, out, scores, p, quant);
+            if let Some(h) = half_out {
+                self.to_f16(At(out, 0), q_len, h);
+            }
+            return;
         }
         // Several tokens run as tiled products where the kernels take the shape.
         let g_n = p.n_head / p.n_kv;
@@ -2279,6 +2316,13 @@ impl<'a> Batch<'a> {
                     .arg(&p.max_ctx)
                     .arg(&tok0)
                     .arg(&n);
+                if half.is_some() {
+                    converted = true;
+                    match half_out {
+                        Some(o) => l.arg(&o.0).arg(&1u32),
+                        None => l.arg(&out.0).arg(&0u32),
+                    };
+                }
                 // The tensor-core kernel takes 64 query rows a block.
                 let (rows, threads) = match half {
                     Some(_) => ((n as usize).div_ceil((64 / g_n) as usize), 256),
@@ -2288,6 +2332,9 @@ impl<'a> Batch<'a> {
             }
             if let Some(quant) = quant {
                 self.quantize(At(out, 0), q_len, quant);
+            }
+            if let (Some(h), false) = (half_out, converted) {
+                self.to_f16(At(out, 0), q_len, h);
             }
             return;
         }
@@ -2312,6 +2359,9 @@ impl<'a> Batch<'a> {
                 .arg(&quant_u);
             let n = per_launch.min((p.n_tok - tok0) as usize);
             self.launch(l, grid2(p.n_head as usize, n, ATTN_THREADS));
+        }
+        if let Some(h) = half_out {
+            self.to_f16(At(out, 0), q_len, h);
         }
     }
 
@@ -2683,9 +2733,9 @@ mod tests {
                 half: false,
             };
             let mut b = gpu.batch();
-            b.attention(&q, &k, &v, &one, &scores, &p, None);
+            b.attention(&q, &k, &v, &one, &scores, &p, None, None);
             p.n_tok = 2;
-            b.attention(&q, &k, &v, &two, &scores, &p, None);
+            b.attention(&q, &k, &v, &two, &scores, &p, None, None);
             b.finish();
             let (mut got, mut want) = (vec![0f32; q_len], vec![0f32; q_len]);
             gpu.read(&one, &mut got);
@@ -2747,9 +2797,9 @@ mod tests {
                 half: false,
             };
             let mut b = gpu.batch();
-            b.attention(&q, &k, &v, &full, &scores, &p, None);
+            b.attention(&q, &k, &v, &full, &scores, &p, None, None);
             p.half = true;
-            b.attention(&q, &k, &v, &half, &scores, &p, None);
+            b.attention(&q, &k, &v, &half, &scores, &p, None, None);
             b.finish();
             let (mut got, mut want) = (vec![0f32; q_len], vec![0f32; q_len]);
             gpu.read(&half, &mut got);

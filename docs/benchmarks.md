@@ -2471,3 +2471,27 @@ Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mist
 4947. Llama-3.2-1B 64: 10630 / 8740; 128: 10362 / 9992; 192: 15435 / 12671; 256: 15003 / 14992;
 384: 17442 / 16135; 512: 20631 / 17701. Qwen3-30B-A3B 64: 1912 / 1529; 128: 2770 / 1770; 192:
 3420 / 2724; 256: 3804 / 2915; 384: 4680 / 3860; 512: 5007 / 4255.
+
+## 2026-11-19: f16 activations written by the kernel that makes them (CUDA)
+
+After the tensor-core attention, `RLI_CUDA_PROF=1` on a 256-token Mistral-7B prompt still showed
+`to_f16` 500 launches of 17.6 us (four a layer: the input of Q/K/V, of the output projection, of
+gate/up and of down), `quant_x` 128 of 19.7 (the attention result quantized for an output
+projection that reads f16) and the int8 copies `rmsnorm` and `swiglu` wrote for nobody. With
+those launches skipped (wrong results, an upper bound): 256 tokens 3850 -> 4326 tok/s, 512
+tokens 5120 -> 5763.
+
+`rmsnorm`, `swiglu` and `attn_pv_h` now write f16 into `Scratch::xh` when the matmuls that
+follow read that (`fed` / `fed_add` in rli-models' cuda.rs mirror `mm_each` / `mm_add`), and
+quantize only for int8 matmuls. At 256 tokens `to_f16` and `quant_x` are gone from the profile,
+`swiglu` 59.8 -> 47.6 us, `rmsnorm` 28.7 -> 22.4. `bench --pp N --tg 0 --gpu-layers 999`, the
+build before and this one in turn, Mistral-7B tok/s: 64 tokens 3057, 3054 -> 3035, 3099; 192:
+3789, 3821 -> 3789, 3894; 256: 3829, 3803 -> 4075, 3899; 512: 5195, 5160 -> 5391, 5239. Logits
+against `--precise` (900-, 300- and 60-character prompts): 0.060, 0.062, 0.085, top-1 the same.
+CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each).
+
+Against llama.cpp (means of two rounds in turn, ours / llama.cpp): Mistral-7B 16: 1272 / 1302;
+64: 3091 / 2931; 128: 3682 / 3416; 160: 3480 / 3804; 192: 3849 / 3884; 224: 3553 / 4081; 256:
+3970 / 4192; 320: 4243 / 4213; 384: 4842 / 4587; 512: 5400 / 4845. Llama-3.2-1B 5-27% ahead at
+16 to 512. Qwen3-30B-A3B 16: 786 / 861; 64 to 512: 18-54% ahead. What is left on Mistral-7B
+is at lengths that are not whole 64-token blocks (160: 9% behind, 224: 13%).

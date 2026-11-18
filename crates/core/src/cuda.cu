@@ -1587,6 +1587,7 @@ extern "C" __global__ void attn_scores_h(const float* q, const float* kc, float*
 
 // The weighted sums of V: 256 threads a block; a warp takes 16 query rows by head_dim / 4
 // values, the scores its product's rows and V, staged with a row per value, its columns.
+// With `half` the result goes to oh as f16 too, for the output projection.
 #define AV_S 20  // words between staged rows of 16
 #define PVH_R 64  // query rows a block
 #define PVH_READ(BASE)                                                                         \
@@ -1611,7 +1612,8 @@ extern "C" __global__ void attn_scores_h(const float* q, const float* kc, float*
     }
 extern "C" __global__ void attn_pv_h(const float* scores, const float* vc, float* out,
                                      uint n_head, uint n_kv, uint head_dim, uint n_pos,
-                                     uint kv_dim, uint max_ctx, uint tok0, uint n_tok) {
+                                     uint kv_dim, uint max_ctx, uint tok0, uint n_tok,
+                                     unsigned short* oh, uint half) {
     __shared__ uint vt[128 * AV_S];
     __shared__ uint ps[PVH_R * AV_S];
     uint tid = threadIdx.x, g_n = n_head / n_kv, tpt = PVH_R / g_n, t0 = blockIdx.y * tpt;
@@ -1664,7 +1666,9 @@ extern "C" __global__ void attn_pv_h(const float* scores, const float* vc, float
         uint o = j / 4, r = 16 * rg + gi + 8 * (j / 2 % 2), t = t0 + r / g_n;
         if (o >= no || t >= n_tok) continue;
         uint d = 8 * (o0 + o) + 2 * gj + j % 2;
-        out[((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d] = c[o][j % 4];
+        ulong at = ((ulong)(tok0 + t) * n_head + blockIdx.x * g_n + r % g_n) * head_dim + d;
+        out[at] = c[o][j % 4];
+        if (half) oh[at] = f2h(c[o][j % 4]);
     }
 }
 
@@ -1700,7 +1704,8 @@ __device__ inline float block_max(float v, float* red) {
 }
 
 // One block per row of n; in-place when x_off == out_off on the same buffer.
-// With `quant` (n a multiple of 32), the result is quantized into xq, xd, xs as well.
+// With `quant` 1 (n a multiple of 32), the result is quantized into xq, xd, xs as well; with
+// 2, written as f16 at xq, for the tensor-core matmuls (a launch of `to_f16` less).
 extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulong out_off,
                                    const float* w, uint n, float eps, signed char* xq,
                                    float* xd, float* xs, uint quant) {
@@ -1714,7 +1719,8 @@ extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulon
     for (uint i = threadIdx.x; i < n; i += blockDim.x) {
         float v = xr[i] * scale * w[i];
         o[i] = v;
-        if (quant) quant_block(v, ((ulong)blockIdx.x * n + i) / 32, xq, xd, xs);
+        if (quant == 1) quant_block(v, ((ulong)blockIdx.x * n + i) / 32, xq, xd, xs);
+        if (quant == 2) ((unsigned short*)xq)[(ulong)blockIdx.x * n + i] = f2h(v);
     }
 }
 
@@ -1735,7 +1741,7 @@ extern "C" __global__ void add_bias(float* a, ulong a_off, const float* b, uint 
     if (i < n) a[a_off + i] += b[i % m];
 }
 
-// With `quant` (n a multiple of 32), the result is quantized into xq, xd, xs as well.
+// `quant` as for rmsnorm.
 extern "C" __global__ void swiglu(float* g, ulong g_off, const float* u, ulong u_off, uint n,
                                   signed char* xq, float* xd, float* xs, uint quant) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1743,7 +1749,8 @@ extern "C" __global__ void swiglu(float* g, ulong g_off, const float* u, ulong u
         float v = g[g_off + i];
         v = v / (1.0f + expf(-v)) * u[u_off + i];
         g[g_off + i] = v;
-        if (quant) quant_block(v, i / 32, xq, xd, xs);
+        if (quant == 1) quant_block(v, i / 32, xq, xd, xs);
+        if (quant == 2) ((unsigned short*)xq)[i] = f2h(v);
     }
 }
 
