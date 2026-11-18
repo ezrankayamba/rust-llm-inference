@@ -2183,3 +2183,33 @@ without `RLI_CUDA_NO_MMA=1` (152). Also tried on the dense int8 matmul and dropp
 (the same to 96, 3% slower at 112, 1.4x slower from 128, where a multiprocessor holds two
 blocks). With the float arithmetic after each `mma` reduced to one add that matmul takes
 103 us, and with the tiles staged once 123: those are where its time is.
+
+## 2026-11-18: CUDA prompt chunks of 24 to 192 tokens on f16 tensor cores, weights decoded in the block
+
+`gemm_q4_k_dense` / `gemm_q6_k_dense` are the MoE experts' kernel (`GEMM_ID`: 64 rows by 64
+tokens, a step's weights decoded to f16 on the way into shared memory) over every token of a
+chunk, the columns in parts that `atomicAdd` into y (`dense_parts`, up to 8). Nothing is
+written out first, which is what `dequant_*` + `gemm_f16_*` could not afford under 129
+tokens. `bench_cuda` (`RLI_DENSE=1` for this kernel), us a matmul, int8 tensor cores against
+this at its best part count: 4096x4096 by 64 tokens 59.3 -> 40.4, 14336x4096 170.4 -> 121.4,
+4096x14336 169.5 -> 121.4; by 128 tokens 103 -> 70, 315 -> 216, 312 -> 215; by 16 tokens
+34.3 against 32.4, 91.6 against 93.0 (so not there). By 256 tokens 129 / 414 / 398 against
+dequant + GEMM's 133 / 453 / 396, by 512 it loses (234 / 796 / 784 against 210 / 595 / 644):
+a block decodes its weights again for every 64 tokens.
+
+`bench --pp N --tg 0 --gpu-layers 999`, R = 2400 / N repetitions (at most 60), before and
+after in turn (two rounds each, tok/s). Mistral-7B: 16 tokens 1040, 1041 against 953, 965
+(not used); 24: 1283, 1283 -> 1366, 1365; 32: 1609, 1643 -> 1735, 1755; 48: 2015, 2006 ->
+2389, 2353; 64: 2365, 2428 -> 2841, 2861; 96: 2343, 2324 -> 2829, 2813; 128: 2742, 2754 ->
+3236, 3324; 192: 3120, 3150 -> 3422, 3471; 256: 3702, 3812 against 3552, 3575 (not used).
+Llama-3.2-1B was noisy that hour (±20%): 48 tokens 7535, 7840 -> 8831, 8663; 64: 9328, 7990
+-> 10436, 8992; the rest within noise. Logits of a 400-character prompt against `--precise`:
+Mistral-7B 0.27 -> 0.085, Llama-3.2-1B 0.20 -> 0.10 (f16 activations, not int8).
+
+Against llama.cpp after it (ours / llama.cpp, two rounds in turn, means): Mistral-7B 24:
+1382 / 1717; 32: 1763 / 2074; 48: 2387 / 2600; 64: 2817 / 2904; 96: 2776 / 3322; 128: 3361 /
+3379; 192: 3442 / 4036. Llama-3.2-1B 24: 4762 / 5080; 32: 6176 / 6340; 48: 8197 / 8263; 64:
+9187 / 9026; 96: 11188 / 10929; 128: 11194 / 11142; 192: 11835 / 12812. Qwen3-30B-A3B 24:
+877 / 1037; 32: 1098 / 1183; 48: 1441 / 1391; 64: 1778 / 1518; 96: 2195 / 1693; 128: 2595 /
+1774; 192: 3213 / 2783. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152 each);
+`gemm_matches_f32_matmul` now covers the new kernel, stored and added.

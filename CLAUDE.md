@@ -270,8 +270,13 @@ Design points that span files:
   compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
   under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
   own kernels (above).
+  Chunks of 24 to 192 tokens (`GEMM_DENSE_TOKENS`) run Q4_K and Q6_K matrices through
+  `gemm_*_dense`, the MoE experts' kernel over every token: f16 `mma.sync`, a step's weights
+  decoded in the block, the columns in parts that add into y (`dense_parts`). Mistral-7B
+  7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 5% slower than
+  dequant + GEMM at 256; logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
-  matmuls remain for chunks of 8-128 tokens. The 64x128 tile runs four warps of four row groups
+  matmuls remain for chunks of 8-23 tokens, and for types and GPUs without that kernel. The 64x128 tile runs four warps of four row groups
   (a read of the token tile feeds four products); it does not wait on global memory.
   What it is short of is the copy into shared memory: with the tiles staged once it runs
   1.5-1.9x faster, and every tile shape tried moves 2.2-2.7 TB/s. cuBLAS on the same A100 is
@@ -300,7 +305,10 @@ Design points that span files:
   level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B;
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
-  moved both engines by 1.6x): 512 tokens level or ahead on all three; Mistral-7B 9% ahead
+  moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
+  `gemm_*_dense`; with it Mistral-7B is level at 64 and 128 tokens and 8-19% behind at 24 to
+  48, 96 and 192, Llama-3.2-1B level from 32 to 128, Qwen3-30B-A3B 7-15% behind at 24 and 32
+  and ahead from 48); Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
   9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 9-24% behind at 8 to 32 (its expert
   matvecs under 20 tokens; the router of a chunk of up to 64 tokens runs as matvecs,

@@ -65,6 +65,13 @@ const MMA_TILE: (usize, usize, u32) = (128, 64, 256);
 /// Tokens a block of the kernels for chunks of no more than that: a block stages its whole
 /// tile of tokens however many the chunk has.
 const MMA_FEW: [usize; 2] = [16, 32];
+/// The chunks [`Batch::gemm_dense`] takes, in tokens. Under them the int8 kernels' 16-token
+/// blocks are ahead (Mistral-7B at 16 tokens: 8% slower this way), and over them writing the
+/// matrix out once for [`Batch::gemm`] is: a block here decodes its weights again for every
+/// 64 tokens (5% slower at 256).
+pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=192;
+/// Most parts of a matrix's columns it takes.
+const GEMM_DENSE_PARTS_MAX: usize = 8;
 /// Most parts [`mma_parts`] splits a matrix's columns into.
 const MMA_PARTS_MAX: usize = 16;
 const MMA_REGS: usize = 80;
@@ -208,6 +215,8 @@ pub struct Gpu {
     gemm_room: (usize, usize),
     /// The f16 products for stacked experts, which decode as they go (`gemm_*_id`).
     gemm_id: Vec<(GgmlType, CudaFunction)>,
+    /// The same over every token, a matrix's columns in parts.
+    gemm_dense: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -260,6 +269,7 @@ impl Gpu {
                 .0
                 >= 8;
         let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
+        let mut gemm_dense = Vec::new();
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -286,6 +296,10 @@ impl Gpu {
                     Ok((t, module.load_function(&n).map_err(err(&n))?))
                 })
                 .collect::<Result<_, String>>()?;
+            for (t, n) in MMQ_KERNELS {
+                let n = format!("{}_dense", n.replace("mmq", "gemm"));
+                gemm_dense.push((t, module.load_function(&n).map_err(err(&n))?));
+            }
             for tt in MMA_FEW {
                 for (t, n) in MMQ_KERNELS {
                     let n = format!("{}_t{tt}", n.replace("mmq", "mma"));
@@ -401,6 +415,7 @@ impl Gpu {
             gemm,
             gemm_room,
             mma_few,
+            gemm_dense,
             gemm_id,
             other,
             zero_id,
@@ -812,6 +827,8 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if let Some((t, _)) = self.gemm_dense.iter().find(|(_, g)| eq(g)) {
+            format!("gemm in-block {t:?}")
         } else if let Some((t, _)) = self.gemm_id.iter().find(|(_, g)| eq(g)) {
             format!("gemm by expert {t:?}")
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
@@ -932,6 +949,20 @@ fn mma_parts(rows: usize, cols: usize, token_tiles: usize, sms: usize) -> usize 
     (4 * held)
         .div_ceil(tiles)
         .min(MMA_PARTS_MAX)
+        .min(cols / 256)
+        .max(1)
+}
+
+/// How many parts [`Batch::gemm_dense`] splits the columns into, as [`mma_parts`]: its blocks
+/// are 64 rows by 64 tokens, and a part is at least a super-block. Measured on an A100, us
+/// for 1 / 2 / 4 / 8 / 16 parts: 4096x4096 by 64 tokens 98 / 64 / 44 / 40 / 45, 14336x4096
+/// 156 / 136 / 121 / 122 / 135; by 256 tokens 147 / 129 / 129 / 129 and 437 / 412 / 414 / 434.
+fn dense_parts(rows: usize, cols: usize, n_tok: usize, sms: usize) -> usize {
+    let tiles = rows.div_ceil(64) * n_tok.div_ceil(64);
+    let held = sms * (65536 / (MMA_REGS * 256));
+    (4 * held)
+        .div_ceil(tiles)
+        .min(GEMM_DENSE_PARTS_MAX)
         .min(cols / 256)
         .max(1)
 }
@@ -1283,6 +1314,59 @@ impl<'a> Batch<'a> {
             .arg(&cols_u)
             .arg(&rb);
         self.launch(a, grid2(rows.div_ceil(64), n_stack, 256));
+    }
+
+    /// Whether [`Batch::gemm_dense`] takes this matrix over a chunk of `n_tok` tokens.
+    pub fn has_gemm_dense(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
+        GEMM_DENSE_TOKENS.contains(&n_tok) && self.has_gemm_id(ty, cols, offset, 0)
+    }
+
+    /// `y = W x` (`y += W x` with `add`) on f16 tensor cores where [`Batch::has_gemm_dense`],
+    /// over the `n_tok` rows of `cols` that [`Batch::to_f16`] left in `xh`. The weights are
+    /// decoded to f16 inside the kernel, as for [`Batch::gemm_id`]: nothing is written out
+    /// first, which costs as much as the product at these sizes. Blocks of 64 rows by 64
+    /// tokens take the columns in parts and add their sums.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_dense(
+        &mut self,
+        ty: GgmlType,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        xh: &GpuHalf,
+        y: At<'_>,
+        n_tok: usize,
+        add: bool,
+    ) {
+        assert!(self.has_gemm_dense(ty, cols, offset, n_tok) && rows > 0);
+        assert!(xh.0.len() >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
+        let parts = dense_parts(rows, cols, n_tok, self.gpu.gemm_room.0);
+        if !add {
+            self.zero_rows(y, (0, rows, rows), n_tok);
+        }
+        let gpu: &'a Gpu = self.gpu;
+        let row_bytes = ty.row_bytes(cols);
+        let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+        let (stride, xd, y_off) = (0u64, 1u32, y.1 as u64);
+        let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
+        let (nt, parts_u) = (n_tok as u32, parts as u32);
+        let f = gpu.gemm_dense.iter().find(|(t, _)| *t == ty);
+        let mut a = self.call(&f.expect("checked by has_gemm_id").1);
+        a.arg(&gpu.weights)
+            .arg(&w_off)
+            .arg(&stride)
+            .arg(&gpu.zero_id.0)
+            .arg(&gpu.zero_id.0)
+            .arg(&xh.0)
+            .arg(&xd)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb)
+            .arg(&nt)
+            .arg(&parts_u);
+        self.launch(a, grid2(rows.div_ceil(64), n_tok.div_ceil(64) * parts, 256));
     }
 
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
@@ -2309,6 +2393,10 @@ mod tests {
                 (17, 256, 300),
                 (2048, 512, 512),
                 (14400, 256, 500),
+                // Chunks short enough for the kernel that decodes the weights itself.
+                (200, 512, 30),
+                (130, 768, 100),
+                (2048, 1024, 192),
             ] {
                 let mut seed = 3u32;
                 let mut next = move || {
@@ -2357,19 +2445,27 @@ mod tests {
                 let (wh, xh) = (gpu.alloc_half(rows * cols), gpu.alloc_half(n * cols));
                 let (y_f32, y_h) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
                 let mut b = gpu.batch();
-                if !b.has_gemm(cols, n) {
-                    return; // no f16 tensor cores, or RLI_CUDA_NO_MMA
+                let dense = b.has_gemm_dense(ty, cols, 0, n);
+                if !dense && !b.has_gemm(cols, n) {
+                    continue; // no kernel for the type, no f16 tensor cores, or RLI_CUDA_NO_MMA
                 }
                 b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
                 b.to_f16(At(&xb, 0), n * cols, &xh);
-                b.dequant(ty, rows, cols, 0, &wh);
-                b.gemm(rows, cols, &wh, &xh, At(&y_h, 0), n);
                 // y_sum = y_f32 + W x, where there is a kernel for it.
                 let y_sum = gpu.alloc(n * rows);
-                let added = b.has_gemm_add(rows, cols, n);
+                let added = dense || b.has_gemm_add(rows, cols, n);
                 if added {
                     b.add(At(&y_sum, 0), At(&y_f32, 0), n * rows);
-                    b.gemm_add(rows, cols, &wh, &xh, At(&y_sum, 0), n);
+                }
+                if dense {
+                    b.gemm_dense(ty, rows, cols, 0, &xh, At(&y_h, 0), n, false);
+                    b.gemm_dense(ty, rows, cols, 0, &xh, At(&y_sum, 0), n, true);
+                } else {
+                    b.dequant(ty, rows, cols, 0, &wh);
+                    b.gemm(rows, cols, &wh, &xh, At(&y_h, 0), n);
+                    if added {
+                        b.gemm_add(rows, cols, &wh, &xh, At(&y_sum, 0), n);
+                    }
                 }
                 b.finish();
                 let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);

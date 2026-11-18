@@ -8,8 +8,8 @@
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::cuda::{
-    ATTN_THREADS, At, AttnParams, Batch, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf, GpuIds, GpuQ,
-    Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
+    ATTN_THREADS, At, AttnParams, Batch, GEMM_DENSE_TOKENS, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf,
+    GpuIds, GpuQ, Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
 };
 use rli_core::{GgmlType, ops};
 use std::any::Any;
@@ -73,7 +73,7 @@ impl Scratch {
         // An MoE token holds its k chosen experts' activations side by side; their outputs are
         // followed by the shared expert's, one row per token.
         let k = c.n_expert_used;
-        let gemm = n >= GEMM_MIN_TOKENS;
+        let (gemm, half) = (n >= GEMM_MIN_TOKENS, n >= *GEMM_DENSE_TOKENS.start());
         Self {
             x: gpu.alloc(n * c.n_embd),
             xb: gpu.alloc(n * c.n_embd),
@@ -90,7 +90,7 @@ impl Scratch {
             starts: gpu.alloc_ids(c.n_expert + 1),
             route_w: gpu.alloc(n * (k + 1)),
             xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)),
-            xh: gpu.alloc_half(if gemm {
+            xh: gpu.alloc_half(if half {
                 n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)
             } else {
                 0
@@ -184,6 +184,15 @@ fn mm_each(
     // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
     // are. F32 and F16 weights are the reference path and keep f32 activations.
     let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
+    let dense = |w: &&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
+    if int8 && ws.iter().all(dense) {
+        // Shorter ones too, the weights decoded on the way into the tensor cores.
+        b.to_f16(x, n * ws[0].cols, &s.xh);
+        for (w, &y) in ws.iter().zip(ys) {
+            b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, y, n, false);
+        }
+        return;
+    }
     if int8 && !ws.iter().any(float) && b.has_gemm(ws[0].cols, n) {
         b.to_f16(x, n * ws[0].cols, &s.xh);
         for (w, &y) in ws.iter().zip(ys) {
@@ -217,6 +226,11 @@ fn mm_add(
     int8: bool,
     quantized: bool,
 ) {
+    if int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n) {
+        b.to_f16(src, n * w.cols, &s.xh);
+        b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, x, n, true);
+        return;
+    }
     let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
     if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], int8) {
         if !quantized {

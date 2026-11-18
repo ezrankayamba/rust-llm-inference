@@ -128,7 +128,7 @@ fn main() {
             );
         }
     }
-    for n_tok in [16, 32, 64] {
+    for n_tok in [32, 64, 128] {
         let xf = gpu.alloc(n_tok * 14336);
         let xqm = gpu.alloc_q(n_tok * 14336);
         let yb = gpu.alloc(n_tok * 14336);
@@ -145,10 +145,17 @@ fn main() {
         ] {
             let bytes = ty.row_bytes(cols) * rows;
             let count = (mem.len() / bytes).min(16);
+            let xh = gpu.alloc_half(n_tok * 14336);
+            // In int8, or (RLI_DENSE) on f16 tensor cores with the weights decoded in the block.
+            let dense = std::env::var_os("RLI_DENSE").is_some();
             let run = || {
                 let mut b = gpu.batch();
                 for i in 0..count {
-                    b.matmul_q(ty, rows, cols, i * bytes, &xqm, At(&yb, 0), n_tok, false);
+                    if dense {
+                        b.gemm_dense(ty, rows, cols, i * bytes, &xh, At(&yb, 0), n_tok, true);
+                    } else {
+                        b.matmul_q(ty, rows, cols, i * bytes, &xqm, At(&yb, 0), n_tok, false);
+                    }
                 }
                 b.finish();
             };
