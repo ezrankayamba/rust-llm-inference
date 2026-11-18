@@ -667,6 +667,51 @@ __device__ inline float mvq_q4_k_step(const uchar* r, const int* xq, const float
     return (hf ? fo : f) * (float)s0 + (hf ? f : fo) * (float)s1 - mins;
 }
 
+// mvq_q4_k_step for 8 super-blocks, both halves read before either is used: with few rows in
+// flight (a token's matvecs) a warp's time is the waits for its reads, and this halves them
+// (decode on an A100: Llama-3.2-1B +4.5%, Qwen3-30B-A3B +3%, Mistral-7B +1.9%). Over the 128
+// (token, expert) rows of a 16-token MoE chunk it was 2% slower: mvq_q4_k_many keeps 4 a step.
+__device__ inline float mvq_q4_k_step8(const uchar* r, const int* xq, const float* xd,
+                                      const float* xs, uint left, uint lane) {
+    uint u = lane / 8, j = lane % 8, hf = j % 2, l = j % 4;
+    float f[2] = {0, 0}, mins[2] = {0, 0};
+    int s0[2] = {0, 0}, s1[2] = {0, 0};
+    U128 hd[2], q[2], x0[2], x1[2];
+    float d[2], sa[2], sb[2];
+    // Both halves of the step's 8 super-blocks are read before either is used.
+    #pragma unroll
+    for (uint t = 0; t < 2; t++) {
+        uint v = u + 4 * t;
+        if (v >= left) continue;
+        const uchar* b = r + v * 144;
+        hd[t] = *(const U128*)b;
+        q[t] = *(const U128*)(b + 16 + 16 * j);
+        x0[t] = *(const U128*)(xq + 64 * v + 16 * (j / 2) + 4 * hf);
+        x1[t] = *(const U128*)(xq + 64 * v + 16 * (j / 2) + 8 + 4 * hf);
+        d[t] = xd[8 * v + j];
+        sa[t] = xs[16 * v + 2 * j];
+        sb[t] = xs[16 * v + 2 * j + 1];
+    }
+    #pragma unroll
+    for (uint t = 0; t < 2; t++) {
+        if (u + 4 * t >= left) continue;
+        #pragma unroll
+        for (uint k = 0; k < 4; k++) {
+            s0[t] = dp4a(q[t].v[k] & 0x0F0F0F0Fu, x0[t].v[k], s0[t]);
+            s1[t] = dp4a((q[t].v[k] >> 4) & 0x0F0F0F0Fu, x1[t].v[k], s1[t]);
+        }
+        uint b0 = (hd[t].v[1] >> 8 * l) & 255, b1 = (hd[t].v[2] >> 8 * l) & 255;
+        uint b2 = (hd[t].v[3] >> 8 * l) & 255;
+        uint sc = j < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
+        uint mn = j < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
+        f[t] = h_bits(hd[t].v[0] & 0xFFFF) * (float)sc * d[t];
+        mins[t] = h_bits(hd[t].v[0] >> 16) * (float)mn * (sa[t] + sb[t]);
+    }
+    float fo0 = __shfl_xor_sync(0xffffffff, f[0], 1), fo1 = __shfl_xor_sync(0xffffffff, f[1], 1);
+    return (hf ? fo0 : f[0]) * (float)s0[0] + (hf ? f[0] : fo0) * (float)s1[0] - mins[0] +
+           (hf ? fo1 : f[1]) * (float)s0[1] + (hf ? f[1] : fo1) * (float)s1[1] - mins[1];
+}
+
 struct __attribute__((aligned(16))) UL2 {
     ulong v[2];
 };
@@ -835,9 +880,10 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, cons
 }
 
 #ifndef RLI_MMA
-MATVEC_Q(mvq_q4_k, mvq_q4_k_step, 144, 4, , )
+MATVEC_Q(mvq_q4_k, mvq_q4_k_step8, 144, 8, , )
+MATVEC_Q(mvq_q4_k_many, mvq_q4_k_step, 144, 4, , )
 MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4, , )
-MATVEC_Q(mvq_q4_k_pair, mvq_q4_k_step, 144, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
+MATVEC_Q(mvq_q4_k_pair, mvq_q4_k_step8, 144, 8, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
 MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
 #endif
 

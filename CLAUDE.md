@@ -235,7 +235,9 @@ Design points that span files:
   Qwen3-30B-A3B). Decode and shorter chunks run the same matrices as int8 matvecs (`mvq_q4_k`,
   `mvq_q6_k`): a Q4_K lane takes one sub-block in four aligned 16-byte reads, since the number
   of separate loads per step, not the arithmetic, was what the f32 matvec spent its time on
-  (Mistral-7B decode 72 -> 129 tok/s). Those reads need the tensor at a multiple of 16 bytes in
+  (Mistral-7B decode 72 -> 129 tok/s). A token's Q4_K matvec reads 8 super-blocks before using
+  any (`mvq_q4_k_step8`, decode +2-4.5%); launches of 32+ grid rows keep 4 a step
+  (`mvq_q4_k_many`), where that was 2% slower. Those reads need the tensor at a multiple of 16 bytes in
   VRAM (`Gpu::has_int8`), else f32 runs. Q6_K blocks are 210 bytes, so its lanes read the
   aligned 16-byte words around each span and shift (`ld24`; the arena ends in 16 bytes of slack
   for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose

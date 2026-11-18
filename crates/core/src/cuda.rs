@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("cuda.cu");
 const MATVEC_ROWS_PER_BLOCK: usize = 4;
+/// Grid rows (matrices or tokens of one launch) from which the Q4_K int8 matvec reads 4
+/// super-blocks a step, not 8: see `mvq_q4_k_step8` in cuda.cu.
+const MVQ_MANY: usize = 32;
 /// f32/f16 matvecs of at most this many rows run a block per row (see `MATVEC` in cuda.cu).
 const MATVEC_WIDE_ROWS: usize = 256;
 const REDUCE_THREADS: u32 = 1024;
@@ -226,6 +229,8 @@ pub struct Gpu {
     mmq_id: Vec<(GgmlType, CudaFunction)>,
     /// The int8 matvecs of the same types: `mvq_*`, and `mvq_*_pair` for two matrices.
     mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
+    /// `mvq_q4_k_many`, for launches of [`MVQ_MANY`] grid rows or more.
+    mvq_many: CudaFunction,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
@@ -451,6 +456,7 @@ impl Gpu {
             mmq,
             mmq_id,
             mvq,
+            mvq_many: func("mvq_q4_k_many")?,
             mma,
             dequant,
             dequant_q4_k_any,
@@ -894,6 +900,8 @@ impl Gpu {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul by expert {t:?}")
+        } else if eq(&self.mvq_many) {
+            "int8 matvec Q4_K, many".to_string()
         } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
             format!("int8 matvec {t:?}")
         } else {
@@ -1757,7 +1765,14 @@ impl<'a> Batch<'a> {
             .iter()
             .find(|(t, ..)| *t == ty)
             .expect("checked by has_matmul_q");
-        let f = if second.is_some() { pair } else { one };
+        let many = second.is_none() && ty == GgmlType::Q4_K && n >= MVQ_MANY;
+        let f = if second.is_some() {
+            pair
+        } else if many {
+            &self.gpu.mvq_many
+        } else {
+            one
+        };
         let (y_off, rb) = (y.1 as u64, ty.row_bytes(cols) as u32);
         let (rows_u, cols_u, ys, add) = (rows as u32, cols as u32, y_stride as u32, add as u32);
         let (z_stride, y2) = second.unwrap_or((0, y));

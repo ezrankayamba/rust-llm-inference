@@ -2565,3 +2565,17 @@ path as before (a prompt differs by the usual MoE noise). With 4 tokens a pass, 
 tok/s: 4 tokens 374 / 306; 8: 530 / 463; 12: 682 / 611; 16: 784 / 734. With 2: 8 tokens 529 /
 497; 16: 786 / 779, and 126.7 us a launch where the plain matvec takes 125. Reading a third
 less weight did not make the launch any shorter: the matvec is not waiting on its weights.
+
+## 2026-11-19: the Q4_K int8 matvec reads 8 super-blocks before using any (CUDA decode)
+
+The grouped trial above said the matvec is not waiting on its weights; what a warp of a
+token's matvec does wait on is each step's reads. `mvq_q4_k_step8` issues the reads of both
+halves of 8 super-blocks, then does their arithmetic. `bench --pp 0 --tg 256 --reps 3
+--gpu-layers 999` on the A100, before and after in turn twice: Llama-3.2-1B 581.6, 583.8 ->
+609.9, 608.8 tok/s; Qwen3-30B-A3B 190.3, 192.7 -> 196.1, 198.5; Mistral-7B 170.6, 170.6 ->
+173.9, 173.6. Over the 128 (token, expert) rows of a 16-token Qwen3-30B-A3B chunk it was 2%
+slower (796 -> 780), so launches of 32 grid rows or more (`MVQ_MANY`) keep 4 a step
+(`mvq_q4_k_many`); with that, prompts are as before (Qwen3-30B-A3B 4 / 8 / 16 tokens 378, 530,
+785 -> 381, 529, 790; Mistral-7B 4 / 6 tokens 251, 275 -> 257, 276). Decode-path logits against
+`--precise` (`dump_logits --per-token`, 200 characters): Llama-3.2-1B 0.31, Mistral-7B 0.17,
+top-1 the same. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each).
