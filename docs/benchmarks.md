@@ -2373,3 +2373,30 @@ CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152 each).
 Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 48:
 2512 / 2617; 96: 2990 / 3370; 192: 3597 / 3868. Qwen3-30B-A3B 48: 1502 / 1401; 96: 2260 /
 1688; 192: 3303 / 2736.
+
+## 2026-11-18: blocks of 128 tokens for CUDA chunks of 65 to 128 (Q6_K: from 65)
+
+`gemm_*_dense` with a part taken out, 14336x4096 Q4_K by 64 tokens (`RLI_DENSE=1 bench_cuda`,
+us): whole 120.6; weights read, decoded and staged in a block's first step only 97.5; read but
+not decoded 103.5; tokens staged once 113.6; no `mma.sync` 128.5. Against llama.cpp's matmul
+(above) ours has the same slope, 46 us per 32 tokens of this matrix, and loses where a chunk
+ends in a tile of few tokens: 96 tokens 195 against 184, though 64 and 128 are ahead. So the
+128-token block dropped earlier today (a warp takes 16 rows by 64 tokens; `GEMM_ID`'s T) is
+back for the chunks it helps. `bench_cuda`, us a matmul, 64-token blocks -> 128-token blocks,
+14336x4096 Q4_K by 72 / 80 / 96 / 112 / 128 / 160 / 192 tokens: 180.1 / 184.6 / 194.9 / 204.2 /
+215.1 / 292.8 / 312.5 -> 165.4 / 169.3 / 182.2 / 195.6 / 209.4 / 299.9 / 325.3; Q6_K: 262.0 /
+266.7 / 278.2 / 289.6 / 301.1 / 414.8 / 436.9 -> 202.3 / 207.0 / 220.5 / 233.5 / 248.7 / 383.1 /
+411.4. So Q4_K takes them for 65 to 128 tokens (`GEMM_DENSE_WIDE_MAX`) and Q6_K from 65 on.
+`bench --pp N --tg 0 --gpu-layers 999`, R = 2400 / N, without and with in turn, Mistral-7B
+tok/s: 72 tokens 2422, 2434 -> 2705, 2704; 96: 3004, 2986 -> 3245, 3174; 128: 3377, 3412 ->
+3560, 3584; 160: 3309, 3275 -> 3329, 3395; 192: 3572, 3669 -> 3583, 3732. CUDA tests pass
+with and without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 72:
+2718 / 2933; 96: 3249 / 3240; 128: 3626 / 3454; 192: 3670 / 3919. Llama-3.2-1B 72: 9608 / 8974;
+96: 11261 / 10394; 128: 11185 / 10699; 192: 13813 / 12341.
+
+Tried and dropped the same day (Mistral-7B, same command): dequant + GEMM from 65 tokens in
+place of the in-block kernel (80 tokens 2610 -> 1811 tok/s, 96: 2933 -> 2087, 128: 3410 ->
+2635, 192: 3601 -> 3146); the in-block kernel past 192 tokens (224: 3449 -> 3544, 256: 3774 ->
+3801, 320: 3906 -> 3843, 384: 4373 -> 3735, 512: 4720 -> 3710).

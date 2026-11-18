@@ -272,7 +272,9 @@ Design points that span files:
   own kernels (above).
   Chunks of 24 to 192 tokens (`GEMM_DENSE_TOKENS`) run Q4_K and Q6_K matrices through
   `gemm_*_dense`, the MoE experts' kernel over every token: f16 `mma.sync`, a step's weights
-  decoded in the block, the columns in parts that add into y (`dense_parts`). Mistral-7B
+  decoded in the block, the columns in parts that add into y (`dense_parts`). Blocks take
+  64 tokens, or 128 for chunks of 65 to 128 (Q6_K: from 65), which then decode a matrix once
+  (Mistral-7B 96 tokens +7%; at 64 or 192 tokens the wide block is slower for Q4_K). Mistral-7B
   7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 5% slower than
   dequant + GEMM at 256; logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K matrices in chunks of 8 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:
@@ -316,8 +318,8 @@ Design points that span files:
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
-  `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 128,
-  5% ahead at 32, 4% behind at 48, 11% at 96, 7% at 192; Llama-3.2-1B level or ahead at 8 to 128;
+  `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 96,
+  5% ahead at 32 and 128, 4% behind at 48, 7% at 72, 6% at 192; Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 5-15% behind at 8 to 32 (the down projection is grouped by expert from
   12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16) and ahead from 48); Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
