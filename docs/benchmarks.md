@@ -2338,3 +2338,22 @@ without `RLI_CUDA_NO_MMA=1` (152 each).
 Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 16:
 1158 / 1326; 24: 1644 / 1719; 32: 2077 / 2066. Qwen3-30B-A3B 16: 713 / 862; 24: 904 / 1020;
 32: 1133 / 1190.
+
+## 2026-11-18: one 8-byte read per row and step in the direct CUDA kernels
+
+`gemm_q4_k_direct` at 16 tokens with a part taken out (`bench_cuda`, us a 14336x4096 matmul):
+whole 74.2; tokens staged once, no barriers 67.5; weights not decoded (the bytes still read)
+67.0; no `mma.sync` 76.8. So it is the reads of the weights. Each lane took four 2-byte reads
+per row and step, as the tensor core's layout has lane gj hold columns 2gj and 2gj + 1 of
+every 8. Dealing the columns differently (lane gj's 16 are those of the word at 8gj: multiply
+k's columns 8half + 2gj.. are the matrix's 8gj + 4k + 2half.., and the tokens are staged in
+that order, four 4-byte stores a thread where it was one of 16) makes it one 8-byte read:
+14336x4096 by 16 tokens 74.2 -> 70.1 us, by 32 tokens 82.2 -> 76.3 (llama.cpp 66.5 and 90.6);
+4096x14336 by 16 tokens 76.6 -> 70.3. Q6_K (three unaligned 8-byte reads per row and two
+steps, and one scale for a lane's columns) 14336x4096 by 16 tokens 119.5 -> 115.3, by 32
+tokens 128.7 -> 125.0. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 8:
+638 / 518; 16: 1203 / 1293; 24: 1750 / 1753; 32: 2195 / 2094. Llama-3.2-1B 8: 1886 / 1945;
+16: 3748 / 3827; 24: 5206 / 5032; 32: 6771 / 6504. Qwen3-30B-A3B 8: 504 / 546; 16: 718 /
+850; 24: 908 / 1014; 32: 1126 / 1191.

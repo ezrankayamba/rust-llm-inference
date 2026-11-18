@@ -277,8 +277,9 @@ Design points that span files:
   dequant + GEMM at 256; logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K matrices in chunks of 8 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:
   blocks of 128 rows by 32 tokens whose lanes decode their own weights from the matrix, only
-  the tokens staged (14336x4096 by 16 tokens 74 us, int8 92; by 32 tokens 82, the 64-token
-  block 99). **In these kernels shared memory costs more than arithmetic**: sharing decoded
+  the tokens staged (14336x4096 by 16 tokens 70 us, int8 92; by 32 tokens 76, the 64-token
+  block 99). A step's columns are dealt so that a lane's 16 are one 8-byte word of the row
+  (the reads are what the kernel waits on: four 2-byte ones were 6% slower). **In these kernels shared memory costs more than arithmetic**: sharing decoded
   scales through it, 128-column steps, reading a step ahead and wider blocks all lost.
   Q6_K has one too (`gemm_q6_k_direct`, 16 to 32 tokens; +3-5% on Mistral-7B at 24 and 32).
   `mm_each` picks a kernel per matrix. llama.cpp's own matmul (`test-backend-ops perf`) is
@@ -315,8 +316,8 @@ Design points that span files:
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
-  `gemm_*_dense`; with them Mistral-7B is 17% ahead at 8 tokens, 13% behind at 16, 4-5% at 24 and 48, level at 32,
-  64 and 128, 11-15% behind at 96 and 192; Llama-3.2-1B level or ahead at 8 to 128;
+  `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 128,
+  5% ahead at 32, 5% behind at 48, 11-15% behind at 96 and 192; Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 5-15% behind at 8 to 32 (the down projection is grouped by expert from
   12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16) and ahead from 48); Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
