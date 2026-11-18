@@ -2318,3 +2318,23 @@ Tried and dropped the same day: `gemm_q4_k_direct` with blocks of 64 tokens for 
 block's 106.0 / 109.5 / 120.5); the one-launch `attention` kernel in place of the three
 tiled ones for short prompts (Mistral-7B 8 tokens 616 -> 633 tok/s, 16 tokens level, 32
 tokens 2017 -> 1984, 64 tokens 2950 -> 2807).
+
+## 2026-11-18: the direct CUDA kernel for Q6_K, chunks of 16 to 32 tokens
+
+`gemm_q6_k_direct`: `gemm_q4_k_direct` with Q6_K's bytes, a lane reading 2 bytes of low
+nibbles per column pair and 2 of high bits per two pairs, once for the two 64-column steps
+that share them. `bench_cuda` with Q6_K shapes (us a matmul, A100; direct / int8 tensor
+cores), 14336x4096 by 8 / 16 / 24 / 32 tokens: 113.7 / 119.5 / 124.1 / 128.7 against 114.1 /
+126.0 / 140.6 / 153.4; 4096x4096: 38.1 / 39.5 / 41.0 / 42.6 against 38.6 / 42.1 / 47.3 / 51.4.
+(llama.cpp, above: 89.4 / 105.2 / 114.5 at 16 / 24 / 32, so Q6_K is still behind it; the
+kernel is 60% slower than the Q4_K one for 1.5x the bytes.) `bench --pp N --tg 0
+--gpu-layers 999`, 60 repetitions, without and with in turn, tok/s, Mistral-7B: 8 tokens 611,
+611 -> 602, 599 (so from 16, `GEMM_DIRECT_Q6_K_MIN`); 16: 1152, 1140 -> 1173, 1147; 24: 1570,
+1563 -> 1628, 1662; 32: 2014, 2011 -> 2061, 2090. Llama-3.2-1B: within its noise. On
+Qwen3-30B-A3B's 2048-column `attn_v` it is 25.9 us at 16 tokens (int8 26.5) and 29.3 at 32
+(the 64-row block 24.9): 0.1 ms of a 28 ms prompt, left alone. CUDA tests pass with and
+without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Mistral-7B 16:
+1158 / 1326; 24: 1644 / 1719; 32: 2077 / 2066. Qwen3-30B-A3B 16: 713 / 862; 24: 904 / 1020;
+32: 1133 / 1190.

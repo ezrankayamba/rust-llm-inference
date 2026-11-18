@@ -75,6 +75,10 @@ pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=192;
 /// tensor cores took 92, by 32 tokens 82 where the 64-token block took 99. A second tile of
 /// tokens decodes the weights again, so not past 32.
 const GEMM_DIRECT_TOKENS: std::ops::RangeInclusive<usize> = 8..=32;
+/// Fewest tokens of a chunk whose Q6_K matrices take `gemm_q6_k_direct`: 14336x4096 by 16
+/// tokens 120 us (int8 126), by 24 tokens 124 (141); by 8 tokens level, and a Mistral-7B
+/// prompt 2% slower.
+const GEMM_DIRECT_Q6_K_MIN: usize = 16;
 /// Most parts of a matrix's columns it takes.
 const GEMM_DENSE_PARTS_MAX: usize = 8;
 /// Most parts [`mma_parts`] splits a matrix's columns into.
@@ -224,7 +228,7 @@ pub struct Gpu {
     /// The same over every token, a matrix's columns in parts.
     gemm_dense: Vec<(GgmlType, CudaFunction)>,
     /// For Q4_K over few tokens: blocks of 128 rows by 32 tokens.
-    gemm_direct: Option<CudaFunction>,
+    gemm_direct: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -277,7 +281,7 @@ impl Gpu {
                 .0
                 >= 8;
         let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
-        let (mut gemm_dense, mut gemm_direct) = (Vec::new(), None);
+        let (mut gemm_dense, mut gemm_direct) = (Vec::new(), Vec::new());
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -308,8 +312,10 @@ impl Gpu {
                 let n = format!("{}_dense", n.replace("mmq", "gemm"));
                 gemm_dense.push((t, module.load_function(&n).map_err(err(&n))?));
             }
-            let n = "gemm_q4_k_direct";
-            gemm_direct = Some(module.load_function(n).map_err(err(n))?);
+            for (t, n) in MMQ_KERNELS {
+                let n = format!("{}_direct", n.replace("mmq", "gemm"));
+                gemm_direct.push((t, module.load_function(&n).map_err(err(&n))?));
+            }
             for tt in MMA_FEW {
                 for (t, n) in MMQ_KERNELS {
                     let n = format!("{}_t{tt}", n.replace("mmq", "mma"));
@@ -838,8 +844,8 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
-        } else if self.gemm_direct.as_ref().is_some_and(eq) {
-            "gemm direct Q4_K".to_string()
+        } else if let Some((t, _)) = self.gemm_direct.iter().find(|(_, g)| eq(g)) {
+            format!("gemm direct {t:?}")
         } else if let Some((t, _)) = self.gemm_dense.iter().find(|(_, g)| eq(g)) {
             format!("gemm in-block {t:?}")
         } else if let Some((t, _)) = self.gemm_id.iter().find(|(_, g)| eq(g)) {
@@ -1350,10 +1356,10 @@ impl<'a> Batch<'a> {
 
     /// Whether [`Batch::gemm_dense`] takes this matrix over a chunk of `n_tok` tokens.
     pub fn has_gemm_dense(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
-        let min = if ty == GgmlType::Q4_K {
-            *GEMM_DIRECT_TOKENS.start()
-        } else {
-            *GEMM_DENSE_TOKENS.start()
+        let min = match ty {
+            GgmlType::Q4_K => *GEMM_DIRECT_TOKENS.start(),
+            GgmlType::Q6_K => GEMM_DIRECT_Q6_K_MIN,
+            _ => *GEMM_DENSE_TOKENS.start(),
         };
         (min..=*GEMM_DENSE_TOKENS.end()).contains(&n_tok) && self.has_gemm_id(ty, cols, offset, 0)
     }
@@ -1377,7 +1383,7 @@ impl<'a> Batch<'a> {
     ) {
         assert!(self.has_gemm_dense(ty, cols, offset, n_tok) && rows > 0);
         assert!(xh.0.len() >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
-        let direct = ty == GgmlType::Q4_K && GEMM_DIRECT_TOKENS.contains(&n_tok);
+        let direct = GEMM_DIRECT_TOKENS.contains(&n_tok);
         let (tr, tt) = if direct { (128, 32) } else { (64, 64) };
         let tiles = rows.div_ceil(tr) * n_tok.div_ceil(tt);
         let sms = self.gpu.gemm_room.0;
@@ -1398,8 +1404,8 @@ impl<'a> Batch<'a> {
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
         let (nt, parts_u) = (n_tok as u32, parts as u32);
         if direct {
-            let f = gpu.gemm_direct.as_ref().expect("loaded with gemm_dense");
-            let mut a = self.call(f);
+            let f = gpu.gemm_direct.iter().find(|(t, _)| *t == ty);
+            let mut a = self.call(&f.expect("loaded with gemm_dense").1);
             a.arg(&gpu.weights)
                 .arg(&w_off)
                 .arg(&xh.0)
@@ -2459,6 +2465,7 @@ mod tests {
                 // Chunks short enough for the kernel that decodes the weights itself.
                 (200, 512, 30),
                 (300, 768, 9),
+                (300, 768, 17),
                 (130, 768, 100),
                 (2048, 1024, 192),
             ] {

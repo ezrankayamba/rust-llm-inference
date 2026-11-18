@@ -1460,6 +1460,91 @@ extern "C" __global__ void gemm_q4_k_direct(const uchar* w, ulong w_off, const u
     }
 }
 
+// The same for Q6_K: a lane reads 2 bytes of low nibbles for each of its eight column pairs
+// and 2 of high bits for each two, once per two steps. Rows must lie at even addresses.
+extern "C" __global__ void gemm_q6_k_direct(const uchar* w, ulong w_off, const uint* xh, float* y,
+                                            ulong y_off, uint rows, uint cols, uint row_bytes,
+                                            uint n_tok, uint parts) {
+    __shared__ uint xt[32 * GE_S];
+    uint ntt = (n_tok + 31) / 32, part = blockIdx.y / ntt, pb = blockIdx.y % ntt * 32;
+    uint kb = part * (cols / 64) / parts, ke = (part + 1) * (cols / 64) / parts;
+    uint last = (n_tok - pb < 32 ? n_tok - pb : 32) - 1;
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, gi = lane / 4, gj = lane % 4;
+    uint row0 = blockIdx.x * 128, ra = 16 * warp + gi, kw = cols / 2;
+    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);
+    const uchar* wr[2];
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        uint r = row0 + ra + 8 * h;
+        wr[h] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes;
+    }
+    const V128* xp = (const V128*)(xh + (ulong)(pb + (tr <= last ? tr : last)) * kw + tw);
+    float c[4][4];
+    #pragma unroll
+    for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;
+    ulong hdr[2][3];
+    uint qa[2][4], qb[2][4], qe[2][4];
+    for (uint ks = kb; ks < ke; ks++) {
+        uint j = ks % 4;
+        #pragma unroll
+        for (uint h = 0; h < 2; h++) {
+            const uchar* b = wr[h] + (ulong)(ks / 4) * 210;
+            if (j == 0 || ks == kb) gq6_k_hdr(b, hdr[h]);
+            // Steps 2n and 2n + 1 take the low and the high nibbles of the same bytes, and
+            // two bits each of the same high-bit bytes: read them once for both.
+            if (j % 2 == 0 || ks == kb) {
+                const uchar* q = b + 64 * (j / 2) + 2 * gj;
+                const uchar* e = b + 128 + 32 * (j / 2) + 2 * gj;
+                #pragma unroll
+                for (uint i = 0; i < 4; i++) {
+                    qa[h][i] = *(const unsigned short*)(q + 8 * i);
+                    qb[h][i] = *(const unsigned short*)(q + 32 + 8 * i);
+                    qe[h][i] = *(const unsigned short*)(e + 8 * i);
+                }
+            }
+        }
+        V128 v = xp[ks * 8];
+        *(V128*)(xt + tr * GE_S + tw) = v;
+        uint a[4][4];
+        #pragma unroll
+        for (uint h = 0; h < 2; h++) {
+            uint sh = 4 * (j % 2), is = 8 * (j / 2) + sh;
+            float d = h_bits((uint)hdr[h][2] & 0xFFFF);
+            #pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                // Sub-blocks is + i / 2 (columns 8i + 2gj..) and is + 2 + i / 2 (32 more).
+                uint ia = is + i / 2, ic = ia + 2;
+                float fa = d * (float)(signed char)(hdr[h][ia / 8] >> 8 * (ia % 8));
+                float fc = d * (float)(signed char)(hdr[h][ic / 8] >> 8 * (ic % 8));
+                uint la = qa[h][i] >> sh, lc = qb[h][i] >> sh;
+                uint e = qe[h][i] >> sh, g = e >> 2;
+                int a0 = (la & 15) | ((e & 3) << 4), a1 = ((la >> 8) & 15) | (((e >> 8) & 3) << 4);
+                int c0 = (lc & 15) | ((g & 3) << 4), c1 = ((lc >> 8) & 15) | (((g >> 8) & 3) << 4);
+                uint va = f2h(fa * (float)(a0 - 32)) | ((uint)f2h(fa * (float)(a1 - 32)) << 16);
+                uint vc = f2h(fc * (float)(c0 - 32)) | ((uint)f2h(fc * (float)(c1 - 32)) << 16);
+                a[i / 2][h + 2 * (i % 2)] = va;
+                a[2 + i / 2][h + 2 * (i % 2)] = vc;
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint o = 0; o < 4; o++) {
+            if (8 * o > last) continue;
+            #pragma unroll
+            for (uint k = 0; k < 4; k++) {
+                const uint* bp = xt + (8 * o + gi) * GE_S + 8 * k + gj;
+                mma16_f16(a[k], bp[0], bp[4], c[o]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint j = 0; j < 16; j++) {
+        uint t = 8 * (j / 4) + 2 * gj + j % 2, row = row0 + ra + 8 * (j / 2 % 2);
+        if (t <= last && row < rows) atomicAdd(y + y_off + (ulong)(pb + t) * rows + row, c[j / 4][j % 4]);
+    }
+}
+
 #else  // the rest of the file is not part of the tensor-core compile
 
 // Block-wide reductions for blockDim.x <= 1024 (a multiple of 32).

@@ -280,11 +280,12 @@ Design points that span files:
   the tokens staged (14336x4096 by 16 tokens 74 us, int8 92; by 32 tokens 82, the 64-token
   block 99). **In these kernels shared memory costs more than arithmetic**: sharing decoded
   scales through it, 128-column steps, reading a step ahead and wider blocks all lost.
+  Q6_K has one too (`gemm_q6_k_direct`, 16 to 32 tokens; +3-5% on Mistral-7B at 24 and 32).
   `mm_each` picks a kernel per matrix. llama.cpp's own matmul (`test-backend-ops perf`) is
   behind ours from 64 tokens and 0-10% ahead at 16 to 24; the rest of a prompt's gap is
   attention (4-6% of a layer) and the MoE experts.
   Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
-  matmuls remain for Q6_K in chunks of 8-23 tokens, and for types and GPUs without those kernels. The 64x128 tile runs four warps of four row groups
+  matmuls remain for Q6_K in chunks of 8-15 tokens, and for types and GPUs without those kernels. The 64x128 tile runs four warps of four row groups
   (a read of the token tile feeds four products); it does not wait on global memory.
   What it is short of is the copy into shared memory: with the tiles staged once it runs
   1.5-1.9x faster, and every tile shape tried moves 2.2-2.7 TB/s. cuBLAS on the same A100 is
@@ -314,7 +315,7 @@ Design points that span files:
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
-  `gemm_*_dense`; with them Mistral-7B is 17% ahead at 8 tokens, 4-10% behind at 16 to 48, level at
+  `gemm_*_dense`; with them Mistral-7B is 17% ahead at 8 tokens, 13% behind at 16, 4-5% at 24 and 48, level at 32,
   64 and 128, 11-15% behind at 96 and 192; Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 5-15% behind at 8 to 32 (the down projection is grouped by expert from
   12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16) and ahead from 48); Mistral-7B 9% ahead
