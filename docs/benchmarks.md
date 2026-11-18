@@ -2124,3 +2124,24 @@ Both engines' short-prompt figures on this host rise with the number of repetiti
 GPU's clocks): Mistral-7B at 16 tokens is 642 / 828 / 924 / 1047 tok/s here and 979 / 1083 /
 1175 / 1289 for llama.cpp over 3 / 8 / 20 / 60 repetitions, so the table's Mistral-7B rows
 overstate the gap (19% at 60 repetitions, not 40%).
+
+## 2026-11-18: CUDA prompts against llama.cpp with the GPU warmed up (A100, 847ca5a)
+
+`bench --pp N --tg 0 --reps R --gpu-layers 999` and `llama-bench -ngl 99 -p N -n 0 -r R` in
+turn with 3 s rests, R = 2400 / N between 8 and 60, two rounds; tok/s. These replace the
+8-repetition short-prompt figures above, which caught both engines before the GPU's clocks
+came up.
+
+| Tokens | Mistral-7B | llama.cpp | Llama-3.2-1B | llama.cpp | Qwen3-30B-A3B | llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 | 574, 572 | 526, 528 | 1847, 1807 | 1919, 1761 | 442, 445 | 523, 514 |
+| 16 | 1046, 1049 | 1293, 1279 | 3216, 3508 | 3789, 3918 | 611, 617 | 836, 861 |
+| 32 | 1620, 1620 | 2106, 2074 | 5834, 5905 | 6604, 6428 | 735, 739 | 1207, 1208 |
+| 64 | 2365, 2379 | 2942, 2871 | 8608, 8375 | 8422, 9043 | 1669, 1675 | 1501, 1507 |
+| 128 | 2723, 2749 | 3518, 3333 | 9457, 10535 | 10958, 11462 | 2574, 2544 | 1780, 1780 |
+| 256 | 3817, 3738 | 4267, 4158 | 12643, 12121 | 12469, 12070 | 3658, 3529 | 2941, 2941 |
+| 512 | 4812, 4757 | 4817, 4859 | 20317, 20980 | 19818, 19099 | 4402, 4408 | 4259, 4178 |
+
+Ahead or level: 512 tokens on all three, Mistral-7B at 8, Llama-3.2-1B at 8, 64 and 256,
+Qwen3-30B-A3B from 64. Behind: Mistral-7B 19-23% at 16 to 128 and 10% at 256;
+Llama-3.2-1B 9-13% at 16, 32 and 128; Qwen3-30B-A3B 14% at 8, 28% at 16, 39% at 32.
