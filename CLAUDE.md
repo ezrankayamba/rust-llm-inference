@@ -278,13 +278,13 @@ Design points that span files:
   compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
   under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
   own kernels (above).
-  Chunks of 24 to 192 tokens (`GEMM_DENSE_TOKENS`) run Q4_K and Q6_K matrices through
+  Chunks of 24 to 256 tokens (`GEMM_DENSE_TOKENS`) run Q4_K and Q6_K matrices through
   `gemm_*_dense`, the MoE experts' kernel over every token: f16 `mma.sync`, a step's weights
   decoded in the block, the columns in parts that add into y (`dense_parts`). Blocks take
   64 tokens, or 128 for chunks of 65 to 128 (Q6_K: from 65), which then decode a matrix once
   (Mistral-7B 96 tokens +7%; at 64 or 192 tokens the wide block is slower for Q4_K). Mistral-7B
-  7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 5% slower than
-  dequant + GEMM at 256; logits 0.085 from `precise` where int8 gave 0.27.
+  7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 6% faster than
+  dequant + GEMM at 224, 1.5% at 256, 2% slower at 320 (runs of 30; shorter runs hid it); logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K matrices in chunks of 8 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:
   blocks of 128 rows by 32 tokens whose lanes decode their own weights from the matrix, only
   the tokens staged (14336x4096 by 16 tokens 70 us, int8 92; by 32 tokens 76, the 64-token
@@ -327,8 +327,8 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
   `gemm_*_dense`; with them Mistral-7B is 23% ahead at 8 tokens, 7% behind at 16, level at 24, 64 and 96,
-  5% ahead at 32 and 128, 2% behind at 48, 7% at 72, 9% at 160, level at 192, 13% behind
-  at 224, 5% at 256, level at 320, 6% ahead at 384, 11% at 512 (2026-11-19); Llama-3.2-1B level or ahead at 8 to 128;
+  5% ahead at 32 and 128, 2% behind at 48, 5% at 72, 7% at 160, level at 192, 6% behind
+  at 224, 3% at 256, level at 320, 6% ahead at 384, 11% at 512 (2026-11-19); Llama-3.2-1B level or ahead at 8 to 128;
   Qwen3-30B-A3B 4% behind at 8 tokens, 11% at 16, level at 24 and ahead from 32 (the down
   projection is grouped by expert from 12 tokens, `MOE_GROUP_DOWN_TOKENS`, +10% at 16; up to
   4 pairs an expert, `GEMM_DIRECT_ID_PAIRS`, the grouped matmuls run `gemm_*_direct_id`,

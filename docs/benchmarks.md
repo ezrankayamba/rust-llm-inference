@@ -2506,3 +2506,29 @@ Tried after it and dropped (Mistral-7B, A100, same command, each pair run in tur
 - Upper bounds from skipping work (wrong results): no `zero_rows` launches, 256 tokens 4025,
   4019 -> 4037, 3935; 512: 5282, 5381 -> 5747, 5656. `swiglu` storing f16 only: nothing at
   either length.
+
+## 2026-11-19: the in-block CUDA matmul up to 256 tokens; where a 160-token prompt goes
+
+Per matrix (`bench_cuda` with its loops set to these lengths, Q4_K, us; in-block / dequant +
+GEMM / llama.cpp's `test-backend-ops perf`): 4096x4096 by 160 tokens 92.7 / 124.9 / 90.4; by
+224: 118.1 / 131.9 / 120.8; by 256: 126.2 / 133.5 / 141.4. 14336x4096 by 160: 292.8 / 420.2 /
+296.5; by 224: 377.6 / 450.6 / 378.9; by 256: 399.9 / 452.8 / 418.2. 4096x14336 by 160: 285.3 /
+391.3; by 224: 372.7 / 398.1; by 256: 400.1 / 395.7. Whole Mistral-7B prompts, `bench --pp N
+--tg 0 --reps 30 --gpu-layers 999`, the in-block kernel up to 192 tokens and up to 320 in
+turn three times: 224 tokens 3662, 3625, 3651 -> 3878, 3862, 3862 tok/s; 256: 4085, 4030, 4039
+-> 4114, 4128, 4090; 320: 4266, 4216, 4238 -> 4163, 4175, 4155. So `GEMM_DENSE_TOKENS` ends at
+256 (the trial of 2026-11-18 that found nothing there used runs of 8 to 10).
+
+A fully offloaded chunk that returns no logits no longer downloads the hidden states nobody
+reads. With both, previous build and this one in turn twice: 64 tokens 3014, 3010 -> 3104,
+3096; 160: 3515, 3516 -> 3547, 3524; 224: 3639, 3656 -> 3832, 3860; 256: 4037, 4052 -> 4097,
+4110. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each). Against llama.cpp
+(two rounds in turn, ours / llama.cpp): Mistral-7B 16: 1276 / 1300; 72: 2788 / 2938; 160: 3535 /
+3785; 224: 3845 / 4099; 256: 3976 / 4111.
+
+Where a 160-token Mistral-7B prompt goes (44.8 ms; a launch skipped by kernel name, `--reps
+400`, so each runs in sequence, not alone as under `RLI_CUDA_PROF`): with every matmul
+skipped 4.3 ms, and of that `attn_pv_h` 0.76, `swiglu` 0.55, `rmsnorm` 0.46, `attn_softmax`
+0.38, `attn_scores_h` 0.29, `rope` 0.27, `to_f16_zero` 0.18; with those skipped too 0.9 ms
+(embeddings up, hidden states down). The matmuls are 39.5 ms, which is also what the
+per-matrix times above add up to, for llama.cpp's as for ours.

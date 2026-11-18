@@ -782,10 +782,11 @@ impl Cuda {
             queue(&mut b);
             b.finish();
         }
-        // The caller has no use for x once it has the logits.
+        // The caller has no use for x once it has the logits, or when no layer is left for
+        // the CPU.
         if want_logits && let Some(out) = logits {
             self.gpu.read(&s.logits, out);
-        } else {
+        } else if !self.covers_all {
             self.gpu.read(&s.x, xs);
         }
         want_logits

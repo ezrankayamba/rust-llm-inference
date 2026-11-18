@@ -68,8 +68,8 @@ const MMA_FEW: [usize; 2] = [16, 32];
 /// The chunks [`Batch::gemm_dense`] takes, in tokens. Under them the int8 kernels' 16-token
 /// blocks are ahead (Mistral-7B at 16 tokens: 8% slower this way), and over them writing the
 /// matrix out once for [`Batch::gemm`] is: a block here decodes its weights again for every
-/// 64 tokens (5% slower at 256).
-pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=192;
+/// 64 tokens (Mistral-7B, runs of 30: 6% faster at 224, 1.5% at 256, 2% slower at 320).
+pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=256;
 /// The chunks whose Q4_K matrices take `gemm_q4_k_direct` instead (blocks of 128 rows by 32
 /// tokens, each lane decoding its own weights): 14336x4096 by 16 tokens 74 us where the int8
 /// tensor cores took 92, by 32 tokens 82 where the 64-token block took 99. A second tile of
