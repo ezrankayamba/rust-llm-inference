@@ -2231,3 +2231,25 @@ Tried and dropped there: a block of 128 rows by 32 tokens for chunks of up to 32
 94.7 us, 4096x14336 104.1 -> 108.0, 4096x4096 34.5 -> 35.6. And a diagnostic: with the
 per-weight decode (int to float, multiply-add, f16) replaced by a mask and an add, 14336x4096
 by 32 tokens takes 91.4 us, not 102.8, so the decode arithmetic is a tenth of that matmul.
+
+## 2026-11-18: the in-block CUDA f16 matmul's Q4_K scales, and where its time goes
+
+Diagnostics on `gemm_q4_k_dense`, 14336x4096 by 32 tokens (102.7 us; `RLI_DENSE=1
+bench_cuda`): weights and tokens staged on the first step only 46.1; one `mma` a step in
+place of up to 16: 88.2; weights staged once 90.4; tokens staged once 100.9; the per-weight
+arithmetic replaced by a mask 91.4. The parts don't add up to the whole, and neither waiting
+less (step ks + 1's global reads issued before step ks is multiplied: 101.7, and 126.9
+against 122.0 at 64 tokens) nor fewer barriers (128-column steps: 95.8 and 121.2 on
+14336x4096, 103.8 and 129.6 on 4096x14336 against 104.3 and 121.4) gained. Both dropped.
+
+Kept: `gq4_k_hdr` converts a super-block's d and dmin from f16 once, not in each of its four
+steps, and `gq4_k_dec` takes a step's two sub-block scales out of the header together:
+14336x4096 by 32 tokens 102.7 -> 98.9 us, 4096x14336 104.3 -> 98.8, 4096x4096 35.2 -> 33.6;
+by 64 tokens 122.0 -> 120.7, 121.4 -> 119.6, 40.5 -> 39.8. CUDA tests pass with and without
+`RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (`bench --pp N --tg 0 --gpu-layers 999` and `llama-bench -p N -n 0`
+in turn, R = 2400 / N repetitions (at most 60), means of two rounds, ours / llama.cpp):
+Mistral-7B 8 tokens 558 / 524; 16: 1047 / 1306; 32: 1845 / 2087; 96: 2907 / 3271.
+Llama-3.2-1B (±20% that hour) 8: 1910 / 1956; 16: 3250 / 3603; 32: 6679 / 6161; 96: 10036 /
+10054. Qwen3-30B-A3B 8: 500 / 537; 16: 658 / 850; 32: 1129 / 1196; 96: 2234 / 1671.

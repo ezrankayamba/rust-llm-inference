@@ -1223,6 +1223,9 @@ __device__ inline ulong ld8(const uchar* p) {
 __device__ inline void gq4_k_hdr(const uchar* b, ulong* hdr) {
     hdr[0] = ((const ulong*)b)[0];
     hdr[1] = ((const ulong*)b)[1];
+    // d and dmin as f32, converted here and not in each of the super-block's four steps.
+    hdr[2] = __float_as_uint(h_bits((uint)hdr[0] & 0xFFFF)) |
+             ((ulong)__float_as_uint(h_bits((uint)(hdr[0] >> 16) & 0xFFFF)) << 32);
 }
 __device__ inline void gq4_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
     raw[0] = *(const ulong*)(b + 16 + 32 * j + 8 * dp);
@@ -1234,9 +1237,15 @@ __device__ inline void gq4_k_dec(const ulong* hdr, const ulong* raw, uint j, uin
     hd.v[1] = (uint)(hdr[0] >> 32);
     hd.v[2] = (uint)hdr[1];
     hd.v[3] = (uint)(hdr[1] >> 32);
-    float sa, ma, sc, mc;
-    q4_k_scale(hd, 2 * j, &sa, &ma);
-    q4_k_scale(hd, 2 * j + 1, &sc, &mc);
+    float d = __uint_as_float((uint)hdr[2]), dmin = __uint_as_float((uint)(hdr[2] >> 32));
+    // Sub-blocks 2j and 2j + 1: 6 bits each, the first four in a byte's low bits, the rest
+    // split between the top two bits of those bytes and a nibble (q4_k_scale).
+    uint b0 = (hd.v[1] >> 16 * (j % 2)) & 0xFFFF, b1 = (hd.v[2] >> 16 * (j % 2)) & 0xFFFF;
+    uint b2 = (hd.v[3] >> 16 * (j % 2)) & 0xFFFF;
+    uint sl = j < 2 ? b0 : (b2 & 0x0F0F) | ((b0 >> 2) & 0x3030);
+    uint ml = j < 2 ? b1 : ((b2 >> 4) & 0x0F0F) | ((b1 >> 2) & 0x3030);
+    float sa = d * (float)(sl & 63), sc = d * (float)((sl >> 8) & 63);
+    float ma = dmin * (float)(ml & 63), mc = dmin * (float)((ml >> 8) & 63);
     #pragma unroll
     for (uint k = 0; k < 4; k++) {
         uint by = (uint)(raw[0] >> 16 * k) & 0xFFFF;

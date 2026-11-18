@@ -306,9 +306,9 @@ Design points that span files:
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three (the rest of this list is from before
-  `gemm_*_dense`; with it Mistral-7B is level at 64 and 128 tokens and 8-19% behind at 24 to
-  48, 96 and 192, Llama-3.2-1B level from 32 to 128, Qwen3-30B-A3B 7-15% behind at 24 and 32
-  and ahead from 48); Mistral-7B 9% ahead
+  `gemm_*_dense`; with it Mistral-7B is level at 64 and 128 tokens and 5-20% behind at 16 to
+  48, 96 and 192, Llama-3.2-1B level from 32 to 128, Qwen3-30B-A3B 6-23% behind at 8 to 32
+  and ahead from 48; that kernel is not short of memory or barriers, see `docs/benchmarks.md`); Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
   9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 9-24% behind at 8 to 32 (its expert
   matvecs under 20 tokens; the router of a chunk of up to 64 tokens runs as matvecs,
