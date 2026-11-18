@@ -90,15 +90,18 @@ fn main() {
         ] {
             let bytes = ty.row_bytes(cols) * rows;
             let count = (mem.len() / bytes).min(16);
-            let time = |dequant: bool, gemm: bool| {
+            // `gemm`: 1 for the product, 2 for the one that adds into y, where it differs.
+            let time = |dequant: bool, gemm: u8| {
                 let run = || {
                     let mut b = gpu.batch();
                     for i in 0..count {
                         if dequant {
                             b.dequant(ty, rows, cols, i * bytes, &wh);
                         }
-                        if gemm {
-                            b.gemm(rows, cols, &wh, &xh, At(&yb, 0), n_tok);
+                        match gemm {
+                            1 => b.gemm(rows, cols, &wh, &xh, At(&yb, 0), n_tok),
+                            2 => b.gemm_add(rows, cols, &wh, &xh, At(&yb, 0), n_tok),
+                            _ => {}
                         }
                     }
                     b.finish();
@@ -113,10 +116,15 @@ fn main() {
                     .fold(f64::MAX, f64::min);
                 best / count as f64 * 1e6
             };
-            let (d, g) = (time(true, false), time(false, true));
+            let (d, g) = (time(true, 0), time(false, 1));
             let tflops = 2.0 * (rows * cols * n_tok) as f64 / g / 1e6;
+            let add = if gpu.batch().has_gemm_add(rows, cols, n_tok) {
+                format!(", adding {:7.1} us", time(false, 2))
+            } else {
+                String::new()
+            };
             println!(
-                "gemm {ty:?} {rows}x{cols} x {n_tok} tokens: dequant {d:7.1} us, gemm {g:7.1} us ({tflops:.0} TFLOPS)"
+                "gemm {ty:?} {rows}x{cols} x {n_tok} tokens: dequant {d:7.1} us, gemm {g:7.1} us ({tflops:.0} TFLOPS){add}"
             );
         }
     }

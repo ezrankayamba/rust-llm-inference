@@ -2003,3 +2003,50 @@ tile still copies 78% of it. An earlier run of the `cp.async` kernels that looke
 better staged half of each step's columns by mistake; the numbers above are the corrected
 ones. Not tried: splitting the columns over blocks (more, shorter blocks, so a last wave
 costs less; needs the partial sums added).
+
+## 2026-11-18: the CUDA f16 GEMM on a 128x128 tile, columns in parts
+
+`gemm_f16_128x128` where `gemm_plan` can fill the GPU with its blocks (A100: 432 at once,
+and an even number per multiprocessor): the columns of a matrix of few rows are split into
+parts whose blocks add their sums into y (`atomicAdd`: the same times as separate buffers),
+a matrix of more rows than 432 blocks take goes 432 blocks first and the rest in parts, and
+the output and down projections add into the residual stream directly. Probes on the way,
+128x128 tile, 512 tokens, us: 4096x4096 in 1 / 2 / 3 / 4 / 6 parts 194.7 / 207.2 / 155.7 /
+174.2 / 166.1; 4096x14336 674.3 / 654.9 / 479.2 / 534.3 / 487.0; 2048x8192 316.7 / 195.7 /
+141.7 / 187.3 / 151.5. Passing the choices at run time to the 64-row kernels made them 4-8%
+slower, so the tile that adds is a kernel of its own. `bench_cuda`, us (before = c5fd822;
+"adding" is `gemm_add`):
+
+| Matrix | 512 tokens before | after | adding | cuBLAS | 128 tokens before | after | adding | cuBLAS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096x4096 | 168.8 | 165.2 | 156.1 | 155.9 | 91.4 | 63.1 | 58.6 | 69.6 |
+| 14336x4096 | 512.7 | 450.0 | 454.4 | 422.3 | 225.3 | 170.2 | 161.8 | 158.5 |
+| 4096x14336 | 603.5 | 491.2 | 479.9 | 313.7 | 304.0 | 147.6 | 143.1 | 120.7 |
+| 2048x2048 | 61.5 | 49.7 | 44.1 | 36.0 | 34.3 | 25.7 | 22.1 | 18.1 |
+| 8192x2048 | 171.8 | 162.4 | 164.0 | 94.1 | 65.4 | 57.6 | 51.6 | 40.6 |
+| 2048x8192 | 236.5 | 147.6 | 142.0 | 99.8 | 169.6 | 52.8 | 49.3 | 46.4 |
+
+Prompt tok/s on the A100 (`bench --pp N --tg 0 --reps 5 --gpu-layers 999` before and after,
+`llama-bench -ngl 99 -p N -n 0 -r 5`, in turn with 6 s rests, two rounds; this host's runs
+swing by up to 10%):
+
+| Model, tokens | before | after | llama.cpp |
+|---|---:|---:|---:|
+| Mistral-7B 512 | 4310, 4275 | 4658, 4680 | 4799, 4823 |
+| Mistral-7B 256 | 3243, 3160 | 3712, 3901 | 3927, 4073 |
+| Mistral-7B 128 | 2012, 1957 | 2430, 2323 | 3088, 3155 |
+| Mistral-7B 64 | 1105, 1143 | 1324, 1353 | 2240, 2318 |
+| Llama-3.2-1B 512 | 17363, 13706 | 16778, 16384 | 15917, 15588 |
+| Llama-3.2-1B 256 | 10745, 12144 | 11329, 11923 | 11767, 11390 |
+| Llama-3.2-1B 128 | 6974, 6448 | 7773, 8463 | 8871, 9443 |
+| Llama-3.2-1B 64 | 3443, 3480 | 4750, 4673 | 6920, 6651 |
+| Qwen3-30B-A3B 512 | 4271, 4318 | 4444, 4435 | 4148, 4245 |
+| Qwen3-30B-A3B 256 | 3522, 3557 | 3565, 3660 | 2861, 2924 |
+| Qwen3-30B-A3B 128 | 2118, 2052 | 2124, 2139 | 1765, 1766 |
+| Qwen3-30B-A3B 64 | 1300, 1319 | 1318, 1376 | 1501, 1504 |
+
+Short prompts had not been compared on CUDA before: the dense models are 1.4-1.7x behind at
+64 tokens and 1.1-1.3x at 128. The CUDA tests pass with and without `RLI_CUDA_NO_MMA=1`
+(152). Logits of a 601-token prompt (Mistral-7B) and a 540-token one (Llama-3.2-1B) against
+`--precise`: 0.076 and 0.159 before, 0.085 and 0.174-0.194 after, top-1 the same. The order
+in which parts add their sums is not fixed, so the logits now differ between runs.

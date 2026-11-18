@@ -214,6 +214,14 @@ fn mm_add(
             b.quantize(src, n * w.cols, &s.xq);
         }
         b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, x, n, true);
+    } else if int8
+        && !matches!(w.ty, GgmlType::F32 | GgmlType::F16)
+        && b.has_gemm_add(w.rows, w.cols, n)
+    {
+        // As in `mm_each`, by the kernel that adds.
+        b.to_f16(src, n * w.cols, &s.xh);
+        b.dequant(w.ty, w.rows, w.cols, w.offset, &s.wh);
+        b.gemm_add(w.rows, w.cols, &s.wh, &s.xh, x, n);
     } else {
         let tmp = At(&s.tmp, 0);
         mm_each(b, s, &[w], src, &[tmp], n, int8, quantized);

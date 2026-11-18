@@ -65,16 +65,21 @@ const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
 const MMA_REGS: usize = 80;
 /// Rows, tokens and threads of a block of the f16 GEMM's kernels, and the columns they take
 /// at a time (`GE_K` in cuda.cu).
-const GEMM_TILES: [(usize, usize, u32); 2] = [(64, 64, 256), (64, 128, 128)];
+const GEMM_TILES: [(usize, usize, u32); 3] = [(64, 64, 256), (64, 128, 128), (128, 128, 128)];
 const GEMM_COLS: usize = 64;
+/// Shared memory of a block of the last of them, in bytes (`GE_S` words a row and a token),
+/// and the most parts [`gemm_parts`] splits a matrix's columns into.
+const GEMM_ADD_SHARED: usize = (128 + 128) * 36 * 4;
+const GEMM_PARTS_MAX: usize = 16;
 /// Fewest blocks the GEMM's larger tile is used for.
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 64;
-const OTHER_KERNELS: [&str; 16] = [
+const OTHER_KERNELS: [&str; 17] = [
     "quant_x",
     "rmsnorm",
     "axpy",
+    "zero_rows",
     "add_bias",
     "swiglu",
     "rope",
@@ -192,6 +197,8 @@ pub struct Gpu {
     dequant_q4_k_any: CudaFunction,
     to_f16: CudaFunction,
     gemm: Option<Vec<CudaFunction>>,
+    /// Multiprocessors, and how many blocks of the 128x128 GEMM tile they hold between them.
+    gemm_room: (usize, usize),
     /// The f16 products for stacked experts, which decode as they go (`gemm_*_id`).
     gemm_id: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
@@ -359,6 +366,12 @@ impl Gpu {
             s: stream.alloc_zeros(2).map_err(err("allocate"))?,
         };
         let name = format!("cuda ({})", ctx.name().map_err(err("device name"))?);
+        let attr = |a| ctx.attribute(a).map_err(err("device attribute"));
+        let sms = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        let shared = attr(
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+        )? as usize;
+        let gemm_room = (sms, sms * (shared / GEMM_ADD_SHARED));
         Ok(Self {
             stream,
             pinned: Mutex::new(None),
@@ -373,6 +386,7 @@ impl Gpu {
             dequant_q4_k_any,
             to_f16,
             gemm,
+            gemm_room,
             gemm_id,
             other,
             zero_id,
@@ -873,6 +887,64 @@ impl<'a> Batch<'a> {
     }
 }
 
+/// How many parts to split the columns of a `rows` x `cols` matrix into so that the blocks
+/// of the 128x128 GEMM tile over `n_tok` tokens fill a GPU of `sms` multiprocessors that
+/// holds `room` of them, if any number does. On an A100 a multiprocessor takes as long over
+/// three of these blocks as over four, half as long over two, and blocks past `room` run
+/// after the rest: so the count closest under an even number per multiprocessor, at least
+/// three quarters of it (128 or 256 blocks on its 108 multiprocessors lost to the smaller
+/// tile; 192, 336 and 384 beat it by 8-40%).
+fn gemm_parts(rows: usize, cols: usize, n_tok: usize, sms: usize, room: usize) -> Option<usize> {
+    let (tr, tt, _) = GEMM_TILES[2];
+    let tiles = rows.div_ceil(tr) * n_tok.div_ceil(tt);
+    (1..=(cols / GEMM_COLS).min(GEMM_PARTS_MAX))
+        .map(|p| (p, tiles * p))
+        .filter(|&(_, b)| b <= room && gemm_fills(b, sms))
+        // The fullest, and of equals the fewest parts.
+        .min_by(|&(p, b), &(q, c)| (c * gemm_full(b, sms), p).cmp(&(b * gemm_full(c, sms), q)))
+        .map(|(p, _)| p)
+}
+
+/// The even number of blocks per multiprocessor that `blocks` is under, and whether it is
+/// within a quarter of it.
+fn gemm_full(blocks: usize, sms: usize) -> usize {
+    blocks.div_ceil(2 * sms) * 2 * sms
+}
+fn gemm_fills(blocks: usize, sms: usize) -> bool {
+    4 * blocks >= 3 * gemm_full(blocks, sms)
+}
+
+/// The launches of the 128x128 GEMM tile that make up a product, as (first row, rows, parts
+/// of the columns), if they can fill the GPU. Where no number of parts does it for all the
+/// rows, as many as fill it by themselves go first, four blocks a multiprocessor or two:
+/// Mistral-7B's 14336 rows are 448 blocks at 512 tokens where an A100 holds 432, and in one
+/// launch the last 16 cost 175 us of 590.
+fn gemm_plan(
+    rows: usize,
+    cols: usize,
+    n_tok: usize,
+    sms: usize,
+    room: usize,
+) -> Option<Vec<(usize, usize, usize)>> {
+    let (tr, tt, _) = GEMM_TILES[2];
+    let ntt = n_tok.div_ceil(tt);
+    let (mut plan, mut row) = (Vec::new(), 0);
+    loop {
+        if let Some(parts) = gemm_parts(rows - row, cols, n_tok, sms, room) {
+            plan.push((row, rows - row, parts));
+            return Some(plan);
+        }
+        let whole = [room, 2 * sms]
+            .into_iter()
+            .map(|blocks| blocks / ntt)
+            .find(|&t| {
+                t > 0 && t * ntt <= room && gemm_fills(t * ntt, sms) && t * tr < rows - row
+            })?;
+        plan.push((row, whole * tr, 1));
+        row += whole * tr;
+    }
+}
+
 fn grid(blocks: usize, threads: u32) -> LaunchConfig {
     grid2(blocks, 1, threads)
 }
@@ -962,6 +1034,22 @@ impl<'a> Batch<'a> {
         self.gpu.gemm.is_some() && cols.is_multiple_of(GEMM_COLS) && n_tok >= GEMM_MIN_TOKENS
     }
 
+    /// Whether [`Batch::gemm_add`] takes this product: as [`Batch::has_gemm`], and the larger
+    /// tile's blocks can be made to fill the GPU (see [`gemm_plan`]).
+    pub fn has_gemm_add(&self, rows: usize, cols: usize, n_tok: usize) -> bool {
+        self.has_gemm(cols, n_tok) && self.gemm_plan(rows, cols, n_tok).is_some()
+    }
+
+    fn gemm_plan(
+        &self,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        let (sms, room) = self.gpu.gemm_room;
+        gemm_plan(rows, cols, n_tok, sms, room)
+    }
+
     /// The `n` values at `x` as f16 in `out`.
     pub fn to_f16(&mut self, x: At<'_>, n: usize, out: &GpuHalf) {
         assert!(x.1 + n <= x.0.len() && n <= out.0.len());
@@ -1019,12 +1107,73 @@ impl<'a> Batch<'a> {
         assert!(self.has_gemm(cols, n_tok) && rows > 0);
         assert!(wh.0.len() >= rows * cols && xh.0.len() >= n_tok * cols);
         assert!(y.1 + n_tok * rows <= y.0.len());
-        let gpu: &'a Gpu = self.gpu;
-        let (rows_u, cols_u) = (rows as u32, cols as u32);
-        let (y_off, nt) = (y.1 as u64, n_tok as u32);
+        if let Some(plan) = self.gemm_plan(rows, cols, n_tok) {
+            for (row, n_rows, parts) in plan {
+                // Parts add their sums.
+                if parts > 1 {
+                    self.zero_rows(y, (row, n_rows, rows), n_tok);
+                }
+                self.gemm_tile(
+                    2,
+                    parts,
+                    parts > 1,
+                    (row, n_rows, rows),
+                    cols,
+                    wh,
+                    xh,
+                    y,
+                    n_tok,
+                );
+            }
+            return;
+        }
         // The larger tile once it still leaves a few blocks per multiprocessor.
         let (lr, lt, _) = GEMM_TILES[1];
         let i = (rows.div_ceil(lr) * n_tok.div_ceil(lt) >= GEMM_BLOCKS_MIN) as usize;
+        self.gemm_tile(i, 1, false, (0, rows, rows), cols, wh, xh, y, n_tok);
+    }
+
+    /// `y += W x` where [`Batch::has_gemm_add`], operands as in [`Batch::gemm`].
+    pub fn gemm_add(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        wh: &GpuHalf,
+        xh: &GpuHalf,
+        y: At<'_>,
+        n_tok: usize,
+    ) {
+        assert!(wh.0.len() >= rows * cols && xh.0.len() >= n_tok * cols);
+        assert!(y.1 + n_tok * rows <= y.0.len() && rows > 0);
+        let plan = self.gemm_plan(rows, cols, n_tok);
+        let plan = plan.filter(|_| self.has_gemm(cols, n_tok));
+        for (row, n_rows, parts) in plan.expect("checked by has_gemm_add") {
+            self.gemm_tile(2, parts, true, (row, n_rows, rows), cols, wh, xh, y, n_tok);
+        }
+    }
+
+    /// Tile `i` of [`GEMM_TILES`] over `parts` parts of the columns and `rows` of the matrix's
+    /// rows (first, how many, of how many), added to what y holds with `acc`. Only the last
+    /// tile takes parts (which need `acc`), `acc` or less than every row.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_tile(
+        &mut self,
+        i: usize,
+        parts: usize,
+        acc: bool,
+        (base, rows, ldy): (usize, usize, usize),
+        cols: usize,
+        wh: &GpuHalf,
+        xh: &GpuHalf,
+        y: At<'_>,
+        n_tok: usize,
+    ) {
+        assert!(i == 2 || (parts == 1 && !acc && base == 0 && rows == ldy));
+        assert!(acc || parts == 1);
+        let gpu: &'a Gpu = self.gpu;
+        let (rows_u, cols_u) = (rows as u32, cols as u32);
+        let (y_off, nt) = (y.1 as u64, n_tok as u32);
+        let (parts_u, base_u, ldy_u, acc_u) = (parts as u32, base as u32, ldy as u32, acc as u32);
         let (tr, tt, threads) = GEMM_TILES[i];
         let mut l = self.call(&gpu.gemm.as_ref().expect("checked by has_gemm")[i]);
         l.arg(&wh.0)
@@ -1033,8 +1182,13 @@ impl<'a> Batch<'a> {
             .arg(&y_off)
             .arg(&rows_u)
             .arg(&cols_u)
-            .arg(&nt);
-        self.launch(l, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt), threads));
+            .arg(&nt)
+            .arg(&parts_u)
+            .arg(&base_u)
+            .arg(&ldy_u)
+            .arg(&acc_u);
+        let cfg = grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, threads);
+        self.launch(l, cfg);
     }
 
     /// Whether [`Batch::gemm_id`] takes a stack of `ty` matrices of `cols` columns at byte
@@ -1596,6 +1750,24 @@ impl<'a> Batch<'a> {
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
+    /// Zeroes `rows` (first, how many, of how many) of each of the `n` tokens at `a`.
+    fn zero_rows(&mut self, a: At<'_>, (base, rows, ldy): (usize, usize, usize), n: usize) {
+        assert!(a.1 + n * ldy <= a.0.len() && base + rows <= ldy);
+        let (a_off, n_u) = (a.1 as u64, n as u32);
+        let (ldy_u, base_u, rows_u) = (ldy as u32, base as u32, rows as u32);
+        let mut l = self.call(self.gpu.other("zero_rows"));
+        l.arg(&a.0.0)
+            .arg(&a_off)
+            .arg(&ldy_u)
+            .arg(&base_u)
+            .arg(&rows_u)
+            .arg(&n_u);
+        self.launch(
+            l,
+            grid((rows * n).div_ceil(ELT_THREADS), ELT_THREADS as u32),
+        );
+    }
+
     /// `a += b`
     pub fn add(&mut self, a: At<'_>, b: At<'_>, n: usize) {
         self.axpy(a, b, 1.0, n);
@@ -2057,7 +2229,15 @@ mod tests {
     #[test]
     fn gemm_matches_f32_matmul() {
         for (ty, _) in MATVEC_KERNELS {
-            for (rows, cols, n) in [(200, 512, 137), (64, 1280, 64), (17, 256, 300)] {
+            // The last two have rows and tokens enough for the larger tile: columns in parts,
+            // and (on an A100) rows in two launches.
+            for (rows, cols, n) in [
+                (200, 512, 137),
+                (64, 1280, 64),
+                (17, 256, 300),
+                (2048, 512, 512),
+                (14400, 256, 500),
+            ] {
                 let mut seed = 3u32;
                 let mut next = move || {
                     seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -2112,6 +2292,13 @@ mod tests {
                 b.to_f16(At(&xb, 0), n * cols, &xh);
                 b.dequant(ty, rows, cols, 0, &wh);
                 b.gemm(rows, cols, &wh, &xh, At(&y_h, 0), n);
+                // y_sum = y_f32 + W x, where there is a kernel for it.
+                let y_sum = gpu.alloc(n * rows);
+                let added = b.has_gemm_add(rows, cols, n);
+                if added {
+                    b.add(At(&y_sum, 0), At(&y_f32, 0), n * rows);
+                    b.gemm_add(rows, cols, &wh, &xh, At(&y_sum, 0), n);
+                }
                 b.finish();
                 let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
                 gpu.read(&y_f32, &mut want);
@@ -2125,6 +2312,14 @@ mod tests {
                     err < 1e-3 * size,
                     "{ty:?} {rows}x{cols}, {n} tokens: rms error {err} against rms {size}"
                 );
+                if added {
+                    gpu.read(&y_sum, &mut got);
+                    let err = rms(&mut got.iter().zip(&want).map(|(a, b)| a - 2.0 * b));
+                    assert!(
+                        err < 1e-3 * size,
+                        "{ty:?} {rows}x{cols}, {n} tokens, added: rms error {err} against {size}"
+                    );
+                }
             }
         }
     }

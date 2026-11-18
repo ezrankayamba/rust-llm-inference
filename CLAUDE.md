@@ -273,12 +273,25 @@ Design points that span files:
   that costs a whole block's time, and real shapes don't divide. Tried and dropped
   (`docs/benchmarks.md`, 2026-11-18): `ldmatrix`, eight warps a block, 32-column steps,
   blocks that take part of a tile, a swizzled 32-word layout, a higher register cap.
+  So `gemm_f16_128x128` (four warps of 64 rows by 64 tokens) runs where its blocks can be
+  made to fill the GPU, and the 64-row tiles elsewhere (`gemm_plan`, `gemm_parts` in
+  cuda.rs): a matrix of few rows has its columns split into parts, each a block that adds
+  its sums into y with `atomicAdd` (free here; y is zeroed first, or is the residual
+  stream: `Batch::gemm_add`, which saves the `axpy` too), and one of more rows than the
+  GPU holds blocks goes as much as fills it, then the rest in parts. The counts that work
+  are an A100's (108 multiprocessors, 4 such blocks each: as long over 3 blocks as over 4,
+  half as long over 2), found by measuring; no other GPU has been tried. **The order
+  the parts add in varies, so a prompt's logits differ from run to run** in the last bits,
+  which the layers amplify (0.17 and 0.19 from `precise` on two runs of one prompt).
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
   is 10-16% ahead on all three models; decode at 2048 positions is level on Llama-3.2-1B and 2%
   ahead on Mistral-7B (2026-11-17), and prompts
-  level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B.
+  level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B;
+  (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
+  other two, and short prompts far behind on the dense models: 64 tokens 1.4-1.7x, 128
+  tokens 1.1-1.3x (Qwen3-30B-A3B: 10% behind at 64, 21-25% ahead at 128 and 256).
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

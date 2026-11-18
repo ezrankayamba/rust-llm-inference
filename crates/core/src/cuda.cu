@@ -1047,22 +1047,31 @@ __device__ inline void mma16_f16(const uint* a, uint b0, uint b1, float* c) {
 // takes words 4 (i % 8).. of rows and tokens i / 8 + 4 NW p.
 //
 // More tokens per block means fewer reads of the weights, but a matrix of few rows then has
-// too few blocks to occupy the GPU, which costs more: the caller picks. Blocks of 128 rows,
-// 32 rows or 256 tokens were all slower on an A100 (docs/benchmarks.md).
+// too few blocks to occupy the GPU, which costs more: the caller picks. Blocks of 32 rows or
+// 256 tokens were slower on an A100, and so are those of 128 rows unless about as many run
+// as the GPU holds (docs/benchmarks.md). For that the columns can be split too: the grid is
+// `parts` times as deep in tokens, block y takes token tile y % ntt and part y / ntt of the
+// column steps, and each adds its sums into y (`acc`), which the caller has set. That is a
+// kernel of its own (ACC): an atomic add costs these blocks nothing measurable, but the
+// choices made at run time made the other kernels 4-8% slower. It also takes a range of the
+// rows: `rows` of them from `base`, of a y with `ldy` rows a token.
 #define GE_K 64
 #define GE_S 36
 struct __attribute__((aligned(16))) V128 {
     uint v[4];
 };
-#define GEMM_F16(NAME, R, T, NW, RG)                                                           \
+#define GEMM_F16(NAME, R, T, NW, RG, ACC)                                                         \
 extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong y_off,         \
-                                uint rows, uint cols, uint n_tok) {                            \
+                                uint rows, uint cols, uint n_tok, uint parts, uint base,       \
+                                uint ldy, uint acc) {                                          \
     const uint NRG = R / (16 * RG), NWG = NW / NRG, NO = T / 8 / NWG;                          \
+    if (!ACC) parts = 1, base = 0, ldy = rows, acc = 0;                                        \
     __shared__ uint wt[R * GE_S];                                                              \
     __shared__ uint xt[T * GE_S];                                                              \
     uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
     uint gi = lane / 4, gj = lane % 4;                                                         \
-    uint row0 = blockIdx.x * R, t0 = blockIdx.y * T;                                           \
+    uint ntt = (n_tok + T - 1) / T, part = ACC ? blockIdx.y / ntt : 0, steps = cols / GE_K;    \
+    uint row0 = blockIdx.x * R, t0 = (ACC ? blockIdx.y % ntt : blockIdx.y) * T;                \
     uint last = n_tok - 1 - t0, kw = cols / 2;                                                 \
     uint ra = 16 * RG * (warp % NRG) + gi, ow = warp / NRG;                                    \
     uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);                                     \
@@ -1071,12 +1080,13 @@ extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong 
     for (uint g = 0; g < RG; g++)                                                              \
         _Pragma("unroll")                                                                      \
         for (uint o = 0; o < NO; o++) c[g][o][0] = c[g][o][1] = c[g][o][2] = c[g][o][3] = 0;   \
-    for (uint ks = 0; ks < cols / GE_K; ks++) {                                                \
+    for (uint ks = part * steps / parts; ks < (part + 1) * steps / parts; ks++) {              \
         V128 v[8];                                                                             \
         _Pragma("unroll")                                                                      \
         for (uint p = 0; p < R / (4 * NW); p++) {                                              \
             uint r = row0 + tr + 4 * NW * p;                                                   \
-            v[p] = *(const V128*)(wh + (ulong)(r < rows ? r : rows - 1) * kw + ks * (GE_K / 2) + tw); \
+            r = base + (r < rows ? r : rows - 1);                                              \
+            v[p] = *(const V128*)(wh + (ulong)r * kw + ks * (GE_K / 2) + tw);                  \
         }                                                                                      \
         _Pragma("unroll")                                                                      \
         for (uint p = 0; p < R / (4 * NW); p++)                                                \
@@ -1121,15 +1131,21 @@ extern "C" __global__ void NAME(const uint* wh, const uint* xh, float* y, ulong 
         for (uint j = 0; j < 4 * NO; j++) {                                                    \
             uint t = (NWG * (j / 4) + ow) * 8 + 2 * gj + j % 2;                                \
             uint row = row0 + ra + 16 * g + 8 * (j / 2 % 2);                                   \
-            if (t <= last && row < rows)                                                       \
-                y[y_off + (ulong)(t0 + t) * rows + row] = c[g][j / 4][j % 4];                  \
+            if (t > last || row >= rows) continue;                                             \
+            float* out = y + y_off + (ulong)(t0 + t) * ldy + base + row;                       \
+            if (acc)                                                                           \
+                atomicAdd(out, c[g][j / 4][j % 4]);                                            \
+            else                                                                               \
+                *out = c[g][j / 4][j % 4];                                                     \
         }                                                                                      \
 }
 
-GEMM_F16(gemm_f16_64x64, 64, 64, 8, 1)
+GEMM_F16(gemm_f16_64x64, 64, 64, 8, 1, 0)
 // Four warps of four row groups each, so a read of the token tile feeds four products: 14-20%
 // faster on an A100 than eight warps of one group, 5-7% than four of two.
-GEMM_F16(gemm_f16_64x128, 64, 128, 4, 4)
+GEMM_F16(gemm_f16_64x128, 64, 128, 4, 4, 0)
+// A warp of 64 rows by 64 tokens: where the column parts fill the GPU (`gemm_parts`).
+GEMM_F16(gemm_f16_128x128, 128, 128, 4, 4, 1)
 
 // Eight bytes at any address, as two aligned reads (so up to 8 bytes past the end are read;
 // the weights end in slack for that).
@@ -1341,6 +1357,12 @@ extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulon
 extern "C" __global__ void axpy(float* a, ulong a_off, const float* b, ulong b_off, uint n, float alpha) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[a_off + i] += alpha * b[b_off + i];
+}
+
+// Zeroes rows base.. (`rows` of them) of the n tokens at a, `ldy` values each.
+extern "C" __global__ void zero_rows(float* a, ulong a_off, uint ldy, uint base, uint rows, uint n) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * n) a[a_off + (ulong)(i / rows) * ldy + base + i % rows] = 0;
 }
 
 // a (n values, rows of m) += b (m values) on every row.
