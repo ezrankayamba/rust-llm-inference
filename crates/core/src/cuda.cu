@@ -841,9 +841,16 @@ MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
 // (MA_NW / MA_RG)-th octet of tokens. Rows and tokens lie MA_S words apart in shared memory so
 // a warp's loads fall in different banks. On an A100 the multiplies are a small part of the
 // time: what set the shape was reading the tiles (larger is better) against registers per
-// thread, which limit how many warps a multiprocessor holds (smaller is better).
-#define MA_R 64
-#define MA_T 128
+// thread, which limit how many warps a multiprocessor holds (smaller is better). Every block
+// stages its tokens again, so the tile is tall: 64 rows by 128 tokens read four times the
+// weights' bytes in tokens on a 64-token chunk.
+//
+// With `parts` the grid is that many times as deep: a block takes one part of the column
+// steps and adds its sums into y, which the caller has set. Few rows are few blocks, and
+// most of the GPU idle (a 4096x4096 matrix by 64 tokens: 179 us in 32 blocks, 56 in 512).
+// `parts` 0 stores the sums of all the columns.
+#define MA_R 128
+#define MA_T 64
 #define MA_NW 8
 #define MA_S 36
 #define MA_RG (MA_R / 16)
@@ -875,8 +882,10 @@ __device__ inline void mma32_s8(int a0, int a1, int a2, int a3, int b0, int b1, 
 #define MATMUL_MMA(NAME, SB_BYTES, K32)                                                        \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, const float* xd,  \
                                 const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
-                                uint row_bytes, uint n_tok) {                                  \
+                                uint row_bytes, uint n_tok, uint parts) {                      \
     const uint NG = K32 ? 4 : 8, NP = MA_R / MA_NW / (K32 ? 2 : 1), NT = MA_T / MA_NW;         \
+    uint acc_on = parts, ntt = (n_tok + MA_T - 1) / MA_T, part = blockIdx.y / ntt;             \
+    if (!parts) parts = 1;                                                                     \
     __shared__ uint wq[MA_R * MA_S];                                                           \
     __shared__ uint tq[MA_T * MA_S];                                                           \
     __shared__ float ws[MA_R * (K32 ? 4 : 8)];                                                 \
@@ -885,13 +894,13 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
     __shared__ float ts[K32 ? MA_T * 4 : 1];                                                   \
     uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
     uint gi = lane / 4, gj = lane % 4;                                                         \
-    uint row0 = blockIdx.x * MA_R, t0 = blockIdx.y * MA_T;                                     \
+    uint row0 = blockIdx.x * MA_R, t0 = blockIdx.y % ntt * MA_T;                               \
     uint last = n_tok - 1 - t0;                                                                \
     uint ra = 16 * (warp % MA_RG) + gi, ow = warp / MA_RG;                                     \
     float acc[4 * MA_NO];                                                                      \
     _Pragma("unroll")                                                                          \
     for (uint j = 0; j < 4 * MA_NO; j++) acc[j] = 0;                                           \
-    for (uint kh = 0; kh < cols / 128; kh++) {                                                 \
+    for (uint kh = part * (cols / 128) / parts; kh < (part + 1) * (cols / 128) / parts; kh++) {\
         ulong sb_off = w_off + (ulong)(kh / 2) * SB_BYTES;                                     \
         uint hf = kh % 2;                                                                      \
         uint v0[16], v1[16], v2[16], v3[16];                                                   \
@@ -1022,7 +1031,9 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
     for (uint j = 0; j < 4 * MA_NO; j++) {                                                     \
         uint t = (j / 4 * (MA_NW / MA_RG) + ow) * 8 + 2 * gj + j % 2;                          \
         uint row = row0 + ra + 8 * (j / 2 % 2);                                                \
-        if (t <= last && row < rows) y[y_off + (ulong)(t0 + t) * rows + row] = acc[j];         \
+        if (t > last || row >= rows) continue;                                                 \
+        if (acc_on) atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);               \
+        else y[y_off + (ulong)(t0 + t) * rows + row] = acc[j];                                 \
     }                                                                                          \
 }
 

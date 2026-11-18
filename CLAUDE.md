@@ -245,8 +245,12 @@ Design points that span files:
   the int8 matvec too (`matvec_q_id`); other weight types stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
-  keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 64 rows x 128 tokens,
-  128 columns at a time, a warp's 16 rows of weights held in registers. They are a second
+  keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 128 rows x 64 tokens
+  (every block stages its tokens again, so tall), 128 columns at a time, a warp's 16 rows of
+  weights held in registers. The columns go in parts whose blocks add their sums into y
+  (`mma_parts`: four times the blocks the GPU runs at once; a 4096x4096 matrix by 64 tokens
+  took 179 us as 32 blocks and 56 as 512), which also lets them add into the residual
+  stream. They are a second
   compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 80 registers per thread,
   which lets a multiprocessor hold more warps but slows the f32 matmuls. About 2x `dp4a` on
   Mistral-7B prompts; not bit-equal to it. Their tile loads issue all of a thread's
@@ -254,15 +258,17 @@ Design points that span files:
   latency, which was most of the loading time with so few warps per multiprocessor
   (65536 / registers / 32 fit). Don't carry that over: the same reordering made the decode
   matvecs, the f32 matmul and the `dp4a` matmul 2-28% slower (`docs/benchmarks.md`).
-  Prompt chunks of 64+ tokens (`GEMM_MIN_TOKENS`) skip all of that for dense matrices, as
-  llama.cpp does with cuBLAS: `to_f16` converts a matmul's input, `dequant_*` writes the matrix
+  Prompt chunks of 129+ tokens (`GEMM_MIN_TOKENS`) skip all of that for dense matrices
+  (llama.cpp 0.9 runs its int8 tensor-core kernel at every length on this GPU, not cuBLAS;
+  writing the matrices out costs as much as multiplying them at 64 tokens, and int8 in parts
+  is ahead up to 128, level at 192, 24% behind at 256 on Mistral-7B): `to_f16` converts a matmul's input, `dequant_*` writes the matrix
   out as f16 into a scratch buffer the size of the largest one (`Scratch::wh`), and
   `gemm_f16_64x64` / `_64x128` multiply them with f16 `mma.sync` and f32 sums (the second
   compile again). Closer to f32 than int8 (~0.07 on dense models) and 1.25-1.3x faster. Not
   under `precise`, not for F32/F16 weights (they keep f32 activations); MoE experts have their
   own kernels (above).
   Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
-  matmuls remain for chunks of 8-63 tokens. The 64x128 tile runs four warps of four row groups
+  matmuls remain for chunks of 8-128 tokens. The 64x128 tile runs four warps of four row groups
   (a read of the token tile feeds four products); it does not wait on global memory.
   What it is short of is the copy into shared memory: with the tiles staged once it runs
   1.5-1.9x faster, and every tile shape tried moves 2.2-2.7 TB/s. cuBLAS on the same A100 is
@@ -290,8 +296,10 @@ Design points that span files:
   ahead on Mistral-7B (2026-11-17), and prompts
   level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B;
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
-  other two, and short prompts far behind on the dense models: 64 tokens 1.4-1.7x, 128
-  tokens 1.1-1.3x (Qwen3-30B-A3B: 10% behind at 64, 21-25% ahead at 128 and 256).
+  other two; short prompts (int8 in parts) behind on Mistral-7B, 1.65x at 16 tokens, 1.35x
+  at 32, 1.15x at 64, 1.24x at 128; Llama-3.2-1B 1.3x behind at 16, 1.14x at 32, level from
+  64; Qwen3-30B-A3B 2x behind at 16 and 32 (its expert matmuls, not these), level at 64,
+  1.3x ahead at 128.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

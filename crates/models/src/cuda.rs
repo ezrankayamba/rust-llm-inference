@@ -209,7 +209,8 @@ fn mm_add(
     int8: bool,
     quantized: bool,
 ) {
-    if n < MMQ_MIN_TOKENS && wants_q(b, &[w], int8) {
+    let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
+    if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], int8) {
         if !quantized {
             b.quantize(src, n * w.cols, &s.xq);
         }

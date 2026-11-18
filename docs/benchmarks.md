@@ -2050,3 +2050,46 @@ Short prompts had not been compared on CUDA before: the dense models are 1.4-1.7
 (152). Logits of a 601-token prompt (Mistral-7B) and a 540-token one (Llama-3.2-1B) against
 `--precise`: 0.076 and 0.159 before, 0.085 and 0.174-0.194 after, top-1 the same. The order
 in which parts add their sums is not fixed, so the logits now differ between runs.
+
+## 2026-11-18: short CUDA prompts on the int8 tensor-core matmul, columns in parts
+
+llama.cpp (0.9.0, cd959ba) no longer takes cuBLAS on this GPU: `ggml_cuda_should_use_mmq`
+returns true for any NVIDIA GPU from Turing on, so every prompt length runs its int8 kernel
+on the quantized weights. Our f16 path writes each matrix out first, which `bench_cuda`
+puts at 46 / 146 us for 4096x4096 / 14336x4096 against 44 / 136 us for the product at 64
+tokens (cuBLAS: 43 / 127), and `mma_q4_k` was slower still: 64 blocks for a 4096-row matrix
+on 108 multiprocessors, each staging 128 tokens. Now a block is 128 rows by 64 tokens and a
+matrix's columns go in parts that add their sums (`mma_parts`). `bench_cuda`, us, Q4_K by
+64 tokens, by number of parts (0 = the 64x128 tile as it was):
+
+| Matrix | 0 | 1 | 2 | 3 | 6 | 8 | 12 | 16 | 24 | f16: dequant + gemm |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096x4096 | 137.2 | 179.2 | 93.7 | 67.2 | 61.2 | 62.6 | 60.0 | 55.8 | 62.1 | 89.9 |
+| 14336x4096 | 317.0 | 284.8 | 224.1 | 187.9 | 175.9 | 165.6 | 165.0 | 165.9 | 183.4 | 282.0 |
+| 4096x14336 | 499.1 | 650.0 | 330.2 | 227.5 | 177.7 | 201.5 | 176.9 | 165.9 | 169.0 | 270.6 |
+
+The f16 GEMM stays from 129 tokens (`GEMM_MIN_TOKENS`, was 64). Int8 against f16 by prompt
+length, tok/s: Mistral-7B 64: 1996 / 1401, 96: 2300 / 2000, 128: 2715 / 2551, 192: 2955 /
+3027, 256: 2904 / 3802; Llama-3.2-1B 64: 6276 / 4907, 128: 8750 / 8683, 256: 11893 / 11393.
+
+Prompt tok/s (as the table above; "before" is the build before the 128x128 f16 tile, two
+commits back):
+
+| Model, tokens | before | after | llama.cpp |
+|---|---:|---:|---:|
+| Mistral-7B 16 | 299, 314 | 633, 619 | 1088, 972 |
+| Mistral-7B 32 | 562, 600 | 1181, 1209 | 1556, 1686 |
+| Mistral-7B 64 | 1094, 1202 | 2001, 1858 | 2222, 2225 |
+| Mistral-7B 128 | 2119, 1979 | 2508, 2493 | 2952, 3236 |
+| Llama-3.2-1B 16 | 866, 882 | 2149, 2126 | 2641, 3031 |
+| Llama-3.2-1B 32 | 1603, 1593 | 3872, 3853 | 4404, 4387 |
+| Llama-3.2-1B 64 | 3389, 3401 | 6308, 6256 | 6438, 6430 |
+| Llama-3.2-1B 128 | 6102, 6146 | 8150, 8574 | 8100, 8149 |
+| Qwen3-30B-A3B 16 | 371, 384 | 456, 396 | 833, 834 |
+| Qwen3-30B-A3B 32 | 577, 580 | 649, 623 | 1182, 1176 |
+| Qwen3-30B-A3B 64 | 1386, 1324 | 1401, 1386 | 1501, 1202 |
+| Qwen3-30B-A3B 128 | 2109, 2069 | 2320, 2280 | 1663, 1762 |
+
+The CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152). Logits of a ~110-token
+prompt against `--precise`: Mistral-7B 0.059 before (f16), 0.146-0.190 now (int8, two
+runs); Llama-3.2-1B 0.129 and 0.207-0.217; top-1 the same.

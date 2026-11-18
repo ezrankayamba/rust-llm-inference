@@ -61,7 +61,9 @@ const MMQ_TILE: usize = 64;
 pub const MMQ_MIN_TOKENS: usize = 8;
 /// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
 /// warps in cuda.cu), and their compile's cap on registers per thread.
-const MMA_TILE: (usize, usize, u32) = (64, 128, 256);
+const MMA_TILE: (usize, usize, u32) = (128, 64, 256);
+/// Most parts [`mma_parts`] splits a matrix's columns into.
+const MMA_PARTS_MAX: usize = 16;
 const MMA_REGS: usize = 80;
 /// Rows, tokens and threads of a block of the f16 GEMM's kernels, and the columns they take
 /// at a time (`GE_K` in cuda.cu).
@@ -74,7 +76,7 @@ const GEMM_PARTS_MAX: usize = 16;
 /// Fewest blocks the GEMM's larger tile is used for.
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
-pub const GEMM_MIN_TOKENS: usize = 64;
+pub const GEMM_MIN_TOKENS: usize = 129;
 const OTHER_KERNELS: [&str; 17] = [
     "quant_x",
     "rmsnorm",
@@ -905,6 +907,21 @@ fn gemm_parts(rows: usize, cols: usize, n_tok: usize, sms: usize, room: usize) -
         .map(|(p, _)| p)
 }
 
+/// How many parts the int8 tensor-core matmul splits the columns into: enough for four
+/// times the blocks a GPU of `sms` multiprocessors runs at once (its registers allow three
+/// each), of at least two 128-column steps. Measured on an A100: 4096x4096 by 64 tokens
+/// 179 us in 1 part, 67 in 3, 56 in 16; 14336x4096 285, 188 (3), 165 (8 to 16), 183 (24).
+fn mma_parts(rows: usize, cols: usize, n_tok: usize, sms: usize) -> usize {
+    let (tr, tt, threads) = MMA_TILE;
+    let tiles = rows.div_ceil(tr) * n_tok.div_ceil(tt);
+    let held = sms * (65536 / (MMA_REGS * threads as usize));
+    (4 * held)
+        .div_ceil(tiles)
+        .min(MMA_PARTS_MAX)
+        .min(cols / 256)
+        .max(1)
+}
+
 /// The even number of blocks per multiprocessor that `blocks` is under, and whether it is
 /// within a quarter of it.
 fn gemm_full(blocks: usize, sms: usize) -> usize {
@@ -1032,6 +1049,11 @@ impl<'a> Batch<'a> {
     /// for writing the matrix out as f16 from [`GEMM_MIN_TOKENS`].
     pub fn has_gemm(&self, cols: usize, n_tok: usize) -> bool {
         self.gpu.gemm.is_some() && cols.is_multiple_of(GEMM_COLS) && n_tok >= GEMM_MIN_TOKENS
+    }
+
+    /// Whether [`Batch::matmul_q`] can add into y for chunks of [`MMQ_MIN_TOKENS`] or more.
+    pub fn has_matmul_q_add(&self) -> bool {
+        self.gpu.mma
     }
 
     /// Whether [`Batch::gemm_add`] takes this product: as [`Batch::has_gemm`], and the larger
@@ -1266,8 +1288,8 @@ impl<'a> Batch<'a> {
 
     /// [`Batch::matmul`] over activations quantized by [`Batch::quantize`] (`n_tok` rows of
     /// `cols` in `xq`), for the matrices [`Gpu::has_int8`] accepts. The result differs from the
-    /// f32 matmul's by the activations' rounding. Under [`MMQ_MIN_TOKENS`] tokens, `add` adds
-    /// it to `y` instead of storing it.
+    /// f32 matmul's by the activations' rounding. `add` adds it to `y` instead of storing it:
+    /// under [`MMQ_MIN_TOKENS`] tokens, and above where [`Batch::has_matmul_q_add`].
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_q(
         &mut self,
@@ -1288,7 +1310,13 @@ impl<'a> Batch<'a> {
                 ty, rows, cols, offset, 0, 1, zero, xq, cols, 1, y, rows, n_tok, add, None,
             );
         }
-        assert!(!add, "the int8 matmul kernels don't accumulate");
+        assert!(
+            !add || self.gpu.mma,
+            "the dp4a matmul kernels don't accumulate"
+        );
+        if !add && self.gpu.mma && mma_parts(rows, cols, n_tok, self.gpu.gemm_room.0) > 1 {
+            self.zero_rows(y, (0, rows, rows), n_tok);
+        }
         let row_bytes = ty.row_bytes(cols);
         let w_off = self.gpu.device_offset(offset, rows * row_bytes) as u64;
         let f = &self
@@ -1312,10 +1340,20 @@ impl<'a> Batch<'a> {
             .arg(&cols_u)
             .arg(&rb)
             .arg(&nt);
+        // The tensor-core kernel in parts, which add: 0 for one part that stores.
+        let parts = if self.gpu.mma {
+            mma_parts(rows, cols, n_tok, self.gpu.gemm_room.0)
+        } else {
+            1
+        };
+        let parts_u = if add || parts > 1 { parts as u32 } else { 0 };
+        if self.gpu.mma {
+            a.arg(&parts_u);
+        }
         let cfg = if self.gpu.mma {
             grid2(
                 rows.div_ceil(MMA_TILE.0),
-                n_tok.div_ceil(MMA_TILE.1),
+                n_tok.div_ceil(MMA_TILE.1) * parts,
                 MMA_TILE.2,
             )
         } else {
@@ -2094,10 +2132,18 @@ mod tests {
             b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
             b.quantize(At(&xb, 0), n * cols, &xq);
             b.matmul_q(ty, rows, cols, 0, &xq, At(&y_q, 0), n, false);
+            // Added to itself where the kernel can: twice the product.
+            let added = n < MMQ_MIN_TOKENS || b.has_matmul_q_add();
+            if added {
+                b.matmul_q(ty, rows, cols, 0, &xq, At(&y_q, 0), n, true);
+            }
             b.finish();
             let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
             gpu.read(&y_f32, &mut want);
             gpu.read(&y_q, &mut got);
+            if added {
+                got.iter_mut().for_each(|v| *v /= 2.0);
+            }
 
             let rms = |v: &mut dyn Iterator<Item = f32>| {
                 (v.map(|a| (a * a) as f64).sum::<f64>() / (n * rows) as f64).sqrt()
@@ -2233,7 +2279,7 @@ mod tests {
             // and (on an A100) rows in two launches.
             for (rows, cols, n) in [
                 (200, 512, 137),
-                (64, 1280, 64),
+                (64, 1280, GEMM_MIN_TOKENS),
                 (17, 256, 300),
                 (2048, 512, 512),
                 (14400, 256, 500),
