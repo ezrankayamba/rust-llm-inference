@@ -2422,3 +2422,22 @@ Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Qwen
 508 / 527; 16: 767 / 862; 24: 1033 / 1038; 32: 1293 / 1199; 48: 1576 / 1401; 64: 1882 / 1529.
 Mistral-7B 8: 640 / 520; 16: 1203 / 1302; 24: 1731 / 1728; 32: 2181 / 2080; 48: 2496 / 2534;
 64: 2994 / 2908.
+
+## 2026-11-18: Q6_K's offset once per super-block in the AVX2 row kernel: faster kernel, same decode
+
+The idea left on 2026-11-13: the AVX2 one-row Q6_K kernel takes the format's offset of 32 off
+with a second `maddubs` and a subtract per 32 weights; with the sum of each 16 activations
+kept in `Q8Act` (16 i16 per 256 values) it is one `madd` per super-block instead, and the
+unsigned weights then need four i32 sums a super-block instead of two. Scratch branch
+`q6k-offset-once` (deleted), `Benchmark` with `base=main`, one thread (runs 44385171538,
+44385181496, 44385192268; two rounds each). `bench_matvec` Q6_K matvec, ms: Xeon 6975P-C
+0.490, 0.476 -> 0.441, 0.452 and 0.520, 0.485 -> 0.442, 0.460; EPYC 7763 0.518, 0.501 -> 0.476,
+0.473 (and 0.538 -> 0.484 on an EPYC 7F72). Llama-3.2-1B decode, tok/s: Xeon 15.9, 16.2 ->
+16.1, 15.7 and 17.2, 16.5 -> 16.3, 16.4; EPYC 7763 17.7, 17.9 -> 18.1, 17.8. Qwen2.5-0.5B
+(Q5_0/Q8_0, no Q6_K) the same, as it should be. A kernel 5-10% faster on a third of the
+model's weights and no decode gain to show for it: not merged. No Zen 4 runner came up.
+
+For the record of where one-thread decode on Zen 4 stands (table of 2026-11-17 above): 21.8
+tok/s against llama.cpp's 23.1 by default, 27.0 with `--repack`. llama.cpp's figure is with
+its own repacked copy of the Q4_K weights (553 MiB peak against our 91, 549 with `--repack`),
+so at equal memory we are 17% ahead, and 6% behind for a sixth of the memory.
