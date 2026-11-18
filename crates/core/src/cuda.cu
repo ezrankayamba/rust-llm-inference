@@ -1230,22 +1230,24 @@ __device__ inline void gq4_k_hdr(const uchar* b, ulong* hdr) {
 __device__ inline void gq4_k_load(const uchar* b, uint j, uint dp, ulong* raw) {
     raw[0] = *(const ulong*)(b + 16 + 32 * j + 8 * dp);
 }
-__device__ inline void gq4_k_dec(const ulong* hdr, const ulong* raw, uint j, uint dp, V128& lo,
-                                 V128& hi) {
-    U128 hd;
-    hd.v[0] = (uint)hdr[0];
-    hd.v[1] = (uint)(hdr[0] >> 32);
-    hd.v[2] = (uint)hdr[1];
-    hd.v[3] = (uint)(hdr[1] >> 32);
+// The scales and offsets of sub-blocks 2j (sa, ma) and 2j + 1 (sc, mc), from gq4_k_hdr's words.
+__device__ inline void gq4_k_scales(const ulong* hdr, uint j, float* sa, float* ma, float* sc,
+                                    float* mc) {
     float d = __uint_as_float((uint)hdr[2]), dmin = __uint_as_float((uint)(hdr[2] >> 32));
-    // Sub-blocks 2j and 2j + 1: 6 bits each, the first four in a byte's low bits, the rest
-    // split between the top two bits of those bytes and a nibble (q4_k_scale).
-    uint b0 = (hd.v[1] >> 16 * (j % 2)) & 0xFFFF, b1 = (hd.v[2] >> 16 * (j % 2)) & 0xFFFF;
-    uint b2 = (hd.v[3] >> 16 * (j % 2)) & 0xFFFF;
+    // 6 bits each, the first four sub-blocks' in a byte's low bits, the rest split between
+    // the top two bits of those bytes and a nibble (q4_k_scale).
+    uint v1 = (uint)(hdr[0] >> 32), v2 = (uint)hdr[1], v3 = (uint)(hdr[1] >> 32);
+    uint b0 = (v1 >> 16 * (j % 2)) & 0xFFFF, b1 = (v2 >> 16 * (j % 2)) & 0xFFFF;
+    uint b2 = (v3 >> 16 * (j % 2)) & 0xFFFF;
     uint sl = j < 2 ? b0 : (b2 & 0x0F0F) | ((b0 >> 2) & 0x3030);
     uint ml = j < 2 ? b1 : ((b2 >> 4) & 0x0F0F) | ((b1 >> 2) & 0x3030);
-    float sa = d * (float)(sl & 63), sc = d * (float)((sl >> 8) & 63);
-    float ma = dmin * (float)(ml & 63), mc = dmin * (float)((ml >> 8) & 63);
+    *sa = d * (float)(sl & 63), *sc = d * (float)((sl >> 8) & 63);
+    *ma = dmin * (float)(ml & 63), *mc = dmin * (float)((ml >> 8) & 63);
+}
+__device__ inline void gq4_k_dec(const ulong* hdr, const ulong* raw, uint j, uint dp, V128& lo,
+                                 V128& hi) {
+    float sa, ma, sc, mc;
+    gq4_k_scales(hdr, j, &sa, &ma, &sc, &mc);
     #pragma unroll
     for (uint k = 0; k < 4; k++) {
         uint by = (uint)(raw[0] >> 16 * k) & 0xFFFF;
@@ -1380,6 +1382,83 @@ GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1)
 #define GEMM_DENSE_ARGS , uint n_tok, uint parts
 GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts)
 GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts)
+
+// gemm_q4_k_dense for chunks of few tokens: a block takes 128 rows by 32 tokens, and a lane
+// decodes the weights of its own two rows that its multiplies take (16 columns of each, read
+// as 2 bytes at a time) straight from the matrix. Only the tokens go through shared memory:
+// a warp shares its rows with no other, and staging them cost more than decoding them. Rows
+// must lie at a multiple of 16 bytes.
+extern "C" __global__ void gemm_q4_k_direct(const uchar* w, ulong w_off, const uint* xh, float* y,
+                                            ulong y_off, uint rows, uint cols, uint row_bytes,
+                                            uint n_tok, uint parts) {
+    __shared__ uint xt[32 * GE_S];
+    uint ntt = (n_tok + 31) / 32, part = blockIdx.y / ntt, pb = blockIdx.y % ntt * 32;
+    uint kb = part * (cols / 64) / parts, ke = (part + 1) * (cols / 64) / parts;
+    uint last = (n_tok - pb < 32 ? n_tok - pb : 32) - 1;
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, gi = lane / 4, gj = lane % 4;
+    uint row0 = blockIdx.x * 128, ra = 16 * warp + gi, kw = cols / 2;
+    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);
+    const uchar* wr[2];
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        uint r = row0 + ra + 8 * h;
+        wr[h] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes;
+    }
+    const V128* xp = (const V128*)(xh + (ulong)(pb + (tr <= last ? tr : last)) * kw + tw);
+    float c[4][4];
+    #pragma unroll
+    for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;
+    ulong hdr[2][3];
+    for (uint ks = kb; ks < ke; ks++) {
+        uint j = ks % 4;
+        uint by[2][4];
+        #pragma unroll
+        for (uint h = 0; h < 2; h++) {
+            const uchar* b = wr[h] + (ulong)(ks / 4) * 144;
+            if (j == 0 || ks == kb) gq4_k_hdr(b, hdr[h]);
+            // Bytes 8i + 2gj and the next: columns 8i + 2gj.. of sub-blocks 2j (low nibbles)
+            // and 2j + 1 (high).
+            #pragma unroll
+            for (uint i = 0; i < 4; i++)
+                by[h][i] = *(const unsigned short*)(b + 16 + 32 * j + 8 * i + 2 * gj);
+        }
+        V128 v = xp[ks * 8];
+        *(V128*)(xt + tr * GE_S + tw) = v;
+        uint a[4][4];
+        #pragma unroll
+        for (uint h = 0; h < 2; h++) {
+            float sa, ma, sc, mc;
+            gq4_k_scales(hdr[h], j, &sa, &ma, &sc, &mc);
+            #pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                uint q = by[h][i];
+                uint a0 = f2h(sa * (float)(q & 15) - ma);
+                uint a1 = f2h(sa * (float)((q >> 8) & 15) - ma);
+                uint c0 = f2h(sc * (float)((q >> 4) & 15) - mc);
+                uint c1 = f2h(sc * (float)(q >> 12) - mc);
+                // Multiply i / 2 of each sub-block; rows h, columns 2gj.. then 8 + 2gj...
+                a[i / 2][h + 2 * (i % 2)] = a0 | (a1 << 16);
+                a[2 + i / 2][h + 2 * (i % 2)] = c0 | (c1 << 16);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint o = 0; o < 4; o++) {
+            if (8 * o > last) continue;
+            #pragma unroll
+            for (uint k = 0; k < 4; k++) {
+                const uint* bp = xt + (8 * o + gi) * GE_S + 8 * k + gj;
+                mma16_f16(a[k], bp[0], bp[4], c[o]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint j = 0; j < 16; j++) {
+        uint t = 8 * (j / 4) + 2 * gj + j % 2, row = row0 + ra + 8 * (j / 2 % 2);
+        if (t <= last && row < rows) atomicAdd(y + y_off + (ulong)(pb + t) * rows + row, c[j / 4][j % 4]);
+    }
+}
 
 #else  // the rest of the file is not part of the tensor-core compile
 

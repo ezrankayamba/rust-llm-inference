@@ -70,6 +70,11 @@ const MMA_FEW: [usize; 2] = [16, 32];
 /// matrix out once for [`Batch::gemm`] is: a block here decodes its weights again for every
 /// 64 tokens (5% slower at 256).
 pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=192;
+/// The chunks whose Q4_K matrices take `gemm_q4_k_direct` instead (blocks of 128 rows by 32
+/// tokens, each lane decoding its own weights): 14336x4096 by 16 tokens 74 us where the int8
+/// tensor cores took 92, by 32 tokens 82 where the 64-token block took 99. A second tile of
+/// tokens decodes the weights again, so not past 32.
+const GEMM_DIRECT_TOKENS: std::ops::RangeInclusive<usize> = 8..=32;
 /// Most parts of a matrix's columns it takes.
 const GEMM_DENSE_PARTS_MAX: usize = 8;
 /// Most parts [`mma_parts`] splits a matrix's columns into.
@@ -218,6 +223,8 @@ pub struct Gpu {
     gemm_id: Vec<(GgmlType, CudaFunction)>,
     /// The same over every token, a matrix's columns in parts.
     gemm_dense: Vec<(GgmlType, CudaFunction)>,
+    /// For Q4_K over few tokens: blocks of 128 rows by 32 tokens.
+    gemm_direct: Option<CudaFunction>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -270,7 +277,7 @@ impl Gpu {
                 .0
                 >= 8;
         let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
-        let mut gemm_dense = Vec::new();
+        let (mut gemm_dense, mut gemm_direct) = (Vec::new(), None);
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -301,6 +308,8 @@ impl Gpu {
                 let n = format!("{}_dense", n.replace("mmq", "gemm"));
                 gemm_dense.push((t, module.load_function(&n).map_err(err(&n))?));
             }
+            let n = "gemm_q4_k_direct";
+            gemm_direct = Some(module.load_function(n).map_err(err(n))?);
             for tt in MMA_FEW {
                 for (t, n) in MMQ_KERNELS {
                     let n = format!("{}_t{tt}", n.replace("mmq", "mma"));
@@ -417,6 +426,7 @@ impl Gpu {
             gemm_room,
             mma_few,
             gemm_dense,
+            gemm_direct,
             gemm_id,
             other,
             zero_id,
@@ -828,6 +838,8 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if self.gemm_direct.as_ref().is_some_and(eq) {
+            "gemm direct Q4_K".to_string()
         } else if let Some((t, _)) = self.gemm_dense.iter().find(|(_, g)| eq(g)) {
             format!("gemm in-block {t:?}")
         } else if let Some((t, _)) = self.gemm_id.iter().find(|(_, g)| eq(g)) {
@@ -958,8 +970,7 @@ fn mma_parts(rows: usize, cols: usize, token_tiles: usize, sms: usize) -> usize 
 /// are 64 rows by 64 tokens, and a part is at least a super-block. Measured on an A100, us
 /// for 1 / 2 / 4 / 8 / 16 parts: 4096x4096 by 64 tokens 98 / 64 / 44 / 40 / 45, 14336x4096
 /// 156 / 136 / 121 / 122 / 135; by 256 tokens 147 / 129 / 129 / 129 and 437 / 412 / 414 / 434.
-fn dense_parts(rows: usize, cols: usize, n_tok: usize, sms: usize) -> usize {
-    let tiles = rows.div_ceil(64) * n_tok.div_ceil(64);
+fn dense_parts(tiles: usize, cols: usize, sms: usize) -> usize {
     let held = sms * (65536 / (MMA_REGS * 256));
     (4 * held)
         .div_ceil(tiles)
@@ -1339,7 +1350,12 @@ impl<'a> Batch<'a> {
 
     /// Whether [`Batch::gemm_dense`] takes this matrix over a chunk of `n_tok` tokens.
     pub fn has_gemm_dense(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
-        GEMM_DENSE_TOKENS.contains(&n_tok) && self.has_gemm_id(ty, cols, offset, 0)
+        let min = if ty == GgmlType::Q4_K {
+            *GEMM_DIRECT_TOKENS.start()
+        } else {
+            *GEMM_DENSE_TOKENS.start()
+        };
+        (min..=*GEMM_DENSE_TOKENS.end()).contains(&n_tok) && self.has_gemm_id(ty, cols, offset, 0)
     }
 
     /// `y = W x` (`y += W x` with `add`) on f16 tensor cores where [`Batch::has_gemm_dense`],
@@ -1361,7 +1377,17 @@ impl<'a> Batch<'a> {
     ) {
         assert!(self.has_gemm_dense(ty, cols, offset, n_tok) && rows > 0);
         assert!(xh.0.len() >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
-        let parts = dense_parts(rows, cols, n_tok, self.gpu.gemm_room.0);
+        let direct = ty == GgmlType::Q4_K && GEMM_DIRECT_TOKENS.contains(&n_tok);
+        let (tr, tt) = if direct { (128, 32) } else { (64, 64) };
+        let tiles = rows.div_ceil(tr) * n_tok.div_ceil(tt);
+        let sms = self.gpu.gemm_room.0;
+        let parts = if direct {
+            // Measured on an A100: 14336x4096 by 16 tokens (112 tiles) 83 us in 4 parts,
+            // 74 in 8, 78 in 12; 4096x14336 (32 tiles) 131 in 4, 86 in 8, 77 in 16.
+            (8 * sms).div_ceil(tiles).min(16).min(cols / 256).max(1)
+        } else {
+            dense_parts(tiles, cols, sms)
+        };
         if !add {
             self.zero_rows(y, (0, rows, rows), n_tok);
         }
@@ -1371,6 +1397,22 @@ impl<'a> Batch<'a> {
         let (stride, xd, y_off) = (0u64, 1u32, y.1 as u64);
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
         let (nt, parts_u) = (n_tok as u32, parts as u32);
+        if direct {
+            let f = gpu.gemm_direct.as_ref().expect("loaded with gemm_dense");
+            let mut a = self.call(f);
+            a.arg(&gpu.weights)
+                .arg(&w_off)
+                .arg(&xh.0)
+                .arg(&y.0.0)
+                .arg(&y_off)
+                .arg(&rows_u)
+                .arg(&cols_u)
+                .arg(&rb)
+                .arg(&nt)
+                .arg(&parts_u);
+            self.launch(a, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, 256));
+            return;
+        }
         let f = gpu.gemm_dense.iter().find(|(t, _)| *t == ty);
         let mut a = self.call(&f.expect("checked by has_gemm_id").1);
         a.arg(&gpu.weights)
@@ -2416,6 +2458,7 @@ mod tests {
                 (14400, 256, 500),
                 // Chunks short enough for the kernel that decodes the weights itself.
                 (200, 512, 30),
+                (300, 768, 9),
                 (130, 768, 100),
                 (2048, 1024, 192),
             ] {

@@ -2261,3 +2261,42 @@ block's second tile is half empty. And not quantizing results that only the f16 
 (`quant_x` after a prompt's attention, the warp reductions in `rmsnorm` and `swiglu`): Mistral-7B
 32 tokens 1840, 1823 against 1842, 1848 tok/s, 64: 2957, 2918 against 2941, 2936, 128 and 512
 the same; the launches around the matmuls are not where a short prompt's time is.
+
+## 2026-11-18: llama.cpp's matmul alone, and a CUDA kernel for chunks of 8 to 32 tokens
+
+llama.cpp's `test-backend-ops perf -o MUL_MAT -b CUDA0` (0.9.0, cd959ba, built with
+`-DLLAMA_BUILD_TESTS=ON`) with our shapes added to `make_test_cases_perf`, us a run on the
+A100, next to ours from `bench_cuda` (`RLI_DENSE=1` for the f16 kernel) before this change.
+Q4_K 14336x4096 by 16 / 24 / 32 / 64 / 96 / 128 tokens: llama.cpp 66.5 / 79.1 / 90.6 / 137.5 /
+184.0 / 230.4; ours 91.6 (int8) / 99.5 / 98.9 / 120.7 / 195.0 / 215.2. 4096x4096: 23.2 / 27.0 /
+30.7 / 46.8 / 60.7 / 76.4 against 34.1 (int8) / 33.4 / 33.6 / 39.8 / 63.6 / 70.4. Q6_K
+14336x4096: 89.4 / 105.2 / 114.5 / 162.2 / 207.5 / 259.9. So its matmul was ahead only under
+64 tokens; from 64 the gap is elsewhere. Run in a Mistral-7B prompt four times each
+(`bench --pp N`), attention's three launches cost 23 us a layer at 32 tokens of 545 and 99 at
+192 of 1670, an RMSNorm 7 and 14.
+
+In our kernels the cost is shared memory, not arithmetic: sharing a row's decoded scales
+through it in the 16-token int8 kernel (each lane decodes all eight of its two rows' every
+step) made 14336x4096 by 16 tokens 106.8 us from 91.6. `gemm_q4_k_direct` goes the other
+way: f16 tensor cores, blocks of 128 rows by 32 tokens, each lane decoding from the matrix
+the 16 weights of each of its two rows that its multiplies take; only the tokens are staged.
+14336x4096 by 8 / 16 / 24 / 32 tokens: 71.1 / 74.2 / 77.8 / 82.4 us; 4096x14336 72.5 / 76.7 /
+80.6 / 85.4; 4096x4096 25.9 / 26.7 / 29.0 / 31.5. Parts: `8 * multiprocessors / tiles`, at
+most 16 (14336x4096 by 16 tokens 83.3 us in 4, 74.2 in 8, 77.6 in 12; 4096x14336 131.0 in 4,
+85.5 in 8, 76.8 in 16). It takes Q4_K matrices in chunks of 8 to 32 tokens
+(`GEMM_DIRECT_TOKENS`); `mm_each` now picks a kernel per matrix, so the Q6_K ones of a group
+keep the int8 kernels under 24 tokens. The int8 matmuls of a group are zeroed by one launch.
+
+`bench --pp N --tg 0 --gpu-layers 999`, 60 repetitions, before and after in turn, tok/s.
+Mistral-7B 8 tokens 571, 569 -> 617, 620; 12: 820, 796 -> 877, 882; 16: 1079, 1061 -> 1150,
+1169; 20: 1090, 1087 -> 1376, 1383; 24: 1432, 1424 -> 1589, 1600; 32: 1837, 1817 -> 1998,
+2014. Llama-3.2-1B (±20%) 16: 3392, 3663 -> 3791, 3852; 20: 4172, 3821 -> 4656, 4392.
+Qwen3-30B-A3B 8 to 20 tokens: the same within 1% (its experts). Logits of a 16-token prompt
+against `--precise`: Mistral-7B 0.21 -> 0.13, Llama-3.2-1B 0.31 -> 0.15. CUDA tests pass with
+and without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Against llama.cpp after it (R = 2400 / N repetitions, at most 60; means of two rounds in turn,
+ours / llama.cpp): Mistral-7B 8: 612 / 521; 16: 1158 / 1287; 24: 1589 / 1718; 32: 1993 / 2087;
+48: 2462 / 2589. Llama-3.2-1B 8: 1957 / 1942; 16: 3430 / 3546; 24: 5066 / 5228; 32: 6979 /
+6331; 48: 9127 / 8226. Qwen3-30B-A3B 8: 513 / 539; 16: 660 / 862; 24: 904 / 1010; 32: 1130 /
+1207; 48: 1472 / 1402.

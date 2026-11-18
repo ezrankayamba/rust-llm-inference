@@ -8,8 +8,8 @@
 use crate::backend::BackendError;
 use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
 use rli_core::cuda::{
-    ATTN_THREADS, At, AttnParams, Batch, GEMM_DENSE_TOKENS, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf,
-    GpuIds, GpuQ, Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
+    ATTN_THREADS, At, AttnParams, Batch, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf, GpuIds, GpuQ,
+    Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
 };
 use rli_core::{GgmlType, ops};
 use std::any::Any;
@@ -73,7 +73,7 @@ impl Scratch {
         // An MoE token holds its k chosen experts' activations side by side; their outputs are
         // followed by the shared expert's, one row per token.
         let k = c.n_expert_used;
-        let (gemm, half) = (n >= GEMM_MIN_TOKENS, n >= *GEMM_DENSE_TOKENS.start());
+        let (gemm, half) = (n >= GEMM_MIN_TOKENS, n >= MMQ_MIN_TOKENS);
         Self {
             x: gpu.alloc(n * c.n_embd),
             xb: gpu.alloc(n * c.n_embd),
@@ -184,17 +184,22 @@ fn mm_each(
     // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
     // are. F32 and F16 weights are the reference path and keep f32 activations.
     let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
-    let dense = |w: &&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
-    if int8 && ws.iter().all(dense) {
-        // Shorter ones too, the weights decoded on the way into the tensor cores.
-        // Its blocks add into y, which the launch that converts x zeroes.
-        let zs: Vec<_> = ws.iter().zip(ys).map(|(w, &y)| (y, n * w.rows)).collect();
+    // Shorter ones too, for the matrices with a kernel that decodes the weights on the way
+    // into the tensor cores. Its blocks add into y, which the launch that converts x zeroes.
+    let dense = |w: &Weight| int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
+    let (half, rest): (Vec<_>, Vec<_>) = ws.iter().zip(ys).partition(|(w, _)| dense(w));
+    if !half.is_empty() {
+        let zs: Vec<_> = half.iter().map(|&(w, &y)| (y, n * w.rows)).collect();
         b.to_f16_zero(x, n * ws[0].cols, &s.xh, &zs);
-        for (w, &y) in ws.iter().zip(ys) {
+        for &(w, &y) in &half {
             b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, y, n, true);
         }
+    }
+    if rest.is_empty() {
         return;
     }
+    let (ws, ys): (Vec<&Weight>, Vec<At<'_>>) = rest.into_iter().map(|(&w, &y)| (w, y)).unzip();
+    let (ws, ys) = (&ws[..], &ys[..]);
     if int8 && !ws.iter().any(float) && b.has_gemm(ws[0].cols, n) {
         b.to_f16(x, n * ws[0].cols, &s.xh);
         for (w, &y) in ws.iter().zip(ys) {
@@ -206,9 +211,24 @@ fn mm_each(
     if !quantized && wants_q(b, ws, int8) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
+    // Where the int8 matmul adds its parts into y, one launch zeroes every result first
+    // (the launch per matrix it would make was 2-3% of a 16-token prompt).
+    let adds = n >= MMQ_MIN_TOKENS && b.has_matmul_q_add();
+    if adds {
+        let q = |(w, _): &(&&Weight, &At<'_>)| wants_q(b, &[**w], int8);
+        let zs: Vec<_> = ws
+            .iter()
+            .zip(ys)
+            .filter(q)
+            .map(|(w, &y)| (y, n * w.rows))
+            .collect();
+        if !zs.is_empty() {
+            b.to_f16_zero(x, 0, &s.xh, &zs);
+        }
+    }
     for (w, &y) in ws.iter().zip(ys) {
         if wants_q(b, &[w], int8) {
-            b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n, false);
+            b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n, adds);
         } else {
             mm(b, w, x, y, n);
         }
