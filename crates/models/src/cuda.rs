@@ -156,6 +156,12 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
 /// 20 tokens 650 and 686, 32 tokens 740 and 997.
 const MOE_GROUP_TOKENS: usize = 20;
 
+/// Most tokens of a chunk whose f32 router runs as a matvec per token (a block of 8 warps
+/// per row and token) and not as the matmul, whose warp walks a row's columns alone:
+/// Qwen3-30B-A3B prompts 9% faster at 8 tokens, 6-7% at 16 and 32, level at 128, 4.5% slower
+/// at 512.
+const ROUTER_MATVEC_TOKENS: usize = 64;
+
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
 fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
     int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset))
@@ -285,7 +291,15 @@ fn moe(
 ) {
     let (ne, k, n_embd) = (experts.len(), c.n_expert_used, c.n_embd);
     let (xb, ids) = (At(&s.xb, 0), &s.route_ids);
-    mm(b, router, xb, At(&s.router, 0), n);
+    if n <= ROUTER_MATVEC_TOKENS && matches!(router.ty, GgmlType::F32 | GgmlType::F16) {
+        // One matrix, so the ids (whatever the last layer left) are multiplied by no stride.
+        let (r, o) = (router, At(&s.router, 0));
+        b.matvec_id(
+            r.ty, r.rows, r.cols, r.offset, 0, 1, ids, xb, r.cols, 1, o, r.rows, n,
+        );
+    } else {
+        mm(b, router, xb, At(&s.router, 0), n);
+    }
     if let Some((gi, _)) = shared {
         mm(b, gi, xb, At(&s.shared_gate, 0), n);
     }

@@ -302,8 +302,9 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three; Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
-  9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 16-28% behind at 8 to 32 (its expert
-  matvecs under 20 tokens), 3% at 48, 11-44% ahead at 64 to 256.
+  9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 9-24% behind at 8 to 32 (its expert
+  matvecs under 20 tokens; the router of a chunk of up to 64 tokens runs as matvecs,
+  `ROUTER_MATVEC_TOKENS`, +6-9%), 3% at 48, 11-44% ahead at 64 to 256.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

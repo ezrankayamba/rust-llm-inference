@@ -2166,3 +2166,20 @@ against `--precise`: 0.83 before, 0.89 after, top-1 the same. Also tried and dro
 dense int8 matmul: a 128-token block for chunks of 65 to 128 (64 sums a lane under the
 80-register cap): 121.9 / 382.4 / 345.0 us at 128 tokens against 103.1 / 314.3 / 311.4 as
 two 64-token blocks.
+
+## 2026-11-18: the MoE router of a short CUDA prompt chunk as matvecs
+
+The router (F32, 128 x 2048 on Qwen3-30B-A3B) ran a prompt chunk through `matmul_f32`, one
+warp walking each row's 64 column steps for a tile of 32 tokens: 75 us a launch at 16 tokens
+(`RLI_CUDA_PROF=1`), 9% of the prompt. Chunks of up to 64 tokens (`ROUTER_MATVEC_TOKENS`) now
+take the decode kernel, a block of 8 warps per row and token: 26 us. `bench --pp N --tg 0
+--gpu-layers 999`, 60 / 60 / 60 / 18 / 8 reps, matmul against matvecs in turn, two rounds,
+tok/s: 8 tokens 451, 454 -> 495, 500; 16: 615, 626 -> 660, 653; 32: 997, 999 -> 1072, 1072;
+128: 2555, 2509 against 2575, 2517; 512: 4375, 4373 against 4176, 4184 (so not there).
+`--precise` logits of a 32-token prompt are the old build's to 7e-6. CUDA tests pass with and
+without `RLI_CUDA_NO_MMA=1` (152). Also tried on the dense int8 matmul and dropped: one
+16-byte load for a token pair's scale and sum and one 8-byte load for its two operand words
+(170.0 us against 170.2 for 14336x4096 by 64 tokens); a register cap of 64, 96, 112 or 128+
+(the same to 96, 3% slower at 112, 1.4x slower from 128, where a multiprocessor holds two
+blocks). With the float arithmetic after each `mma` reduced to one add that matmul takes
+103 us, and with the tiles staged once 123: those are where its time is.
