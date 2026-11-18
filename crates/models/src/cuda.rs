@@ -155,6 +155,10 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
 /// 128 experts a token) on an A100: 16 tokens 621 tok/s a pair at a time and 594 grouped,
 /// 20 tokens 650 and 686, 32 tokens 740 and 997.
 const MOE_GROUP_TOKENS: usize = 20;
+/// The same for the down projection on f16 tensor cores. It has the most rows and the
+/// fewest columns, so a matvec per pair is mostly its per-row work: Qwen3-30B-A3B at 16
+/// tokens 661 tok/s -> 727 grouped, at 12 tokens 608 -> 625, at 8 tokens 502 -> 475.
+const MOE_GROUP_DOWN_TOKENS: usize = 12;
 
 /// Most tokens of a chunk whose f32 router runs as a matvec per token (a block of 8 warps
 /// per row and token) and not as the matmul, whose warp walks a row's columns alone:
@@ -362,7 +366,11 @@ fn moe(
     // decoded once for all of its tokens.
     // Q4_K stacks then go through f16 tensor cores, where the GPU has them.
     let grouped = n >= MOE_GROUP_TOKENS;
-    if grouped && wants_q(b, &[&e.gate, &e.up, &e.down], int8) {
+    // The down projection is grouped from fewer tokens: see MOE_GROUP_DOWN_TOKENS.
+    let d = &e.down;
+    let down_half =
+        n >= MOE_GROUP_DOWN_TOKENS && int8 && b.has_gemm_id(d.ty, d.cols, d.offset, down_stride);
+    if (grouped || down_half) && wants_q(b, &[&e.gate, &e.up, &e.down], int8) {
         b.moe_group(ids, &s.perm, &s.starts, n * k, ne);
     }
     let groups = (&s.perm, &s.starts);
@@ -422,9 +430,8 @@ fn moe(
             );
         }
     }
-    let d = &e.down;
     let (ty, at) = (d.ty, d.offset);
-    if half(b, d, down_stride) {
+    if down_half {
         b.swiglu(gate, up, n * k * ff, None);
         b.to_f16(gate, n * k * ff, &s.xh);
         b.gemm_id(

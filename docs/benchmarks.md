@@ -2300,3 +2300,21 @@ ours / llama.cpp): Mistral-7B 8: 612 / 521; 16: 1158 / 1287; 24: 1589 / 1718; 32
 48: 2462 / 2589. Llama-3.2-1B 8: 1957 / 1942; 16: 3430 / 3546; 24: 5066 / 5228; 32: 6979 /
 6331; 48: 9127 / 8226. Qwen3-30B-A3B 8: 513 / 539; 16: 660 / 862; 24: 904 / 1010; 32: 1130 /
 1207; 48: 1472 / 1402.
+
+## 2026-11-18: the MoE down projection grouped by expert from 12 tokens on CUDA
+
+`RLI_CUDA_PROF=1` on a 16-token Qwen3-30B-A3B prompt: the expert matvecs are 61% of the
+time, and the Q6_K ones (the down projection in half the layers: 2048 rows by 768 columns
+for each of 128 pairs) take 315 us a launch where the gate and up ones take 138 for as many
+weights. Grouped by expert on f16 tensor cores (`gemm_*_id`), as every expert matrix is from
+20 tokens: `bench --pp N --tg 0 --gpu-layers 999`, 60 repetitions, in turn, tok/s: 16 tokens
+660, 663 -> 727 (the Q6_K layers alone: 705, 701); 12 tokens 604, 613 -> 625; 8 tokens 500,
+503 -> 475 (so from 12, `MOE_GROUP_DOWN_TOKENS`). CUDA tests pass with and without
+`RLI_CUDA_NO_MMA=1` (152 each). Against llama.cpp after it (means of two rounds in turn,
+ours / llama.cpp): 12 tokens 615 / 667; 16: 729 / 862; 20: 774 / 891.
+
+Tried and dropped the same day: `gemm_q4_k_direct` with blocks of 64 tokens for chunks of
+33 to 64 (14336x4096 by 40 / 48 / 64 tokens 112.6 / 117.6 / 129.9 us against the 64-row
+block's 106.0 / 109.5 / 120.5); the one-launch `attention` kernel in place of the three
+tiled ones for short prompts (Mistral-7B 8 tokens 616 -> 633 tok/s, 16 tokens level, 32
+tokens 2017 -> 1984, 64 tokens 2950 -> 2807).
