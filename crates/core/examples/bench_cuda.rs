@@ -63,10 +63,10 @@ fn main() {
         };
         println!("{ty:?} {rows}x{cols}: f32 {}{q}", time(false));
     }
-    // The f16 GEMM of long prompts: writing a matrix out as f16, and multiplying it by 256
-    // tokens. Random activations, so the products are ordinary numbers.
-    {
-        let n_tok = 256;
+    // The f16 GEMM of long prompts: writing a matrix out as f16, and multiplying it by 512
+    // and 128 tokens (the shapes of Mistral-7B and Llama-3.2-1B). Random activations, so the
+    // products are ordinary numbers.
+    for n_tok in [512, 128] {
         let mut seed = 5u32;
         let xs: Vec<f32> = (0..n_tok * 14336)
             .map(|_| {
@@ -84,7 +84,9 @@ fn main() {
             (GgmlType::Q4_K, 4096, 4096),
             (GgmlType::Q4_K, 14336, 4096),
             (GgmlType::Q4_K, 4096, 14336),
-            (GgmlType::Q6_K, 4096, 4096),
+            (GgmlType::Q4_K, 2048, 2048),
+            (GgmlType::Q4_K, 8192, 2048),
+            (GgmlType::Q4_K, 2048, 8192),
         ] {
             let bytes = ty.row_bytes(cols) * rows;
             let count = (mem.len() / bytes).min(16);

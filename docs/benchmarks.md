@@ -1942,3 +1942,64 @@ turn, 20 s rests, 5 reps):
 | 72 | 1265.4 | 1262.4 | 1026.3 | 194.9 | 196.9 | 152.3 |
 | 100 | 1309.7 | 1303.3 | 1101.4 | 193.4 | 194.1 | 158.8 |
 | 112 | 1363.7 | 1365.7 | 1232.4 | 199.4 | 199.2 | 177.2 |
+
+## 2026-11-18: what the CUDA f16 GEMM is short of (A100; nothing changed in the kernel)
+
+Mistral-7B pp512 is 4131 tok/s here against llama.cpp's 4850-4960; `RLI_CUDA_PROF=1` puts 61%
+of it in `gemm_f16` and 16% in `dequant`. cuBLAS's f16 GEMM on the same GPU (PyTorch
+`half @ half`, 200 runs, us) against ours (`bench_cuda`, which now runs these shapes at 512
+and 128 tokens):
+
+| Matrix | 512 tokens: ours | cuBLAS | 128 tokens: ours | cuBLAS |
+|---|---:|---:|---:|---:|
+| 4096x4096 | 168.8 | 155.9 | 91.4 | 69.6 |
+| 14336x4096 | 512.7 | 422.3 | 225.3 | 158.5 |
+| 4096x14336 | 603.5 | 313.7 | 304.0 | 120.7 |
+| 2048x2048 | 61.5 | 36.0 | 34.3 | 18.1 |
+| 8192x2048 | 171.8 | 94.1 | 65.4 | 40.6 |
+| 2048x8192 | 236.5 | 99.8 | 169.6 | 46.4 |
+
+A Mistral-7B layer is 2297 us of GEMM here and 1782 with cuBLAS: 16 ms of a 124 ms prompt,
+most of the gap. Diagnostics on the 64x128 tile (512 tokens; 4096x4096 / 14336x4096 /
+4096x14336, us):
+
+| Variant | | | |
+|---|---:|---:|---:|
+| as it is | 168.9 | 512.7 | 603.5 |
+| every block reads the same 64 weight rows (weights in L2) | 164.8 | 475.8 | 558.6 |
+| tiles staged at the first step only, barriers kept | 110.1 | 304.6 | 360.6 |
+| ... and no barriers | 102.6 | 279.2 | 333.8 |
+| tokens staged once, weights every step | 123.1 | 411.1 | 410.0 |
+| weights staged once, tokens every step | 148.8 | 416.6 | 500.7 |
+| column steps outermost (16 sums between revisits, not 4) | 199.9 | 603.9 | 696.4 |
+| operands through `ldmatrix.x4` (weights only: 179.5 / 529.9 / 628.5) | 184.6 | 542.1 | 634.7 |
+| rows 32 words apart, 16-byte chunks swizzled | 187.7 | 563.1 | 669.1 |
+
+So the products alone run at 156-215 TFLOPS and the copy into shared memory is 35-40% of the
+time, the token tile (two thirds of the bytes) more than the weights; not memory latency,
+not the shared-memory loads, not the register cap (80, 168 and 224 give the same times).
+Every shape and tile moves 2.2-2.7 TB/s from global to shared memory.
+
+Other tiles, with rows chosen so the block count is a multiple of the 108 multiprocessors
+(x 4096 columns, 512 tokens, us):
+
+| Tile (rows x tokens, warps) | 13824 | 6912 | 3456 | 14336 | 4096 | 4096x14336 |
+|---|---:|---:|---:|---:|---:|---:|
+| 64x128, 4 (as it is) | 507.9 | 294.5 | 159.7 | 512.7 | 169.0 | 606.1 |
+| 128x128, 4 | 415.6 | 222.1 | 168.5 | 590.8 | 194.6 | 672.9 |
+| 128x128, 8 | | | | 770.1 | 300.4 | 1020.4 |
+| 64x256, 8 | | | | 830.7 | 317.3 | 1097.9 |
+| 128x128, 4, `cp.async` into two buffers | 403.7 | 208.0 | 129.3 | 507.7 | 183.1 | 605.4 |
+| 64x128, 4, `cp.async` (2 blocks a multiprocessor) | 611.2 | 294.5 | 149.8 | 687.0 | 265.9 | 894.5 |
+| 128x256, 8, `cp.async` | 369.7 | 193.0 | 187.7 | 545.9 | 184.6 | 619.1 |
+| 256x128, 8, `cp.async` | 376.2 | 193.2 | 190.6 | 557.7 | 187.7 | 630.9 |
+
+The larger tiles reach 135-157 TFLOPS where the blocks divide evenly (13824 and 6912 rows)
+and lose it otherwise: 14336 rows are 16 blocks more than 13824 and cost 175 us more, a
+second wave that takes a block's whole time with most of the GPU idle. Letting the caller
+give a block fewer rows and tokens than its tile, so the count fits (4096x512 as 215 blocks
+of 96x104), did not help: 180.3 / 557.1 / 622.0, because a block that multiplies 59% of a
+tile still copies 78% of it. An earlier run of the `cp.async` kernels that looked 15-25%
+better staged half of each step's columns by mistake; the numbers above are the corrected
+ones. Not tried: splitting the columns over blocks (more, shorter blocks, so a last wave
+costs less; needs the partial sums added).

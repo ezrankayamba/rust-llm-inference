@@ -264,6 +264,15 @@ Design points that span files:
   Q4_K and Q6_K have wide dequantizers (16-byte stores; Q6_K reads through `ld24`); the int8
   matmuls remain for chunks of 8-63 tokens. The 64x128 tile runs four warps of four row groups
   (a read of the token tile feeds four products); it does not wait on global memory.
+  What it is short of is the copy into shared memory: with the tiles staged once it runs
+  1.5-1.9x faster, and every tile shape tried moves 2.2-2.7 TB/s. cuBLAS on the same A100 is
+  level on 4096x4096 x 512 tokens (156 us against 169) and far ahead on Mistral-7B's FFN
+  (422 against 513, 314 against 603), which is most of the prompt gap. A 128x128 tile on four
+  warps with `cp.async` into two buffers reaches 135-157 TFLOPS, but only where the block
+  count is a multiple of what the GPU runs at once: a few blocks more run as a second wave
+  that costs a whole block's time, and real shapes don't divide. Tried and dropped
+  (`docs/benchmarks.md`, 2026-11-18): `ldmatrix`, eight warps a block, 32-column steps,
+  blocks that take part of a tile, a swizzled 32-word layout, a higher register cap.
   Graph capture is thread-local: in global mode another thread's allocation fails while it
   is open.
   Against llama.cpp's CUDA backend on the same A100 (`docs/benchmarks.md`, 2026-11-15): decode
