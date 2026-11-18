@@ -87,8 +87,9 @@ const GEMM_PARTS_MAX: usize = 16;
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 129;
-const OTHER_KERNELS: [&str; 17] = [
+const OTHER_KERNELS: [&str; 18] = [
     "quant_x",
+    "to_f16_zero",
     "rmsnorm",
     "axpy",
     "zero_rows",
@@ -1124,6 +1125,26 @@ impl<'a> Batch<'a> {
         let mut l = self.call(&self.gpu.to_f16);
         l.arg(&x.0.0).arg(&x_off).arg(&out.0).arg(&n_u);
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+    }
+
+    /// [`Batch::to_f16`], and zeros in the `len` values at each of up to three `zs`.
+    pub fn to_f16_zero(&mut self, x: At<'_>, n: usize, out: &GpuHalf, zs: &[(At<'_>, usize)]) {
+        assert!(x.1 + n <= x.0.len() && n <= out.0.len() && zs.len() <= 3);
+        assert!(zs.iter().all(|(z, len)| z.1 + len <= z.0.len()));
+        let (x_off, n_u) = (x.1 as u64, n as u32);
+        // A slot with no result zeroes nothing of x.
+        let slot = |i: usize| {
+            zs.get(i)
+                .map_or((x.0, 0, 0), |&(z, len)| (z.0, z.1 as u64, len as u32))
+        };
+        let (a, b, c) = (slot(0), slot(1), slot(2));
+        let mut l = self.call(self.gpu.other("to_f16_zero"));
+        l.arg(&x.0.0).arg(&x_off).arg(&out.0).arg(&n_u);
+        l.arg(&a.0.0).arg(&a.1).arg(&a.2);
+        l.arg(&b.0.0).arg(&b.1).arg(&b.2);
+        l.arg(&c.0.0).arg(&c.1).arg(&c.2);
+        let most = zs.iter().map(|z| z.1).max().unwrap_or(0).max(n);
+        self.launch(l, grid(most.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
     /// Writes the `rows x cols` matrix of `ty` at byte `offset` of the model file out as f16

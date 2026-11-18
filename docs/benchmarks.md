@@ -2213,3 +2213,21 @@ Against llama.cpp after it (ours / llama.cpp, two rounds in turn, means): Mistra
 877 / 1037; 32: 1098 / 1183; 48: 1441 / 1391; 64: 1778 / 1518; 96: 2195 / 1693; 128: 2595 /
 1774; 192: 3213 / 2783. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152 each);
 `gemm_matches_f32_matmul` now covers the new kernel, stored and added.
+
+## 2026-11-18: zeroing folded into the f16 conversion ahead of the in-block CUDA matmuls
+
+`RLI_CUDA_PROF=1` on a 32-token Mistral-7B prompt: `zero_rows` 6.1% and `to_f16` 4.9% of the
+time, nine launches a layer between them. `to_f16_zero` converts a matmul's input and zeroes
+up to three results in one launch (Q, K and V; gate and up), five launches fewer a layer.
+`bench --pp N --tg 0 --gpu-layers 999`, R = 2400 / N repetitions (at most 60), before and
+after in turn, tok/s on Mistral-7B: 24 tokens 1350, 1359 -> 1401, 1420; 32: 1746, 1762 ->
+1813, 1783; 64: 2834, 2865 -> 2898, 2923; 128: 3282, 3269 -> 3315, 3419. Against llama.cpp
+after it (ours / llama.cpp, means of two rounds): Mistral-7B 24: 1393 / 1734; 32: 1809 / 2105;
+48: 2423 / 2563. Qwen3-30B-A3B 24: 888 / 1028; 32: 1110 / 1201; 48: 1480 / 1375. CUDA tests
+pass with and without `RLI_CUDA_NO_MMA=1` (152 each).
+
+Tried and dropped there: a block of 128 rows by 32 tokens for chunks of up to 32 (at 24 and
+32 tokens half of the 64x64 block's warps have no tokens): 14336x4096 by 32 tokens 102.7 ->
+94.7 us, 4096x14336 104.1 -> 108.0, 4096x4096 34.5 -> 35.6. And a diagnostic: with the
+per-weight decode (int to float, multiply-add, f16) replaced by a mask and an add, 14336x4096
+by 32 tokens takes 91.4 us, not 102.8, so the decode arithmetic is a tenth of that matmul.

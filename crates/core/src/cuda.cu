@@ -346,6 +346,18 @@ extern "C" __global__ void to_f16(const float* x, ulong x_off, unsigned short* o
     if (i < n) out[i] = f2h(x[x_off + i]);
 }
 
+// to_f16, and zeros in up to three results of the matmuls that will add into them (n0, n1
+// and n2 values; 0 for none): a launch instead of four.
+extern "C" __global__ void to_f16_zero(const float* x, ulong x_off, unsigned short* out, uint n,
+                                       float* z0, ulong o0, uint n0, float* z1, ulong o1, uint n1,
+                                       float* z2, ulong o2, uint n2) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = f2h(x[x_off + i]);
+    if (i < n0) z0[o0 + i] = 0;
+    if (i < n1) z1[o1 + i] = 0;
+    if (i < n2) z2[o2 + i] = 0;
+}
+
 // A warp per 32 weights of a row.
 #define DEQUANT(NAME, WT)                                                                      \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, unsigned short* out, uint rows, uint cols, \

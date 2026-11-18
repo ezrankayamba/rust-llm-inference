@@ -187,9 +187,11 @@ fn mm_each(
     let dense = |w: &&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     if int8 && ws.iter().all(dense) {
         // Shorter ones too, the weights decoded on the way into the tensor cores.
-        b.to_f16(x, n * ws[0].cols, &s.xh);
+        // Its blocks add into y, which the launch that converts x zeroes.
+        let zs: Vec<_> = ws.iter().zip(ys).map(|(w, &y)| (y, n * w.rows)).collect();
+        b.to_f16_zero(x, n * ws[0].cols, &s.xh, &zs);
         for (w, &y) in ws.iter().zip(ys) {
-            b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, y, n, false);
+            b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, y, n, true);
         }
         return;
     }
