@@ -211,7 +211,8 @@ Design points that span files:
   first barrier, since K, softmax, then V was three waits on memory in a row (142 -> 153 tok/s); under 128 the second launch costs more than it saves. MoE layers are routed on the GPU with no sync, in decode and in prompt chunks alike:
   `moe_topk` takes a warp per token, then every token's k experts run as grid rows of one launch
   per matrix (each matvec kernel takes an expert id per row, `Batch::matvec_id`), so a (token,
-  expert) pair decodes its expert's weights again. Chunks of 64+ tokens (`MOE_GROUP_TOKENS`)
+  expert) pair decodes its expert's weights again. Chunks of 20+ tokens (`MOE_GROUP_TOKENS`;
+  was 64, and 32 tokens of Qwen3-30B-A3B ran 740 tok/s where they now run 997)
   don't: `moe_group` sorts the chunk's pairs by expert on the GPU, and a block of
   `gemm_q4_k_id` / `gemm_q6_k_id` takes 64 rows of one expert and the pairs that chose it,
   decoding the weights to f16 in shared memory on the way into f16 `mma.sync` (no scratch
@@ -301,8 +302,8 @@ Design points that span files:
   other two. Warmed up (R = 2400 / N repetitions; short runs catch the GPU's clocks low and
   moved both engines by 1.6x): 512 tokens level or ahead on all three; Mistral-7B 9% ahead
   at 8 tokens, 19-23% behind at 16 to 128, 10% at 256; Llama-3.2-1B level at 8, 64 and 256,
-  9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 14-39% behind at 8 to 32 (its expert
-  matvecs), 11-44% ahead at 64 to 256.
+  9-13% behind at 16, 32 and 128; Qwen3-30B-A3B 16-28% behind at 8 to 32 (its expert
+  matvecs under 20 tokens), 3% at 48, 11-44% ahead at 64 to 256.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per
   token), `argmax` is written to vectorize, and `Gpu::read` downloads the logits through

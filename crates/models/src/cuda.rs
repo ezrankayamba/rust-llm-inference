@@ -151,8 +151,10 @@ fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
 
-/// Fewest tokens of a chunk whose expert matrices run grouped by expert.
-const MOE_GROUP_TOKENS: usize = 64;
+/// Fewest tokens of a chunk whose expert matrices run grouped by expert. Qwen3-30B-A3B (8 of
+/// 128 experts a token) on an A100: 16 tokens 621 tok/s a pair at a time and 594 grouped,
+/// 20 tokens 650 and 686, 32 tokens 740 and 997.
+const MOE_GROUP_TOKENS: usize = 20;
 
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
 fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {

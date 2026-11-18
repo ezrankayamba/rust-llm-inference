@@ -2145,3 +2145,24 @@ came up.
 Ahead or level: 512 tokens on all three, Mistral-7B at 8, Llama-3.2-1B at 8, 64 and 256,
 Qwen3-30B-A3B from 64. Behind: Mistral-7B 19-23% at 16 to 128 and 10% at 256;
 Llama-3.2-1B 9-13% at 16, 32 and 128; Qwen3-30B-A3B 14% at 8, 28% at 16, 39% at 32.
+
+## 2026-11-18: CUDA MoE expert matmuls grouped by expert from 20 tokens (was 64)
+
+`MOE_GROUP_TOKENS` 64 -> 20. Qwen3-30B-A3B on the A100, `bench --pp N --tg 0 --reps 60
+--gpu-layers 999`, tok/s, a pair at a time / grouped: 8 tokens 435 / 344, 16: 621 / 594,
+20: 650 / 686, 24: 691 / 808, 28: 718 / 919, 32: 740 / 997, 48: 791 / 1337. Against
+llama.cpp (`-r 60`, in turn, two rounds):
+
+| Tokens | before | after | llama.cpp |
+|---|---:|---:|---:|
+| 8 | 442, 445 | 461, 447 | 548, 548 |
+| 16 | 611, 617 | 616, 621 | 861, 861 |
+| 24 | 691, 691 | 810, 810 | 1030, 1019 |
+| 32 | 735, 739 | 996, 1001 | 1202, 1185 |
+| 48 | 791 | 1337, 1352 | 1370, 1399 |
+
+The CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152). Logits of a 32-token prompt
+against `--precise`: 0.83 before, 0.89 after, top-1 the same. Also tried and dropped for the
+dense int8 matmul: a 128-token block for chunks of 65 to 128 (64 sums a lane under the
+80-register cap): 121.9 / 382.4 / 345.0 us at 128 tokens against 103.1 / 314.3 / 311.4 as
+two 64-token blocks.
