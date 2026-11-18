@@ -1390,164 +1390,143 @@ GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE
 GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64)
 GEMM_ID(gemm_q6_k_dense128, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128)
 
-// gemm_q4_k_dense for chunks of few tokens: a block takes 128 rows by 32 tokens, and a lane
-// decodes the weights of its own two rows that its multiplies take straight from the matrix.
-// Only the tokens go through shared memory: a warp shares its rows with no other, and staging
-// them cost more than decoding them. A step's 64 columns are dealt so that lane gj's 16 are
-// those of one 8-byte word, 8gj.. and 32 + 8gj.. (four 2-byte reads per row, with the columns
-// in order, were 6% slower): multiply k takes columns 8gj + 4k + 2half.. as its columns
-// 8half + 2gj.., and the tokens are staged in that order. Rows must lie at a multiple of 16
-// bytes.
-extern "C" __global__ void gemm_q4_k_direct(const uchar* w, ulong w_off, const uint* xh, float* y,
-                                            ulong y_off, uint rows, uint cols, uint row_bytes,
-                                            uint n_tok, uint parts) {
-    __shared__ uint xt[32 * GE_S];
-    uint ntt = (n_tok + 31) / 32, part = blockIdx.y / ntt, pb = blockIdx.y % ntt * 32;
-    uint kb = part * (cols / 64) / parts, ke = (part + 1) * (cols / 64) / parts;
-    uint last = (n_tok - pb < 32 ? n_tok - pb : 32) - 1;
-    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, gi = lane / 4, gj = lane % 4;
-    uint row0 = blockIdx.x * 128, ra = 16 * warp + gi, kw = cols / 2;
-    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);
-    const uchar* wr[2];
+// GEMM_ID for few tokens a tile: a block takes 128 rows by 32 tokens, and a lane decodes the
+// weights of its own two rows that its multiplies take straight from the matrix. Only the
+// tokens go through shared memory: a warp shares its rows with no other, and staging them
+// cost more than decoding them. A step's 64 columns are dealt so that lane gj's 16 are those
+// of one 8-byte word of the row, 8gj.. and 32 + 8gj.. (four 2-byte reads per row, with the
+// columns in order, were 6% slower): multiply k takes columns 8gj + 4k + 2half.. as its
+// columns 8half + 2gj.., and the tokens are staged in that order.
+//
+// *_load reads a step's bytes of one row (kept from step to step in `raw`; `first` in the
+// block's first step), *_dec decodes them into rows h of the four multiplies' fragments.
+//
+// Q4_K: the low nibbles are sub-block 2j, the high ones 2j + 1. Rows must lie at a multiple
+// of 16 bytes.
+__device__ inline void dq4_k_load(const uchar* b, uint j, bool first, uint gj, ulong* raw) {
+    raw[0] = *(const ulong*)(b + 16 + 32 * j + 8 * gj);
+}
+__device__ inline void dq4_k_dec(const ulong* hdr, const ulong* raw, uint j, uint gj, uint h,
+                                 uint a[4][4]) {
+    float sa, ma, sc, mc;
+    gq4_k_scales(hdr, j, &sa, &ma, &sc, &mc);
     #pragma unroll
-    for (uint h = 0; h < 2; h++) {
-        uint r = row0 + ra + 8 * h;
-        wr[h] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes;
+    for (uint i = 0; i < 4; i++) {
+        uint q = (uint)(raw[0] >> 16 * i) & 0xFFFF;
+        uint a0 = f2h(sa * (float)(q & 15) - ma);
+        uint a1 = f2h(sa * (float)((q >> 8) & 15) - ma);
+        uint c0 = f2h(sc * (float)((q >> 4) & 15) - mc);
+        uint c1 = f2h(sc * (float)(q >> 12) - mc);
+        // Multiply i / 2 of each sub-block; rows h, its columns 2gj.. then 8 + 2gj...
+        a[i / 2][h + 2 * (i % 2)] = a0 | (a1 << 16);
+        a[2 + i / 2][h + 2 * (i % 2)] = c0 | (c1 << 16);
     }
-    const V128* xp = (const V128*)(xh + (ulong)(pb + (tr <= last ? tr : last)) * kw + tw);
-    float c[4][4];
+}
+// Q6_K: 8 bytes of low nibbles for each half of the lane's columns and 8 of high bits for
+// both, read once for the two steps that share them; the lane's columns share a scale.
+__device__ inline void dq6_k_load(const uchar* b, uint j, bool first, uint gj, ulong* raw) {
+    if (j % 2 && !first) return;
+    raw[0] = ld8(b + 64 * (j / 2) + 8 * gj);
+    raw[1] = ld8(b + 64 * (j / 2) + 32 + 8 * gj);
+    raw[2] = ld8(b + 128 + 32 * (j / 2) + 8 * gj);
+}
+__device__ inline void dq6_k_dec(const ulong* hdr, const ulong* raw, uint j, uint gj, uint h,
+                                 uint a[4][4]) {
+    uint sh = 4 * (j % 2), ia = 8 * (j / 2) + sh + gj / 2, ic = ia + 2;
+    float d = h_bits((uint)hdr[2] & 0xFFFF);
+    float fa = d * (float)(signed char)(hdr[ia / 8] >> 8 * (ia % 8));
+    float fc = d * (float)(signed char)(hdr[ic / 8] >> 8 * (ic % 8));
     #pragma unroll
-    for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;
-    ulong hdr[2][3];
-    for (uint ks = kb; ks < ke; ks++) {
-        uint j = ks % 4;
-        ulong by[2];
-        #pragma unroll
-        for (uint h = 0; h < 2; h++) {
-            const uchar* b = wr[h] + (ulong)(ks / 4) * 144;
-            if (j == 0 || ks == kb) gq4_k_hdr(b, hdr[h]);
-            // Columns 8gj.. of sub-blocks 2j (low nibbles) and 2j + 1 (high).
-            by[h] = *(const ulong*)(b + 16 + 32 * j + 8 * gj);
-        }
-        V128 v = xp[ks * 8];
-        #pragma unroll
-        for (uint i = 0; i < 4; i++) xt[tr * GE_S + 16 * (tw / 16) + 4 * i + tw / 4 % 4] = v.v[i];
-        uint a[4][4];
-        #pragma unroll
-        for (uint h = 0; h < 2; h++) {
-            float sa, ma, sc, mc;
-            gq4_k_scales(hdr[h], j, &sa, &ma, &sc, &mc);
-            #pragma unroll
-            for (uint i = 0; i < 4; i++) {
-                uint q = (uint)(by[h] >> 16 * i) & 0xFFFF;
-                uint a0 = f2h(sa * (float)(q & 15) - ma);
-                uint a1 = f2h(sa * (float)((q >> 8) & 15) - ma);
-                uint c0 = f2h(sc * (float)((q >> 4) & 15) - mc);
-                uint c1 = f2h(sc * (float)(q >> 12) - mc);
-                // Multiply i / 2 of each sub-block; rows h, its columns 2gj.. then 8 + 2gj...
-                a[i / 2][h + 2 * (i % 2)] = a0 | (a1 << 16);
-                a[2 + i / 2][h + 2 * (i % 2)] = c0 | (c1 << 16);
-            }
-        }
-        __syncthreads();
-        #pragma unroll
-        for (uint o = 0; o < 4; o++) {
-            if (8 * o > last) continue;
-            #pragma unroll
-            for (uint k = 0; k < 4; k++) {
-                const uint* bp = xt + (8 * o + gi) * GE_S + 8 * k + gj;
-                mma16_f16(a[k], bp[0], bp[4], c[o]);
-            }
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (uint j = 0; j < 16; j++) {
-        uint t = 8 * (j / 4) + 2 * gj + j % 2, row = row0 + ra + 8 * (j / 2 % 2);
-        if (t <= last && row < rows) atomicAdd(y + y_off + (ulong)(pb + t) * rows + row, c[j / 4][j % 4]);
+    for (uint i = 0; i < 4; i++) {
+        uint la = (uint)(raw[0] >> 16 * i) >> sh, lc = (uint)(raw[1] >> 16 * i) >> sh;
+        uint e = (uint)(raw[2] >> 16 * i) >> sh, g = e >> 2;
+        int a0 = (la & 15) | ((e & 3) << 4), a1 = ((la >> 8) & 15) | (((e >> 8) & 3) << 4);
+        int c0 = (lc & 15) | ((g & 3) << 4), c1 = ((lc >> 8) & 15) | (((g >> 8) & 3) << 4);
+        a[i / 2][h + 2 * (i % 2)] =
+            f2h(fa * (float)(a0 - 32)) | ((uint)f2h(fa * (float)(a1 - 32)) << 16);
+        a[2 + i / 2][h + 2 * (i % 2)] =
+            f2h(fc * (float)(c0 - 32)) | ((uint)f2h(fc * (float)(c1 - 32)) << 16);
     }
 }
 
-// The same for Q6_K: a lane reads 8 bytes of low nibbles for each half of its columns and 8
-// of high bits for both, once per two steps, and its columns share a scale.
-extern "C" __global__ void gemm_q6_k_direct(const uchar* w, ulong w_off, const uint* xh, float* y,
-                                            ulong y_off, uint rows, uint cols, uint row_bytes,
-                                            uint n_tok, uint parts) {
-    __shared__ uint xt[32 * GE_S];
-    uint ntt = (n_tok + 31) / 32, part = blockIdx.y / ntt, pb = blockIdx.y % ntt * 32;
-    uint kb = part * (cols / 64) / parts, ke = (part + 1) * (cols / 64) / parts;
-    uint last = (n_tok - pb < 32 ? n_tok - pb : 32) - 1;
-    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, gi = lane / 4, gj = lane % 4;
-    uint row0 = blockIdx.x * 128, ra = 16 * warp + gi, kw = cols / 2;
-    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);
-    const uchar* wr[2];
-    #pragma unroll
-    for (uint h = 0; h < 2; h++) {
-        uint r = row0 + ra + 8 * h;
-        wr[h] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes;
-    }
-    const V128* xp = (const V128*)(xh + (ulong)(pb + (tr <= last ? tr : last)) * kw + tw);
-    float c[4][4];
-    #pragma unroll
-    for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;
-    ulong hdr[2][3];
-    ulong qa[2], qb[2], qe[2];
-    for (uint ks = kb; ks < ke; ks++) {
-        uint j = ks % 4;
-        #pragma unroll
-        for (uint h = 0; h < 2; h++) {
-            const uchar* b = wr[h] + (ulong)(ks / 4) * 210;
-            if (j == 0 || ks == kb) gq6_k_hdr(b, hdr[h]);
-            // Steps 2n and 2n + 1 take the low and the high nibbles of the same bytes, and
-            // two bits each of the same high-bit bytes: read them once for both.
-            if (j % 2 == 0 || ks == kb) {
-                qa[h] = ld8(b + 64 * (j / 2) + 8 * gj);
-                qb[h] = ld8(b + 64 * (j / 2) + 32 + 8 * gj);
-                qe[h] = ld8(b + 128 + 32 * (j / 2) + 8 * gj);
-            }
-        }
-        V128 v = xp[ks * 8];
-        #pragma unroll
-        for (uint i = 0; i < 4; i++) xt[tr * GE_S + 16 * (tw / 16) + 4 * i + tw / 4 % 4] = v.v[i];
-        uint a[4][4];
-        #pragma unroll
-        for (uint h = 0; h < 2; h++) {
-            uint sh = 4 * (j % 2), is = 8 * (j / 2) + sh;
-            float d = h_bits((uint)hdr[h][2] & 0xFFFF);
-            // Sub-blocks is + gj / 2 (columns 8gj..) and two on (32 more).
-            uint ia = is + gj / 2, ic = ia + 2;
-            float fa = d * (float)(signed char)(hdr[h][ia / 8] >> 8 * (ia % 8));
-            float fc = d * (float)(signed char)(hdr[h][ic / 8] >> 8 * (ic % 8));
-            #pragma unroll
-            for (uint i = 0; i < 4; i++) {
-                uint la = (uint)(qa[h] >> 16 * i) >> sh, lc = (uint)(qb[h] >> 16 * i) >> sh;
-                uint e = (uint)(qe[h] >> 16 * i) >> sh, g = e >> 2;
-                int a0 = (la & 15) | ((e & 3) << 4), a1 = ((la >> 8) & 15) | (((e >> 8) & 3) << 4);
-                int c0 = (lc & 15) | ((g & 3) << 4), c1 = ((lc >> 8) & 15) | (((g >> 8) & 3) << 4);
-                uint va = f2h(fa * (float)(a0 - 32)) | ((uint)f2h(fa * (float)(a1 - 32)) << 16);
-                uint vc = f2h(fc * (float)(c0 - 32)) | ((uint)f2h(fc * (float)(c1 - 32)) << 16);
-                a[i / 2][h + 2 * (i % 2)] = va;
-                a[2 + i / 2][h + 2 * (i % 2)] = vc;
-            }
-        }
-        __syncthreads();
-        #pragma unroll
-        for (uint o = 0; o < 4; o++) {
-            if (8 * o > last) continue;
-            #pragma unroll
-            for (uint k = 0; k < 4; k++) {
-                const uint* bp = xt + (8 * o + gi) * GE_S + 8 * k + gj;
-                mma16_f16(a[k], bp[0], bp[4], c[o]);
-            }
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (uint j = 0; j < 16; j++) {
-        uint t = 8 * (j / 4) + 2 * gj + j % 2, row = row0 + ra + 8 * (j / 2 % 2);
-        if (t <= last && row < rows) atomicAdd(y + y_off + (ulong)(pb + t) * rows + row, c[j / 4][j % 4]);
-    }
+// With ID, block (x, e) takes 128 rows of expert e and the pairs that chose it, 32 at a
+// time, and stores its results; without, 32 of a chunk's tokens and a part of the columns,
+// adding into y.
+#define GEMM_DIRECT(NAME, SB_BYTES, HDR, LOAD, DEC, ID, ARGS, NTOK, PARTS)                     \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const uint* perm,   \
+                                const uint* start, const uint* xh, uint x_div, float* y,       \
+                                ulong y_off, uint rows, uint cols, uint row_bytes ARGS) {      \
+    __shared__ uint xt[32 * GE_S];                                                             \
+    __shared__ uint pr[32];                                                                    \
+    uint ntt = ID ? 1 : ((NTOK) + 31) / 32, part = ID ? 0 : blockIdx.y / ntt;                  \
+    uint ey = ID ? blockIdx.y : 0, pb = ID ? start[ey] : blockIdx.y % ntt * 32;                \
+    uint p1 = ID ? start[ey + 1] : ((NTOK) < pb + 32 ? (NTOK) : pb + 32);                      \
+    uint kb = part * (cols / 64) / (PARTS), ke = (part + 1) * (cols / 64) / (PARTS);           \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32, gi = lane / 4, gj = lane % 4;       \
+    uint row0 = blockIdx.x * 128, ra = 16 * warp + gi, kw = cols / 2;                          \
+    uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);                                     \
+    const uchar* wr[2];                                                                        \
+    _Pragma("unroll")                                                                          \
+    for (uint h = 0; h < 2; h++) {                                                             \
+        uint r = row0 + ra + 8 * h;                                                            \
+        wr[h] = w + w_off + ey * stride + (ulong)(r < rows ? r : rows - 1) * row_bytes;        \
+    }                                                                                          \
+    for (uint p0 = pb; p0 < p1; p0 += 32) {                                                    \
+        uint last = (p1 - p0 < 32 ? p1 - p0 : 32) - 1;                                         \
+        if (ID) {                                                                              \
+            if (threadIdx.x <= last) pr[threadIdx.x] = perm[p0 + threadIdx.x];                 \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+        uint tl = tr <= last ? tr : last;                                                      \
+        ulong xr = ID ? pr[tl] / x_div : p0 + tl;                                              \
+        const V128* xp = (const V128*)(xh + xr * kw + tw);                                     \
+        float c[4][4];                                                                         \
+        _Pragma("unroll")                                                                      \
+        for (uint o = 0; o < 4; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;                \
+        ulong hdr[2][3], raw[2][3];                                                            \
+        for (uint ks = kb; ks < ke; ks++) {                                                    \
+            uint j = ks % 4;                                                                   \
+            _Pragma("unroll")                                                                  \
+            for (uint h = 0; h < 2; h++) {                                                     \
+                const uchar* b = wr[h] + (ulong)(ks / 4) * SB_BYTES;                           \
+                if (j == 0 || ks == kb) HDR(b, hdr[h]);                                        \
+                LOAD(b, j, ks == kb, gj, raw[h]);                                              \
+            }                                                                                  \
+            V128 v = xp[ks * 8];                                                               \
+            _Pragma("unroll")                                                                  \
+            for (uint i = 0; i < 4; i++)                                                       \
+                xt[tr * GE_S + 16 * (tw / 16) + 4 * i + tw / 4 % 4] = v.v[i];                  \
+            uint a[4][4];                                                                      \
+            _Pragma("unroll")                                                                  \
+            for (uint h = 0; h < 2; h++) DEC(hdr[h], raw[h], j, gj, h, a);                     \
+            __syncthreads();                                                                   \
+            _Pragma("unroll")                                                                  \
+            for (uint o = 0; o < 4; o++) {                                                     \
+                if (8 * o > last) continue;                                                    \
+                _Pragma("unroll")                                                              \
+                for (uint k = 0; k < 4; k++) {                                                 \
+                    const uint* bp = xt + (8 * o + gi) * GE_S + 8 * k + gj;                    \
+                    mma16_f16(a[k], bp[0], bp[4], c[o]);                                       \
+                }                                                                              \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < 16; j++) {                                                        \
+            uint t = 8 * (j / 4) + 2 * gj + j % 2, row = row0 + ra + 8 * (j / 2 % 2);          \
+            if (t > last || row >= rows) continue;                                             \
+            float* out = y + y_off + (ulong)(ID ? pr[t] : p0 + t) * rows + row;                \
+            if (ID) *out = c[j / 4][j % 4];                                                    \
+            else atomicAdd(out, c[j / 4][j % 4]);                                              \
+        }                                                                                      \
+        if (ID) __syncthreads();                                                               \
+    }                                                                                          \
 }
+
+GEMM_DIRECT(gemm_q4_k_direct, 144, gq4_k_hdr, dq4_k_load, dq4_k_dec, 0, GEMM_DENSE_ARGS, n_tok, parts)
+GEMM_DIRECT(gemm_q6_k_direct, 210, gq6_k_hdr, dq6_k_load, dq6_k_dec, 0, GEMM_DENSE_ARGS, n_tok, parts)
+GEMM_DIRECT(gemm_q4_k_direct_id, 144, gq4_k_hdr, dq4_k_load, dq4_k_dec, 1, , 0, 1)
+GEMM_DIRECT(gemm_q6_k_direct_id, 210, gq6_k_hdr, dq6_k_load, dq6_k_dec, 1, , 0, 1)
 
 #else  // the rest of the file is not part of the tensor-core compile
 

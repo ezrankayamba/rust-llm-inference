@@ -2400,3 +2400,25 @@ Tried and dropped the same day (Mistral-7B, same command): dequant + GEMM from 6
 place of the in-block kernel (80 tokens 2610 -> 1811 tok/s, 96: 2933 -> 2087, 128: 3410 ->
 2635, 192: 3601 -> 3146); the in-block kernel past 192 tokens (224: 3449 -> 3544, 256: 3774 ->
 3801, 320: 3906 -> 3843, 384: 4373 -> 3735, 512: 4720 -> 3710).
+
+## 2026-11-18: the direct CUDA kernel by expert, for few pairs an expert
+
+A prompt chunk's MoE experts ran `gemm_*_id` (64 rows of an expert by its pairs, 64 at a
+time, weights staged) from 20 tokens. But 32 tokens of Qwen3-30B-A3B are 256 pairs over 128
+experts: every tile is nearly empty, the case `gemm_*_direct` exists for. `gemm_*_direct_id`
+is that kernel taking an expert and its pairs (`GEMM_DIRECT`, one macro for the four now).
+`bench --pp N --tg 0 --gpu-layers 999`, R = 2400 / N (at most 60), staged and direct in
+turn, Qwen3-30B-A3B tok/s: 16 tokens (its down projection only) 745, 740 -> 767, 758; 24:
+926, 923 -> 1042, 1033; 32: 1171, 1163 -> 1277, 1282; 48: 1497, 1526 -> 1575, 1587; 64: 1843,
+1860 -> 1886, 1868; 80: 1997, 1992 -> 1972, 1966; 96: 2276, 2248 -> 2173, 2142; 112: 2458,
+2429 -> 2321, 2317; 128: 2626, 2709 -> 2500, 2473; 512: 4493, 4490 -> 3514, 3514. So up to 4
+pairs an expert on average (`GEMM_DIRECT_ID_PAIRS`: 64 tokens of this model). Grouping gate
+and up from 8, 12 or 16 tokens, or down from 8, was still slower than their matvecs (8 tokens
+508 -> 403 tok/s, 12 tokens 651 -> 583, 16 tokens 760 -> 735). CUDA tests pass with and
+without `RLI_CUDA_NO_MMA=1` (152 each; `matmul_q_id_matches_matvec_q_id` now also runs 9
+tokens, which take the new kernel).
+
+Against llama.cpp after it (means of two rounds in turn, ours / llama.cpp): Qwen3-30B-A3B 8:
+508 / 527; 16: 767 / 862; 24: 1033 / 1038; 32: 1293 / 1199; 48: 1576 / 1401; 64: 1882 / 1529.
+Mistral-7B 8: 640 / 520; 16: 1203 / 1302; 24: 1731 / 1728; 32: 2181 / 2080; 48: 2496 / 2534;
+64: 2994 / 2908.

@@ -75,6 +75,12 @@ pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=192;
 /// tensor cores took 92, by 32 tokens 82 where the 64-token block took 99. A second tile of
 /// tokens decodes the weights again, so not past 32.
 const GEMM_DIRECT_TOKENS: std::ops::RangeInclusive<usize> = 8..=32;
+/// Most (token, expert) pairs an expert, on average, for which [`Batch::gemm_id`] takes
+/// `gemm_*_direct_id` (128 rows by 32 pairs a block, no weights staged) and not `gemm_*_id`
+/// (64 by 64, staged): Qwen3-30B-A3B's 128 experts, 8 a token, at 32 tokens 1167 -> 1280
+/// tok/s, at 48 tokens 1512 -> 1581, at 64 level, at 96 tokens 2262 -> 2158, at 512 tokens
+/// 4492 -> 3514.
+const GEMM_DIRECT_ID_PAIRS: usize = 4;
 /// Fewest tokens of a chunk whose Q6_K matrices take `gemm_q6_k_direct`: 14336x4096 by 16
 /// tokens 120 us (int8 126), by 24 tokens 124 (141); by 8 tokens level, and a Mistral-7B
 /// prompt 2% slower.
@@ -236,6 +242,7 @@ pub struct Gpu {
     gemm_dense128: Vec<(GgmlType, CudaFunction)>,
     /// For Q4_K over few tokens: blocks of 128 rows by 32 tokens.
     gemm_direct: Vec<(GgmlType, CudaFunction)>,
+    gemm_direct_id: Vec<(GgmlType, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -289,6 +296,7 @@ impl Gpu {
                 >= 8;
         let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
         let (mut gemm_dense, mut gemm_direct) = (Vec::new(), Vec::new());
+        let mut gemm_direct_id = Vec::new();
         let mut gemm_dense128 = Vec::new();
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
@@ -325,6 +333,8 @@ impl Gpu {
             for (t, n) in MMQ_KERNELS {
                 let n = format!("{}_direct", n.replace("mmq", "gemm"));
                 gemm_direct.push((t, module.load_function(&n).map_err(err(&n))?));
+                let n = format!("{n}_id");
+                gemm_direct_id.push((t, module.load_function(&n).map_err(err(&n))?));
             }
             for tt in MMA_FEW {
                 for (t, n) in MMQ_KERNELS {
@@ -444,6 +454,7 @@ impl Gpu {
             gemm_dense,
             gemm_dense128,
             gemm_direct,
+            gemm_direct_id,
             gemm_id,
             other,
             zero_id,
@@ -855,6 +866,8 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if let Some((t, _)) = self.gemm_direct_id.iter().find(|(_, g)| eq(g)) {
+            format!("gemm direct by expert {t:?}")
         } else if let Some((t, _)) = self.gemm_direct.iter().find(|(_, g)| eq(g)) {
             format!("gemm direct {t:?}")
         } else if let Some((t, _)) = self.gemm_dense128.iter().find(|(_, g)| eq(g)) {
@@ -1350,7 +1363,13 @@ impl<'a> Batch<'a> {
         let w_off = gpu.device_offset(offset, span) as u64;
         let (stride, xd, y_off) = (stride as u64, x_div as u32, y.1 as u64);
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
-        let f = gpu.gemm_id.iter().find(|(t, _)| *t == ty);
+        let direct = n <= GEMM_DIRECT_ID_PAIRS * n_stack;
+        let f = if direct {
+            &gpu.gemm_direct_id
+        } else {
+            &gpu.gemm_id
+        };
+        let f = f.iter().find(|(t, _)| *t == ty);
         let mut a = self.call(&f.expect("checked by has_gemm_id").1);
         a.arg(&gpu.weights)
             .arg(&w_off)
@@ -1364,7 +1383,10 @@ impl<'a> Batch<'a> {
             .arg(&rows_u)
             .arg(&cols_u)
             .arg(&rb);
-        self.launch(a, grid2(rows.div_ceil(64), n_stack, 256));
+        self.launch(
+            a,
+            grid2(rows.div_ceil(if direct { 128 } else { 64 }), n_stack, 256),
+        );
     }
 
     /// Whether [`Batch::gemm_dense`] takes this matrix over a chunk of `n_tok` tokens.
@@ -1423,23 +1445,9 @@ impl<'a> Batch<'a> {
         let (stride, xd, y_off) = (0u64, 1u32, y.1 as u64);
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
         let (nt, parts_u) = (n_tok as u32, parts as u32);
-        if direct {
-            let f = gpu.gemm_direct.iter().find(|(t, _)| *t == ty);
-            let mut a = self.call(&f.expect("loaded with gemm_dense").1);
-            a.arg(&gpu.weights)
-                .arg(&w_off)
-                .arg(&xh.0)
-                .arg(&y.0.0)
-                .arg(&y_off)
-                .arg(&rows_u)
-                .arg(&cols_u)
-                .arg(&rb)
-                .arg(&nt)
-                .arg(&parts_u);
-            self.launch(a, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, 256));
-            return;
-        }
-        let f = if wide {
+        let f = if direct {
+            &gpu.gemm_direct
+        } else if wide {
             &gpu.gemm_dense128
         } else {
             &gpu.gemm_dense
@@ -1460,7 +1468,7 @@ impl<'a> Batch<'a> {
             .arg(&rb)
             .arg(&nt)
             .arg(&parts_u);
-        self.launch(a, grid2(rows.div_ceil(64), n_tok.div_ceil(tt) * parts, 256));
+        self.launch(a, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, 256));
     }
 
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
@@ -2366,8 +2374,14 @@ mod tests {
     /// none, and a last row tile partly filled. Needs an NVIDIA GPU.
     #[test]
     fn matmul_q_id_matches_matvec_q_id() {
-        let (rows, cols, ne, k, n_tok) = (72, 512, 7, 3, 90);
-        for (ty, scales_at) in [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])] {
+        let (rows, cols, ne, k) = (72, 512, 7, 3);
+        // 90 tokens, and 9: few enough pairs an expert for the kernel that stages no weights.
+        for (ty, scales_at, n_tok) in [
+            (GgmlType::Q4_K, &[0, 2][..], 90),
+            (GgmlType::Q6_K, &[208][..], 90),
+            (GgmlType::Q4_K, &[0, 2][..], 9),
+            (GgmlType::Q6_K, &[208][..], 9),
+        ] {
             let mut seed = 7u32;
             let mut next = move || {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
