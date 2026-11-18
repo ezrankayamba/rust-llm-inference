@@ -250,7 +250,9 @@ Design points that span files:
   weights held in registers. The columns go in parts whose blocks add their sums into y
   (`mma_parts`: four times the blocks the GPU runs at once; a 4096x4096 matrix by 64 tokens
   took 179 us as 32 blocks and 56 as 512), which also lets them add into the residual
-  stream. They are a second
+  stream. Chunks of up to 16 or 32 tokens have kernels with that many tokens a block
+  (`MMA_FEW`; +6-10%), and the 16-token Q4_K one reads its weights straight into the lanes
+  that multiply them (+7%; nothing at 32 tokens, slower at 64). They are a second
   compile of `cuda.cu` (`-DRLI_MMA`, only those kernels) capped at 80 registers per thread,
   which lets a multiprocessor hold more warps but slows the f32 matmuls. About 2x `dp4a` on
   Mistral-7B prompts; not bit-equal to it. Their tile loads issue all of a thread's
@@ -296,9 +298,9 @@ Design points that span files:
   ahead on Mistral-7B (2026-11-17), and prompts
   level on Llama-3.2-1B (within its noise) and Qwen3-30B-A3B, 1.16x behind on Mistral-7B;
   (2026-11-18, with the 128x128 tile) pp512 3% behind on Mistral-7B and 5-6% ahead on the
-  other two; short prompts (int8 in parts) behind on Mistral-7B, 1.65x at 16 tokens, 1.35x
-  at 32, 1.15x at 64, 1.24x at 128; Llama-3.2-1B 1.3x behind at 16, 1.14x at 32, level from
-  64; Qwen3-30B-A3B 2x behind at 16 and 32 (its expert matmuls, not these), level at 64,
+  other two; short prompts (int8 in parts) behind on Mistral-7B, 1.2x at 8 tokens, 1.7x at
+  16, 1.5x at 32, 1.15x at 64, 1.24x at 128; Llama-3.2-1B 3-8% behind at 8 and 16, 1.1-1.15x
+  at 24 and 32, level from 64; Qwen3-30B-A3B 2x behind at 16 and 32 (its expert matmuls, not these), level at 64,
   1.3x ahead at 128.
 - **A decoded token's CPU time is GPU idle time.** On CUDA it was a quarter of a Llama-3.2-1B
   token. A pass that runs wholly on an accelerator skips `pool().install` (a thread wake-up per

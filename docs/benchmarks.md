@@ -2093,3 +2093,27 @@ commits back):
 The CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (152). Logits of a ~110-token
 prompt against `--precise`: Mistral-7B 0.059 before (f16), 0.146-0.190 now (int8, two
 runs); Llama-3.2-1B 0.129 and 0.207-0.217; top-1 the same.
+
+## 2026-11-18: 16- and 32-token blocks for the CUDA int8 tensor-core matmul
+
+Kernels of 16 and 32 tokens a block for chunks that fit (`MMA_FEW`), and in the 16-token
+Q4_K one each lane reads its operands from the matrix instead of through shared memory.
+`bench_cuda`, Q4_K by 16 tokens, us: 64-token blocks 39.3 / 109.1 / 112.2 (4096x4096 /
+14336x4096 / 4096x14336) -> direct 34.1 / 91.3 / 94.8; direct reads at 32 tokens 44.8 /
+128.9 / 131.5 against 45.5 / 129.2 / 130.9 staged, and at 64 tokens 68.6 / 197.5 / 204.6
+against 59.2 / 170.2 / 169.3, so only the 16-token kernel has them. More parts than
+`mma_parts` gives change nothing at these sizes. Prompt tok/s, A100, 8 reps:
+
+| Model, tokens | 64-token blocks | 16/32-token blocks | and direct reads | llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B 8 | 1130 | 1248, 1245, 1241 | 1325, 1352 | 1427, 1365 |
+| Llama-3.2-1B 16 | 2162 | 2348, 2344, 2364 | 2520, 2559 | 2743, 2726 |
+| Llama-3.2-1B 24 | 3071 | 3263, 3293, 3317 | 3265, 3289 | 3803, 3674 |
+| Llama-3.2-1B 32 | 3874 | 4104, 4255, 4102 | 4165, 4342 | 4675, 4650 |
+| Mistral-7B 8 | 325 | 339, 339, 439 | 381, 425 | 475, 486 |
+| Mistral-7B 16 | 732 | 804, 657, 706 | 654, 701 | 1122, 1168 |
+| Mistral-7B 24 | 1048 | 1144, 928, 1095 | 1068, 1060 | 1365, 1385 |
+| Mistral-7B 32 | 1168 | 1367, 1305, 1165 | 1168, 1165 | 1801, 1788 |
+
+Mistral-7B's runs on this host spread by 10-30% within a run; Llama-3.2-1B's by under 1%.
+The CUDA tests pass (152).

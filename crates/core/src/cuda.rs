@@ -62,6 +62,9 @@ pub const MMQ_MIN_TOKENS: usize = 8;
 /// Rows, tokens and threads of a block of the tensor-core matmuls (`MA_R`, `MA_T`, `MA_NW`
 /// warps in cuda.cu), and their compile's cap on registers per thread.
 const MMA_TILE: (usize, usize, u32) = (128, 64, 256);
+/// Tokens a block of the kernels for chunks of no more than that: a block stages its whole
+/// tile of tokens however many the chunk has.
+const MMA_FEW: [usize; 2] = [16, 32];
 /// Most parts [`mma_parts`] splits a matrix's columns into.
 const MMA_PARTS_MAX: usize = 16;
 const MMA_REGS: usize = 80;
@@ -186,6 +189,8 @@ pub struct Gpu {
     /// Per weight type: the matvec kernel and the matmul one.
     matvec: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     mmq: Vec<(GgmlType, CudaFunction)>,
+    /// The tensor-core kernels of [`MMA_FEW`] tokens a block.
+    mma_few: Vec<(GgmlType, usize, CudaFunction)>,
     /// The int8 matmuls over pairs grouped by expert (`mmq_*_id`).
     mmq_id: Vec<(GgmlType, CudaFunction)>,
     /// The int8 matvecs of the same types: `mvq_*`, and `mvq_*_pair` for two matrices.
@@ -254,7 +259,7 @@ impl Gpu {
                 .map_err(err("compute capability"))?
                 .0
                 >= 8;
-        let (mut gemm, mut gemm_id) = (None, Vec::new());
+        let (mut gemm, mut gemm_id, mut mma_few) = (None, Vec::new(), Vec::new());
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -281,6 +286,12 @@ impl Gpu {
                     Ok((t, module.load_function(&n).map_err(err(&n))?))
                 })
                 .collect::<Result<_, String>>()?;
+            for tt in MMA_FEW {
+                for (t, n) in MMQ_KERNELS {
+                    let n = format!("{}_t{tt}", n.replace("mmq", "mma"));
+                    mma_few.push((t, tt, module.load_function(&n).map_err(err(&n))?));
+                }
+            }
             MMQ_KERNELS
                 .iter()
                 .map(|&(t, n)| {
@@ -389,6 +400,7 @@ impl Gpu {
             to_f16,
             gemm,
             gemm_room,
+            mma_few,
             gemm_id,
             other,
             zero_id,
@@ -804,6 +816,8 @@ impl Gpu {
             format!("gemm by expert {t:?}")
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul {t:?}")
+        } else if let Some((t, tt, _)) = self.mma_few.iter().find(|(.., g)| eq(g)) {
+            format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul by expert {t:?}")
         } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
@@ -911,9 +925,9 @@ fn gemm_parts(rows: usize, cols: usize, n_tok: usize, sms: usize, room: usize) -
 /// times the blocks a GPU of `sms` multiprocessors runs at once (its registers allow three
 /// each), of at least two 128-column steps. Measured on an A100: 4096x4096 by 64 tokens
 /// 179 us in 1 part, 67 in 3, 56 in 16; 14336x4096 285, 188 (3), 165 (8 to 16), 183 (24).
-fn mma_parts(rows: usize, cols: usize, n_tok: usize, sms: usize) -> usize {
-    let (tr, tt, threads) = MMA_TILE;
-    let tiles = rows.div_ceil(tr) * n_tok.div_ceil(tt);
+fn mma_parts(rows: usize, cols: usize, token_tiles: usize, sms: usize) -> usize {
+    let (tr, _, threads) = MMA_TILE;
+    let tiles = rows.div_ceil(tr) * token_tiles;
     let held = sms * (65536 / (MMA_REGS * threads as usize));
     (4 * held)
         .div_ceil(tiles)
@@ -1314,18 +1328,30 @@ impl<'a> Batch<'a> {
             !add || self.gpu.mma,
             "the dp4a matmul kernels don't accumulate"
         );
-        if !add && self.gpu.mma && mma_parts(rows, cols, n_tok, self.gpu.gemm_room.0) > 1 {
+        let gpu: &'a Gpu = self.gpu;
+        let few = gpu
+            .mma_few
+            .iter()
+            .find(|(t, tt, _)| *t == ty && n_tok <= *tt);
+        let tt = few.map_or(MMA_TILE.1, |f| f.1);
+        // The tensor-core kernel in parts, which add: 0 for one part that stores.
+        let parts = if gpu.mma {
+            mma_parts(rows, cols, n_tok.div_ceil(tt), gpu.gemm_room.0)
+        } else {
+            1
+        };
+        if !add && parts > 1 {
             self.zero_rows(y, (0, rows, rows), n_tok);
         }
         let row_bytes = ty.row_bytes(cols);
-        let w_off = self.gpu.device_offset(offset, rows * row_bytes) as u64;
-        let f = &self
-            .gpu
-            .mmq
-            .iter()
-            .find(|(t, _)| *t == ty)
-            .expect("checked by has_matmul_q")
-            .1;
+        let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+        let f = match few {
+            Some(f) => &f.2,
+            None => {
+                let f = gpu.mmq.iter().find(|(t, _)| *t == ty);
+                &f.expect("checked by has_matmul_q").1
+            }
+        };
         let (y_off, rb) = (y.1 as u64, row_bytes as u32);
         let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
         let mut a = self.call(f);
@@ -1340,12 +1366,6 @@ impl<'a> Batch<'a> {
             .arg(&cols_u)
             .arg(&rb)
             .arg(&nt);
-        // The tensor-core kernel in parts, which add: 0 for one part that stores.
-        let parts = if self.gpu.mma {
-            mma_parts(rows, cols, n_tok, self.gpu.gemm_room.0)
-        } else {
-            1
-        };
         let parts_u = if add || parts > 1 { parts as u32 } else { 0 };
         if self.gpu.mma {
             a.arg(&parts_u);
@@ -1353,7 +1373,7 @@ impl<'a> Batch<'a> {
         let cfg = if self.gpu.mma {
             grid2(
                 rows.div_ceil(MMA_TILE.0),
-                n_tok.div_ceil(MMA_TILE.1) * parts,
+                n_tok.div_ceil(tt) * parts,
                 MMA_TILE.2,
             )
         } else {
@@ -2104,9 +2124,15 @@ mod tests {
     #[test]
     fn matmul_q_matches_f32_matmul() {
         let types = [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])];
-        for ((rows, cols, n), (ty, scales_at)) in [(200, 512, 137), (203, 1280, 1), (64, 1024, 5)]
-            .into_iter()
-            .flat_map(|size| types.map(|t| (size, t)))
+        for ((rows, cols, n), (ty, scales_at)) in [
+            (200, 512, 137),
+            (203, 1280, 1),
+            (64, 1024, 5),
+            (130, 512, 13),
+            (130, 768, 30),
+        ]
+        .into_iter()
+        .flat_map(|size| types.map(|t| (size, t)))
         {
             let mut seed = 1u32;
             let mut next = move || {

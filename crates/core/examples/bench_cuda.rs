@@ -66,7 +66,7 @@ fn main() {
     // The f16 GEMM of long prompts: writing a matrix out as f16, and multiplying it by 512
     // and 128 tokens (the shapes of Mistral-7B and Llama-3.2-1B). Random activations, so the
     // products are ordinary numbers.
-    for n_tok in [512, 128, 64] {
+    for n_tok in [512, 256] {
         let mut seed = 5u32;
         let xs: Vec<f32> = (0..n_tok * 14336)
             .map(|_| {
@@ -128,7 +128,7 @@ fn main() {
             );
         }
     }
-    for n_tok in [64, 128] {
+    for n_tok in [16, 32, 64] {
         let xf = gpu.alloc(n_tok * 14336);
         let xqm = gpu.alloc_q(n_tok * 14336);
         let yb = gpu.alloc(n_tok * 14336);
