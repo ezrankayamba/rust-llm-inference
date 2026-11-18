@@ -2495,3 +2495,14 @@ Against llama.cpp (means of two rounds in turn, ours / llama.cpp): Mistral-7B 16
 3970 / 4192; 320: 4243 / 4213; 384: 4842 / 4587; 512: 5400 / 4845. Llama-3.2-1B 5-27% ahead at
 16 to 512. Qwen3-30B-A3B 16: 786 / 861; 64 to 512: 18-54% ahead. What is left on Mistral-7B
 is at lengths that are not whole 64-token blocks (160: 9% behind, 224: 13%).
+
+Tried after it and dropped (Mistral-7B, A100, same command, each pair run in turn twice):
+- A tail of 8 to 32 tokens past whole 64-token blocks through `gemm_*_direct`, the rest through
+  the in-block kernel (two launches adding into y; with the in-block kernel allowed up to 224
+  tokens): 96 tokens 3276, 3305 -> 3002, 2914 tok/s; 160: 3444, 3490 -> 3584, 3444; 224: 3710,
+  3775 -> 3518, 3525. A prompt's cost still goes up a step per started 64-token block (128
+  tokens 34.8 ms, 160 46.0, 192 49.9, 224 63.0, 256 64.5) where llama.cpp's is a line (37.5,
+  42.1, 49.4, 54.9, 61.1): that step is the 9% and 13% at 160 and 224.
+- Upper bounds from skipping work (wrong results): no `zero_rows` launches, 256 tokens 4025,
+  4019 -> 4037, 3935; 512: 5282, 5381 -> 5747, 5656. `swiglu` storing f16 only: nothing at
+  either length.
