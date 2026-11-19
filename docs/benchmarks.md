@@ -2689,3 +2689,9 @@ at 256): Mistral-7B 48 tokens 2551, 2470 / 2567, 2597 tok/s; 72: 2744, 2822 / 27
 3559, 3485 / 3559, 3572; 256: 4120, 4068 / 4094, 4119. Qwen3-30B-A3B 48: 1611, 1610 / 1635,
 1687; 72: 1924, 1935 / 1950, 1961; 160: 3173, 3214 / 3256, 3215; 256: 4045, 4048 / 4102, 4112.
 One or two percent at most, inside the runs' spread: a chunk that long is its matmuls.
+
+Tried and dropped: the multi-token Q4_K matvec reading each token's activations just before
+their products, not all tokens' first (fewer values held at once; `--reps 200`, in turn
+twice): Mistral-7B 2 tokens 280, 279 -> 257, 257 tok/s; 3: 356, 362 -> 332, 328; 4: 404, 406 ->
+398, 399. With the read-ahead trial above, the kernel sits between the two: more reads in
+flight than a step's cost it registers, fewer cost it waits.
