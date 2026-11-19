@@ -198,7 +198,7 @@ fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
     let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
     let dense = |w: &&&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
-    if int8 && (rest.is_empty() || (!rest.iter().any(|w| float(w)) && b.has_gemm(ws[0].cols, n))) {
+    if int8 && (rest.is_empty() || (!rest.iter().any(float) && b.has_gemm(ws[0].cols, n))) {
         Fed::Half
     } else if wants_q(b, ws, int8) {
         Fed::Q
