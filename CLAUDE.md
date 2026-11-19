@@ -392,9 +392,13 @@ cargo build --release --no-default-features --features rli/cuda,rli-server/cuda 
 cargo test --workspace --release                       # all tests, including Metal on macOS
 cargo test --workspace --release --no-default-features # CPU-only tests
 cargo test -p <crate> <test_name>                      # single test
-cargo clippy --workspace --all-targets -- -D warnings  # also with --no-default-features and --features rli-models/cuda
+cargo clippy --workspace --all-targets -- -D warnings  # also with --no-default-features, and with --no-default-features --features rli-models/cuda
 cargo fmt --all
 ```
+
+On macOS, lint CUDA with Metal off (`--no-default-features --features rli-models/cuda`): with
+both features on, rli-models compiles its Metal backend and leaves `cuda.rs` out, so clippy never
+sees it (a dozen pushes failed CI's lint that way on 2026-11-19). Check the CI result after pushing.
 
 CI (`.github/workflows/ci.yml`) runs on pushes to `main` and on PRs: fmt and clippy, plus the tests
 on Linux x86-64 (the only run of the AVX2 kernels; this Mac can't run them, even under Rosetta). Each job has a 4-minute timeout, so a change that
