@@ -2652,3 +2652,26 @@ Tried and dropped on the same chunks: the int8 tensor-core matmul from 2 tokens 
 the matvecs and the direct kernel (Mistral-7B 2 tokens 255 -> 160 tok/s, 4: 376 -> 315, 6:
 539 -> 469); the direct kernel staging only the token rows a chunk has, by eights (5 to 24
 tokens: within 1% either way).
+
+Chunks of up to 32 tokens (`GRAPH_TOKENS`) are replayed as CUDA graphs, one per chunk
+length, as a decoded token is. Launched one by one / replayed (`--reps 200` up to 7 tokens,
+1600 / N above; in turn twice): Mistral-7B 2 tokens 264, 264 / 280, 280 tok/s; 4: 391, 391 /
+406, 402; 7: 624, 625 / 647, 649; 8: 692, 694 / 725, 731; 16: 1282, 1308 / 1339, 1333; 24: 1837,
+1812 / 1878, 1847; 32: 2284, 2249 / 2371, 2363. Llama-3.2-1B 2: 877, 861 / 956, 911; 4: 1477,
+1447 / 1528, 1487; 7: 2150, 2143 / 2295, 2308; 8: 2434, 2396 / 2709, 2625; 16: 4197, 4332 /
+4871, 4846; 24: 5925, 6100 / 6482, 6233. Qwen3-30B-A3B 2: 280, 283 / 322, 316; 4: 417, 420 /
+449, 456; 7: 517, 516 / 546, 545; 8: 531, 533 / 566, 569; 16: 787, 788 / 813, 811; 24: 1072,
+1062 / 1127, 1144; 32: 1315, 1314 / 1362, 1375.
+**The benchmark repeats one length, which is the best case.** A graph captured anew every
+run (launched one by one / captured each time): Mistral-7B 2 tokens 264 / 253; 8: 670 / 626;
+32: 1934 / 1779. Llama-3.2-1B 2: 881 / 760; 8: 1730 / 1739. Qwen3-30B-A3B 2: 286 / 252; 8: 515 /
+486; 32: 1192 / 1156. So a length gets its graph the second time it comes up: its first chunk
+runs as before, its second pays the capture.
+
+CUDA tests pass both ways (154 each, with `short_chunk_repeated_matches_its_first_run`).
+Against llama.cpp (two rounds, ours / llama.cpp): Mistral-7B 2: 270 / 274; 3: 323 / 373; 4:
+399 / 411; 5: 447 / 444; 6: 542 / 492; 7: 623 / 533; 8: 702 / 517; 16: 1333 / 1300; 24: 1858 /
+1716; 32: 2331 / 2083. Llama-3.2-1B 2: 719 / 715; 3: 947 / 910; 4: 1208 / 1191; 5: 1426 / 1358;
+6: 1630 / 1485; 7: 1770 / 1912; 8: 2029 / 1940; 16: 4129 / 3760; 24: 5652 / 5264; 32: 8016 /
+6098. Qwen3-30B-A3B 2: 290 / 302; 3: 365 / 376; 4: 428 / 420; 5: 461 / 444; 6: 503 / 485; 7:
+536 / 529; 8: 550 / 529; 16: 817 / 862; 24: 1125 / 1023; 32: 1379 / 1188.

@@ -624,3 +624,43 @@ fn prefill_in_two_batches_matches_one_batch() {
         }
     }
 }
+
+/// CUDA replays a short chunk's launches as a graph from the second chunk of a length on.
+#[test]
+fn short_chunk_repeated_matches_its_first_run() {
+    let prompt = prompt();
+    for moe in [false, true] {
+        let path = model_path("llama", 4, 2, moe);
+        let layers = if rli_models::backend::HAS_GPU {
+            vec![0, LAYERS, 1]
+        } else {
+            vec![0]
+        };
+        for gpu_layers in layers {
+            let m = load(&path, gpu_layers);
+            let first = run(&m, &prompt[..9], true);
+            for rep in 0..2 {
+                let again = run(&m, &prompt[..9], true);
+                for (what, a, b) in [("prompt", &again.0, &first.0), ("next", &again.1, &first.1)] {
+                    let d = max_diff(a, b);
+                    assert!(
+                        d < 1e-4,
+                        "moe {moe}, {gpu_layers} GPU layers, repeat {rep}: {what} logits: max diff {d}"
+                    );
+                }
+            }
+            // The same length again, further into a context.
+            let whole = run(&m, &prompt[..13], true);
+            let mut s = m.new_session(1024);
+            assert!(m.forward_batch(&mut s, &prompt[..4], false).is_none());
+            let after = m
+                .forward_batch(&mut s, &prompt[4..13], true)
+                .expect("logits");
+            let d = max_diff(&after, &whole.0);
+            assert!(
+                d < 1e-4,
+                "moe {moe}, {gpu_layers} GPU layers: at 4: max diff {d}"
+            );
+        }
+    }
+}

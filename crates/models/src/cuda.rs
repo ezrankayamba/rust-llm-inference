@@ -112,7 +112,9 @@ struct Kv {
 struct Cuda {
     /// The launches of one decoded token. Declared before `gpu`, so that it is dropped while
     /// the device context is still there.
-    graph: Mutex<Option<Graph>>,
+    /// The launches of a chunk of `i + 1` tokens as a graph, and whether a chunk of that
+    /// length has run before.
+    graph: Mutex<[(Option<Graph>, bool); GRAPH_TOKENS]>,
     gpu: Gpu,
     layers: Vec<GpuLayer>,
     output_norm: GpuBuf,
@@ -776,11 +778,17 @@ impl Cuda {
                 mm_each(b, s, &out, xb, &[At(&s.logits, 0)], 1, int8, f);
             }
         };
-        // One token's launches are replayed as a graph, which costs less per launch and leaves
-        // the CPU out of it. A layer routed on the CPU reads back mid-pass, so it can't be.
-        if n == 1 && self.batchable && !rli_core::cuda::profiling() {
-            let mut graph = self.graph.lock().unwrap_or_else(|p| p.into_inner());
-            self.gpu.run_graph(&mut graph, queue);
+        // A short chunk's launches are replayed as a graph, which costs less per launch and
+        // leaves the CPU out of it. Capturing one costs a chunk about what replaying it saves,
+        // so a length other than one token gets its graph the second time it comes up. A
+        // layer routed on the CPU reads back mid-pass, so it can't be.
+        let mut graph = self.graph.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = graph.get_mut(n.wrapping_sub(1)).filter(|_| self.batchable);
+        if let Some((g, seen)) = slot
+            && (n == 1 || std::mem::replace(seen, true))
+            && !rli_core::cuda::profiling()
+        {
+            self.gpu.run_graph(g, queue);
         } else {
             let mut b = self.gpu.batch();
             queue(&mut b);
@@ -796,6 +804,11 @@ impl Cuda {
         want_logits
     }
 }
+
+/// The longest chunk replayed as a CUDA graph. Replayed against launched one by one, 200
+/// runs each on an A100: Mistral-7B 2 tokens 264 -> 280 tok/s, 8 tokens 693 -> 728, 32 tokens
+/// 2267 -> 2367; Qwen3-30B-A3B 2 tokens 281 -> 319, 16 tokens 787 -> 812.
+const GRAPH_TOKENS: usize = 32;
 
 impl Accelerator for Cuda {
     fn name(&self) -> &str {
@@ -976,7 +989,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         n_head: c.n_head,
         head_dim: c.head_dim,
         scratch: Mutex::new(scratch),
-        graph: Mutex::new(None),
+        graph: Mutex::new(Default::default()),
         batch: Mutex::new(None),
         gpu,
     };

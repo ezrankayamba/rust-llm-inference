@@ -241,8 +241,9 @@ Design points that span files:
   through `mvq_q4_k_multi2/3/4` and `mvq_q6_k_multi2/3/4` (a row read once for all its
   tokens; a kernel per count, since holding 4 tokens' activations slows 2); the direct
   kernel takes both from 5 tokens, and under 8 tokens (`ATTN_TILED_MIN`) attention is the
-  one decode launch. Prompts of 2 to 5 tokens are still 5-11% behind llama.cpp (2026-11-19;
-  Llama-3.2-1B level at 2 and 4), 6 and 7 level or ahead on Mistral-7B. Those reads need the tensor at a multiple of 16 bytes in
+  one decode launch. With chunks of up to 32 tokens replayed as graphs (below), prompts of
+  2 to 32 tokens are level or ahead of llama.cpp (2026-11-19) except Mistral-7B at 3 tokens
+  (13% behind) and 4 (3%), Qwen3-30B-A3B at 2 and 3 (3-4%) and at 16 (5%). Those reads need the tensor at a multiple of 16 bytes in
   VRAM (`Gpu::has_int8`), else f32 runs. Q6_K blocks are 210 bytes, so its lanes read the
   aligned 16-byte words around each span and shift (`ld24`; the arena ends in 16 bytes of slack
   for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose
@@ -257,7 +258,10 @@ Design points that span files:
   from 155 to 178 tok/s, past llama.cpp's 171.5. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
   `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
   so the queueing code is the same either way; a pass whose launches differ is captured anew,
-  and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Stacked MoE experts run
+  and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Prompt chunks of up
+  to 32 tokens (`GRAPH_TOKENS`) have a graph per length too (+3-14%), captured the second
+  time a length comes up, since a capture costs a chunk up to 14% once; the benchmark
+  repeats one length, which is the best case. Stacked MoE experts run
   the int8 matvec too (`matvec_q_id`); other weight types stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
