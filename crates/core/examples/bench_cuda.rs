@@ -67,6 +67,9 @@ fn main() {
     // and 128 tokens (the shapes of Mistral-7B and Llama-3.2-1B). Random activations, so the
     // products are ordinary numbers.
     for n_tok in [512, 256] {
+        if !gpu.batch().has_gemm(4096, n_tok) {
+            continue;
+        }
         let mut seed = 5u32;
         let xs: Vec<f32> = (0..n_tok * 14336)
             .map(|_| {
@@ -128,7 +131,7 @@ fn main() {
             );
         }
     }
-    for n_tok in [32, 64, 128] {
+    for n_tok in [32, 64, 128, 256, 512] {
         let xf = gpu.alloc(n_tok * 14336);
         let xqm = gpu.alloc_q(n_tok * 14336);
         let yb = gpu.alloc(n_tok * 14336);
@@ -139,6 +142,8 @@ fn main() {
             (GgmlType::Q4_K, 4096, 4096),
             (GgmlType::Q4_K, 14336, 4096),
             (GgmlType::Q4_K, 4096, 14336),
+            (GgmlType::Q6_K, 4096, 4096),
+            (GgmlType::Q6_K, 4096, 14336),
             (GgmlType::Q4_K, 2048, 2048),
             (GgmlType::Q4_K, 8192, 2048),
             (GgmlType::Q4_K, 2048, 8192),

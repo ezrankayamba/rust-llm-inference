@@ -2973,3 +2973,100 @@ Ruled out here, by measurement:
 - **Steps of 128 columns** in the in-block Q4_K kernel (64-token blocks, `GEMM_ID` with two
   quarters a step): 4096x4096 by 64 tokens 25.0 -> 27.0 us, 14336x4096 63.3 -> 69.0,
   4096x14336 78.7 -> 82.2. Not merged.
+
+## 2026-11-19: lean int8 tensor-core matmuls for the RTX 5090 (`MATMUL_MMK`)
+
+Same machine as the baseline above (RTX 5090, Windows, driver 610.60), llama.cpp cd959ba,
+runs of about 4 s alternated with 3 s rests, two rounds, the better kept. Commands as in
+the baseline section (`bench --pp N --tg 0 --reps R --gpu-layers 999` against
+`llama-bench -ngl 99 -p N -n 0 -r R`).
+
+**What was wrong.** `nvdisasm` on the 32-token int8 kernel (`mma_q4_k_t32`, compiled with
+`nvcc -DRLI_MMA -arch=sm_80 -cubin`): 2136 instructions, about 1500 of them in a
+128-column step, of which the multiply is 16 `IMMA`. The rest is loading: a scale decode
+that 4 lanes of 32 take part in, every word read as two 16-bit halves, 64-bit address
+arithmetic per read, 160 spills under the 80-register cap. Replacing the `mma` or the float
+arithmetic with nothing, or the global reads with constants, changed a step by under 0.1 us
+of 2.2. With one part (a block alone on a multiprocessor) a step took 2.2 us whatever the
+block count, and blocks beyond one per multiprocessor took proportionally longer: this card
+is short of instructions executed, not of memory or tensor cores.
+
+**The kernels** (`mmk_q4_k_t32/64/128`, `mmk_q6_k_*`; a third compile, no register cap,
+on by default from compute capability 12.0, `RLI_CUDA_LEAN=0/1`): llama.cpp's layout in
+our terms. Quants go to shared memory as int8 through 16-byte reads with every lane busy;
+`ldmatrix` fills the multiply's registers; three float operations a result (`fmaf`); at 64
+and 128 tokens a warp takes two groups of 16 rows against one load of the tokens; and the
+work is dealt evenly to one block per multiprocessor (units = a tile's 128-column steps,
+block b takes units bU/B to (b+1)U/B, every block adds into y). Q6_K's scales are integers,
+so the two products of a 32-column block are combined as integers before the one float.
+
+Q4_K matmul alone (`bench_cuda`, us, 16 distinct matrices, our zeroing launch included;
+llama.cpp from `test-backend-ops perf`, one matrix repeated):
+
+| shape x tokens | old int8 `mma` | old in-block f16 | lean | llama.cpp |
+|---|---|---|---|---|
+| 4096x4096 x 32 / 64 / 128 | 26.6 / 31.5 / 47.0 | 18.8 / 25.0 / 41.2 | 16.6 / 20.9 / 31.2 | 14.1 / 19.8 / 32.0 |
+| 14336x4096 x 32 / 64 / 128 | 54.1 / 72.0 / 120.3 | 48.9 / 63.3 / 106.6 | 34.6 / 42.4 / 70.5 | 26.5 / 37.8 / 63.0 |
+| 4096x4096 x 256 / 512 | | 157 (512, dequant + GEMM) | 45.6 / 76.3 | 45.2 / 74.6 |
+| 14336x4096 x 256 / 512 | | 297 / 465 (dequant + GEMM) | 126.8 / 236.0 | 115.0 / 218.1 |
+
+Q6_K (4096x4096 and 4096x14336, us): old int8 `mma` at 32 / 64 / 128 / 256 / 512 tokens
+29.2, 72.0 / 35.2, 84.4 / 51.4, 127.4 / 83.9, 223.2 / 140.6, 432.9; lean 24.2, 56.0 /
+29.2, 66.9 / 41.6, 108.8 / 62.3, 175.1 / 105.0, 318.6.
+
+Steps on the way (14336x4096, us at 32 / 64 / 128 tokens, no zeroing launch): lean loads
+and even split 45.1 / 53.5 / 76.8; `ldmatrix`, `fmaf` and 32-bit split arithmetic 34.9 /
+44.3 / 85.9; two row groups a warp at 64 and 128 tokens: 128 tokens 85.9 -> 72. With the
+zeroing launch: 38.9 / 49.4 / 76.3; the next step's reads issued before this one's
+products 34.8 / 42.6 / 84.3 (the 128-token block has no registers left: 512 tokens 246 ->
+290), so the 128-token block reads only its weights ahead: 70.5, 512 tokens 236.0. For
+Q6_K any read-ahead was slower (4096x14336 by 512 tokens 319 -> 334): off. With only 8
+tokens of a block multiplied the 32-, 64- and 128-token blocks took 26.5 / 30.6 / 38.8
+us: loading, not multiplying, is most of a short prompt's matmul.
+
+Tried: two blocks a multiprocessor (whole prompts 3-6% slower at 48 to 128 tokens); a
+forced tile size per length, which set `lean_tile` (192 tokens 8-10% faster as three
+64-token tiles than two of 128; Llama-3.2-1B 128 tokens 7% faster in 64-token tiles, 64
+tokens 3.5% in 32-token ones; Mistral-7B at 48 to 128 tokens best with the smallest tile
+that holds the prompt).
+
+Whole prompts, tok/s, ours against llama.cpp (ratio; the baseline's ratio in brackets):
+
+| tokens | Mistral-7B Q4_K_M | Llama-3.2-1B Q4_K_M |
+|---|---|---|
+| 8 | 1571 / 1561 = 1.01 (0.74) | 5474 / 4892 = 1.12 (0.99) |
+| 16 | 3025 / 2831 = 1.07 (0.76) | 10312 / 8945 = 1.15 (0.99) |
+| 32 | 5633 / 4961 = 1.14 (0.79) | 18778 / 14991 = 1.25 (1.01) |
+| 48 | 6203 / 6520 = 0.95 | 16685 / 20641 = 0.81 |
+| 64 | 7496 / 7687 = 0.98 (0.70) | 21293 / 24141 = 0.88 (0.85) |
+| 96 | 8755 / 9087 = 0.96 (0.69) | 29303 / 29059 = 1.01 (0.90) |
+| 128 | 9993 / 10168 = 0.98 (0.68) | 30647 / 32744 = 0.94 (0.81) |
+| 192 | 10544 / 11396 = 0.93 (0.67) | 44527 / 42563 = 1.05 (0.83) |
+| 256 | 11732 / 12594 = 0.93 (0.65) | 49874 / 47164 = 1.06 (0.81) |
+| 384 | 12218 / 14484 = 0.84 (0.52) | 52071 / 51047 = 1.02 (0.62) |
+| 512 | 12663 / 14658 = 0.86 (0.53) | 56864 / 62198 = 0.91 (0.64) |
+
+(Llama-3.2-1B at 8 tokens is from the run before, where both engines were steady; in the
+last run llama.cpp read 3675 there. Its 384-token figure was 56113 in the run before, which
+would make that row 0.93.) Decode was not changed; in this run it read 268.4 against 253.8
+(Mistral-7B) and 975.8 against 895.5 (Llama-3.2-1B), llama.cpp lower than in the baseline
+(278.2, 975.1), so not a result.
+
+Against our own old path (measured before the read-ahead and the tile rule, 8 to 512
+tokens): Mistral-7B 17-52% faster at every length; Llama-3.2-1B 6% slower at 64 tokens and
+1.5-39% faster at the others.
+
+**Accuracy.** `dump_logits` on the 5090: `--precise` against `ref_forward.py`, batched
+and `--per-token`, 4e-6 to 8e-6 (Llama-3.2-1B at 98 and 294 tokens, Mistral-7B at 102).
+Default logits against `--precise`: lean 0.154 / 0.190 / 0.142, the old path (f16
+activations at these lengths) 0.085 / 0.097 / 0.072; top-1 the same in all. The lean
+kernels are int8 activations at every length from 8 tokens, as llama.cpp's are.
+
+Tests on the 5090 (`cargo test --workspace --release --no-default-features --features
+rli-models/cuda`): pass by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO_MMA=1`.
+
+**Still behind:** Mistral-7B from 48 tokens (2-16%), Llama-3.2-1B at 48, 64, 128 and 512
+(6-19%). A 512-token Mistral-7B prompt is 79% lean matmuls; by the table above they are
+within 8% of llama.cpp's, so the rest of the gap is outside them (attention, `swiglu`,
+`rmsnorm`, the zeroing launches: 20% of the prompt) and in Q6_K. Not yet looked at on this
+card: Qwen3-30B-A3B's expert kernels, prompts of 2 to 4 tokens, decode.

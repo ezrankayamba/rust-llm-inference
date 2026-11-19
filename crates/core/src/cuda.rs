@@ -72,6 +72,8 @@ const MMA_TILE: (usize, usize, u32) = (128, 64, 256);
 /// Tokens a block of the kernels for chunks of no more than that: a block stages its whole
 /// tile of tokens however many the chunk has.
 const MMA_FEW: [usize; 2] = [16, 32];
+/// Tokens a block of the lean kernels (`MATMUL_MMK` and `MATMUL_MMK6` in cuda.cu).
+const MMK_TOKENS: [usize; 3] = [32, 64, 128];
 /// The chunks [`Batch::gemm_dense`] takes, in tokens. Under them the int8 kernels' 16-token
 /// blocks are ahead (Mistral-7B at 16 tokens: 8% slower this way), and over them writing the
 /// matrix out once for [`Batch::gemm`] is: a block here decodes its weights again for every
@@ -248,6 +250,8 @@ pub struct Gpu {
     mvq6_multi: [CudaFunction; 3],
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
+    /// The lean tensor-core kernels (`mmk_*`) by type and tokens a block; empty where unused.
+    mmk: Vec<(GgmlType, usize, CudaFunction)>,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
     /// and the f16 tensor-core product of the two, where the GPU has one.
     dequant: Vec<(GgmlType, CudaFunction)>,
@@ -323,6 +327,37 @@ impl Gpu {
         let mut gemm_direct_id = Vec::new();
         let mut attn_half = None;
         let mut gemm_dense128 = Vec::new();
+        // From compute capability 12.0 (Blackwell) the lean kernels take the int8 matmuls of
+        // 8 tokens and more: a third compile, of them alone and with no register cap. They
+        // were written for an RTX 5090 and measured only there, hence the capability;
+        // RLI_CUDA_LEAN=1 or 0 turns them on or off anywhere tensor cores are in use.
+        let lean = match std::env::var("RLI_CUDA_LEAN").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => {
+                ctx.compute_capability()
+                    .map_err(err("compute capability"))?
+                    .0
+                    >= 12
+            }
+        };
+        let mut mmk = Vec::new();
+        if mma && lean {
+            let opts = cudarc::nvrtc::CompileOptions {
+                arch: Some("compute_80"),
+                options: vec!["-DRLI_MMA".into(), "-DRLI_MMK".into()],
+                ..Default::default()
+            };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
+                .map_err(|e| format!("CUDA lean kernel compile failed: {e:?}"))?;
+            let module = ctx.load_module(ptx).map_err(err("load CUDA module"))?;
+            for (t, name) in [(GgmlType::Q4_K, "q4_k"), (GgmlType::Q6_K, "q6_k")] {
+                for tt in MMK_TOKENS {
+                    let n = format!("mmk_{name}_t{tt}");
+                    mmk.push((t, tt, module.load_function(&n).map_err(err(&n))?));
+                }
+            }
+        }
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -485,6 +520,7 @@ impl Gpu {
                 func("mvq_q6_k_multi4")?,
             ],
             mma,
+            mmk,
             dequant,
             dequant_q4_k_any,
             to_f16,
@@ -923,6 +959,8 @@ impl Gpu {
             format!("gemm by expert {t:?}")
         } else if let Some((t, _)) = self.mmq.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul {t:?}")
+        } else if let Some((t, tt, _)) = self.mmk.iter().find(|(.., g)| eq(g)) {
+            format!("lean matmul {t:?}, {tt} tokens")
         } else if let Some((t, tt, _)) = self.mma_few.iter().find(|(.., g)| eq(g)) {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
@@ -1047,6 +1085,20 @@ fn mma_parts(rows: usize, cols: usize, token_tiles: usize, sms: usize) -> usize 
         .min(MMA_PARTS_MAX)
         .min(cols / 256)
         .max(1)
+}
+
+/// Tokens a block of the lean kernels for `n_tok` tokens: the largest of [`MMK_TOKENS`] whose
+/// last tile is more than half full (the work is dealt out by tile and step, so a tile with
+/// few tokens leaves its blocks idle: 192 tokens ran 8-10% faster in three tiles of 64 than
+/// in two of 128) and that leaves two steps for each of `sms` blocks (Llama-3.2-1B, whose
+/// matrices are 2048 wide: 128 tokens 7% faster in tiles of 64, 64 tokens 3.5% in 32).
+fn lean_tile(n_tok: usize, rows: usize, cols: usize, sms: usize) -> usize {
+    let fits = |&t: &usize| {
+        let tiles = n_tok.div_ceil(t);
+        tiles * t - n_tok < t / 2 && rows.div_ceil(128) * tiles * (cols / 128) >= 2 * sms
+    };
+    let all = MMK_TOKENS.iter().rev();
+    *all.clone().find(|t| fits(t)).unwrap_or(&MMK_TOKENS[0])
 }
 
 /// How many parts [`Batch::gemm_dense`] splits the columns into, as [`mma_parts`]: its blocks
@@ -1188,7 +1240,10 @@ impl<'a> Batch<'a> {
     /// Whether [`Batch::gemm`] takes `n_tok` tokens over a matrix of `cols` columns: it pays
     /// for writing the matrix out as f16 from [`GEMM_MIN_TOKENS`].
     pub fn has_gemm(&self, cols: usize, n_tok: usize) -> bool {
-        self.gpu.gemm.is_some() && cols.is_multiple_of(GEMM_COLS) && n_tok >= GEMM_MIN_TOKENS
+        self.gpu.mmk.is_empty()
+            && self.gpu.gemm.is_some()
+            && cols.is_multiple_of(GEMM_COLS)
+            && n_tok >= GEMM_MIN_TOKENS
     }
 
     /// Whether [`Batch::matmul_q`] can add into y for chunks of [`MMQ_MIN_TOKENS`] or more.
@@ -1448,7 +1503,10 @@ impl<'a> Batch<'a> {
             GgmlType::Q6_K => GEMM_DIRECT_Q6_K_MIN,
             _ => *GEMM_DENSE_TOKENS.start(),
         };
-        (min..=*GEMM_DENSE_TOKENS.end()).contains(&n_tok) && self.has_gemm_id(ty, cols, offset, 0)
+        let lean = n_tok >= MMQ_MIN_TOKENS && self.gpu.mmk.iter().any(|(t, ..)| *t == ty);
+        !lean
+            && (min..=*GEMM_DENSE_TOKENS.end()).contains(&n_tok)
+            && self.has_gemm_id(ty, cols, offset, 0)
     }
 
     /// `y = W x` (`y += W x` with `add`) on f16 tensor cores where [`Batch::has_gemm_dense`],
@@ -1605,6 +1663,39 @@ impl<'a> Batch<'a> {
             "the dp4a matmul kernels don't accumulate"
         );
         let gpu: &'a Gpu = self.gpu;
+        let mut lean = gpu.mmk.iter().filter(|(t, ..)| *t == ty);
+        let tt = lean_tile(n_tok, rows, cols, gpu.gemm_room.0);
+        // The kernels count rows' offsets and their units of work in 32 bits.
+        let row_bytes = ty.row_bytes(cols);
+        let units = rows.div_ceil(128) * n_tok.div_ceil(tt) * (cols / 128);
+        let small = (units * gpu.gemm_room.0).max(rows * row_bytes) < u32::MAX as usize;
+        if let Some((_, _, f)) = lean.find(|(_, t, _)| *t == tt && small) {
+            if !add {
+                self.zero_rows(y, (0, rows, rows), n_tok);
+            }
+            let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+            // The units of work (a tile's 128-column steps) are dealt evenly to a block per
+            // multiprocessor, of at least two steps. Two blocks each was 3-6% slower over
+            // Mistral-7B and Llama-3.2-1B prompts of 48 to 128 tokens.
+            let blocks = gpu.gemm_room.0.min(units / 2).max(1);
+            let (y_off, rb) = (y.1 as u64, row_bytes as u32);
+            let (rows_u, cols_u, nt, one) = (rows as u32, cols as u32, n_tok as u32, 1u32);
+            let mut a = self.call(f);
+            a.arg(&gpu.weights)
+                .arg(&w_off)
+                .arg(&xq.q)
+                .arg(&xq.d)
+                .arg(&xq.s)
+                .arg(&y.0.0)
+                .arg(&y_off)
+                .arg(&rows_u)
+                .arg(&cols_u)
+                .arg(&rb)
+                .arg(&nt)
+                .arg(&one);
+            self.launch(a, grid2(blocks, 1, 256));
+            return;
+        }
         let few = gpu
             .mma_few
             .iter()

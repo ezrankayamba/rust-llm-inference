@@ -364,6 +364,26 @@ Design points that span files:
   (`rmsnorm` with 256 threads for a 2048-wide row cost twice a trivial launch). `RLI_CUDA_PROF=1`
   times every launch and prints the totals per kernel when the device is dropped; it is how
   that was found.
+- **An RTX 5090 is short of instructions executed, not of memory or tensor cores.** One
+  block of 8 warps keeps a multiprocessor busy there, so a kernel's step costs what its
+  instruction count does: `MATMUL_MMA`'s 128-column step is 1500 a warp, 16 of them `mma`
+  (replacing those, or the global reads, with nothing changed a step by under 0.1 us of 2.2).
+  Count with `nvdisasm` (`nvcc -DRLI_MMA -arch=sm_80 -cubin` on a copy of cuda.cu with the
+  alignment attribute spelled for MSVC), not by reasoning. From compute capability 12.0 the
+  int8 matmuls of 8+ tokens are the lean kernels (`MATMUL_MMK` Q4_K, `MATMUL_MMK6` Q6_K; a
+  third compile with no register cap; `RLI_CUDA_LEAN=0/1`; `has_gemm` and `has_gemm_dense`
+  then say no, so every length is int8, logits ~0.15-0.19 from `precise` where the f16 paths
+  gave 0.07-0.10): llama.cpp's layout, 16-byte reads with every lane busy, `ldmatrix` into
+  the multiply's registers, three float operations a result, two row groups a warp against
+  one load of the tokens at 64 and 128 tokens a block, and the work (a tile's 128-column
+  steps) dealt evenly to one block per multiprocessor, each adding into y. Q4_K reads the
+  next step before multiplying this one (weights only in the 128-token block, which has no
+  registers left); Q6_K is slower for it. `lean_tile` picks the block's tokens: a last tile
+  under half full leaves its blocks idle. Against llama.cpp on the 5090 (`docs/benchmarks.md`,
+  2026-11-19): prompts of 8 to 32 tokens 1-25% ahead, 48 to 512 between 19% behind and 6%
+  ahead (were 15-48% behind); the A100 keeps the kernels above. Windows launches cost 8-10 us
+  each alone (WDDM), so benchmark runs must last seconds: short ones leave the GPU at idle
+  clocks.
 - **CUDA is checked by hand.** CI only compiles it, so after changing it run on an NVIDIA GPU:
   the tests with `--no-default-features --features rli-models/cuda`, and `dump_logits --precise`
   against `ref_forward.py` both batched and with `--per-token` (the decode kernels).
