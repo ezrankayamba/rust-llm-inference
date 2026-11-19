@@ -2630,3 +2630,11 @@ rounds, ours / llama.cpp): Mistral-7B 2: 233 / 266; 3: 311 / 354; 4: 358 / 416; 
 514 / 495; 7: 591 / 532. Llama-3.2-1B 2: 642 / 613; 3: 826 / 947; 4: 1015 / 1202; 5: 1308 / 1399;
 6: 1543 / 1702; 7: 1885 / 1852. Qwen3-30B-A3B 2: 272 / 294; 3: 327 / 364; 4: 386 / 421; 5: 421 /
 455; 6: 471 / 497; 7: 503 / 538.
+
+Tried and dropped: the multi-token matvecs reading 8 super-blocks before using any, as the
+one-token kernel does (`--reps 200`, in turn twice, 4 a step / 8): Mistral-7B 2 tokens 254,
+257 / 251, 249 tok/s; 3: 322, 322 / 311, 311; 4: 374, 373 / 343, 347. Llama-3.2-1B 2: 832, 856 /
+880, 878; 3: 1140, 1135 / 1074, 1072; 4: 1405, 1362 / 1330, 1257. With several tokens a warp
+has arithmetic enough per step that it is no longer just waiting for its reads: a second
+token adds half again to the Q4_K matvecs' time (3.2 -> 4.7 ms a chunk) with no more weight
+read.
