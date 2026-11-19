@@ -2742,3 +2742,13 @@ Against llama.cpp (two rounds, ours / llama.cpp): Mistral-7B 64: 2924 / 2881; 72
 engines a few percent slower than in the morning's runs.) A block of either kind costs
 nearly the same whatever it holds (14336x4096: 124 us by 64 tokens in 64-token blocks, 180
 by 72 in a 128-token one), which is the 10% at 72 tokens.
+
+Tried and dropped: a Q4_K block sized to the chunk, 32 NW tokens on 4 NW warps for NW 3 and 5
+to 8 (`gemm_q4_k_dense96` .. `256`), one block a row tile. Per matrix, us, as it is / sized:
+14336x4096 by 72 tokens 180.1 / 177.5; 96: 194.3 / 197.6; 160: 301.3 / 358.0; 192: 326.8 /
+403.6; 224: 378.1 / 442.9; 256: 403.3 / 482.1 (4096x4096 and 4096x14336 the same way). So
+nothing for 72 tokens and a loss from 160. The module's register cap (80) is not what holds
+these kernels back: at 64, 56 and 48 every one of those times is the same to the microsecond.
+A 16-warp block fits 120 + 0.78 n us for n tokens of 14336x4096 and a 64-token block is 124
+full, so the cost of a block is mostly not its tokens, and not its thread count either (96
+tokens on 12 warps cost what they do on 16).
