@@ -2917,3 +2917,59 @@ From the A100 to this card llama.cpp's Mistral-7B pp512 went from 4845 to 14641 
 and ours from 5400 to 7710 (1.4x): the kernels and thresholds were chosen by measuring on an
 A100 and do not carry over. Our speed stops rising past 256 tokens, where the dequantize +
 `gemm_f16_*` path takes over.
+
+## 2026-11-19: why the RTX 5090 gap: llama.cpp's matmul alone, and what was ruled out
+
+Nothing changed in the engine. Same machine and builds as the entry above.
+
+`RLI_CUDA_PROF=1 bench --pp N --tg 0 --reps 20` on Mistral-7B: the matmuls are 82-87% of a
+prompt (512 tokens: `gemm_f16 128x128` 69%, `dequant` 18%; 128: the in-block kernels 81%;
+8: `gemm direct Q4_K` 59%, the int8 Q6_K matmul 11%). A trivial launch costs 8-10 us timed
+alone here, where it was about 4 on the A100 (WDDM).
+
+llama.cpp's `test-backend-ops perf -o MUL_MAT -b CUDA0` with our shapes added, Q4_K, us a run,
+next to ours from `bench_cuda` (in-block f16 with `RLI_DENSE=1` up to 128 tokens; dequantize
+plus `gemm_f16` from 256):
+
+| Shape | Tokens | llama.cpp | ours | on the A100: llama.cpp | ours |
+|---|---:|---:|---:|---:|---:|
+| 14336x4096 | 32 | 26.5 | 48.9 | 90.6 | 98.9 |
+| 14336x4096 | 64 | 37.8 | 63.3 | 137.5 | 120.7 |
+| 14336x4096 | 128 | 63.0 | 106.6 | 230.4 | 215.2 |
+| 14336x4096 | 256 | 115.0 | 297 | | |
+| 14336x4096 | 512 | 218.1 | 465 | | |
+| 4096x4096 | 32 | 14.1 | 18.8 | 30.7 | 33.6 |
+| 4096x4096 | 64 | 19.8 | 25.0 | 46.8 | 39.8 |
+| 4096x4096 | 128 | 32.0 | 41.2 | 76.4 | 70.4 |
+| 4096x4096 | 512 | 74.6 | 157 | | |
+
+llama.cpp at 2 / 4 / 8 / 16 tokens of 14336x4096: 12.9 / 20.2 / 17.1 / 19.9 us (its test
+repeats one matrix, so the weights are in cache; ours run 16 distinct ones, and one matrix
+repeated runs the same). Its Q6_K is 20-35% slower than its Q4_K.
+
+**From the A100 to this card llama.cpp's kernel runs 3.4-3.7x faster and ours 2x.** Its
+kernel is one code for both (`mmq-config-blackwell.cuh` has only the FP4 types; Q4_K takes
+the Ampere table: 256 threads, 128 rows by up to 128 tokens a block, 256 columns a step,
+stream-k). So it scales with the multiprocessors and their clock (170 at 2.9 GHz against
+108 at 1.4), and ours does not, at any length. As time per matrix it is about 12 us + 0.40
+us a token for 14336x4096; ours in-block 35 + 0.45 (64-token blocks) or 0.69 (128-token
+ones), dequantize + GEMM 106 + 0.66.
+
+What its kernel does that ours don't: weights go into shared memory as int8, a 4-bit
+quant per byte, with two masks per 8 weights (ours: a float multiply, a subtraction and an
+f16 conversion per weight); the scales are applied to the integer sums; activations are
+int8, a tile of them one contiguous copy; `mma` takes 32 columns an instruction where f16
+takes 16; and the gate and up matrices of an FFN are one kernel with the activation fused
+(`has_fusion`).
+
+Ruled out here, by measurement:
+
+- **Blocks in flight.** Column parts forced to 1 / 2 / 4 / 8 / 16 / 32 (in-block f16,
+  14336x4096 by 64 tokens): 95.6 / 70.1 / 67.8 / 63.3 / 62.8 / 63.3 us; by 128: 139.8 /
+  109.0 / 108.4 / 106.3 / 119.2 / 119.0. The int8 tensor-core kernel the same shape. What
+  `dense_parts` and `mma_parts` choose is at the floor.
+- **Memory.** One matrix repeated against 16 distinct ones: within 3% for every kernel, and
+  a matrix's weights are read at 0.3-0.5 TB/s of the card's 1.8.
+- **Steps of 128 columns** in the in-block Q4_K kernel (64-token blocks, `GEMM_ID` with two
+  quarters a step): 4096x4096 by 64 tokens 25.0 -> 27.0 us, 14336x4096 63.3 -> 69.0,
+  4096x14336 78.7 -> 82.2. Not merged.
