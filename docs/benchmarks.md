@@ -2775,3 +2775,105 @@ CUDA tests pass both ways (154 each). Against llama.cpp (two rounds, ours / llam
 Mistral-7B 32: 2335 / 2073; 48: 2600 / 2573; 64: 3041 / 2901; 72: 2794 / 2923; 96: 3318 / 3228;
 128: 3787 / 3448; 160: 3442 / 3772; 192: 3761 / 3953; 224: 3976 / 4042; 256: 4261 / 4163.
 Llama-3.2-1B 2-22% ahead at 32 to 256; Qwen3-30B-A3B 15-58%.
+
+## 2026-11-19: where the engine stands against llama.cpp, and against 2026-11-15
+
+A summary of the entries above, not a new run: each figure is the last one measured for
+that case, with its date, beside the same case before 2026-11-16 (commit 061dbf3) or, where
+a case had not been measured then, the first time it was. tok/s throughout; llama.cpp is
+v0.9.0. Q4_K_M files. "Then" and "now" were measured on different days, so compare each
+with the llama.cpp figure taken beside it, not across the two.
+
+### CUDA (A100), all layers offloaded
+
+Prompts of 512 tokens and decode, then (2026-11-15) and now (2026-11-19; decode from the
+8-super-block matvec entry, 512 tokens from the f16-activations entry):
+
+| Model | pp512 then | llama.cpp | pp512 now | llama.cpp | tg128 then | tg128 now |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B | 12042-15164 | 14501 | 20631 (11-18) | 17701 | 595-611 | 609 |
+| Mistral-7B | 3424-3479 | 4912 | 5400 | 4845 | 171 | 174 |
+| Qwen3-30B-A3B | 3859-3879 | 4242 | 5007 (11-18) | 4255 | 195 | 197 |
+
+Decode was 10-16% ahead of llama.cpp then and has not been compared since. Decode at 2048
+positions was 6-11% behind then; level on Llama-3.2-1B and 2% ahead on Mistral-7B on
+2026-11-17.
+
+Shorter prompts were first measured warm on 2026-11-18 (847ca5a), and 2 to 4 tokens on
+2026-11-19 before the multi-token matvecs. Ours / llama.cpp, first and last:
+
+| Tokens | Mistral-7B first | now | Llama-3.2-1B first | now | Qwen3-30B-A3B first | now |
+|---:|---|---|---|---|---|---|
+| 2 | 209 / 271 | 265 / 274 | | 729 / 664 | | 281 / 287 |
+| 4 | 254 / 424 | 399 / 419 | | 1286 / 1260 | | 425 / 415 |
+| 8 | 573 / 527 | 702 / 517 | 1827 / 1840 | 2029 / 1940 | 444 / 519 | 550 / 529 |
+| 16 | 1048 / 1286 | 1332 / 1292 | 3362 / 3854 | 4145 / 3675 | 614 / 849 | 817 / 861 |
+| 32 | 1620 / 2090 | 2335 / 2073 | 5870 / 6516 | 7418 / 6462 | 737 / 1208 | 1377 / 1197 |
+| 64 | 2372 / 2907 | 3041 / 2901 | 8492 / 8733 | 10003 / 9314 | 1672 / 1504 | 1964 / 1517 |
+| 72 | | 2794 / 2923 | | 9618 / 9441 | | 1926 / 1461 |
+| 128 | 2736 / 3426 | 3787 / 3448 | 9996 / 11210 | 11592 / 10739 | 2559 / 1780 | 2790 / 1766 |
+| 160 | 3391 / 3726 | 3442 / 3772 | | 12141 / 11678 | | 3091 / 2557 |
+| 192 | | 3761 / 3953 | | 14550 / 13353 | | 3486 / 2751 |
+| 224 | 3370 / 4177 | 3976 / 4042 | | 14237 / 13299 | | 3702 / 2805 |
+| 256 | 3778 / 4213 | 4261 / 4163 | 12382 / 12270 | 17434 / 14507 | 3594 / 2941 | 3858 / 2909 |
+
+Behind now: Mistral-7B at 160 tokens (9%), 192 (5%), 72 (4%), 224 (2%) and 2 to 4 (2-5%);
+Qwen3-30B-A3B at 3 tokens (357 / 376) and 16 (5%). Runs differ by about 5% (more on
+Llama-3.2-1B).
+
+### Metal (Apple M4)
+
+| Case | Then (2026-11-16, before the first change) | llama.cpp | Now | llama.cpp |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B pp512 | 757.5 | 1395.0 | 1468.3 (11-18) | 1425.9 |
+| Llama-3.2-1B pp64 | | | 1289.6 (11-18) | 1282.2 |
+| Llama-3.2-1B pp16 | 279.1 | 796.1 | 720.0 (11-17) | 654.4 |
+| Llama-3.2-1B tg128 | 92.5 | 110.6 | 106.8 (11-16) | 107.2 |
+| Mistral-7B pp512 | 117.9 | 181.9 | 198.8 (11-18) | 191.8 |
+| Mistral-7B pp64 | | | 204.4 (11-18) | 199.5 |
+| Mistral-7B pp20 | | | 117.7 (11-18) | 117.8 |
+| Mistral-7B tg128 | 19.1 | 21.2 | 21.7 (11-16) | 21.3 |
+| Qwen2.5-0.5B pp512 | 1689.7 | 3358.3 | 2910 (11-16) | 3382 |
+| Qwen2.5-0.5B tg128 | 153.3 | 182.3 | 185.2 (11-16) | 177.9 |
+| SmolLM2-135M pp512 | | | 7170 (11-16) | 9180 |
+| SmolLM2-135M tg128 | 222 | 326 | 363 (11-16) | 326 |
+| Qwen3-30B-A3B tg48 | 37.9 | 42.0-42.3 | 43.5 (11-16) | 42.0-42.3 |
+
+Behind now: prompts on the two small models, Qwen2.5-0.5B 14% and SmolLM2-135M 22%, which
+were last measured on 2026-11-16 and not again after the tile work of 2026-11-17 and 18.
+
+### Apple M4 CPU, Llama-3.2-1B
+
+| Threads | Prompt then (11-16) | llama.cpp | Prompt now (11-17) | llama.cpp | Decode then | llama.cpp | Decode now | llama.cpp |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 85.0 | 116.3 | 100.9 | 114.7 | 23.4 | 45.5 | 38.3 | 45.5 |
+| 4 | 273.4 | 411.4 | 324.6 | 408.6 | 71.2 | 85.3 | 84.6 | 84.9 |
+
+(Prompts of 128 tokens then, 256 now.) Behind now: prompts 12% on one thread and 21% on
+four, one-thread decode 16%; `--coarse-acts`, off by default, takes the one-thread prompt
+to 116.4. Qwen2.5-0.5B (Q5_0 and Q8_0) prompts are 2.2x ahead and its decode level on four
+threads (2026-11-16).
+
+### x86 CPU (GitHub runners), Llama-3.2-1B, one thread, prompt / decode
+
+Runners differ from run to run, so each row is one run.
+
+| CPU | Then | llama.cpp | Now (2026-11-17, e92dfcd) | llama.cpp |
+|---|---|---|---|---|
+| EPYC 7763 (AVX2) | 42.7 / - (11-12) | 48.1 / - | 49.3 / 17.9 | 49.3 / 17.3 |
+| EPYC 9V74 (Zen 4) | - / 26 (11-13) | - / 30 | 97.0 / 26.3 | 83.5 / 29.9 |
+| EPYC 9V45 (Zen 5) | 124.1 / 33.4 (11-17, 58ff301) | 147.9 / 35.2 | 170.1 / 34.5 | 156.0 / 37.4 |
+| Xeon 6975P-C (AMX) | 78.6 / - (11-17 morning) | 144.2 / - | 119.1 / 16.3 | 142.6 / 12.3 |
+
+Behind now: one-thread decode on Zen 4 and Zen 5 without `--repack` (0-12%; 31.8 against
+29.9 on the 9V74 with it), and K-quant prompts on Xeons with AMX (1.16-1.2x).
+
+### What is behind, in one place
+
+- CUDA: Mistral-7B prompts at 72, 160, 192 and 224 tokens (2-9%) and 2 to 4 tokens (2-5%);
+  Qwen3-30B-A3B at 3 and 16 tokens (5%).
+- Metal: prompts on Qwen2.5-0.5B (14%) and SmolLM2-135M (22%), not measured since 2026-11-16.
+- M4 CPU: K-quant prompts (12-21%) and one-thread decode (16%), with one activation scale
+  per 32 values kept by decision.
+- x86: one-thread decode on Zen 4 and 5 unless `--repack` (opt-in for its memory), and
+  K-quant prompts on AMX Xeons.
