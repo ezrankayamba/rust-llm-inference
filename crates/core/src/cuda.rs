@@ -76,8 +76,10 @@ pub const GEMM_DENSE_TOKENS: std::ops::RangeInclusive<usize> = 24..=256;
 /// The chunks whose Q4_K matrices take `gemm_q4_k_direct` instead (blocks of 128 rows by 32
 /// tokens, each lane decoding its own weights): 14336x4096 by 16 tokens 74 us where the int8
 /// tensor cores took 92, by 32 tokens 82 where the 64-token block took 99. A second tile of
-/// tokens decodes the weights again, so not past 32.
-const GEMM_DIRECT_TOKENS: std::ops::RangeInclusive<usize> = 8..=32;
+/// tokens decodes the weights again, so not past 32. Its time hardly depends on the tokens,
+/// so 2 to 4 take the int8 matvec that reads a row once for all of them (`mvq_q4_k_multi`;
+/// Mistral-7B at 4 tokens 357 tok/s against 346 this way, at 5 tokens 321 against 434).
+const GEMM_DIRECT_TOKENS: std::ops::RangeInclusive<usize> = 5..=32;
 /// Most (token, expert) pairs an expert, on average, for which [`Batch::gemm_id`] takes
 /// `gemm_*_direct_id` (128 rows by 32 pairs a block, no weights staged) and not `gemm_*_id`
 /// (64 by 64, staged): Qwen3-30B-A3B's 128 experts, 8 a token, at 32 tokens 1167 -> 1280
@@ -88,6 +90,10 @@ const GEMM_DIRECT_ID_PAIRS: usize = 4;
 /// tokens 120 us (int8 126), by 24 tokens 124 (141); by 8 tokens level, and a Mistral-7B
 /// prompt 2% slower.
 const GEMM_DIRECT_Q6_K_MIN: usize = 16;
+/// Under [`MMQ_MIN_TOKENS`], where Q6_K has only a matvec per token, chunks from this many
+/// tokens take `gemm_q6_k_direct` too (Mistral-7B at 3 tokens 283 -> 295 tok/s, at 4 tokens
+/// 321 -> 356; at 2 tokens 224 -> 215).
+const GEMM_DIRECT_Q6_K_FEW: usize = 3;
 /// Chunks of 65 tokens up to this take blocks of 128 tokens (`gemm_*_dense128`: a warp takes
 /// 16 rows by 64 tokens), which decode a matrix once where 64-token blocks decode it twice:
 /// 14336x4096 Q4_K by 96 tokens 195 us -> 182, by 128 tokens 215 -> 209, but by 64 tokens
@@ -231,6 +237,8 @@ pub struct Gpu {
     mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     /// `mvq_q4_k_many`, for launches of [`MVQ_MANY`] grid rows or more.
     mvq_many: CudaFunction,
+    /// `mvq_q4_k_multi`.
+    mvq_multi: CudaFunction,
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
@@ -457,6 +465,7 @@ impl Gpu {
             mmq_id,
             mvq,
             mvq_many: func("mvq_q4_k_many")?,
+            mvq_multi: func("mvq_q4_k_multi")?,
             mma,
             dequant,
             dequant_q4_k_any,
@@ -900,6 +909,8 @@ impl Gpu {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul by expert {t:?}")
+        } else if eq(&self.mvq_multi) {
+            "int8 matvec Q4_K, few tokens".to_string()
         } else if eq(&self.mvq_many) {
             "int8 matvec Q4_K, many".to_string()
         } else if let Some((t, ..)) = self.mvq.iter().find(|(_, a, b)| eq(a) || eq(b)) {
@@ -1413,6 +1424,7 @@ impl<'a> Batch<'a> {
     pub fn has_gemm_dense(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
         let min = match ty {
             GgmlType::Q4_K => *GEMM_DIRECT_TOKENS.start(),
+            GgmlType::Q6_K if n_tok < MMQ_MIN_TOKENS => GEMM_DIRECT_Q6_K_FEW,
             GgmlType::Q6_K => GEMM_DIRECT_Q6_K_MIN,
             _ => *GEMM_DENSE_TOKENS.start(),
         };
@@ -1438,7 +1450,7 @@ impl<'a> Batch<'a> {
     ) {
         assert!(self.has_gemm_dense(ty, cols, offset, n_tok) && rows > 0);
         assert!(xh.0.len() >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
-        let direct = GEMM_DIRECT_TOKENS.contains(&n_tok);
+        let direct = n_tok <= *GEMM_DIRECT_TOKENS.end();
         let wide = n_tok > 64 && (n_tok <= GEMM_DENSE_WIDE_MAX || ty == GgmlType::Q6_K);
         let (tr, tt) = if direct {
             (128, 32)
@@ -1524,6 +1536,29 @@ impl<'a> Batch<'a> {
     ) {
         assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n_tok > 0);
         assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
+        // A few tokens of a Q4_K matrix share one read of each row.
+        if n_tok < MMQ_MIN_TOKENS && n_tok > 1 && ty == GgmlType::Q4_K {
+            let gpu: &'a Gpu = self.gpu;
+            let row_bytes = ty.row_bytes(cols);
+            let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+            let (y_off, rb, nt, add) = (y.1 as u64, row_bytes as u32, n_tok as u32, add as u32);
+            let (rows_u, cols_u) = (rows as u32, cols as u32);
+            let mut a = self.call(&gpu.mvq_multi);
+            a.arg(&gpu.weights)
+                .arg(&w_off)
+                .arg(&xq.q)
+                .arg(&xq.d)
+                .arg(&xq.s)
+                .arg(&y.0.0)
+                .arg(&y_off)
+                .arg(&rows_u)
+                .arg(&cols_u)
+                .arg(&rb)
+                .arg(&nt)
+                .arg(&add);
+            let threads = (MATVEC_ROWS_PER_BLOCK * 32) as u32;
+            return self.launch(a, grid(rows.div_ceil(MATVEC_ROWS_PER_BLOCK), threads));
+        }
         if n_tok < MMQ_MIN_TOKENS {
             let zero = &self.gpu.zero_id;
             return self.matvec_q_id(
@@ -2390,7 +2425,8 @@ impl<'a> Batch<'a> {
 mod tests {
     use super::*;
 
-    /// The int8 matmul, and the int8 matvec (under 8 tokens), against the f32 ones over the same
+    /// The int8 matmul, and the int8 matvec (under 8 tokens; Q4_K's takes up to 4 tokens a pass,
+    /// so 5 is a pass and a token and 3 a pass partly filled), against the f32 ones over the same
     /// random weights: they differ only by the rounding of activations to int8. The sizes
     /// leave a row tile, a token tile and a matvec step partly filled. Needs an NVIDIA GPU, so
     /// CI doesn't run it; `RLI_CUDA_NO_MMA=1` checks the dp4a matmuls on a GPU that would use
@@ -2402,6 +2438,7 @@ mod tests {
             (200, 512, 137),
             (203, 1280, 1),
             (64, 1024, 5),
+            (130, 768, 3),
             (130, 512, 13),
             (130, 768, 30),
         ]

@@ -237,7 +237,10 @@ Design points that span files:
   of separate loads per step, not the arithmetic, was what the f32 matvec spent its time on
   (Mistral-7B decode 72 -> 129 tok/s). A token's Q4_K matvec reads 8 super-blocks before using
   any (`mvq_q4_k_step8`, decode +2-4.5%); launches of 32+ grid rows keep 4 a step
-  (`mvq_q4_k_many`), where that was 2% slower. Those reads need the tensor at a multiple of 16 bytes in
+  (`mvq_q4_k_many`), where that was 2% slower. Chunks of 2 to 4 tokens run Q4_K through
+  `mvq_q4_k_multi` (a row read once for up to 4 tokens); the direct kernel takes Q4_K from
+  5 tokens and Q6_K from 3. Prompts of 2 to 5 tokens are still 7-20% behind llama.cpp
+  (2026-11-19), 6 and 7 level or ahead on Mistral-7B. Those reads need the tensor at a multiple of 16 bytes in
   VRAM (`Gpu::has_int8`), else f32 runs. Q6_K blocks are 210 bytes, so its lanes read the
   aligned 16-byte words around each span and shift (`ld24`; the arena ends in 16 bytes of slack
   for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose
@@ -287,7 +290,7 @@ Design points that span files:
   (Mistral-7B 96 tokens +7%; at 64 or 192 tokens the wide block is slower for Q4_K). Mistral-7B
   7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 6% faster than
   dequant + GEMM at 224, 1.5% at 256, 2% slower at 320 (runs of 30; shorter runs hid it); logits 0.085 from `precise` where int8 gave 0.27.
-  Q4_K matrices in chunks of 8 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:
+  Q4_K matrices in chunks of 5 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:
   blocks of 128 rows by 32 tokens whose lanes decode their own weights from the matrix, only
   the tokens staged (14336x4096 by 16 tokens 70 us, int8 92; by 32 tokens 76, the 64-token
   block 99). A step's columns are dealt so that a lane's 16 are one 8-byte word of the row

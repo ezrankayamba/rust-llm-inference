@@ -2579,3 +2579,32 @@ slower (796 -> 780), so launches of 32 grid rows or more (`MVQ_MANY`) keep 4 a s
 785 -> 381, 529, 790; Mistral-7B 4 / 6 tokens 251, 275 -> 257, 276). Decode-path logits against
 `--precise` (`dump_logits --per-token`, 200 characters): Llama-3.2-1B 0.31, Mistral-7B 0.17,
 top-1 the same. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each).
+
+## 2026-11-19: CUDA prompts of 2 to 7 tokens
+
+Never compared before: under 8 tokens (`MMQ_MIN_TOKENS`) a chunk ran one int8 matvec a token
+and matrix, each reading the matrix again. Ours / llama.cpp, tok/s, two rounds in turn
+(`cmp_only.sh`, A100): Mistral-7B 2 tokens 209 / 271; 4: 254 / 424; 6: 276 / 492.
+Llama-3.2-1B 2: 575 / 671; 4: 1009 / 1291; 6: 1225 / 1646. Qwen3-30B-A3B 2: 246 / 290; 4: 365 /
+405; 6: 436 / 484.
+
+- `mvq_q4_k_multi`: a warp takes a weight row and up to 4 tokens a pass, the row read and
+  decoded once. `RLI_CUDA_PROF=1`, Mistral-7B, a launch: 36.4 us for one token, 43.4 for two,
+  54.4 for four.
+- `gemm_*_direct` takes about as long for 4 tokens as for 16, so it is ahead from 5 tokens
+  for Q4_K (`GEMM_DIRECT_TOKENS`, was 8) and from 3 for Q6_K, which has no multi-token
+  matvec (`GEMM_DIRECT_Q6_K_FEW`).
+
+`bench --pp N --tg 0 --reps 150 --gpu-layers 999`, tok/s (a matvec a token as before / multi
+/ multi and Q6_K direct / the direct kernel for both types): Mistral-7B 2 tokens 213 / 224 /
+215 / 177; 3: 239 / 283 / 295 / 267; 4: 258 / 321 / 356 / 346; 5: 270 / 321 / 368 / 434; 6: 278 /
+345 / - / 519; 7: 284 / 366 / - / 601. Llama-3.2-1B 2: 633 / 715 / 685 / 566; 3: 954 / 959 / 975 /
+857; 4: 1115 / 1217 / 1304 / 1112; 5: 1313 / 1314 / 1406 / 1456; 6: 1402 / 1518 / - / 1612; 7:
+1468 / 1722 / - / 1930. CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each; the
+int8 test now has a 3-token case beside the 5-token one).
+
+Against llama.cpp after it (two rounds, ours / llama.cpp): Mistral-7B 2: 216 / 272; 3: 288 /
+362; 4: 349 / 427; 5: 428 / 469; 6: 518 / 488; 7: 584 / 526. Llama-3.2-1B 2: 646 / 704; 3: 736 /
+883; 4: 1037 / 1270; 5: 1344 / 1445; 6: 1538 / 1586; 7: 1648 / 1920. Qwen3-30B-A3B 2: 243 / 295;
+3: 310 / 369; 4: 365 / 421; 5: 405 / 445; 6: 455 / 495; 7: 486 / 519. Still behind at 2 to 5
+tokens: a 2-token Mistral-7B chunk takes 9.2 ms where a decoded token takes 5.75.
