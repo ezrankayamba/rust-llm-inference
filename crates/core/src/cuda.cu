@@ -890,79 +890,85 @@ MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
 // a pass, so the row's weights and scales are read and decoded once for all of them, where
 // a grid row per token read them once each. Token t reads row t of the activations and
 // writes (with `add`, adds into) row t of y.
-#define MVM_P 4
-extern "C" __global__ void mvq_q4_k_multi(const uchar* w, ulong w_off, const int* xq,
-                                          const float* xd, const float* xs, float* y,
-                                          ulong y_off, uint rows, uint cols, uint row_bytes,
-                                          uint n_tok, uint add) {
-    uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;
-    uint lane = threadIdx.x % 32, n_sb = cols / 256;
-    if (row >= rows) return;
-    const uchar* r = w + w_off + (ulong)row * row_bytes;
-    uint u = lane / 8, j = lane % 8, hf = j % 2, l = j % 4;
-    for (uint p0 = 0; p0 < n_tok; p0 += MVM_P) {
-        uint np = n_tok - p0 < MVM_P ? n_tok - p0 : MVM_P;
-        float acc[MVM_P];
-        #pragma unroll
-        for (uint p = 0; p < MVM_P; p++) acc[p] = 0;
-        for (uint c = 0; c < n_sb; c += 4) {
-            float f[MVM_P], mins[MVM_P];
-            int s0[MVM_P], s1[MVM_P];
-            #pragma unroll
-            for (uint p = 0; p < MVM_P; p++) {
-                f[p] = mins[p] = 0;
-                s0[p] = s1[p] = 0;
-            }
-            if (c + u < n_sb) {
-                const uchar* b = r + (c + u) * 144;
-                U128 hd = *(const U128*)b;
-                U128 q = *(const U128*)(b + 16 + 16 * j);
-                U128 x0[MVM_P], x1[MVM_P];
-                float d[MVM_P], sa[MVM_P], sb[MVM_P];
-                #pragma unroll
-                for (uint p = 0; p < MVM_P; p++) {
-                    if (p >= np) continue;
-                    ulong xo = (ulong)(p0 + p) * cols + 256 * (c + u);
-                    x0[p] = *(const U128*)(xq + xo / 4 + 16 * (j / 2) + 4 * hf);
-                    x1[p] = *(const U128*)(xq + xo / 4 + 16 * (j / 2) + 8 + 4 * hf);
-                    d[p] = xd[xo / 32 + j];
-                    sa[p] = xs[xo / 16 + 2 * j];
-                    sb[p] = xs[xo / 16 + 2 * j + 1];
-                }
-                uint b0 = (hd.v[1] >> 8 * l) & 255, b1 = (hd.v[2] >> 8 * l) & 255;
-                uint b2 = (hd.v[3] >> 8 * l) & 255;
-                uint sc = j < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);
-                uint mn = j < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);
-                float fs = h_bits(hd.v[0] & 0xFFFF) * (float)sc;
-                float fm = h_bits(hd.v[0] >> 16) * (float)mn;
-                #pragma unroll
-                for (uint p = 0; p < MVM_P; p++) {
-                    if (p >= np) continue;
-                    #pragma unroll
-                    for (uint k = 0; k < 4; k++) {
-                        s0[p] = dp4a(q.v[k] & 0x0F0F0F0Fu, x0[p].v[k], s0[p]);
-                        s1[p] = dp4a((q.v[k] >> 4) & 0x0F0F0F0Fu, x1[p].v[k], s1[p]);
-                    }
-                    f[p] = fs * d[p];
-                    mins[p] = fm * (sa[p] + sb[p]);
-                }
-            }
-            #pragma unroll
-            for (uint p = 0; p < MVM_P; p++) {
-                if (p >= np) continue;
-                float fo = __shfl_xor_sync(0xffffffff, f[p], 1);
-                acc[p] += (hf ? fo : f[p]) * (float)s0[p] + (hf ? f[p] : fo) * (float)s1[p] - mins[p];
-            }
-        }
-        #pragma unroll
-        for (uint p = 0; p < MVM_P; p++) {
-            if (p >= np) continue;
-            float a = warp_sum(acc[p]);
-            float* yr = y + y_off + (ulong)(p0 + p) * rows + row;
-            if (lane == 0) *yr = add ? *yr + a : a;
-        }
-    }
+// A kernel per MVM_P, since one that holds 4 tokens' activations runs 2 tokens 6% slower
+// than one that holds 2 (Mistral-7B, 2-token chunks: 225 -> 240 tok/s).
+#define MVQ_MULTI(NAME, MVM_P)                                                                 \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq,                    \
+                                          const float* xd, const float* xs, float* y,          \
+                                          ulong y_off, uint rows, uint cols, uint row_bytes,   \
+                                          uint n_tok, uint add) {                              \
+    uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
+    uint lane = threadIdx.x % 32, n_sb = cols / 256;                                           \
+    if (row >= rows) return;                                                                   \
+    const uchar* r = w + w_off + (ulong)row * row_bytes;                                       \
+    uint u = lane / 8, j = lane % 8, hf = j % 2, l = j % 4;                                    \
+    for (uint p0 = 0; p0 < n_tok; p0 += MVM_P) {                                               \
+        uint np = n_tok - p0 < MVM_P ? n_tok - p0 : MVM_P;                                     \
+        float acc[MVM_P];                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < MVM_P; p++) acc[p] = 0;                                           \
+        for (uint c = 0; c < n_sb; c += 4) {                                                   \
+            float f[MVM_P], mins[MVM_P];                                                       \
+            int s0[MVM_P], s1[MVM_P];                                                          \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < MVM_P; p++) {                                                 \
+                f[p] = mins[p] = 0;                                                            \
+                s0[p] = s1[p] = 0;                                                             \
+            }                                                                                  \
+            if (c + u < n_sb) {                                                                \
+                const uchar* b = r + (c + u) * 144;                                            \
+                U128 hd = *(const U128*)b;                                                     \
+                U128 q = *(const U128*)(b + 16 + 16 * j);                                      \
+                U128 x0[MVM_P], x1[MVM_P];                                                     \
+                float d[MVM_P], sa[MVM_P], sb[MVM_P];                                          \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < MVM_P; p++) {                                             \
+                    if (p >= np) continue;                                                     \
+                    ulong xo = (ulong)(p0 + p) * cols + 256 * (c + u);                         \
+                    x0[p] = *(const U128*)(xq + xo / 4 + 16 * (j / 2) + 4 * hf);               \
+                    x1[p] = *(const U128*)(xq + xo / 4 + 16 * (j / 2) + 8 + 4 * hf);           \
+                    d[p] = xd[xo / 32 + j];                                                    \
+                    sa[p] = xs[xo / 16 + 2 * j];                                               \
+                    sb[p] = xs[xo / 16 + 2 * j + 1];                                           \
+                }                                                                              \
+                uint b0 = (hd.v[1] >> 8 * l) & 255, b1 = (hd.v[2] >> 8 * l) & 255;             \
+                uint b2 = (hd.v[3] >> 8 * l) & 255;                                            \
+                uint sc = j < 4 ? b0 & 63 : (b2 & 15) | ((b0 >> 6) << 4);                      \
+                uint mn = j < 4 ? b1 & 63 : (b2 >> 4) | ((b1 >> 6) << 4);                      \
+                float fs = h_bits(hd.v[0] & 0xFFFF) * (float)sc;                               \
+                float fm = h_bits(hd.v[0] >> 16) * (float)mn;                                  \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < MVM_P; p++) {                                             \
+                    if (p >= np) continue;                                                     \
+                    _Pragma("unroll")                                                          \
+                    for (uint k = 0; k < 4; k++) {                                             \
+                        s0[p] = dp4a(q.v[k] & 0x0F0F0F0Fu, x0[p].v[k], s0[p]);                 \
+                        s1[p] = dp4a((q.v[k] >> 4) & 0x0F0F0F0Fu, x1[p].v[k], s1[p]);          \
+                    }                                                                          \
+                    f[p] = fs * d[p];                                                          \
+                    mins[p] = fm * (sa[p] + sb[p]);                                            \
+                }                                                                              \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < MVM_P; p++) {                                                 \
+                if (p >= np) continue;                                                         \
+                float fo = __shfl_xor_sync(0xffffffff, f[p], 1);                               \
+                float fa = hf ? fo : f[p], fb = hf ? f[p] : fo;                                \
+                acc[p] += fa * (float)s0[p] + fb * (float)s1[p] - mins[p];                     \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < MVM_P; p++) {                                                     \
+            if (p >= np) continue;                                                             \
+            float a = warp_sum(acc[p]);                                                        \
+            float* yr = y + y_off + (ulong)(p0 + p) * rows + row;                              \
+            if (lane == 0) *yr = add ? *yr + a : a;                                            \
+        }                                                                                      \
+    }                                                                                          \
 }
+MVQ_MULTI(mvq_q4_k_multi2, 2)
+MVQ_MULTI(mvq_q4_k_multi3, 3)
+MVQ_MULTI(mvq_q4_k_multi4, 4)
 #endif
 
 #ifdef RLI_MMA

@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("cuda.cu");
 const MATVEC_ROWS_PER_BLOCK: usize = 4;
+/// Fewest tokens of a chunk whose attention runs as tiled products (three launches, and a
+/// fourth to quantize the result); fewer take the one `attention` launch a decoded token
+/// does (Mistral-7B: 2 tokens 239 -> 248 tok/s, 4 tokens 358 -> 366, 6 tokens 526 -> 535).
+const ATTN_TILED_MIN: u32 = 8;
 /// Grid rows (matrices or tokens of one launch) from which the Q4_K int8 matvec reads 4
 /// super-blocks a step, not 8: see `mvq_q4_k_step8` in cuda.cu.
 const MVQ_MANY: usize = 32;
@@ -237,8 +241,8 @@ pub struct Gpu {
     mvq: Vec<(GgmlType, CudaFunction, CudaFunction)>,
     /// `mvq_q4_k_many`, for launches of [`MVQ_MANY`] grid rows or more.
     mvq_many: CudaFunction,
-    /// `mvq_q4_k_multi`.
-    mvq_multi: CudaFunction,
+    /// `mvq_q4_k_multi2`, `3` and `4`: for that many tokens a pass.
+    mvq_multi: [CudaFunction; 3],
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
@@ -465,7 +469,11 @@ impl Gpu {
             mmq_id,
             mvq,
             mvq_many: func("mvq_q4_k_many")?,
-            mvq_multi: func("mvq_q4_k_multi")?,
+            mvq_multi: [
+                func("mvq_q4_k_multi2")?,
+                func("mvq_q4_k_multi3")?,
+                func("mvq_q4_k_multi4")?,
+            ],
             mma,
             dequant,
             dequant_q4_k_any,
@@ -909,7 +917,7 @@ impl Gpu {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul by expert {t:?}")
-        } else if eq(&self.mvq_multi) {
+        } else if self.mvq_multi.iter().any(eq) {
             "int8 matvec Q4_K, few tokens".to_string()
         } else if eq(&self.mvq_many) {
             "int8 matvec Q4_K, many".to_string()
@@ -1543,7 +1551,7 @@ impl<'a> Batch<'a> {
             let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
             let (y_off, rb, nt, add) = (y.1 as u64, row_bytes as u32, n_tok as u32, add as u32);
             let (rows_u, cols_u) = (rows as u32, cols as u32);
-            let mut a = self.call(&gpu.mvq_multi);
+            let mut a = self.call(&gpu.mvq_multi[n_tok.min(4) - 2]);
             a.arg(&gpu.weights)
                 .arg(&w_off)
                 .arg(&xq.q)
@@ -2314,7 +2322,11 @@ impl<'a> Batch<'a> {
         }
         // Several tokens run as tiled products where the kernels take the shape.
         let g_n = p.n_head / p.n_kv;
-        if p.n_tok > 1 && 32 % g_n == 0 && p.head_dim <= 128 && p.head_dim.is_multiple_of(4) {
+        if p.n_tok >= ATTN_TILED_MIN
+            && 32 % g_n == 0
+            && p.head_dim <= 128
+            && p.head_dim.is_multiple_of(4)
+        {
             for tok0 in (0..p.n_tok).step_by(per_launch) {
                 let n = (per_launch as u32).min(p.n_tok - tok0);
                 let seen = (p.n_pos + tok0 + n - 1) as usize;

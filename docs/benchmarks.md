@@ -2608,3 +2608,25 @@ Against llama.cpp after it (two rounds, ours / llama.cpp): Mistral-7B 2: 216 / 2
 883; 4: 1037 / 1270; 5: 1344 / 1445; 6: 1538 / 1586; 7: 1648 / 1920. Qwen3-30B-A3B 2: 243 / 295;
 3: 310 / 369; 4: 365 / 421; 5: 405 / 445; 6: 455 / 495; 7: 486 / 519. Still behind at 2 to 5
 tokens: a 2-token Mistral-7B chunk takes 9.2 ms where a decoded token takes 5.75.
+
+Two more for those chunks, each against the build before it (`--reps 200`, in turn twice):
+- A multi-token matvec kernel per token count (`mvq_q4_k_multi2`, `3`, `4`): the one that
+  holds four tokens' activations ran two tokens slower. Mistral-7B 2 tokens 223, 224 -> 238,
+  239 tok/s; 3: 297, 297 -> 306, 307; 4: 358, 356 -> 357, 358.
+- The one `attention` launch under 8 tokens (`ATTN_TILED_MIN`), which also quantizes its
+  result, in place of the three tiled ones and `quant_x`: Mistral-7B 2 tokens 237, 241 -> 249,
+  248; 3: 308, 304 -> 317, 319; 4: 359, 357 -> 366, 367; 6: 524, 527 -> 534, 535. Llama-3.2-1B
+  2: 795, 778 -> 855, 863; 3: 1075, 1054 -> 1128, 1079; 4: 1273, 1303 -> 1416, 1353; 6: 1859,
+  1853 -> 1845, 1922.
+
+Where a short Mistral-7B chunk went before these two (launches skipped by kernel name,
+`--reps 200`; 1 / 2 / 4 tokens): whole 5.79 / 8.95 / 11.06 ms; the Q4_K matvecs 3.20 / 5.27 /
+6.90; Q6_K (matvecs; the direct kernel at 4) 1.26 / 1.93 / 2.15; everything else 1.31 / 1.94 /
+2.01, of which attention 0.21 / 0.73 / 0.63. One token is replayed as a CUDA graph with gate
+and up in one launch.
+
+CUDA tests pass with and without `RLI_CUDA_NO_MMA=1` (153 each). Against llama.cpp (two
+rounds, ours / llama.cpp): Mistral-7B 2: 233 / 266; 3: 311 / 354; 4: 358 / 416; 5: 434 / 463; 6:
+514 / 495; 7: 591 / 532. Llama-3.2-1B 2: 642 / 613; 3: 826 / 947; 4: 1015 / 1202; 5: 1308 / 1399;
+6: 1543 / 1702; 7: 1885 / 1852. Qwen3-30B-A3B 2: 272 / 294; 3: 327 / 364; 4: 386 / 421; 5: 421 /
+455; 6: 471 / 497; 7: 503 / 538.
