@@ -94,10 +94,10 @@ const GEMM_DIRECT_ID_PAIRS: usize = 4;
 /// tokens 120 us (int8 126), by 24 tokens 124 (141); by 8 tokens level, and a Mistral-7B
 /// prompt 2% slower.
 const GEMM_DIRECT_Q6_K_MIN: usize = 16;
-/// Under [`MMQ_MIN_TOKENS`], where Q6_K has only a matvec per token, chunks from this many
-/// tokens take `gemm_q6_k_direct` too (Mistral-7B at 3 tokens 283 -> 295 tok/s, at 4 tokens
-/// 321 -> 356; at 2 tokens 224 -> 215).
-const GEMM_DIRECT_Q6_K_FEW: usize = 3;
+/// Under [`MMQ_MIN_TOKENS`], chunks from this many tokens take `gemm_q6_k_direct` too; fewer
+/// run `mvq_q6_k_multi*` (Mistral-7B with those against the direct kernel: 3 tokens 317 ->
+/// 331 tok/s, 4 tokens 371 -> 390, 5 tokens level).
+const GEMM_DIRECT_Q6_K_FEW: usize = 5;
 /// Chunks of 65 tokens up to this take blocks of 128 tokens (`gemm_*_dense128`: a warp takes
 /// 16 rows by 64 tokens), which decode a matrix once where 64-token blocks decode it twice:
 /// 14336x4096 Q4_K by 96 tokens 195 us -> 182, by 128 tokens 215 -> 209, but by 64 tokens
@@ -243,6 +243,8 @@ pub struct Gpu {
     mvq_many: CudaFunction,
     /// `mvq_q4_k_multi2`, `3` and `4`: for that many tokens a pass.
     mvq_multi: [CudaFunction; 3],
+    /// `mvq_q6_k_multi2`, `3` and `4`.
+    mvq6_multi: [CudaFunction; 3],
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
@@ -473,6 +475,11 @@ impl Gpu {
                 func("mvq_q4_k_multi2")?,
                 func("mvq_q4_k_multi3")?,
                 func("mvq_q4_k_multi4")?,
+            ],
+            mvq6_multi: [
+                func("mvq_q6_k_multi2")?,
+                func("mvq_q6_k_multi3")?,
+                func("mvq_q6_k_multi4")?,
             ],
             mma,
             dequant,
@@ -917,6 +924,8 @@ impl Gpu {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
             format!("int8 matmul by expert {t:?}")
+        } else if self.mvq6_multi.iter().any(eq) {
+            "int8 matvec Q6_K, few tokens".to_string()
         } else if self.mvq_multi.iter().any(eq) {
             "int8 matvec Q4_K, few tokens".to_string()
         } else if eq(&self.mvq_many) {
@@ -1544,14 +1553,19 @@ impl<'a> Batch<'a> {
     ) {
         assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n_tok > 0);
         assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
-        // A few tokens of a Q4_K matrix share one read of each row.
-        if n_tok < MMQ_MIN_TOKENS && n_tok > 1 && ty == GgmlType::Q4_K {
+        // A few tokens of a Q4_K or Q6_K matrix share one read of each row.
+        let multi = match ty {
+            GgmlType::Q4_K => Some(&self.gpu.mvq_multi),
+            GgmlType::Q6_K => Some(&self.gpu.mvq6_multi),
+            _ => None,
+        };
+        if let (Some(multi), true) = (multi, n_tok < MMQ_MIN_TOKENS && n_tok > 1) {
             let gpu: &'a Gpu = self.gpu;
             let row_bytes = ty.row_bytes(cols);
             let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
             let (y_off, rb, nt, add) = (y.1 as u64, row_bytes as u32, n_tok as u32, add as u32);
             let (rows_u, cols_u) = (rows as u32, cols as u32);
-            let mut a = self.call(&gpu.mvq_multi[n_tok.min(4) - 2]);
+            let mut a = self.call(&multi[n_tok.min(4) - 2]);
             a.arg(&gpu.weights)
                 .arg(&w_off)
                 .arg(&xq.q)
@@ -2450,7 +2464,9 @@ mod tests {
             (200, 512, 137),
             (203, 1280, 1),
             (64, 1024, 5),
+            (130, 768, 2),
             (130, 768, 3),
+            (131, 512, 4),
             (130, 512, 13),
             (130, 768, 30),
         ]

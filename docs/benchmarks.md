@@ -2638,3 +2638,17 @@ one-token kernel does (`--reps 200`, in turn twice, 4 a step / 8): Mistral-7B 2 
 has arithmetic enough per step that it is no longer just waiting for its reads: a second
 token adds half again to the Q4_K matvecs' time (3.2 -> 4.7 ms a chunk) with no more weight
 read.
+
+Q6_K has the multi-token matvecs too (`mvq_q6_k_multi2`, `3`, `4`), and its direct kernel
+starts at 5 tokens, not 3 (`--reps 200`, in turn twice: before / direct from 3 / multi to 4):
+Mistral-7B 2 tokens 253, 256 / 267, 267 / 267, 265 tok/s; 3: 325, 323 / 317, 317 / 331, 332; 4:
+371, 371 / 371, 371 / 392, 389; 5: 451, 447 / 447, 454 / 446, 448. Llama-3.2-1B within its noise
+(2: 844, 837 / 888, 862 / 875, 861; 4: 1429, 1383 / 1389, 1369 / 1414, 1440). CUDA tests pass
+both ways (153 each). Against llama.cpp (two rounds, ours / llama.cpp): Mistral-7B 2: 247 /
+269; 3: 320 / 355; 4: 378 / 423; 5: 428 / 453. Llama-3.2-1B 2: 678 / 670; 3: 958 / 1014; 4: 1149 /
+1141; 5: 1320 / 1460. Qwen3-30B-A3B 2: 269 / 301; 3: 340 / 365; 4: 400 / 421; 5: 418 / 455.
+
+Tried and dropped on the same chunks: the int8 tensor-core matmul from 2 tokens in place of
+the matvecs and the direct kernel (Mistral-7B 2 tokens 255 -> 160 tok/s, 4: 376 -> 315, 6:
+539 -> 469); the direct kernel staging only the token rows a chunk has, by eights (5 to 24
+tokens: within 1% either way).

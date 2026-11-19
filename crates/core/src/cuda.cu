@@ -969,6 +969,75 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq,     
 MVQ_MULTI(mvq_q4_k_multi2, 2)
 MVQ_MULTI(mvq_q4_k_multi3, 3)
 MVQ_MULTI(mvq_q4_k_multi4, 4)
+// The same for Q6_K: mvq_q6_k_step's weights, decoded once for the pass's tokens.
+#define MVQ6_MULTI(NAME, MVM_P)                                                                \
+extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq,                    \
+                                const float* xd, const float* xs, float* y,                    \
+                                ulong y_off, uint rows, uint cols, uint row_bytes,             \
+                                uint n_tok, uint add) {                                        \
+    uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
+    uint lane = threadIdx.x % 32, n_sb = cols / 256;                                           \
+    if (row >= rows) return;                                                                   \
+    const uchar* r = w + w_off + (ulong)row * row_bytes;                                       \
+    uint u = lane / 8, j = lane % 8, n = j / 4, kk = j / 2 % 2, hf = j % 2;                    \
+    uint at = 128 * n + 32 * kk + 16 * hf, ia = at / 16;                                       \
+    for (uint p0 = 0; p0 < n_tok; p0 += MVM_P) {                                               \
+        uint np = n_tok - p0 < MVM_P ? n_tok - p0 : MVM_P;                                     \
+        float acc[MVM_P];                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < MVM_P; p++) acc[p] = 0;                                           \
+        for (uint c = 0; c + u < n_sb; c += 4) {                                               \
+            const uchar* b = r + (c + u) * 210;                                                \
+            ulong ql[3], qh[3], sc[3];                                                         \
+            ld24(b + 64 * n + 32 * kk + 16 * hf, ql);                                          \
+            ld24(b + 128 + 32 * n + 16 * hf, qh);                                              \
+            ld24(b + 192, sc);                                                                 \
+            U128 xa[MVM_P], xb[MVM_P];                                                         \
+            float da[MVM_P], db[MVM_P];                                                        \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < MVM_P; p++) {                                                 \
+                if (p >= np) continue;                                                         \
+                ulong xo = (ulong)(p0 + p) * cols + 256 * (c + u) + at;                        \
+                xa[p] = *(const U128*)(xq + xo / 4);                                           \
+                xb[p] = *(const U128*)(xq + xo / 4 + 16);                                      \
+                da[p] = xd[xo / 32];                                                           \
+                db[p] = xd[xo / 32 + 2];                                                       \
+            }                                                                                  \
+            uint wa[4], wb[4];                                                                 \
+            _Pragma("unroll")                                                                  \
+            for (uint t = 0; t < 4; t++) {                                                     \
+                uint lw = (uint)(ql[t / 2] >> 32 * (t % 2));                                   \
+                uint hw = (uint)(qh[t / 2] >> 32 * (t % 2));                                   \
+                wa[t] = word_q6_k(lw, hw, kk);                                                 \
+                wb[t] = word_q6_k(lw, hw, kk + 2);                                             \
+            }                                                                                  \
+            float d = h_bits((uint)sc[2] & 0xFFFF);                                            \
+            float fa = d * (float)(signed char)(sc[ia / 8] >> 8 * (ia % 8));                   \
+            float fb = d * (float)(signed char)(sc[ia / 8] >> 8 * (ia % 8 + 4));               \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < MVM_P; p++) {                                                 \
+                if (p >= np) continue;                                                         \
+                int sa = 0, sb = 0;                                                            \
+                _Pragma("unroll")                                                              \
+                for (uint t = 0; t < 4; t++) {                                                 \
+                    sa = dp4a(wa[t], xa[p].v[t], sa);                                          \
+                    sb = dp4a(wb[t], xb[p].v[t], sb);                                          \
+                }                                                                              \
+                acc[p] += fa * da[p] * (float)sa + fb * db[p] * (float)sb;                     \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < MVM_P; p++) {                                                     \
+            if (p >= np) continue;                                                             \
+            float a = warp_sum(acc[p]);                                                        \
+            float* yr = y + y_off + (ulong)(p0 + p) * rows + row;                              \
+            if (lane == 0) *yr = add ? *yr + a : a;                                            \
+        }                                                                                      \
+    }                                                                                          \
+}
+MVQ6_MULTI(mvq_q6_k_multi2, 2)
+MVQ6_MULTI(mvq_q6_k_multi3, 3)
+MVQ6_MULTI(mvq_q6_k_multi4, 4)
 #endif
 
 #ifdef RLI_MMA
