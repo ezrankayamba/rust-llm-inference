@@ -238,12 +238,13 @@ Design points that span files:
   (Mistral-7B decode 72 -> 129 tok/s). A token's Q4_K matvec reads 8 super-blocks before using
   any (`mvq_q4_k_step8`, decode +2-4.5%); launches of 32+ grid rows keep 4 a step
   (`mvq_q4_k_many`), where that was 2% slower. Chunks of 2 to 4 tokens run Q4_K and Q6_K
-  through `mvq_q4_k_multi2/3/4` and `mvq_q6_k_multi2/3/4` (a row read once for all its
-  tokens; a kernel per count, since holding 4 tokens' activations slows 2); the direct
+  through `mvq_q4_k_multi2/3/4` and `mvq_q6_k_multi2/4` (a row read once for all its
+  tokens; a kernel per count, since holding 4 tokens' activations slows 2, though Q6_K's
+  for 3 was slower than its 4); the direct
   kernel takes both from 5 tokens, and under 8 tokens (`ATTN_TILED_MIN`) attention is the
   one decode launch. With chunks of up to 32 tokens replayed as graphs (below), prompts of
-  2 to 32 tokens are level or ahead of llama.cpp (2026-11-19) except Mistral-7B at 3 tokens
-  (13% behind) and 4 (3%), Qwen3-30B-A3B at 2 and 3 (3-4%) and at 16 (5%). Those reads need the tensor at a multiple of 16 bytes in
+  2 to 32 tokens are level or ahead of llama.cpp (2026-11-19) except Mistral-7B at 2 to 4
+  tokens (2-7% behind) and Qwen3-30B-A3B at 16 (5%). Those reads need the tensor at a multiple of 16 bytes in
   VRAM (`Gpu::has_int8`), else f32 runs. Q6_K blocks are 210 bytes, so its lanes read the
   aligned 16-byte words around each span and shift (`ld24`; the arena ends in 16 bytes of slack
   for that). Launches cost about 4 microseconds each, so a token's are kept few: kernels whose

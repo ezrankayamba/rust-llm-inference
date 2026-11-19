@@ -243,7 +243,7 @@ pub struct Gpu {
     mvq_many: CudaFunction,
     /// `mvq_q4_k_multi2`, `3` and `4`: for that many tokens a pass.
     mvq_multi: [CudaFunction; 3],
-    /// `mvq_q6_k_multi2`, `3` and `4`.
+    /// The Q6_K ones, for 2, 3 and 4 tokens.
     mvq6_multi: [CudaFunction; 3],
     /// `mmq` holds the tensor-core kernels (`mma_*`), which take larger blocks.
     mma: bool,
@@ -478,7 +478,9 @@ impl Gpu {
             ],
             mvq6_multi: [
                 func("mvq_q6_k_multi2")?,
-                func("mvq_q6_k_multi3")?,
+                // One that holds 3 tokens took 69 us a launch on Mistral-7B where this takes 56
+                // for 3 or 4 (3-token chunks 345 -> 360 tok/s).
+                func("mvq_q6_k_multi4")?,
                 func("mvq_q6_k_multi4")?,
             ],
             mma,

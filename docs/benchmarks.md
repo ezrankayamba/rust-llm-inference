@@ -2675,3 +2675,11 @@ Against llama.cpp (two rounds, ours / llama.cpp): Mistral-7B 2: 270 / 274; 3: 32
 6: 1630 / 1485; 7: 1770 / 1912; 8: 2029 / 1940; 16: 4129 / 3760; 24: 5652 / 5264; 32: 8016 /
 6098. Qwen3-30B-A3B 2: 290 / 302; 3: 365 / 376; 4: 428 / 420; 5: 461 / 444; 6: 503 / 485; 7:
 536 / 529; 8: 550 / 529; 16: 817 / 862; 24: 1125 / 1023; 32: 1379 / 1188.
+
+`RLI_CUDA_PROF=1` on Mistral-7B at 2 / 3 / 4 tokens: the Q4_K multi-token matvec 34.1 / 40.1 /
+47.4 us a launch, the Q6_K one 54.5 / 69.4 / 55.6. So Q6_K takes its 4-token kernel for 3
+tokens and has none for 3 (`--reps 200`, in turn twice): Mistral-7B 3 tokens 343, 348 ->
+359, 361 tok/s; Llama-3.2-1B 1294, 1201 -> 1298, 1277; Qwen3-30B-A3B 392, 386 -> 387, 387.
+CUDA tests pass both ways (154 each). Against llama.cpp (two rounds, ours / llama.cpp):
+Mistral-7B 2: 267 / 273; 3: 348 / 365; 4: 391 / 422. Llama-3.2-1B 2: 761 / 684; 3: 986 / 923; 4:
+1219 / 1200. Qwen3-30B-A3B 2: 301 / 297; 3: 367 / 357; 4: 428 / 421.

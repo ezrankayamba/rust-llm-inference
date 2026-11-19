@@ -1036,7 +1036,6 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq,     
     }                                                                                          \
 }
 MVQ6_MULTI(mvq_q6_k_multi2, 2)
-MVQ6_MULTI(mvq_q6_k_multi3, 3)
 MVQ6_MULTI(mvq_q6_k_multi4, 4)
 #endif
 
