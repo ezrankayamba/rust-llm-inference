@@ -2877,3 +2877,43 @@ Behind now: one-thread decode on Zen 4 and Zen 5 without `--repack` (0-12%; 31.8
   per 32 values kept by decision.
 - x86: one-thread decode on Zen 4 and 5 unless `--repack` (opt-in for its memory), and
   K-quant prompts on AMX Xeons.
+
+## 2026-11-19: first runs on an RTX 5090 (Windows), against llama.cpp: the baseline
+
+The first build on Windows and the first GPU other than the A100: GeForce RTX 5090 (32 GB,
+driver 610.60, WDDM), Core Ultra 9 285, Windows 11, MSVC, CUDA Toolkit 12.9 for NVRTC. The
+engine built and passed its tests (`--no-default-features --features rli-models/cuda`, and
+`matmul_q_matches_f32_matmul` with and without `RLI_CUDA_NO_MMA=1`) with no change, at 77dc776.
+llama.cpp is cd959ba built there with `-DGGML_CUDA=ON`. Q4_K_M files, every layer offloaded.
+
+`bench --pp N --tg 0 --reps R --gpu-layers 999` and `llama-bench -ngl 99 -p N -n 0 -r R` in turn
+with 3 s rests, two rounds (they agree within 1%), mean tok/s. R is sized for about 4 s of work
+a run (60 to 3171). **With R = 2400 / N, as on the A100, a run lasted a fraction of a second**
+and the GPU stayed at 0-13% utilization and under 120 W of 575; sized this way it is at 80-88%
+and 380-470 W for both engines. Its clock still falls to 400-650 MHz in each rest. Decode is
+`--tg 256 --reps 10`.
+
+| Test | Llama-3.2-1B | llama.cpp | ratio | Mistral-7B | llama.cpp | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| Prompt, 2 | 1656 | 1786 | 0.93 | 476 | 516 | 0.92 |
+| Prompt, 4 | 2896 | 3336 | 0.87 | 782 | 954 | 0.82 |
+| Prompt, 8 | 4769 | 4830 | 0.99 | 1142 | 1542 | 0.74 |
+| Prompt, 16 | 8694 | 8778 | 0.99 | 2144 | 2816 | 0.76 |
+| Prompt, 32 | 15284 | 15200 | 1.01 | 3894 | 4908 | 0.79 |
+| Prompt, 64 | 20428 | 23936 | 0.85 | 5340 | 7603 | 0.70 |
+| Prompt, 96 | 25980 | 28796 | 0.90 | 6174 | 8978 | 0.69 |
+| Prompt, 128 | 26090 | 32226 | 0.81 | 6936 | 10173 | 0.68 |
+| Prompt, 192 | 35435 | 42550 | 0.83 | 7639 | 11354 | 0.67 |
+| Prompt, 256 | 38066 | 47180 | 0.81 | 8104 | 12494 | 0.65 |
+| Prompt, 384 | 34995 | 56422 | 0.62 | 7550 | 14455 | 0.52 |
+| Prompt, 512 | 39780 | 61792 | 0.64 | 7710 | 14641 | 0.53 |
+| Decode, 256 | 966.3 | 975.1 | 0.99 | 267.6 | 278.2 | 0.96 |
+
+Decode is level on Llama-3.2-1B and 4% behind on Mistral-7B. Prompts are level only on
+Llama-3.2-1B at 8 to 32 tokens; elsewhere 7-19% behind on it up to 256 tokens and 36-38% at 384
+and 512, and 8-48% behind on Mistral-7B, more the longer the prompt. On the A100 the same
+commit was level or ahead on Llama-3.2-1B and between 9% behind and 11% ahead on Mistral-7B.
+From the A100 to this card llama.cpp's Mistral-7B pp512 went from 4845 to 14641 tok/s (3.0x)
+and ours from 5400 to 7710 (1.4x): the kernels and thresholds were chosen by measuring on an
+A100 and do not carry over. Our speed stops rising past 256 tokens, where the dequantize +
+`gemm_f16_*` path takes over.
