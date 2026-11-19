@@ -297,8 +297,10 @@ Design points that span files:
   193 to 256; Q6_K: every chunk from 65), which then decode a matrix once. Q4_K's 128-token
   block has 16 warps of 16 rows by 32 tokens, so a thread holds what it does in the
   64-token one (on 8 warps it was 6-13% slower; Q6_K is 40% slower on 16 and keeps 8).
-  **A block costs nearly the same however many tokens it holds**, so 72 tokens are 10%
-  behind llama.cpp and 160 are 7%. Mistral-7B
+  The Q4_K kernels issue a step's reads before the step before it multiplies (`AHEAD`:
+  4-18% a matrix, Mistral-7B 3-6% at most lengths; Q6_K is 3-7% slower that way).
+  **A block costs nearly the same however many tokens it holds**, so Mistral-7B is still
+  behind llama.cpp at 72 tokens (4%), 160 (9%) and 192 (5%). Mistral-7B
   7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 6% faster than
   dequant + GEMM at 224, 1.5% at 256, 2% slower at 320 (runs of 30; shorter runs hid it); logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K matrices in chunks of 5 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:

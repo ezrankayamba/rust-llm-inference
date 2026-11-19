@@ -2752,3 +2752,26 @@ these kernels back: at 64, 56 and 48 every one of those times is the same to the
 A 16-warp block fits 120 + 0.78 n us for n tokens of 14336x4096 and a 64-token block is 124
 full, so the cost of a block is mostly not its tokens, and not its thread count either (96
 tokens on 12 warps cost what they do on 16).
+
+## 2026-11-19: the in-block CUDA matmul reads a step ahead (Q4_K)
+
+`GEMM_ID` with `AHEAD` issues a step's reads of weights and activations before the step
+before it multiplies, so they are under way meanwhile (a warp runs on past a read until it
+needs the value). Per matrix (`bench_cuda` with `RLI_DENSE=1`, its loop set to these lengths;
+us; before / after): Q4_K 4096x4096 by 64 tokens 46.7 / 40.9; 72: 58.1 / 53.4; 128: 71.0 /
+66.2; 160: 95.9 / 95.4; 256: 127.3 / 122.9. 14336x4096: 124.3 / 118.8; 180.1 / 164.2; 219.0 /
+203.3; 301.5 / 297.9; 403.7 / 376.8. 4096x14336: 145.3 / 122.1; 193.7 / 159.3; 215.0 / 195.1;
+298.6 / 295.7; 389.6 / 373.5. Q6_K 4096x14336 is slower for it (159.8 / 165.4; 206.2 / 216.9;
+250.9 / 260.9; 363.2 / 390.7; 432.6 / 464.9) and keeps the old order.
+Whole prompts, `bench --pp N --tg 0 --reps 30 --gpu-layers 999`, before and after in turn
+twice: Mistral-7B 48 tokens 2398, 2469 -> 2544, 2545 tok/s; 64: 2891, 2985 -> 3057, 2980; 72:
+2636, 2628 -> 2845, 2758; 96: 3263, 3217 -> 3399, 3324; 128: 3741, 3751 -> 3945, 3948; 160:
+3493, 3426 -> 3468, 3454; 192: 3753, 3771 -> 3813, 3811; 224: 3921, 3908 -> 4032, 4067; 256:
+4173, 4138 -> 4267, 4282. The Q4_K expert kernel (`gemm_q4_k_id`) the same way,
+Qwen3-30B-A3B: 24 tokens 1074, 1065 -> 1086, 1102; 32: 1317, 1370 -> 1352, 1387; 64: 1924,
+1923 -> 1957, 1908; 128: 2721, 2745 -> 2790, 2783; 256: 3926, 3917 -> 3981, 4005.
+
+CUDA tests pass both ways (154 each). Against llama.cpp (two rounds, ours / llama.cpp):
+Mistral-7B 32: 2335 / 2073; 48: 2600 / 2573; 64: 3041 / 2901; 72: 2794 / 2923; 96: 3318 / 3228;
+128: 3787 / 3448; 160: 3442 / 3772; 192: 3761 / 3953; 224: 3976 / 4042; 256: 4261 / 4163.
+Llama-3.2-1B 2-22% ahead at 32 to 256; Qwen3-30B-A3B 15-58%.

@@ -1500,7 +1500,10 @@ __device__ inline void gq6_k_dec(const ulong* hdr, const ulong* raw, uint j, uin
 // T is the tokens a block takes at a time, 64 or 128, and it has 4 NW warps: each takes 16
 // rows by T / NW tokens, and the first 8 decode. 128 tokens on 8 warps had a warp hold twice
 // the sums and tiles, and ran Q4_K 6-13% slower than on 16 (Q6_K, though, 40% faster).
-#define GEMM_ID(NAME, SB_BYTES, HDR, LOAD, DEC, DENSE, ARGS, NTOK, PARTS, T, NW)               \
+// With AHEAD a step's reads are issued before the step before it multiplies, so they are
+// under way meanwhile: Q4_K 14336x4096 by 72 tokens 180 us -> 164, by 256 tokens 404 -> 377;
+// Q6_K 3-7% slower for it.
+#define GEMM_ID(NAME, SB_BYTES, HDR, LOAD, DEC, DENSE, ARGS, NTOK, PARTS, T, NW, AHEAD)        \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const uint* perm,   \
                                 const uint* start, const uint* xh, uint x_div, float* y,       \
                                 ulong y_off, uint rows, uint cols, uint row_bytes ARGS) {      \
@@ -1532,18 +1535,20 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
         _Pragma("unroll")                                                                      \
         for (uint o = 0; o < T / (8 * NW); o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;     \
         ulong hdr[3], raw[3];                                                                  \
+        V128 v[T / (16 * NW)];                                                                 \
         for (uint ks = kb; ks < ke; ks++) {                                                    \
             uint j = ks % 4;                                                                   \
-            const uchar* b = wr + (ulong)(ks / 4) * SB_BYTES;                                  \
-            if (dec) {                                                                         \
-                if (j == 0 || ks == kb) HDR(b, hdr);                                           \
-                LOAD(b, j, ks == kb, dp, raw);                                                 \
+            if (!(AHEAD) || ks == kb) {                                                        \
+                const uchar* b = wr + (ulong)(ks / 4) * SB_BYTES;                              \
+                if (dec) {                                                                     \
+                    if (j == 0 || ks == kb) HDR(b, hdr);                                       \
+                    LOAD(b, j, ks == kb, dp, raw);                                             \
+                }                                                                              \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < T / (16 * NW); p++)                                       \
+                    if (tr + 16 * NW * p <= last)                                              \
+                        v[p] = *(const V128*)(xh + xr[p] * kw + ks * 32 + tw);                 \
             }                                                                                  \
-            V128 v[T / (16 * NW)];                                                             \
-            _Pragma("unroll")                                                                  \
-            for (uint p = 0; p < T / (16 * NW); p++)                                           \
-                if (tr + 16 * NW * p <= last)                                                  \
-                    v[p] = *(const V128*)(xh + xr[p] * kw + ks * 32 + tw);                     \
             if (dec) {                                                                         \
                 V128 lo, hi;                                                                   \
                 DEC(hdr, raw, j, dp, lo, hi);                                                  \
@@ -1555,6 +1560,19 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
                 if (tr + 16 * NW * p <= last)                                                  \
                     *(V128*)(xt + (tr + 16 * NW * p) * GE_S + tw) = v[p];                      \
             __syncthreads();                                                                   \
+            /* The next step's reads, issued before this one's products. */                    \
+            if ((AHEAD) && ks + 1 < ke) {                                                      \
+                uint j1 = (ks + 1) % 4;                                                        \
+                const uchar* b1 = wr + (ulong)((ks + 1) / 4) * SB_BYTES;                       \
+                if (dec) {                                                                     \
+                    if (j1 == 0) HDR(b1, hdr);                                                 \
+                    LOAD(b1, j1, false, dp, raw);                                              \
+                }                                                                              \
+                _Pragma("unroll")                                                              \
+                for (uint p = 0; p < T / (16 * NW); p++)                                       \
+                    if (tr + 16 * NW * p <= last)                                              \
+                        v[p] = *(const V128*)(xh + xr[p] * kw + (ks + 1) * 32 + tw);           \
+            }                                                                                  \
             uint a[4][4];                                                                      \
             _Pragma("unroll")                                                                  \
             for (uint k = 0; k < 4; k++) {                                                     \
@@ -1589,13 +1607,13 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
     }                                                                                          \
 }
 
-GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 0, , 0, 1, 64, 2)
-GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1, 64, 2)
+GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 0, , 0, 1, 64, 2, 1)
+GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1, 64, 2, 0)
 #define GEMM_DENSE_ARGS , uint n_tok, uint parts
-GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2)
-GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 4)
-GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2)
-GEMM_ID(gemm_q6_k_dense128, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 2)
+GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2, 1)
+GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 4, 1)
+GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2, 0)
+GEMM_ID(gemm_q6_k_dense128, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 2, 0)
 
 // GEMM_ID for few tokens a tile: a block takes 128 rows by 32 tokens, and a lane decodes the
 // weights of its own two rows that its multiplies take straight from the matrix. Only the
