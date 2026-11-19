@@ -2695,3 +2695,22 @@ their products, not all tokens' first (fewer values held at once; `--reps 200`, 
 twice): Mistral-7B 2 tokens 280, 279 -> 257, 257 tok/s; 3: 356, 362 -> 332, 328; 4: 404, 406 ->
 398, 399. With the read-ahead trial above, the kernel sits between the two: more reads in
 flight than a step's cost it registers, fewer cost it waits.
+
+All lengths again after the day's changes (two rounds, ours / llama.cpp; `cmp_only.sh`, runs
+of 2400 / N capped at 60): Mistral-7B 2: 265 / 274; 3: 342 / 348; 4: 399 / 419; 16: 1332 / 1292;
+48: 2575 / 2579; 72: 2758 / 2936; 96: 3329 / 3310; 160: 3468 / 3647; 192: 3886 / 3853; 224: 3776 /
+4118; 256: 3998 / 4254; 320: 4230 / 4226. Llama-3.2-1B 2-19% ahead at 2 to 320 but for 2-4% at
+4 and 96. Qwen3-30B-A3B 2: 281 / 287; 3: 357 / 376; 4: 425 / 415; 16: 817 / 861; 48 to 320:
+16-38% ahead.
+
+What Mistral-7B is behind by at 72, 160, 224 and 256 tokens is not in a matrix product. Per
+matrix, ours (`bench_cuda` with `RLI_DENSE=1`, its loop set to these lengths) / llama.cpp's
+`test-backend-ops perf`, us: Q4_K 4096x4096 by 160 / 224 / 256 tokens 92.8, 118.2, 126.4 /
+89.5, 120.0, 141.3; 14336x4096: 292.4, 377.3, 400.0 / 296.4, 379.3, 416.9; 4096x14336: 285.1,
+373.2, 400.0 / 294.8, 379.7, 420.3. Q6_K 4096x4096: 116.1, 132.4, 142.5 / 109.5, 138.8, 158.7;
+14336x4096: 383.0, 438.4, 469.2 / 358.1, 431.7, 468.1; 4096x14336: 371.7, 415.3, 445.2 / 355.8,
+432.5, 476.3. Only Q6_K at 160 is behind (4-7%; about half the layers' down projections).
+In sequence (launches skipped by kernel name, `--reps 40`): a 192-token prompt is 49.2 ms,
+6.3 without its matmuls, 4.2 without attention too, 1.4 with nothing but the transfers; a
+256-token one 62.6, 8.9, 5.5 and 1.5. So attention goes from 2.1 to 3.4 ms and the matmuls
+from 42.9 to 53.7, 7% more than their separate times add up to.
