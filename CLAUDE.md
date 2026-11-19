@@ -293,8 +293,12 @@ Design points that span files:
   Chunks of 24 to 256 tokens (`GEMM_DENSE_TOKENS`) run Q4_K and Q6_K matrices through
   `gemm_*_dense`, the MoE experts' kernel over every token: f16 `mma.sync`, a step's weights
   decoded in the block, the columns in parts that add into y (`dense_parts`). Blocks take
-  64 tokens, or 128 for chunks of 65 to 128 (Q6_K: from 65), which then decode a matrix once
-  (Mistral-7B 96 tokens +7%; at 64 or 192 tokens the wide block is slower for Q4_K). Mistral-7B
+  64 tokens, or 128 where the last such block holds more than 64 (chunks of 65 to 128 and
+  193 to 256; Q6_K: every chunk from 65), which then decode a matrix once. Q4_K's 128-token
+  block has 16 warps of 16 rows by 32 tokens, so a thread holds what it does in the
+  64-token one (on 8 warps it was 6-13% slower; Q6_K is 40% slower on 16 and keeps 8).
+  **A block costs nearly the same however many tokens it holds**, so 72 tokens are 10%
+  behind llama.cpp and 160 are 7%. Mistral-7B
   7-21% faster than int8 tensor cores there, 8% slower at 16 tokens, 6% faster than
   dequant + GEMM at 224, 1.5% at 256, 2% slower at 320 (runs of 30; shorter runs hid it); logits 0.085 from `precise` where int8 gave 0.27.
   Q4_K matrices in chunks of 5 to 32 tokens (`GEMM_DIRECT_TOKENS`) take `gemm_q4_k_direct`:

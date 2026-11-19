@@ -1497,9 +1497,10 @@ __device__ inline void gq6_k_dec(const ulong* hdr, const ulong* raw, uint j, uin
 // apart) and the pairs that chose e, 64 at a time. Pair p reads row p / x_div of xh and writes
 // row p of y. Thread i decodes for row i / 4, into words 4 (i % 4).. of each half of the step.
 // As in GEMM_F16, a step's reads are all issued before its first store.
-// T is the tokens a block takes at a time, 64 or 128: each of its 8 warps takes 16 rows by
-// T / 2 of them.
-#define GEMM_ID(NAME, SB_BYTES, HDR, LOAD, DEC, DENSE, ARGS, NTOK, PARTS, T)                   \
+// T is the tokens a block takes at a time, 64 or 128, and it has 4 NW warps: each takes 16
+// rows by T / NW tokens, and the first 8 decode. 128 tokens on 8 warps had a warp hold twice
+// the sums and tiles, and ran Q4_K 6-13% slower than on 16 (Q6_K, though, 40% faster).
+#define GEMM_ID(NAME, SB_BYTES, HDR, LOAD, DEC, DENSE, ARGS, NTOK, PARTS, T, NW)               \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const uint* perm,   \
                                 const uint* start, const uint* xh, uint x_div, float* y,       \
                                 ulong y_off, uint rows, uint cols, uint row_bytes ARGS) {      \
@@ -1516,35 +1517,43 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
     uint ra = 16 * (warp % 4) + gi, ow = warp / 4;                                             \
     uint tr = threadIdx.x / 8, tw = 4 * (threadIdx.x % 8);                                     \
     uint dr = threadIdx.x / 4, dp = threadIdx.x % 4;                                           \
+    bool dec = threadIdx.x < 256;                                                              \
     const uchar* wr = w + w_off + ey * stride +                                                \
                       (ulong)(row0 + dr < rows ? row0 + dr : rows - 1) * row_bytes;            \
     for (uint p0 = pb; p0 < p1; p0 += T) {                                                     \
         uint last = (p1 - p0 < T ? p1 - p0 : T) - 1;                                           \
         if (threadIdx.x <= last) pr[threadIdx.x] = DENSE ? p0 + threadIdx.x : perm[p0 + threadIdx.x];\
         __syncthreads();                                                                       \
-        ulong xr[T / 32];                                                                      \
+        ulong xr[T / (16 * NW)];                                                               \
         _Pragma("unroll")                                                                      \
-        for (uint p = 0; p < T / 32; p++) xr[p] = tr + 32 * p <= last ? pr[tr + 32 * p] / x_div : 0;\
-        float c[T / 16][4];                                                                    \
+        for (uint p = 0; p < T / (16 * NW); p++)                                               \
+            xr[p] = tr + 16 * NW * p <= last ? pr[tr + 16 * NW * p] / x_div : 0;               \
+        float c[T / (8 * NW)][4];                                                              \
         _Pragma("unroll")                                                                      \
-        for (uint o = 0; o < T / 16; o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;           \
+        for (uint o = 0; o < T / (8 * NW); o++) c[o][0] = c[o][1] = c[o][2] = c[o][3] = 0;     \
         ulong hdr[3], raw[3];                                                                  \
         for (uint ks = kb; ks < ke; ks++) {                                                    \
             uint j = ks % 4;                                                                   \
             const uchar* b = wr + (ulong)(ks / 4) * SB_BYTES;                                  \
-            if (j == 0 || ks == kb) HDR(b, hdr);                                               \
-            LOAD(b, j, ks == kb, dp, raw);                                                     \
-            V128 v[T / 32];                                                                    \
+            if (dec) {                                                                         \
+                if (j == 0 || ks == kb) HDR(b, hdr);                                           \
+                LOAD(b, j, ks == kb, dp, raw);                                                 \
+            }                                                                                  \
+            V128 v[T / (16 * NW)];                                                             \
             _Pragma("unroll")                                                                  \
-            for (uint p = 0; p < T / 32; p++)                                                  \
-                if (tr + 32 * p <= last) v[p] = *(const V128*)(xh + xr[p] * kw + ks * 32 + tw);\
-            V128 lo, hi;                                                                       \
-            DEC(hdr, raw, j, dp, lo, hi);                                                      \
-            *(V128*)(wt + dr * GE_S + 4 * dp) = lo;                                            \
-            *(V128*)(wt + dr * GE_S + 16 + 4 * dp) = hi;                                       \
+            for (uint p = 0; p < T / (16 * NW); p++)                                           \
+                if (tr + 16 * NW * p <= last)                                                  \
+                    v[p] = *(const V128*)(xh + xr[p] * kw + ks * 32 + tw);                     \
+            if (dec) {                                                                         \
+                V128 lo, hi;                                                                   \
+                DEC(hdr, raw, j, dp, lo, hi);                                                  \
+                *(V128*)(wt + dr * GE_S + 4 * dp) = lo;                                        \
+                *(V128*)(wt + dr * GE_S + 16 + 4 * dp) = hi;                                   \
+            }                                                                                  \
             _Pragma("unroll")                                                                  \
-            for (uint p = 0; p < T / 32; p++)                                                  \
-                if (tr + 32 * p <= last) *(V128*)(xt + (tr + 32 * p) * GE_S + tw) = v[p];      \
+            for (uint p = 0; p < T / (16 * NW); p++)                                           \
+                if (tr + 16 * NW * p <= last)                                                  \
+                    *(V128*)(xt + (tr + 16 * NW * p) * GE_S + tw) = v[p];                      \
             __syncthreads();                                                                   \
             uint a[4][4];                                                                      \
             _Pragma("unroll")                                                                  \
@@ -1556,8 +1565,8 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
                 a[k][3] = ap[8 * GE_S + 4];                                                    \
             }                                                                                  \
             _Pragma("unroll")                                                                  \
-            for (uint o = 0; o < T / 16; o++) {                                                \
-                uint tb = (2 * o + ow) * 8;                                                    \
+            for (uint o = 0; o < T / (8 * NW); o++) {                                          \
+                uint tb = (NW * o + ow) * 8;                                                   \
                 if (tb > last) continue;                                                       \
                 _Pragma("unroll")                                                              \
                 for (uint k = 0; k < 4; k++) {                                                 \
@@ -1568,8 +1577,8 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
             __syncthreads();                                                                   \
         }                                                                                      \
         _Pragma("unroll")                                                                      \
-        for (uint j = 0; j < T / 4; j++) {                                                     \
-            uint t = (2 * (j / 4) + ow) * 8 + 2 * gj + j % 2;                                  \
+        for (uint j = 0; j < T / (2 * NW); j++) {                                              \
+            uint t = (NW * (j / 4) + ow) * 8 + 2 * gj + j % 2;                                 \
             uint row = row0 + ra + 8 * (j / 2 % 2);                                            \
             if (t > last || row >= rows) continue;                                             \
             float* out = y + y_off + (ulong)pr[t] * rows + row;                                \
@@ -1580,13 +1589,13 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
     }                                                                                          \
 }
 
-GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 0, , 0, 1, 64)
-GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1, 64)
+GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 0, , 0, 1, 64, 2)
+GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1, 64, 2)
 #define GEMM_DENSE_ARGS , uint n_tok, uint parts
-GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64)
-GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128)
-GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64)
-GEMM_ID(gemm_q6_k_dense128, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128)
+GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2)
+GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 4)
+GEMM_ID(gemm_q6_k_dense, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2)
+GEMM_ID(gemm_q6_k_dense128, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 2)
 
 // GEMM_ID for few tokens a tile: a block takes 128 rows by 32 tokens, and a lane decodes the
 // weights of its own two rows that its multiplies take straight from the matrix. Only the

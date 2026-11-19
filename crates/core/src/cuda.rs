@@ -98,12 +98,13 @@ const GEMM_DIRECT_Q6_K_MIN: usize = 16;
 /// run `mvq_q6_k_multi*` (Mistral-7B with those against the direct kernel: 3 tokens 317 ->
 /// 331 tok/s, 4 tokens 371 -> 390, 5 tokens level).
 const GEMM_DIRECT_Q6_K_FEW: usize = 5;
-/// Chunks of 65 tokens up to this take blocks of 128 tokens (`gemm_*_dense128`: a warp takes
-/// 16 rows by 64 tokens), which decode a matrix once where 64-token blocks decode it twice:
-/// 14336x4096 Q4_K by 96 tokens 195 us -> 182, by 128 tokens 215 -> 209, but by 64 tokens
-/// 121 -> 158 and by 192 tokens 313 -> 325. Q6_K, whose decoding costs more, takes them
-/// at every length from 65: by 96 tokens 278 -> 221, by 192 tokens 437 -> 411.
-const GEMM_DENSE_WIDE_MAX: usize = 128;
+/// Blocks of 128 tokens (`gemm_*_dense128`) decode a matrix once where 64-token blocks decode
+/// it twice. Q6_K, whose decoding costs more, takes them at every length from 65 (4096x14336
+/// by 96 tokens 278 us -> 221, by 192 tokens 437 -> 411). Q4_K takes them where the last one
+/// has more than this many tokens, so 65 to 128 and 193 to 256: 14336x4096 by 72 / 128 / 224 /
+/// 256 tokens 192 / 244 / 397 / 418 us in 64-token blocks, 180 / 219 / 378 / 404 in these; by
+/// 160 / 192, where the last would hold 32 or 64, 301 / 327 against 329 / 353.
+const GEMM_DENSE_WIDE_REST: usize = 64;
 /// Most parts of a matrix's columns it takes.
 const GEMM_DENSE_PARTS_MAX: usize = 8;
 /// Most parts [`mma_parts`] splits a matrix's columns into.
@@ -1470,7 +1471,8 @@ impl<'a> Batch<'a> {
         assert!(self.has_gemm_dense(ty, cols, offset, n_tok) && rows > 0);
         assert!(xh.0.len() >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
         let direct = n_tok <= *GEMM_DIRECT_TOKENS.end();
-        let wide = n_tok > 64 && (n_tok <= GEMM_DENSE_WIDE_MAX || ty == GgmlType::Q6_K);
+        let wide =
+            n_tok > 64 && (ty == GgmlType::Q6_K || (n_tok - 1) % 128 >= GEMM_DENSE_WIDE_REST);
         let (tr, tt) = if direct {
             (128, 32)
         } else if wide {
@@ -1519,7 +1521,16 @@ impl<'a> Batch<'a> {
             .arg(&rb)
             .arg(&nt)
             .arg(&parts_u);
-        self.launch(a, grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, 256));
+        // Q4_K's blocks of 128 tokens have 16 warps (`NW` in cuda.cu).
+        let threads = if wide && ty == GgmlType::Q4_K {
+            512
+        } else {
+            256
+        };
+        self.launch(
+            a,
+            grid2(rows.div_ceil(tr), n_tok.div_ceil(tt) * parts, threads),
+        );
     }
 
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
@@ -2661,6 +2672,7 @@ mod tests {
                 (300, 768, 9),
                 (300, 768, 17),
                 (130, 768, 100),
+                (130, 768, 230),
                 (2048, 1024, 192),
             ] {
                 let mut seed = 3u32;

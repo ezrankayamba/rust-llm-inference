@@ -2714,3 +2714,31 @@ In sequence (launches skipped by kernel name, `--reps 40`): a 192-token prompt i
 6.3 without its matmuls, 4.2 without attention too, 1.4 with nothing but the transfers; a
 256-token one 62.6, 8.9, 5.5 and 1.5. So attention goes from 2.1 to 3.4 ms and the matmuls
 from 42.9 to 53.7, 7% more than their separate times add up to.
+
+## 2026-11-19: 128-token blocks on 16 warps for Q4_K (CUDA)
+
+`gemm_q4_k_dense128` had 8 warps take 16 rows by 64 tokens each: twice the sums and token
+tiles per thread of the 64-token block. On 16 warps of 16 rows by 32 tokens (the first 8
+decode; `NW` in `GEMM_ID`) a thread holds what it does there. Per matrix (`bench_cuda` with
+`RLI_DENSE=1`, its loop set to these lengths; us; 64-token blocks / 128 on 8 warps / on 16):
+Q4_K 4096x4096 by 72 tokens - / 61.6 / 58.0; 96: - / 69.7 / 62.3; 128: - / 81.1 / 70.8; 160:
+95.5 / 103.9 / 104.3; 192: 103.7 / 112.2 / 110.7; 224: 123.8 / 120.7 / 118.3; 256: 132.2 /
+131.0 / 127.3. 14336x4096 by 72: - / 191.9 / 180.0; 96: - / 214.3 / 194.2; 128: - / 244.4 /
+219.4; 160: 301.0 / 347.3 / 329.0; 192: 326.7 / 379.8 / 353.2; 224: 397.0 / 414.2 / 378.4; 256:
+418.2 / 448.7 / 403.5. 4096x14336 by 72: - / 195.9 / 192.9; 128: - / 246.6 / 214.8; 224: 397.3 /
+378.7 / 365.7; 256: 422.6 / 406.0 / 389.7. Q6_K 4096x14336 on 16 warps is slower at every
+length (72: 206.1 -> 295.4; 128: 250.7 -> 332.0; 256: 432.3 -> 602.0), so it keeps 8.
+Q4_K now takes 128-token blocks where the last holds more than 64 tokens (65 to 128 and 193
+to 256; `GEMM_DENSE_WIDE_REST`). Whole prompts, `bench --pp N --tg 0 --reps 30 --gpu-layers
+999`, before and after in turn twice: Mistral-7B 72 tokens 2595, 2582 -> 2615, 2647 tok/s; 96:
+3062, 3066 -> 3224, 3195; 128: 3586, 3522 -> 3722, 3762; 224: 3708, 3686 -> 3936, 3909; 256:
+3990, 3928 -> 4151, 4127. Llama-3.2-1B within its spread (128: 12843, 14604 -> 14787, 13412;
+224: 18082, 18100 -> 19108, 18732).
+
+CUDA tests pass both ways (154 each; `gemm_matches_f32_matmul` has a two-block case).
+Against llama.cpp (two rounds, ours / llama.cpp): Mistral-7B 64: 2924 / 2881; 72: 2654 / 2934;
+96: 3210 / 3314; 128: 3686 / 3428; 160: 3424 / 3701; 192: 3785 / 4008; 224: 3915 / 4141; 256:
+4084 / 4144. Llama-3.2-1B 4-17% ahead at 64 to 256; Qwen3-30B-A3B 17-53%. (The GPU ran both
+engines a few percent slower than in the morning's runs.) A block of either kind costs
+nearly the same whatever it holds (14336x4096: 124 us by 64 tokens in 64-token blocks, 180
+by 72 in a 128-token one), which is the 10% at 72 tokens.
