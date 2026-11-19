@@ -259,10 +259,12 @@ Design points that span files:
   from 155 to 178 tok/s, past llama.cpp's 171.5. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
   `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
   so the queueing code is the same either way; a pass whose launches differ is captured anew,
-  and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Prompt chunks of up
-  to 32 tokens (`GRAPH_TOKENS`) have a graph per length too (+3-14%), captured the second
+  and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Prompt chunks of any
+  length have a graph per length too (`GRAPH_TOKENS`; +3-14% up to 32 tokens on the A100,
+  and on an RTX 5090 under Windows, where a launch costs 8-10 us, Mistral-7B +19% at 48
+  tokens, +7% at 128, +1% at 512, Llama-3.2-1B +55%, +21%, +7%), captured the second
   time a length comes up, since a capture costs a chunk up to 14% once; the benchmark
-  repeats one length, which is the best case. Stacked MoE experts run
+  repeats one length, which is the best case. At most 64 are kept for lengths over 32. Stacked MoE experts run
   the int8 matvec too (`matvec_q_id`); other weight types stay f32. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`

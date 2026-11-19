@@ -783,7 +783,15 @@ impl Cuda {
         // so a length other than one token gets its graph the second time it comes up. A
         // layer routed on the CPU reads back mid-pass, so it can't be.
         let mut graph = self.graph.lock().unwrap_or_else(|p| p.into_inner());
-        let slot = graph.get_mut(n.wrapping_sub(1)).filter(|_| self.batchable);
+        let long = graph[GRAPH_SHORT..]
+            .iter()
+            .filter(|g| g.0.is_some())
+            .count();
+        let room =
+            |g: &(Option<Graph>, bool)| n <= GRAPH_SHORT || g.0.is_some() || long < GRAPH_LONG_MAX;
+        let slot = graph
+            .get_mut(n.wrapping_sub(1))
+            .filter(|g| self.batchable && room(g));
         if let Some((g, seen)) = slot
             && (n == 1 || std::mem::replace(seen, true))
             && !rli_core::cuda::profiling()
@@ -805,10 +813,18 @@ impl Cuda {
     }
 }
 
-/// The longest chunk replayed as a CUDA graph. Replayed against launched one by one, 200
-/// runs each on an A100: Mistral-7B 2 tokens 264 -> 280 tok/s, 8 tokens 693 -> 728, 32 tokens
-/// 2267 -> 2367; Qwen3-30B-A3B 2 tokens 281 -> 319, 16 tokens 787 -> 812.
-const GRAPH_TOKENS: usize = 32;
+/// The longest chunk replayed as a CUDA graph: any. Replayed against launched one by one,
+/// 200 runs each on an A100: Mistral-7B 2 tokens 264 -> 280 tok/s, 8 tokens 693 -> 728, 32
+/// tokens 2267 -> 2367; Qwen3-30B-A3B 2 tokens 281 -> 319, 16 tokens 787 -> 812. It was 32
+/// until an RTX 5090 under Windows, where a launch costs 8-10 us: Mistral-7B 48 tokens
+/// 6239 -> 7413 tok/s, 128 tokens 9965 -> 10701, 512 tokens 12668 -> 12782; Llama-3.2-1B
+/// 48 tokens 16623 -> 25736, 256 tokens 48821 -> 55822, 512 tokens 55971 -> 59712; 1024
+/// and 1536 tokens (chunks at different positions) level. Not measured past 32 on Linux.
+const GRAPH_TOKENS: usize = BATCH_CHUNK;
+/// Most graphs kept for chunks of more than [`GRAPH_SHORT`] tokens: a graph holds a node per
+/// launch, and a server sees many lengths. The lengths that come up first keep theirs.
+const GRAPH_LONG_MAX: usize = 64;
+const GRAPH_SHORT: usize = 32;
 
 impl Accelerator for Cuda {
     fn name(&self) -> &str {
@@ -989,7 +1005,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         n_head: c.n_head,
         head_dim: c.head_dim,
         scratch: Mutex::new(scratch),
-        graph: Mutex::new(Default::default()),
+        graph: Mutex::new(std::array::from_fn(|_| (None, false))),
         batch: Mutex::new(None),
         gpu,
     };

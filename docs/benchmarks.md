@@ -3070,3 +3070,50 @@ rli-models/cuda`): pass by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO
 within 8% of llama.cpp's, so the rest of the gap is outside them (attention, `swiglu`,
 `rmsnorm`, the zeroing launches: 20% of the prompt) and in Q6_K. Not yet looked at on this
 card: Qwen3-30B-A3B's expert kernels, prompts of 2 to 4 tokens, decode.
+
+## 2026-11-19: prompt chunks of every length replayed as CUDA graphs (RTX 5090)
+
+A 512-token Mistral-7B layer is about 19 launches, and under Windows (WDDM) a launch
+costs 8-10 us where a replayed graph node costs 1.3-7: the kernels of a layer summed to
+what the layer took. `GRAPH_TOKENS` was 32, the lengths at which we were already ahead of
+llama.cpp (which replays graphs at every length). Now any chunk length is replayed, with
+at most 64 graphs kept for lengths over 32 (`GRAPH_LONG_MAX`). Ours alone, tok/s, limit 32
+against no limit (`own.py`, runs of 3 s alternated, two rounds):
+
+| tokens | Mistral-7B | Llama-3.2-1B |
+|---|---|---|
+| 48 | 6239 -> 7413 | 16623 -> 25736 |
+| 64 | 7455 -> 8600 | 21478 -> 31992 |
+| 128 | 9965 -> 10701 | 30434 -> 36883 |
+| 256 | 11578 -> 12192 | 48821 -> 55822 |
+| 512 | 12668 -> 12782 | 55971 -> 59712 |
+| 1024 | 12246 -> 12253 | 54855 -> 55773 |
+| 1536 | 11699 -> 11639 | 52287 -> 53548 |
+
+A graph is captured the second time a length comes up, so the benchmark's one repeated
+length is the best case; 1024 and 1536 tokens (512-token chunks at different positions)
+show the replay holds across positions. Not measured on Linux, where a launch is about 4 us.
+
+Against llama.cpp with it (same method as above), Mistral-7B Q4_K_M, tok/s:
+
+| tokens | ours | llama.cpp | ratio |
+|---|---|---|---|
+| 2 | 483 | 523 | 0.92 |
+| 4 | 790 | 969 | 0.82 |
+| 8 | 1557 | 1561 | 1.00 |
+| 16 | 3012 | 2842 | 1.06 |
+| 32 | 5602 | 4939 | 1.13 |
+| 48 | 7327 | 6528 | 1.12 |
+| 64 | 8504 | 7688 | 1.11 |
+| 96 | 9483 | 9053 | 1.05 |
+| 128 | 10604 | 10189 | 1.04 |
+| 192 | 11060 | 11388 | 0.97 |
+| 256 | 12252 | 12594 | 0.97 |
+| 384 | 12630 | 14537 | 0.87 |
+| 512 | 12946 | 14720 | 0.88 |
+| decode, 256 | 267.8 | 279.9 | 0.96 |
+
+Llama-3.2-1B: 2 tokens 1663 / 1818 (0.92), 4: 2881 / 3377 (0.85), 8: 5545 / 4877 (1.14),
+16: 10298 / 8893 (1.16), 32: 18678 / 15398 (1.21); the link to the machine dropped before
+the longer lengths ran. Tests on the 5090 pass by default and with `RLI_CUDA_LEAN=0`;
+`dump_logits --precise` against `ref_forward.py` 6.7e-6 batched, 5.7e-6 per token.
