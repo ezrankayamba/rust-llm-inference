@@ -3385,3 +3385,25 @@ by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO_MMA=1`; logits: Llama-3
 `--precise` 7.6e-6 from NumPy batched and per-token, lean 0.190 from `precise`; Mistral-7B
 lean 0.140; Qwen3-30B-A3B int8 0.763 (precise batched against per-token 1.28e-4, the router's
 known run-to-run spread). Top-1 unchanged in all.
+
+## 2026-11-20: lean matmul tiles stored whole, partial ones fixed up after (RTX 5090, dropped)
+
+The lean kernels add every block's sums into y with `atomicAdd`, so y is zeroed first (59 MB
+for Mistral-7B's gate and up at 512 tokens). Tried llama.cpp's stream-k fixup instead: the
+block whose work starts a tile stores it (or adds it to the residual stream) without atomics,
+a block whose first tile starts mid-way writes it to its own slot of a scratch buffer, and a
+second kernel (`mmk_fixup`) adds the slots into y; no zeroing. `bench_cuda`, us, best of two
+alternated runs (2917-2932 MHz, 194-216 W), before -> after:
+
+| Q4_K shape x tokens | 128 | 512 |
+|---|---|---|
+| 4096x4096 | 31.4 -> 39.6 | 76.2 -> 82.4 |
+| 14336x4096 | 70.0 -> 76.2 | 234.8 -> 231.9 |
+| 4096x14336 | 65.9 -> 74.1 | 221.4 -> 229.7 |
+| 2048x2048 | 17.5 -> 18.8 | 31.0 -> 39.3 |
+| 8192x2048 | 31.2 -> 39.5 | 82.6 -> 85.8 |
+
+Q6_K 4096x14336: 95.7 -> 98.3 (128 tokens), 308.0 -> 300.9 (512). The fixup costs about 8 us a
+matmul (up to one 128x128 slot of atomics per block, 170 of them), and the zeroing it saves
+was worth at most 3 us even on the 14336-row matrix: zeroing is not the tall matrices' gap
+to llama.cpp. Not run on whole models.
