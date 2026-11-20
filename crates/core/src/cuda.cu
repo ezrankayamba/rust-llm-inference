@@ -1328,7 +1328,9 @@ MATMUL_MMK(mmk_q4_k_id32, MMK_SIG_ID, MMK_PRE_ID, 1, 32, 1, 1)
 MATMUL_MMK(mmk_q4_k_id64, MMK_SIG_ID, MMK_PRE_ID, 1, 64, 2, 1)
 
 // The same for Q6_K: 16 columns a scale, so twice the multiplies, and no offsets. Its rows
-// lie at even addresses only, so a quant word is read as two halves; a lane takes a word.
+// lie at even addresses only, so a quant word is read as two halves. A lane reads a word of
+// low bits and one of high bits and decodes both nibbles, two words, from them (llama.cpp's
+// load; taking one word, and half of each read: 4096x14336 by 128 tokens 109 -> 96 us).
 __device__ inline void ldm1(const uint* p, int* b) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x1.b16 {%0}, [%1];" : "=r"(b[0]) : "l"(p));
 }
@@ -1337,9 +1339,9 @@ __device__ inline void ldm1(const uint* p, int* b) {
             const uchar* sb = wb + (ulong)((KH) / 2) * 210;                                    \
             uint hf = (KH) % 2;                                                                \
             _Pragma("unroll")                                                                  \
-            for (uint p = 0; p < 16; p++) {                                                    \
-                v0[p] = u32e(sb + ro[p] + 64 * hf + 32 * (k % 2) + i);                         \
-                v1[p] = u32e(sb + ro[p] + 128 + 32 * hf + i);                                  \
+            for (uint p = 0; p < 8; p++) {                                                     \
+                v0[p] = u32e(sb + ro[p] + 64 * hf + 4 * tx);                                   \
+                v1[p] = u32e(sb + ro[p] + 128 + 32 * hf + 4 * (tx % 8));                       \
             }                                                                                  \
             _Pragma("unroll")                                                                  \
             for (uint p = 0; p < 4; p++) {                                                     \
@@ -1378,13 +1380,15 @@ extern "C" __global__ void NAME(SIG) {                                          
         uint k1 = ue - u < nk - k0 ? k0 + (ue - u) : nk;                                       \
         uint row0 = (ID ? blockIdx.x : tile % nrt) * 128, t0 = tile / nrt * T;                 \
         uint last = np - 1 - t0;                                                               \
-        /* Row 16 warp + p of the tile for quants, and a row to every 8 lanes for scales. */   \
-        uint ro[16], rs[4];                                                                    \
+        /* Rows 16 warp + 2 p + lane / 16 of the tile for quants (16 lanes a row, each reading \
+           a word of low nibbles, 32 columns apart from the high ones, and the word of high    \
+           bits both use), and a row to every 8 lanes for scales. */                           \
+        uint ro[8], rs[4];                                                                     \
         const uint* xp[T / 32];                                                                \
         const float* dp[T / 32];                                                               \
         _Pragma("unroll")                                                                      \
-        for (uint p = 0; p < 16; p++) {                                                        \
-            uint r = row0 + 16 * warp + p;                                                     \
+        for (uint p = 0; p < 8; p++) {                                                         \
+            uint r = row0 + 16 * warp + 2 * p + lane / 16;                                     \
             ro[p] = (r < rows ? r : rows - 1) * row_bytes;                                     \
         }                                                                                      \
         _Pragma("unroll")                                                                      \
@@ -1403,8 +1407,8 @@ extern "C" __global__ void NAME(SIG) {                                          
         float acc[T / 2];                                                                      \
         _Pragma("unroll")                                                                      \
         for (uint j = 0; j < T / 2; j++) acc[j] = 0;                                           \
-        uint k = lane / 8, i = 4 * (lane % 8);                                                 \
-        uint v0[16], v1[16], hd[4];                                                            \
+        uint tx = lane % 16, up = lane / 16;                                                   \
+        uint v0[8], v1[8], hd[4];                                                              \
         int sc[4];                                                                             \
         U128 xv[T / 32];                                                                       \
         F128 dv[T / 32];                                                                       \
@@ -1424,8 +1428,19 @@ extern "C" __global__ void NAME(SIG) {                                          
                 MMK6_READ_X(kh, T)                                                             \
             }                                                                                  \
             _Pragma("unroll")                                                                  \
-            for (uint p = 0; p < 16; p++)                                                      \
-                wq[(16 * warp + p) * MK_S + lane] = word_q6_k(v0[p], v1[p], k);                \
+            for (uint p = 0; p < 8; p++) {                                                     \
+                /* Word tx of the row: quarter tx / 8 (low nibbles), and tx / 8 + 2 (high). */ \
+                uint hb = v1[p] >> (tx & 8) / 4;                                               \
+                uint lo = (v0[p] & 0x0F0F0F0Fu) | ((hb << 4) & 0x30303030u);                   \
+                uint hi = ((v0[p] >> 4) & 0x0F0F0F0Fu) | (hb & 0x30303030u);                   \
+                lo = ((lo | 0x80808080u) - 0x20202020u) ^ 0x80808080u;                         \
+                hi = ((hi | 0x80808080u) - 0x20202020u) ^ 0x80808080u;                         \
+                /* The second row's lanes store their high word first, so the two halves of    \
+                   the warp write different banks (rows are MK_S = 4 banks apart). */          \
+                uint* wr = wq + (16 * warp + 2 * p + up) * MK_S + tx;                          \
+                wr[16 * up] = up ? hi : lo;                                                    \
+                wr[16 - 16 * up] = up ? lo : hi;                                               \
+            }                                                                                  \
             _Pragma("unroll")                                                                  \
             for (uint p = 0; p < 4; p++) {                                                     \
                 ws[(16 * warp + 4 * p + lane / 8) * 8 + lane % 8] = sc[p];                     \

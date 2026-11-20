@@ -3353,3 +3353,35 @@ Logits unchanged on Llama-3.2-1B and Mistral-7B. On Qwen3-30B-A3B the precise ba
 logits vary from run to run since the tiled f32 router (6e1a75f) adds its column parts with
 `atomicAdd`: of four runs, one was 1.28e-04 from the others, which were within 1e-05 of each
 other and of the per-token path (per-token runs bit-identical); top-1 the same throughout.
+
+## 2026-11-20: lean Q6_K reads both nibbles of every word (RTX 5090, Windows)
+
+`MATMUL_MMK6` read, for each lane and row, a word of low bits and a word of high bits, and
+used one nibble and one bit pair of them: half of every read. Now a lane decodes both
+nibbles of its words into two (llama.cpp's `load_tiles_q6_K`), so a row takes 16 lanes and
+a warp's load covers two rows; the second row's lanes store their high word first, so the
+two halves of the warp write different banks.
+
+Matmul alone (`bench_cuda`, us, best of two runs alternated; 2925-2940 MHz, 204-212 W;
+llama.cpp `test-backend-ops perf` from the same day for reference):
+
+| Q6_K shape x tokens | before | after | llama.cpp |
+|---|---|---|---|
+| 1024x4096 x 128 / 512 | 17.7 / 37.2 | 18.5 / 37.2 | |
+| 4096x4096 x 128 / 512 | 41.3 / 104.4 | 41.2 / 102.4 | 38.5 / 93.5 |
+| 4096x14336 x 128 / 512 | 108.9 / 316.9 | 95.6 / 307.2 | 84.8 / 292.0 |
+
+Whole prompts (`bench --pp N --tg 0`, before and after alternated, tok/s; ratio to llama.cpp
+from the same day):
+
+| model | 128 | 512 | 1024 |
+|---|---|---|---|
+| Mistral-7B | 11113 -> 11233 (+1.1%, 1.10) | 13439 -> 13482 (+0.3%, 0.92) | 13250 -> 13276 (+0.2%, 0.90) |
+| Qwen3-30B-A3B | 7772 -> 7768 | 13346 -> 13316 (1.04) | 12779 -> 12806 (0.99) |
+| Llama-3.2-1B | 39408 -> 39531 (1.21) | 66130 -> 65858 (1.07) | 67734 -> 67937 (1.04) |
+
+Q6_K is 15% of a Mistral-7B prompt, so the matmul's gain is small in the whole. Tests pass
+by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO_MMA=1`; logits: Llama-3.2-1B
+`--precise` 7.6e-6 from NumPy batched and per-token, lean 0.190 from `precise`; Mistral-7B
+lean 0.140; Qwen3-30B-A3B int8 0.763 (precise batched against per-token 1.28e-4, the router's
+known run-to-run spread). Top-1 unchanged in all.
