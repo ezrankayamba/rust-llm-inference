@@ -3186,3 +3186,41 @@ with one block per multiprocessor that wait is not hidden. Not merged.
 The lean kernels' shared arrays were 16-byte aligned by chance: a 4-byte `__shared__`
 declared before them gave `CUDA_ERROR_MISALIGNED_ADDRESS` on their 16-byte accesses.
 Declare `__align__(16)` on such arrays when changing the kernels.
+
+## 2026-11-20: decode reads its position from the device (RTX 5090, Windows)
+
+A replayed decode graph updated 4 nodes a layer every token (the K and V matvecs' cache
+offset, the rotation's position, attention's length): 128 a token on Mistral-7B, 192 on
+Qwen3-30B-A3B. With the GPU idle between tokens timed (read of the logits done to
+`cuGraphLaunch` returned): Mistral-7B 170 us of a 3717 us token (4.6%), Llama-3.2-1B 79 of
+1019 (7.8%), Qwen3-30B-A3B 302 of 3061 (9.9%); of a Mistral-7B token's host time, the
+queueing closure 38 us, the updates 32, `cuGraphLaunch` 77 (Qwen3-30B-A3B 67, 50, 149).
+
+Now the position is a device word written before the graph (`Scratch::pos`), the kernels add
+it to their argument (`RopeArgs::pos_dev`, `AttnParams::pos_dev`), K and V go to scratch and
+`rope` / `norm_rope` store them into the cache, and `attention_part`'s grid grows in steps of
+8 parts with the blocks past the context left empty. Node updates a token: 0.2 and 0.4; GPU
+idle 139 and 243 us. Logits unchanged in every printed digit (per-token against batched,
+precise: Qwen3-30B-A3B 7.63e-06, Mistral-7B 7.87e-06, Llama-3.2-1B 7.63e-06; Llama-3.2-1B
+per-token against NumPy 7.6e-06 over 294 tokens).
+
+Decode, 128 tokens, best of 3 alternating runs (`tgc.py`; SM clock, power):
+
+| model | context | before | after |
+|---|---|---|---|
+| Mistral-7B | 0 | 269.5 (2902 MHz, 468 W) | 270.3 (2902 MHz, 466 W) +0.3% |
+| Mistral-7B | 1024 | 257.9 (2887 MHz, 503 W) | 259.4 (2884 MHz, 512 W) +0.6% |
+| Llama-3.2-1B | 0 | 985.4 (2858 MHz, 189 W) | 992.2 (2895 MHz, 276 W) +0.7% |
+| Llama-3.2-1B | 1024 | 936.0 (2887 MHz, 200 W) | 944.7 (2887 MHz, 214 W) +0.9% |
+| Qwen3-30B-A3B | 0 | 330.8 (2902 MHz, 360 W) | 334.5 (2902 MHz, 362 W) +1.1% |
+| Qwen3-30B-A3B | 1024 | 313.6 (2880 MHz, 388 W) | 318.3 (2887 MHz, 391 W) +1.5% |
+
+A first estimate that skipped the updates (results wrong) gained 2.7% and 5.7%: with stale
+arguments attention read only the positions of the token the graph was captured at.
+
+Measured in the same session: GPU idle between tokens is now mostly `cuGraphLaunch` (69 us
+Mistral-7B, 129 us Qwen3-30B-A3B), which grows with the graph's nodes. Attention's share of a
+prompt, by skipping it (results wrong; Mistral-7B / Llama-3.2-1B): 256 tokens 6.3% / 8.8%,
+512 tokens 7.6% / 13.4%, 1024 tokens 12.9% / 20.8%. Qwen3-30B-A3B's grouped expert tiles
+are 91% padding at 16 tokens, 76% at 64, 66% at 256, 48% at 512 (the busiest expert holds at
+most 6 tiles, so the load is even enough).

@@ -231,6 +231,7 @@ fn main() {
                 max_ctx: max_ctx as u32,
                 scale: 0.1,
                 half: false,
+                pos_dev: None,
             };
             let run = || {
                 let mut b = gpu.batch();

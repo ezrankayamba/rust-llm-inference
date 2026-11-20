@@ -38,6 +38,8 @@ const ATTN_PART: usize = 32;
 const ATTN_PART_THREADS: u32 = 256;
 const ATTN_PART_HEADS: u32 = 8;
 const ATTN_PART_MAX: usize = 2048;
+/// Decode attention's parts go in multiples of this many (see [`Batch::attention_decode`]).
+const ATTN_PART_STEP: usize = 8;
 /// Fewest cached positions it runs for; under that its second launch costs more than the
 /// one-launch kernel loses (A100: 13-20 against 10-17 microseconds at 128 positions, 19-26
 /// against 37-55 at 512).
@@ -190,7 +192,7 @@ impl<'a> From<&'a GpuBuf> for At<'a> {
     }
 }
 
-pub struct AttnParams {
+pub struct AttnParams<'a> {
     pub n_head: u32,
     pub n_kv: u32,
     pub head_dim: u32,
@@ -203,6 +205,9 @@ pub struct AttnParams {
     pub scale: f32,
     /// Several tokens' scores and sums may run on f16 tensor cores (not under `precise`).
     pub half: bool,
+    /// A device word and the value it holds, which the kernels read in place of that much of
+    /// `n_pos`: launches that differ only in it are then the same (see [`RopeArgs::pos_dev`]).
+    pub pos_dev: Option<(&'a GpuIds, u32)>,
 }
 
 /// Rotary embedding settings for [`Batch::rope`].
@@ -218,6 +223,40 @@ pub struct RopeArgs<'a> {
     pub theta: f32,
     pub neox: bool,
     pub freq_factors: Option<&'a GpuBuf>,
+    /// A device word and the value it holds, which the kernel reads in place of that much of
+    /// `pos`: a replayed graph's launches then need no update as the position moves.
+    pub pos_dev: Option<(&'a GpuIds, usize)>,
+    /// The K cache, the V rows and the V cache: the rotated keys are stored into the cache at
+    /// their positions instead of back in place, and V is copied there (`rope_dim ==
+    /// head_dim`).
+    pub store: Option<(&'a GpuBuf, &'a GpuBuf, &'a GpuBuf)>,
+}
+
+impl RopeArgs<'_> {
+    /// The kernels' position argument, and the device word they add to it.
+    fn dev_pos<'g>(&'g self, zero: &'g GpuIds) -> (u32, &'g GpuIds) {
+        match self.pos_dev {
+            Some((d, v)) => ((self.pos - v) as u32, d),
+            None => (self.pos as u32, zero),
+        }
+    }
+
+    /// The store arguments: K cache, V rows, V cache, the cache row length and the flag.
+    fn store_args<'g>(&'g self, x: &'g GpuBuf, heads2: usize) -> [&'g GpuBuf; 3] {
+        match self.store {
+            Some((k, vs, vd)) => {
+                assert_eq!(
+                    self.rope_dim, self.head_dim,
+                    "storing rope needs full rotation"
+                );
+                let at = (self.pos + self.n_tok) * self.n_heads2 * self.head_dim;
+                assert!(k.len() >= at && vd.len() >= at);
+                assert!(vs.len() >= heads2 * self.head_dim);
+                [k, vs, vd]
+            }
+            None => [x, x, x],
+        }
+    }
 }
 
 /// An uploaded byte range of the model file: `[file_off, file_off + len)` lives at `dev_off`.
@@ -611,6 +650,12 @@ impl Gpu {
     }
 
     /// Copies `data` into the start of `dst` (ordered after queued work on the stream).
+    pub fn write_ids(&self, dst: &mut GpuIds, data: &[u32]) {
+        self.stream
+            .memcpy_htod(data, &mut dst.0.slice_mut(..data.len()))
+            .expect("CUDA upload failed");
+    }
+
     pub fn write(&self, dst: &mut GpuBuf, data: &[f32]) {
         self.stream
             .memcpy_htod(data, &mut dst.0.slice_mut(..data.len()))
@@ -2301,13 +2346,11 @@ impl<'a> Batch<'a> {
         let (nh2, per_tok2) = (heads2 as u32, r.n_heads2 as u32);
         let ff = r.freq_factors.unwrap_or(x.0);
         let has_ff = r.freq_factors.is_some() as u32;
-        let (nh, hd, rd, pos) = (
-            heads as u32,
-            r.head_dim as u32,
-            r.rope_dim as u32,
-            r.pos as u32,
-        );
+        let (pos, posd) = r.dev_pos(&self.gpu.zero_id);
+        let (nh, hd, rd) = (heads as u32, r.head_dim as u32, r.rope_dim as u32);
         let (neox, per_tok) = (r.neox as u32, r.n_heads as u32);
+        let [kd, vs, vd] = r.store_args(x.0, heads2);
+        let (kv_dim, store) = ((r.n_heads2 * r.head_dim) as u32, r.store.is_some() as u32);
         let mut l = self.call(self.gpu.other("rope"));
         l.arg(&x.0.0)
             .arg(&x_off)
@@ -2323,8 +2366,19 @@ impl<'a> Batch<'a> {
             .arg(&x2.0.0)
             .arg(&x2_off)
             .arg(&nh2)
-            .arg(&per_tok2);
-        let n = (heads + heads2) * r.rope_dim / 2;
+            .arg(&per_tok2)
+            .arg(&posd.0)
+            .arg(&kd.0)
+            .arg(&vs.0)
+            .arg(&vd.0)
+            .arg(&kv_dim)
+            .arg(&store);
+        let copy = if r.store.is_some() {
+            heads2 * r.head_dim
+        } else {
+            0
+        };
+        let n = (heads + heads2) * r.rope_dim / 2 + copy;
         self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
     }
 
@@ -2352,13 +2406,12 @@ impl<'a> Batch<'a> {
         let (x_off, x2_off) = (x.1 as u64, x2.1 as u64);
         let ff = r.freq_factors.unwrap_or(x.0);
         let has_ff = r.freq_factors.is_some() as u32;
-        let (nh, hd, rd, pos) = (
-            heads as u32,
-            r.head_dim as u32,
-            r.rope_dim as u32,
-            r.pos as u32,
-        );
+        let (pos, posd) = r.dev_pos(&self.gpu.zero_id);
+        let (nh, hd, rd) = (heads as u32, r.head_dim as u32, r.rope_dim as u32);
         let (neox, per_tok, per_tok2) = (r.neox as u32, r.n_heads as u32, r.n_heads2 as u32);
+        let [kd, vs, vd] = r.store_args(x.0, heads2);
+        let (kv_dim, nh2) = ((r.n_heads2 * r.head_dim) as u32, heads2 as u32);
+        let store = r.store.is_some() as u32;
         let mut l = self.call(self.gpu.other("norm_rope"));
         l.arg(&x.0.0)
             .arg(&x_off)
@@ -2376,8 +2429,24 @@ impl<'a> Batch<'a> {
             .arg(&x2_off)
             .arg(&wk.0)
             .arg(&per_tok2)
-            .arg(&eps);
-        self.launch(l, grid(heads + heads2, hd));
+            .arg(&eps)
+            .arg(&posd.0)
+            .arg(&kd.0)
+            .arg(&vs.0)
+            .arg(&vd.0)
+            .arg(&kv_dim)
+            .arg(&nh2)
+            .arg(&store);
+        let copy = if r.store.is_some() { heads2 } else { 0 };
+        self.launch(l, grid(heads + heads2 + copy, hd));
+    }
+
+    /// The attention kernels' `n_pos` argument, and the device word they add to it.
+    fn attn_pos<'g>(p: &'g AttnParams<'_>, zero: &'g GpuIds) -> (u32, &'g GpuIds) {
+        match p.pos_dev {
+            Some((d, v)) => (p.n_pos - v, d),
+            None => (p.n_pos, zero),
+        }
     }
 
     /// f32s of `scores` scratch [`Batch::attention`] needs for one token at `max_ctx`.
@@ -2395,11 +2464,19 @@ impl<'a> Batch<'a> {
         v: &GpuBuf,
         out: &GpuBuf,
         scores: &GpuBuf,
-        p: &AttnParams,
+        p: &AttnParams<'_>,
         quant: Option<&GpuQ>,
     ) {
+        // Parts in multiples of ATTN_PART_STEP, those past the context left empty, so the
+        // grid changes once in that many parts and not every ATTN_PART positions.
+        let room = scores.len() / (p.n_head * (p.head_dim + 2)) as usize;
         let n_parts = (p.n_pos as usize).div_ceil(ATTN_PART);
-        assert!(scores.len() >= (p.n_head * (p.head_dim + 2)) as usize * n_parts);
+        assert!(room >= n_parts);
+        let n_parts = n_parts
+            .next_multiple_of(ATTN_PART_STEP)
+            .min(room)
+            .min(ATTN_PART_MAX);
+        let (n_pos, posd) = Self::attn_pos(p, &self.gpu.zero_id);
         let mut l = self.call(self.gpu.other("attention_part"));
         l.arg(&q.0)
             .arg(&k.0)
@@ -2408,9 +2485,10 @@ impl<'a> Batch<'a> {
             .arg(&p.n_head)
             .arg(&p.n_kv)
             .arg(&p.head_dim)
-            .arg(&p.n_pos)
+            .arg(&n_pos)
             .arg(&p.kv_dim)
-            .arg(&p.scale);
+            .arg(&p.scale)
+            .arg(&posd.0);
         self.launch(l, grid2(p.n_kv as usize, n_parts, ATTN_PART_THREADS));
         let n_parts = n_parts as u32;
         let mut l = self.call(self.gpu.other("attention_merge"));
@@ -2440,7 +2518,7 @@ impl<'a> Batch<'a> {
         v: &GpuBuf,
         out: &GpuBuf,
         scores: &GpuBuf,
-        p: &AttnParams,
+        p: &AttnParams<'_>,
         quant: Option<&GpuQ>,
         half_out: Option<&GpuHalf>,
     ) {
@@ -2475,6 +2553,10 @@ impl<'a> Batch<'a> {
             && p.head_dim <= 128
             && p.head_dim.is_multiple_of(4)
         {
+            assert!(
+                p.pos_dev.is_none(),
+                "tiled attention takes its positions from the host"
+            );
             for tok0 in (0..p.n_tok).step_by(per_launch) {
                 let n = (per_launch as u32).min(p.n_tok - tok0);
                 let seen = (p.n_pos + tok0 + n - 1) as usize;
@@ -2548,6 +2630,7 @@ impl<'a> Batch<'a> {
             }
             return;
         }
+        let (n_pos, posd) = Self::attn_pos(p, &self.gpu.zero_id);
         for tok0 in (0..p.n_tok).step_by(per_launch) {
             let mut l = self.call(self.gpu.other("attention"));
             l.arg(&q.0)
@@ -2558,7 +2641,7 @@ impl<'a> Batch<'a> {
                 .arg(&p.n_head)
                 .arg(&p.n_kv)
                 .arg(&p.head_dim)
-                .arg(&p.n_pos)
+                .arg(&n_pos)
                 .arg(&p.kv_dim)
                 .arg(&p.max_ctx)
                 .arg(&p.scale)
@@ -2566,7 +2649,8 @@ impl<'a> Batch<'a> {
                 .arg(&xq.q)
                 .arg(&xq.d)
                 .arg(&xq.s)
-                .arg(&quant_u);
+                .arg(&quant_u)
+                .arg(&posd.0);
             let n = per_launch.min((p.n_tok - tok0) as usize);
             self.launch(l, grid2(p.n_head as usize, n, ATTN_THREADS));
         }
@@ -2946,6 +3030,7 @@ mod tests {
                 max_ctx: max_ctx as u32,
                 scale: 0.5,
                 half: false,
+                pos_dev: None,
             };
             let mut b = gpu.batch();
             b.attention(&q, &k, &v, &one, &scores, &p, None, None);
@@ -3010,6 +3095,7 @@ mod tests {
                 max_ctx: max_ctx as u32,
                 scale: 0.5,
                 half: false,
+                pos_dev: None,
             };
             let mut b = gpu.batch();
             b.attention(&q, &k, &v, &full, &scores, &p, None, None);

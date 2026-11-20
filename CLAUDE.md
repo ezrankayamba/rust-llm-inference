@@ -258,7 +258,11 @@ Design points that span files:
   up to 256 rows (the router) gets a block of 8 warps per row. That took Qwen3-30B-A3B decode
   from 155 to 178 tok/s, past llama.cpp's 171.5. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
   `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
-  so the queueing code is the same either way; a pass whose launches differ is captured anew,
+  so the queueing code is the same either way (a decoded token reads its position from a
+  device word, `RopeArgs::pos_dev` and `AttnParams::pos_dev`, and its keys and values go to
+  scratch, from which `rope` / `norm_rope` store them into the cache, so a replayed token
+  updates no node; it was 4 a layer, and on the 5090 the launch of the graph, 70-130 us
+  under WDDM and growing with its nodes, is most of what is left between tokens); a pass whose launches differ is captured anew,
   and one that reads back mid-pass (CPU-routed MoE) can't be replayed. Prompt chunks of any
   length have a graph per length too (`GRAPH_TOKENS`; +3-14% up to 32 tokens on the A100,
   and on an RTX 5090 under Windows, where a launch costs 8-10 us, Mistral-7B +19% at 48

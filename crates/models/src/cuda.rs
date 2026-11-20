@@ -59,6 +59,11 @@ struct Scratch {
     xh: GpuHalf,
     wh: GpuHalf,
     logits: GpuBuf,
+    /// A decoded token's position, and its keys and values before they are stored: see
+    /// `Cuda::pass`.
+    pos: GpuIds,
+    k_new: GpuBuf,
+    v_new: GpuBuf,
 }
 
 impl Scratch {
@@ -97,6 +102,9 @@ impl Scratch {
             }),
             wh: gpu.alloc_half(if gemm { max_w } else { 0 }),
             logits: gpu.alloc(logits),
+            pos: gpu.alloc_ids(1),
+            k_new: gpu.alloc(c.kv_dim()),
+            v_new: gpu.alloc(c.kv_dim()),
         }
     }
 }
@@ -595,6 +603,15 @@ impl Cuda {
             kv.max_ctx
         );
         self.gpu.write(&mut s.x, xs);
+        // A decoded token's launches read its position from the device, and its keys and
+        // values go to scratch, from which the rotation stores them into the cache: the
+        // replayed graph then needs no update from one token to the next. Updating its 4
+        // nodes a layer cost Mistral-7B decode 2.7% and Qwen3-30B-A3B 5.7% on an RTX 5090
+        // under Windows, more than the updates' own time (they also slow the launch).
+        let dev = n == 1 && c.rope_dim == hd;
+        if dev {
+            self.gpu.write_ids(&mut s.pos, &[pos as u32]);
+        }
         let s = &*s;
         // Matrices with an int8 kernel multiply in int8, as the CPU does; `precise` keeps every
         // product in f32.
@@ -610,11 +627,20 @@ impl Cuda {
             theta: c.rope_theta,
             neox: c.arch.neox_rope(),
             freq_factors: self.rope_freqs.as_ref(),
+            pos_dev: dev.then_some((&s.pos, pos)),
+            store: None,
         };
         let want_logits = self.covers_all && logits.is_some();
         let queue = |b: &mut Batch<'_>| {
             for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
-                let (k_at, v_at) = (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim));
+                let (k_at, v_at) = match dev {
+                    true => (At(&s.k_new, 0), At(&s.v_new, 0)),
+                    false => (At(&kv.k[l], pos * kv_dim), At(&kv.v[l], pos * kv_dim)),
+                };
+                let rope = RopeArgs {
+                    store: dev.then_some((&kv.k[l], &s.v_new, &kv.v[l])),
+                    ..rope
+                };
                 let (xb, eps) = (At(&s.xb, 0), c.rms_eps);
                 // After the last layer of the model only the row the logits come from is read:
                 // there the rows before `lo` get their keys and values (and, since the kernels
@@ -688,6 +714,7 @@ impl Cuda {
                     max_ctx: kv.max_ctx as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                     half: int8,
+                    pos_dev: dev.then_some((&s.pos, pos as u32)),
                 };
                 if m == 0 {
                     break;

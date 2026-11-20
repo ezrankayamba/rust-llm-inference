@@ -2403,20 +2403,31 @@ extern "C" __global__ void swiglu(float* g, ulong g_off, const float* u, ulong u
     }
 }
 
-// x holds n_heads heads of consecutive tokens, heads_per_tok each, the first at position pos;
-// x2 likewise (the keys, after the queries).
+// x holds n_heads heads of consecutive tokens, heads_per_tok each, the first at position
+// pos + *posd; x2 likewise (the keys, after the queries). With `store` (rope_dim == head_dim),
+// the rotated keys go to the cache rows kdst from that position on instead of back into x2,
+// and vsrc's n_heads2 heads are copied to vdst there: a decoded token's launches then take
+// its position from the device word and are the same every token.
 extern "C" __global__ void rope(float* x, ulong x_off, const float* ff, uint has_ff, uint n_heads,
                                 uint head_dim, uint rope_dim, uint pos, float theta, uint neox,
                                 uint heads_per_tok, float* x2, ulong x2_off, uint n_heads2,
-                                uint heads_per_tok2) {
+                                uint heads_per_tok2, const uint* posd, float* kdst,
+                                const float* vsrc, float* vdst, uint kv_dim, uint store) {
+    pos += *posd;
     uint half_dim = rope_dim / 2;
     uint gid = blockIdx.x * blockDim.x + threadIdx.x;
+    float* out = 0;
     if (gid >= n_heads * half_dim) {
         gid -= n_heads * half_dim;
-        if (gid >= n_heads2 * half_dim) return;
+        if (gid >= n_heads2 * half_dim) {
+            gid -= n_heads2 * half_dim;
+            if (store && gid < n_heads2 * head_dim) vdst[(ulong)pos * kv_dim + gid] = vsrc[gid];
+            return;
+        }
         x = x2;
         x_off = x2_off;
         heads_per_tok = heads_per_tok2;
+        if (store) out = kdst + (ulong)pos * kv_dim;
     }
     uint hh = gid / half_dim, i = gid % half_dim;
     float freq = powf(theta, -2.0f * (float)i / (float)rope_dim);
@@ -2424,40 +2435,54 @@ extern "C" __global__ void rope(float* x, ulong x_off, const float* ff, uint has
     float s, c;
     sincosf((float)(pos + hh / heads_per_tok) * freq, &s, &c);
     float* hd = x + x_off + (ulong)hh * head_dim;
+    float* od = out ? out + (ulong)hh * head_dim : hd;
     uint a = neox ? i : 2 * i;
     uint b = neox ? i + half_dim : 2 * i + 1;
     float x0 = hd[a], x1 = hd[b];
-    hd[a] = x0 * c - x1 * s;
-    hd[b] = x0 * s + x1 * c;
+    od[a] = x0 * c - x1 * s;
+    od[b] = x0 * s + x1 * c;
 }
 
 // rmsnorm over each head (weights wq for x's heads, wk for x2's), then rope: Qwen3 normalizes
 // its queries and keys, and this saves a token two launches a layer. One block per head, a
-// thread per value: head_dim threads, a multiple of 32.
+// thread per value: head_dim threads, a multiple of 32. posd, kdst, vsrc, vdst, kv_dim and
+// store as in `rope`: with store, n_heads2 more blocks copy V.
 extern "C" __global__ void norm_rope(float* x, ulong x_off, const float* wq, const float* ff,
                                      uint has_ff, uint n_heads, uint head_dim, uint rope_dim,
                                      uint pos, float theta, uint neox, uint heads_per_tok,
                                      float* x2, ulong x2_off, const float* wk,
-                                     uint heads_per_tok2, float eps) {
+                                     uint heads_per_tok2, float eps, const uint* posd,
+                                     float* kdst, const float* vsrc, float* vdst, uint kv_dim,
+                                     uint n_heads2, uint store) {
     __shared__ float red[32];
     __shared__ float val[1024];
+    pos += *posd;
     uint hh = blockIdx.x, i = threadIdx.x, half_dim = rope_dim / 2;
     const float* wn = wq;
+    float* out = 0;
+    if (hh >= n_heads + n_heads2) {
+        hh -= n_heads + n_heads2;
+        ulong at = (ulong)hh * head_dim + i;
+        vdst[(ulong)pos * kv_dim + at] = vsrc[at];
+        return;
+    }
     if (hh >= n_heads) {
         hh -= n_heads;
         x = x2;
         x_off = x2_off;
         heads_per_tok = heads_per_tok2;
         wn = wk;
+        if (store) out = kdst + (ulong)pos * kv_dim;
     }
     float* hd = x + x_off + (ulong)hh * head_dim;
+    float* od = out ? out + (ulong)hh * head_dim : hd;
     float v = hd[i], wv = wn[i];
     float s = block_sum(v * v, red);
     v = v * rsqrtf(s / (float)head_dim + eps) * wv;
     val[i] = v;
     __syncthreads();
     if (i >= rope_dim) {
-        hd[i] = v;
+        od[i] = v;
         return;
     }
     // This value's pair, its other half, and whether this is the first of the two.
@@ -2469,7 +2494,7 @@ extern "C" __global__ void norm_rope(float* x, ulong x_off, const float* wq, con
     float sn, c;
     sincosf((float)(pos + hh / heads_per_tok) * freq, &sn, &c);
     float o = val[other];
-    hd[i] = first ? v * c - o * sn : o * sn + v * c;
+    od[i] = first ? v * c - o * sn : o * sn + v * c;
 }
 
 __device__ inline uint warp_min_u(uint v) {
@@ -2545,18 +2570,19 @@ extern "C" __global__ void moe_combine(float* x, ulong x_off, const float* src, 
 }
 
 // One block per query head (x) and token (y): token tok0 + y of the batch attends to the first
-// n_pos + tok0 + y cached positions. `scores` is one row of max_ctx per block. Needs
+// n_pos + *posd + tok0 + y cached positions. `scores` is one row of max_ctx per block. Needs
 // head_dim <= blockDim.x <= 1024. With `quant` (head_dim a multiple of 32), the result is
 // quantized into xq, xd, xs as well.
 extern "C" __global__ void attention(const float* q, const float* kc, const float* vc, float* out,
                                      float* scores, uint n_head, uint n_kv, uint head_dim, uint n_pos,
                                      uint kv_dim, uint max_ctx, float scale, uint tok0,
-                                     signed char* xq, float* xd, float* xs, uint quant) {
+                                     signed char* xq, float* xd, float* xs, uint quant,
+                                     const uint* posd) {
     __shared__ float red[32];
     __shared__ float part[1024];
     uint hh = blockIdx.x;
     uint tok = tok0 + blockIdx.y;
-    n_pos += tok;
+    n_pos += *posd + tok;
     uint kv_off = (hh / (n_head / n_kv)) * head_dim;
     const float* qh = q + ((ulong)tok * n_head + hh) * head_dim;
     float* oh = out + ((ulong)tok * n_head + hh) * head_dim;
@@ -2606,6 +2632,8 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
 // unnormalized weighted V per query head to `parts` (head_dim + 2 floats per head and block),
 // which `attention_merge` combines. Needs head_dim <= AP_T and a multiple of 4. Under about
 // 128 positions the second launch costs more than `attention` loses by reading in turn.
+// The context is n_pos + *posd positions; blocks past its end leave an empty part, so the
+// grid need not change every 32 positions.
 #define AP_T 256
 #define AP_G 8   // AP_T / 32: a warp per query head in the softmax
 #define AP_B 8   // reads issued together
@@ -2615,14 +2643,25 @@ extern "C" __global__ void attention(const float* q, const float* kc, const floa
 
 extern "C" __global__ void attention_part(const float* q, const float* kc, const float* vc,
                                           float* parts, uint n_head, uint n_kv, uint head_dim,
-                                          uint n_pos, uint kv_dim, float scale) {
+                                          uint n_pos, uint kv_dim, float scale,
+                                          const uint* posd) {
     __shared__ float qs[AP_G * AP_T];
     __shared__ float sc[AP_G * AP_T];
     __shared__ float ev[AP_G * 32];
     __shared__ float ms[AP_G * 2];
     uint tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     uint g_n = n_head / n_kv, h0 = blockIdx.x * g_n;
-    uint base = blockIdx.y * 32, cnt = min(32u, n_pos - base);
+    n_pos += *posd;
+    uint base = blockIdx.y * 32;
+    if (base >= n_pos) {
+        for (uint i = tid; i < g_n * (head_dim + 2); i += AP_T) {
+            uint g = i / (head_dim + 2), j = i % (head_dim + 2);
+            float* part = parts + ((ulong)(h0 + g) * gridDim.y + blockIdx.y) * (head_dim + 2);
+            part[j] = j == head_dim ? NEG_INF : 0.0f;
+        }
+        return;
+    }
+    uint cnt = min(32u, n_pos - base);
     ulong kv_off = (ulong)base * kv_dim + blockIdx.x * head_dim;
     // The block's reads of K and V are all issued here, before anything waits on one: a read
     // that is used at once makes the thread wait out the memory latency, and K, the scores'
