@@ -117,12 +117,16 @@ struct Kv {
     max_ctx: usize,
 }
 
+/// A chunk length's graph, and whether a chunk of that length has run before.
+type GraphSlot = (Option<Graph>, bool);
+
 struct Cuda {
     /// The launches of one decoded token. Declared before `gpu`, so that it is dropped while
     /// the device context is still there.
     /// The launches of a chunk of `i + 1` tokens as a graph, and whether a chunk of that
-    /// length has run before.
-    graph: Mutex<[(Option<Graph>, bool); GRAPH_TOKENS]>,
+    /// length has run before: `[0]` for chunks that return no logits, `[1]` for those that do
+    /// (the last of a prompt, whose last layer and output head launch other kernels).
+    graph: Mutex<[[GraphSlot; GRAPH_TOKENS]; 2]>,
     gpu: Gpu,
     layers: Vec<GpuLayer>,
     output_norm: GpuBuf,
@@ -822,13 +826,17 @@ impl Cuda {
         // leaves the CPU out of it. Capturing one costs a chunk about what replaying it saves,
         // so a length other than one token gets its graph the second time it comes up. A
         // layer routed on the CPU reads back mid-pass, so it can't be.
-        let mut graph = self.graph.lock().unwrap_or_else(|p| p.into_inner());
-        let long = graph[GRAPH_SHORT..]
+        let mut graphs = self.graph.lock().unwrap_or_else(|p| p.into_inner());
+        let long = graphs
             .iter()
+            .flat_map(|g| &g[GRAPH_SHORT..])
             .filter(|g| g.0.is_some())
             .count();
-        let room =
-            |g: &(Option<Graph>, bool)| n <= GRAPH_SHORT || g.0.is_some() || long < GRAPH_LONG_MAX;
+        // A prompt of several chunks alternates between the two kinds; with one graph a
+        // length, each chunk recaptured it (3.2 ms of CPU with the GPU idle, a chunk of
+        // Qwen3-30B-A3B on an RTX 5090).
+        let graph = &mut graphs[usize::from(want_logits)];
+        let room = |g: &GraphSlot| n <= GRAPH_SHORT || g.0.is_some() || long < GRAPH_LONG_MAX;
         let slot = graph
             .get_mut(n.wrapping_sub(1))
             .filter(|g| self.batchable && room(g));
@@ -1045,7 +1053,9 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         n_head: c.n_head,
         head_dim: c.head_dim,
         scratch: Mutex::new(scratch),
-        graph: Mutex::new(std::array::from_fn(|_| (None, false))),
+        graph: Mutex::new(std::array::from_fn(|_| {
+            std::array::from_fn(|_| (None, false))
+        })),
         batch: Mutex::new(None),
         gpu,
     };

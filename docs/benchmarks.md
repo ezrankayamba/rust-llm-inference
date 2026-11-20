@@ -3325,3 +3325,31 @@ staging). Logits unchanged, tests pass three ways. Prompts, best of 2 alternatin
 -0.2% at 2048, where attention is the largest share: the kernel is not waiting on its K/V
 reads. Mistral-7B runs at the 575 W limit from 64 tokens (2677-2700 MHz from 512); Qwen3
 draws 440-450 W at 1024-2048 where llama.cpp draws 575.
+
+## 2026-11-20: a graph per length and per logits (RTX 5090, Windows)
+
+Qwen3-30B-A3B prompts lost 10% from 512 to 1024 tokens while llama.cpp gained 1%, and
+`RLI_CUDA_PROF=1` (which runs without graphs) showed no such loss in the kernels. Timing each
+chunk's host side (a temporary counter in `run_graph`): a 1024-token prompt is two 512-token
+chunks, the second returning logits, and they launch different kernels (the last layer's one
+row, the output head), so with one graph per length each chunk recaptured it. A recapture
+was 3.2 ms of CPU per chunk on Qwen3-30B-A3B (1.0 ms on Mistral-7B) with the GPU idle; a
+replay 0.33-0.56 ms, of which the 175-240 node updates were 0.04-0.18 ms. With a graph each
+for chunks with and without logits, no chunk recaptures after the first passes.
+
+Prompts, best of 2 alternating runs (`ppc.py`; before / after tok/s, and after against
+llama.cpp's numbers from the same day):
+
+| model | 512 | 1024 | 2048 |
+|---|---|---|---|
+| Qwen3-30B-A3B | 13324 / 13324 (1.04) | 12142 / 12768 +5.2% (0.99) | 11731 / 12030 +2.6% (0.99) |
+| Mistral-7B | 13423 / 13266 -1.2% (0.90) | 12855 / 13159 +2.4% (0.89) | 12535 / 12679 +1.2% (0.90) |
+| Llama-3.2-1B | 62597 / 62703 (1.02) | 61715 / 65397 +6.0% (1.00) | 66117 / 67613 +2.3% (1.12) |
+
+512 tokens is one chunk, so unchanged (Mistral-7B's -1.2% at the 575 W limit is noise).
+GPU utilization at 1024-2048 tokens rose 2-5 points with the idle time gone.
+
+Logits unchanged on Llama-3.2-1B and Mistral-7B. On Qwen3-30B-A3B the precise batched
+logits vary from run to run since the tiled f32 router (6e1a75f) adds its column parts with
+`atomicAdd`: of four runs, one was 1.28e-04 from the others, which were within 1e-05 of each
+other and of the per-token path (per-token runs bit-identical); top-1 the same throughout.
