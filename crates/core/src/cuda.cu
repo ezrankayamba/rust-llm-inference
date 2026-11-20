@@ -3107,4 +3107,61 @@ extern "C" __global__ void attn_pv(const float* scores, const float* vc, float* 
         for (uint i = 0; i < 4; i++) oh[4 * dq + i] = o[4 * j + i];
     }
 }
+// y += W x for an F32 matrix over many tokens (the MoE router): a block of 256 threads takes
+// 32 rows by 32 tokens and part blockIdx.z of the columns, 32 at a time through shared
+// memory, a thread 2 rows by 2 tokens; the parts add into y, which the caller zeroes. The
+// one-warp-per-row matmul ran 128 x 2048 by 512 tokens at 2 TFLOPS on an RTX 5090.
+extern "C" __global__ void matmul_f32_tiled(const uchar* w, ulong w_off, const float* x,
+                                            ulong x_off, float* y, ulong y_off, uint rows,
+                                            uint cols, uint n_tok) {
+    __shared__ float ws[32][33];
+    __shared__ float xs[32][33];
+    const float* W = (const float*)(w + w_off);
+    x += x_off;
+    y += y_off;
+    uint tid = threadIdx.x, r0 = blockIdx.x * 32, t0 = blockIdx.y * 32;
+    uint tr = tid % 16, tt = tid / 16;
+    uint steps = cols / 32, s0 = blockIdx.z * steps / gridDim.z;
+    uint s1 = (blockIdx.z + 1) * steps / gridDim.z;
+    float a00 = 0, a01 = 0, a10 = 0, a11 = 0;
+    float wv[4], xv[4];
+    #define MF_READ(S)                                                                         \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < 4; j++) {                                                         \
+            uint i = tid + 256 * j, r = i / 32, c = 32 * (S) + i % 32;                         \
+            wv[j] = r0 + r < rows ? W[(ulong)(r0 + r) * cols + c] : 0.0f;                      \
+            xv[j] = t0 + r < n_tok ? x[(ulong)(t0 + r) * cols + c] : 0.0f;                     \
+        }
+    if (s0 < s1) {
+        MF_READ(s0)
+    }
+    for (uint st = s0; st < s1; st++) {
+        #pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            uint i = tid + 256 * j;
+            ws[i / 32][i % 32] = wv[j];
+            xs[i / 32][i % 32] = xv[j];
+        }
+        __syncthreads();
+        if (st + 1 < s1) {
+            MF_READ(st + 1)
+        }
+        #pragma unroll
+        for (uint c = 0; c < 32; c++) {
+            float w0 = ws[tr][c], w1 = ws[tr + 16][c], x0 = xs[tt][c], x1 = xs[tt + 16][c];
+            a00 = fmaf(w0, x0, a00);
+            a01 = fmaf(w0, x1, a01);
+            a10 = fmaf(w1, x0, a10);
+            a11 = fmaf(w1, x1, a11);
+        }
+        __syncthreads();
+    }
+    #undef MF_READ
+    float a[4] = {a00, a01, a10, a11};
+    #pragma unroll
+    for (uint j = 0; j < 4; j++) {
+        uint r = r0 + tr + 16 * (j / 2), t = t0 + tt + 16 * (j % 2);
+        if (r < rows && t < n_tok) atomicAdd(y + (ulong)t * rows + r, a[j]);
+    }
+}
 #endif  // RLI_MMA

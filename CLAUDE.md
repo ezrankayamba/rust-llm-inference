@@ -260,7 +260,10 @@ Design points that span files:
   ones 2-5% slower): 12 launches a dense layer, was 20. A Qwen3 MoE layer takes 14: its chosen
   experts' gate and up stacks are one launch too (decode only; 1.5% slower over a prompt chunk),
   `norm_rope` does the per-head query and key norms with the rotation, and an f32/f16 matvec of
-  up to 256 rows (the router) gets a block of 8 warps per row. That took Qwen3-30B-A3B decode
+  up to 256 rows (the router) gets a block of 8 warps per row. Over prompt chunks of 16+ tokens an F32
+  router is a tiled f32 matmul (`matmul_f32_tiled`: 32 rows by 32 tokens, the columns in parts
+  that add into y) where the warp-per-row matmul ran 2 TFLOPS: Qwen3-30B-A3B pp128 +29%,
+  pp512 +9%. That took Qwen3-30B-A3B decode
   from 155 to 178 tok/s, past llama.cpp's 171.5. One token's launches are captured as a CUDA graph and replayed (`Gpu::run_graph`):
   `Batch` compares each launch with the graph's and updates the nodes whose arguments changed,
   so the queueing code is the same either way (a decoded token reads its position from a

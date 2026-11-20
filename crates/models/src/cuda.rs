@@ -175,6 +175,10 @@ const MOE_GROUP_DOWN_TOKENS: usize = 12;
 /// Qwen3-30B-A3B prompts 9% faster at 8 tokens, 6-7% at 16 and 32, level at 128, 4.5% slower
 /// at 512.
 const ROUTER_MATVEC_TOKENS: usize = 64;
+/// Fewest tokens of a chunk whose F32 router runs as the tiled f32 matmul
+/// (`Batch::matmul_f32_add`). Qwen3-30B-A3B on an RTX 5090, against the matvec and matmul
+/// above: 16 tokens +1.2%, 32 +3.2%, 64 +5.3%, 128 +27-29%, 256 +18%, 512 +9-10%, 1024 +7%.
+const ROUTER_TILED_TOKENS: usize = 16;
 
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
 fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
@@ -397,7 +401,11 @@ fn moe(
 ) {
     let (ne, k, n_embd) = (experts.len(), c.n_expert_used, c.n_embd);
     let (xb, ids) = (At(&s.xb, 0), &s.route_ids);
-    if n <= ROUTER_MATVEC_TOKENS && matches!(router.ty, GgmlType::F32 | GgmlType::F16) {
+    if n >= ROUTER_TILED_TOKENS && router.ty == GgmlType::F32 {
+        let o = At(&s.router, 0);
+        b.to_f16_zero(xb, 0, &s.xh, &[(o, n * router.rows)]);
+        b.matmul_f32_add(router.rows, router.cols, router.offset, xb, o, n);
+    } else if n <= ROUTER_MATVEC_TOKENS && matches!(router.ty, GgmlType::F32 | GgmlType::F16) {
         // One matrix, so the ids (whatever the last layer left) are multiplied by no stride.
         let (r, o) = (router, At(&s.router, 0));
         b.matvec_id(

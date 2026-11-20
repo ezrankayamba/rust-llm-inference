@@ -126,7 +126,7 @@ const GEMM_PARTS_MAX: usize = 16;
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 129;
-const OTHER_KERNELS: [&str; 18] = [
+const OTHER_KERNELS: [&str; 19] = [
     "quant_x",
     "to_f16_zero",
     "rmsnorm",
@@ -145,6 +145,7 @@ const OTHER_KERNELS: [&str; 18] = [
     "moe_topk",
     "moe_group",
     "moe_combine",
+    "matmul_f32_tiled",
 ];
 /// Most experts `moe_topk` can choose among.
 pub const MOE_MAX_EXPERTS: usize = 2048;
@@ -1302,6 +1303,53 @@ impl<'a> Batch<'a> {
                 (MATVEC_ROWS_PER_BLOCK * 32) as u32,
             ),
         );
+    }
+
+    /// [`Batch::matmul`] for an F32 matrix over `n_tok` tokens, added into y, which the
+    /// caller zeroes (as [`Batch::to_f16_zero`] does): tiles of 32 rows by 32 tokens, the
+    /// columns in as many parts as give every multiprocessor two blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_f32_add(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        x: At<'_>,
+        y: At<'_>,
+        n_tok: usize,
+    ) {
+        let span = rows * cols * 4;
+        let (_, w_off, _) = self.matrix(GgmlType::F32, rows, cols, offset, span, true);
+        assert!(
+            n_tok > 0 && x.1 + n_tok * cols <= x.0.len() && y.1 + n_tok * rows <= y.0.len(),
+            "matmul buffer too small"
+        );
+        let tiles = rows.div_ceil(32) * n_tok.div_ceil(32);
+        let parts = (2 * self.gpu.gemm_room.0)
+            .div_ceil(tiles)
+            .clamp(1, cols / 32);
+        let (x_off, y_off) = (x.1 as u64, y.1 as u64);
+        let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
+        let mut a = self.call(self.gpu.other("matmul_f32_tiled"));
+        a.arg(&self.gpu.weights)
+            .arg(&w_off)
+            .arg(&x.0.0)
+            .arg(&x_off)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&nt);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                rows.div_ceil(32) as u32,
+                n_tok.div_ceil(32) as u32,
+                parts as u32,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.launch(a, cfg);
     }
 
     /// Whether [`Batch::gemm`] takes `n_tok` tokens over a matrix of `cols` columns: it pays
@@ -2710,6 +2758,42 @@ mod tests {
     /// leave a row tile, a token tile and a matvec step partly filled. Needs an NVIDIA GPU, so
     /// CI doesn't run it; `RLI_CUDA_NO_MMA=1` checks the dp4a matmuls on a GPU that would use
     /// the tensor-core ones.
+    #[test]
+    fn tiled_f32_matmul_matches_matmul() {
+        for (rows, cols, n) in [
+            (128, 2048, 512),
+            (100, 256, 70),
+            (60, 96, 9),
+            (128, 2048, 2),
+        ] {
+            let mut seed = 7u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / 8388608.0 - 1.0
+            };
+            let w: Vec<u8> = (0..rows * cols)
+                .flat_map(|_| next().to_le_bytes())
+                .collect();
+            let x: Vec<f32> = (0..n * cols).map(|_| next()).collect();
+            let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            let xb = gpu.upload(&x);
+            let (want_b, got_b) = (gpu.alloc(n * rows), gpu.upload(&vec![0f32; n * rows]));
+            let mut b = gpu.batch();
+            b.matmul(GgmlType::F32, rows, cols, 0, At(&xb, 0), At(&want_b, 0), n);
+            b.matmul_f32_add(rows, cols, 0, At(&xb, 0), At(&got_b, 0), n);
+            b.finish();
+            let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+            gpu.read(&want_b, &mut want);
+            gpu.read(&got_b, &mut got);
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(err < 1e-3, "{rows}x{cols} by {n}: max difference {err}");
+        }
+    }
+
     #[test]
     fn matmul_q_matches_f32_matmul() {
         let types = [(GgmlType::Q4_K, &[0, 2][..]), (GgmlType::Q6_K, &[208][..])];

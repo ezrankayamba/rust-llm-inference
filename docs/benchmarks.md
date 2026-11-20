@@ -3279,3 +3279,31 @@ GPU right after, best of 2 alternating rounds (`cmpc.py`; tok/s, ours / llama.cp
 
 Mistral-7B from 512 tokens runs at the power limit in both engines; Qwen3-30B-A3B from 512
 draws 100-135 W less than llama.cpp, so its kernels leave the GPU waiting.
+
+## 2026-11-20: a tiled f32 matmul for the MoE router (RTX 5090, Qwen3-30B-A3B)
+
+`RLI_CUDA_PROF=1` on Qwen3-30B-A3B prompts: the F32 router (128 x 2048) was 5.5-6% of a 32-
+or 64-token prompt (the matvec, 20-28 us a launch) and 11% of a 256- or 512-token one (the
+matmul with a warp per row, 125-130 us: 2 TFLOPS); the expert matmuls 56-65%, flash
+attention 3-5%. `matmul_f32_tiled`: 32 rows by 32 tokens a block of 256 threads, 32 columns
+a step through shared memory, a thread 2 rows by 2 tokens, the columns in as many parts as
+give every multiprocessor two blocks, adding into y zeroed by `to_f16_zero`. All f32: tests
+three ways pass (`tiled_f32_matmul_matches_matmul`, within 1e-3 of the old matmul), per-token
+against batched with `precise` 1.1e-05 (was 7.63e-06: the sums run in another order), int8
+0.763, top-1 the same.
+
+Prompts, best of 2 alternating runs of about 3 s (`ownc.py`; tok/s, SM clock and power;
+"tiled from 65" and "from 8" were a temporary switch for the cutover):
+
+| tokens | old router | tiled from 65 | tiled from 8 |
+|---|---|---|---|
+| 16 | 1749 (2842 MHz, 524 W) | 1750 | 1770 (2857, 475 W) +1.2% |
+| 32 | 3151 (2917, 408) | 3152 | 3252 (2902, 292) +3.2% |
+| 64 | 4872 (2902, 488) | 4860 | 5128 (2902, 473) +5.3% |
+| 128 | 6034 (2872, 422) | 7798 (2895, 520) +29.2% | 7645 +26.7% |
+| 256 | 9319 (2872, 428) | 10975 (2880, 513) +17.8% | 11074 +18.8% |
+| 512 | 11945 (2857, 467) | 13022 (2857, 491) +9.0% | 13187 +10.4% |
+| 1024 | 10970 (2865, 432) | 11699 (2865, 444) +6.6% | 11744 +7.1% |
+
+The cutover is 16 tokens (`ROUTER_TILED_TOKENS`). Against llama.cpp's numbers from the same
+afternoon: 256 tokens 1.3x (8416), 512 1.02-1.03x (12757), 1024 0.91 (12872).
