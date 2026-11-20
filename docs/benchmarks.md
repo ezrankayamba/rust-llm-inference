@@ -3264,3 +3264,18 @@ about 3 s (`ownc.py`; tok/s, SM clock and power of the flash run):
 
 Mistral-7B runs at the 575 W limit from 256 tokens either way. The KV cache is still f32,
 converted to f16 as it is staged.
+
+Against llama.cpp (cd959ba, its default `-fa auto`, i.e. flash attention on) on the same
+GPU right after, best of 2 alternating rounds (`cmpc.py`; tok/s, ours / llama.cpp, power):
+
+| model | 64 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| Mistral-7B | 8845 / 7677 1.15 | 12531 / 12547 1.00 | 13351 / 14711 0.91 | 12903 / 14773 0.87 | 12550 / 14087 0.89 |
+| (power) | 575 / 516 W | 575 / 575 | 575 / 574 | 574 / 574 | 574 / 575 |
+| Llama-3.2-1B | 32677 / 24045 1.36 | 59354 / 47008 1.26 | 65705 / 61614 1.07 | 64045 / 65546 0.98 | 67106 / 60601 1.11 |
+| (power) | 479 / 379 W | 538 / 440 | 544 / 496 | 534 / 534 | 570 / 515 |
+| Qwen3-30B-A3B | 4855 / 4294 1.13 | 9326 / 8416 1.11 | 12145 / 12757 0.95 | 11116 / 12872 0.86 | 10770 / 12192 0.88 |
+| (power) | 503 / 541 W | 473 / 575 | 478 / 575 | 441 / 575 | 441 / 577 |
+
+Mistral-7B from 512 tokens runs at the power limit in both engines; Qwen3-30B-A3B from 512
+draws 100-135 W less than llama.cpp, so its kernels leave the GPU waiting.
