@@ -206,6 +206,11 @@ Design points that span files:
   Outside `precise`, scores and sums run on f16 tensor cores (`attn_scores_h`, `attn_pv_h`,
   the second compile; head sizes a multiple of 32; `attn_pv_h` takes 64 query rows a block
   and stages V with a row per value): 2-3x on those kernels, Mistral-7B pp512 +7%.
+  Where the lean kernels run (capability 12+), head sizes 64 and 128 take one fused kernel
+  instead (`attn_flash_*`, the lean compile; `RLI_CUDA_FLASH=0` keeps the three): a warp owns
+  16 query rows, holds their queries in registers and steps through 32 positions at a time
+  with a running maximum and sum, so no scores reach memory and one launch covers a chunk.
+  On the 5090, prompts +2-4% at 64 to 256 tokens, +3-7% at 512, +16-35% at 2048 (2026-11-20).
   **Past 128 tokens llama.cpp's matmul is no faster than ours; what a layer spends outside
   its matmuls is** (attention, `swiglu`, the f16 conversions: 285 us against 80 at 192
   tokens before this). The kernel that makes a matmul's input writes it in the form the

@@ -3235,3 +3235,32 @@ after, tok/s): Mistral-7B 64 tokens 8725 / 8775, 256: 12340 / 12314, 512: 12976 
 Llama-3.2-1B 64: 31700 / 31788, 256: 57191 / 57151, 512: 61432 / 61525; Qwen3-30B-A3B 64:
 4761 / 4736, 256: 9094 / 9112, 512: 11712 / 11709; Mistral-7B decode 269.9 / 270.1. The
 stores are 4 bytes a value against the matmuls' reads of the same rows; not merged.
+
+## 2026-11-20: flash attention for prompt chunks (RTX 5090, Windows)
+
+Prompt attention was three launches per chunk (`attn_scores_h`, `attn_softmax`, `attn_pv_h`)
+with every score written to memory and read twice. `attn_flash_64` / `attn_flash_128` (the
+lean compile) do it in one: a block takes a KV head and 64 query rows, a warp 16 of them with
+their queries in registers as f16; each 32-position step stages K and V^T in f16, multiplies
+on tensor cores, keeps a running maximum and sum per row and rescales its sums. Tests three
+ways pass (the f16-vs-f32 attention test gained a 300-token prompt, a 64-token chunk after
+517 cached positions and a 9-token chunk; within 5e-3). Logits with int8 activations against
+`precise`: Llama-3.2-1B 0.183 (was 0.191), Mistral-7B 0.136 (was 0.179); top-1 the same.
+
+Prompts, the same binary with and without `RLI_CUDA_FLASH=0`, best of 2 alternating runs of
+about 3 s (`ownc.py`; tok/s, SM clock and power of the flash run):
+
+| model | 64 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| Mistral-7B, three kernels | 8696 | 12245 | 12999 | 12234 | 10881 |
+| Mistral-7B, flash | 8882 +2.1% | 12524 +2.3% | 13412 +3.2% | 12854 +5.1% | 12581 +15.6% |
+| (flash: clock, power) | 2842 MHz 574 W | 2752 575 | 2688 576 | 2707 574 | 2700 574 |
+| Llama-3.2-1B, three kernels | 31626 | 56881 | 61155 | 57257 | 49750 |
+| Llama-3.2-1B, flash | 32768 +3.6% | 59381 +4.4% | 65336 +6.8% | 64238 +12.2% | 67312 +35.3% |
+| (flash: clock, power) | 2880 MHz 473 W | 2857 537 | 2842 537 | 2842 533 | 2835 569 |
+| Qwen3-30B-A3B, three kernels | 4762 | 9061 | 11692 | 10464 | 8972 |
+| Qwen3-30B-A3B, flash | 4774 +0.3% | 9285 +2.5% | 12066 +3.2% | 11110 +6.2% | 10773 +20.1% |
+| (flash: clock, power) | 2887 MHz 339 W | 2865 469 | 2850 474 | 2850 439 | 2850 433 |
+
+Mistral-7B runs at the 575 W limit from 256 tokens either way. The KV cache is still f32,
+converted to f16 as it is staged.

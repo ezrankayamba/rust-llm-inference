@@ -312,6 +312,8 @@ pub struct Gpu {
     gemm_direct_id: Vec<(GgmlType, CudaFunction)>,
     /// `attn_scores_h` and `attn_pv_h`.
     attn_half: Option<(CudaFunction, CudaFunction)>,
+    /// Flash attention (`attn_flash_*`, the lean compile) by head size; empty where unused.
+    attn_flash: Vec<(u32, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -383,6 +385,7 @@ impl Gpu {
             }
         };
         let (mut mmk, mut mmk_id) = (Vec::new(), Vec::new());
+        let mut attn_flash = Vec::new();
         if mma && lean {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -400,6 +403,13 @@ impl Gpu {
                 for tt in [32, 64] {
                     let n = format!("mmk_{name}_id{tt}");
                     mmk_id.push((t, tt, module.load_function(&n).map_err(err(&n))?));
+                }
+            }
+            // Fused attention for prompt chunks; RLI_CUDA_FLASH=0 keeps the three kernels.
+            if std::env::var("RLI_CUDA_FLASH").as_deref() != Ok("0") {
+                for hd in [64, 128] {
+                    let n = format!("attn_flash_{hd}");
+                    attn_flash.push((hd, module.load_function(&n).map_err(err(&n))?));
                 }
             }
         }
@@ -578,6 +588,7 @@ impl Gpu {
             gemm_direct,
             gemm_direct_id,
             attn_half,
+            attn_flash,
             gemm_id,
             other,
             zero_id,
@@ -995,6 +1006,8 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if let Some((hd, _)) = self.attn_flash.iter().find(|(_, g)| eq(g)) {
+            format!("attn_flash {hd}")
         } else if self.attn_half.as_ref().is_some_and(|h| eq(&h.0)) {
             "attn_scores_h".to_string()
         } else if self.attn_half.as_ref().is_some_and(|h| eq(&h.1)) {
@@ -2557,6 +2570,28 @@ impl<'a> Batch<'a> {
                 p.pos_dev.is_none(),
                 "tiled attention takes its positions from the host"
             );
+            let gpu: &'a Gpu = self.gpu;
+            let flash = gpu.attn_flash.iter().find(|(hd, _)| *hd == p.head_dim);
+            if let Some((_, f)) = flash.filter(|_| p.half) {
+                let mut l = self.call(f);
+                l.arg(&q.0).arg(&k.0).arg(&v.0).arg(&out.0);
+                match half_out {
+                    Some(o) => l.arg(&o.0).arg(&1u32),
+                    None => l.arg(&out.0).arg(&0u32),
+                };
+                l.arg(&p.n_head)
+                    .arg(&p.n_kv)
+                    .arg(&p.n_pos)
+                    .arg(&p.kv_dim)
+                    .arg(&p.scale)
+                    .arg(&p.n_tok);
+                let rows = (p.n_tok as usize).div_ceil((64 / g_n) as usize);
+                self.launch(l, grid2(p.n_kv as usize, rows, 128));
+                if let Some(quant) = quant {
+                    self.quantize(At(out, 0), q_len, quant);
+                }
+                return;
+            }
             for tok0 in (0..p.n_tok).step_by(per_launch) {
                 let n = (per_launch as u32).min(p.n_tok - tok0);
                 let seen = (p.n_pos + tok0 + n - 1) as usize;
@@ -3062,6 +3097,9 @@ mod tests {
             (8, 2, 64, 40, 70),
             (16, 2, 128, 100, 37),
             (4, 4, 96, 10, 50),
+            (32, 8, 128, 1, 300),
+            (32, 4, 128, 517, 64),
+            (32, 8, 64, 1, 9),
         ] {
             let mut seed = 11u32;
             let mut rand = |n: usize| -> Vec<f32> {

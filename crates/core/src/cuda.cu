@@ -1086,6 +1086,16 @@ __device__ inline void mma32_s8(int a0, int a1, int a2, int a3, int b0, int b1, 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// c += a b^T over 16 columns of f16: lane 4i + j gives columns 2j, 2j + 1 and 8 + 2j, 9 + 2j
+// of rows i and i + 8 and of token i, and receives the sums of rows i and i + 8 with tokens
+// 2j and 2j + 1.
+__device__ inline void mma16_f16(const uint* a, uint b0, uint b1, float* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 #ifdef RLI_MMK
 // Q4_K by int8 tensor cores, written for instruction count: one block per multiprocessor keeps
 // it busy, so a step costs what its instructions do, and MATMUL_MMA's step is 1500 a warp,
@@ -1508,6 +1518,177 @@ MATMUL_MMK6(mmk_q6_k_t64, MMK_SIG, MMK_PRE, 0, 64, 2, 0)
 MATMUL_MMK6(mmk_q6_k_t128, MMK_SIG, MMK_PRE, 0, 128, 2, 0)
 MATMUL_MMK6(mmk_q6_k_id32, MMK_SIG_ID, MMK_PRE_ID, 1, 32, 1, 0)
 MATMUL_MMK6(mmk_q6_k_id64, MMK_SIG_ID, MMK_PRE_ID, 1, 64, 2, 0)
+
+// Causal attention in one kernel (flash attention): scores, softmax and the weighted sum of V
+// for 64 query rows (tokens by the query heads of one KV head, as in attn_pv_h) without
+// writing the scores out. A warp owns 16 rows: their queries stay in registers as f16, and
+// each 32-position step of K and V, staged in f16, gives the warp's scores on tensor cores,
+// a running maximum and sum per row (the sums rescaled when the maximum grows), and the
+// products with V added into the row's results, which are divided by the sum at the end.
+// Positions past those the block's last token sees are staged as zeros (V must not be NaN).
+#define FA_KS 68  // words between staged rows of K
+#define FA_VS 20  // words between staged rows of V^T (32 positions)
+template <uint HD>
+__device__ inline void attn_flash(const float* q, const float* kc, const float* vc, float* out,
+                                  unsigned short* oh, uint half, uint n_head, uint n_kv,
+                                  uint n_pos, uint kv_dim, float scale, uint n_tok) {
+    __shared__ uint kt[32 * FA_KS];
+    __shared__ uint vt[HD * FA_VS];
+    const uint N4 = HD / 4, LOADS = 32 * N4 / 128;
+    uint tid = threadIdx.x, g_n = n_head / n_kv, t0 = blockIdx.y * (64 / g_n);
+    uint t_end = min(t0 + 64 / g_n, n_tok), limit = n_pos + t_end - 1;
+    uint lane = tid % 32, warp = tid / 32, gi = lane / 4, gj = lane % 4;
+    uint kvh = blockIdx.x, head0 = kvh * g_n;
+    // The warp's rows gi and gi + 8: token, positions seen (1 for rows past the last token,
+    // whose results are not written), and the query fragments of all of head_dim.
+    uint rt[2], vis[2];
+    uint qa[HD / 16][4];
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        uint r = 16 * warp + gi + 8 * h;
+        rt[h] = t0 + r / g_n;
+        vis[h] = rt[h] < n_tok ? n_pos + rt[h] : 1;
+        const float* qr = q + ((ulong)rt[h] * n_head + head0 + r % g_n) * HD;
+        #pragma unroll
+        for (uint k = 0; k < HD / 16; k++) {
+            float2 lo = make_float2(0, 0), hi = make_float2(0, 0);
+            if (rt[h] < n_tok) {
+                lo = *(const float2*)(qr + 16 * k + 2 * gj);
+                hi = *(const float2*)(qr + 16 * k + 8 + 2 * gj);
+            }
+            qa[k][h] = f2h(lo.x) | ((uint)f2h(lo.y) << 16);
+            qa[k][2 + h] = f2h(hi.x) | ((uint)f2h(hi.y) << 16);
+        }
+    }
+    // The last position any row of this warp sees: later steps are all masked for it.
+    uint w_last = t0 + (16 * warp + 15) / g_n;
+    uint w_vis = n_pos + min(w_last, n_tok - 1);
+    bool w_live = t0 + 16 * warp / g_n < n_tok;
+    float sl = scale * 1.4426950408889634f;  // exp(x) = exp2(x log2 e)
+    float m[2] = {NEG_INF, NEG_INF}, l[2] = {0, 0};
+    float acc[HD / 8][4];
+    #pragma unroll
+    for (uint o = 0; o < HD / 8; o++) acc[o][0] = acc[o][1] = acc[o][2] = acc[o][3] = 0;
+    for (uint base = 0; base < limit; base += 32) {
+        float4 kr[LOADS], vr[LOADS];
+        #pragma unroll
+        for (uint j = 0; j < LOADS; j++) {
+            uint i = tid + j * 128, p = i / N4, d = 4 * (i % N4);
+            ulong at = (ulong)(base + p) * kv_dim + kvh * HD + d;
+            bool in = base + p < limit;
+            kr[j] = in ? *(const float4*)(kc + at) : make_float4(0, 0, 0, 0);
+            vr[j] = in ? *(const float4*)(vc + at) : make_float4(0, 0, 0, 0);
+        }
+        unsigned short* vh = (unsigned short*)vt;
+        #pragma unroll
+        for (uint j = 0; j < LOADS; j++) {
+            uint i = tid + j * 128, p = i / N4, d = 4 * (i % N4);
+            kt[p * FA_KS + d / 2] = f2h(kr[j].x) | ((uint)f2h(kr[j].y) << 16);
+            kt[p * FA_KS + d / 2 + 1] = f2h(kr[j].z) | ((uint)f2h(kr[j].w) << 16);
+            vh[d * 2 * FA_VS + p] = f2h(vr[j].x);
+            vh[(d + 1) * 2 * FA_VS + p] = f2h(vr[j].y);
+            vh[(d + 2) * 2 * FA_VS + p] = f2h(vr[j].z);
+            vh[(d + 3) * 2 * FA_VS + p] = f2h(vr[j].w);
+        }
+        __syncthreads();
+        if (w_live && base < w_vis) {
+            float sc[4][4];
+            #pragma unroll
+            for (uint n = 0; n < 4; n++) sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0;
+            #pragma unroll
+            for (uint k = 0; k < HD / 16; k++) {
+                #pragma unroll
+                for (uint n = 0; n < 4; n++) {
+                    const uint* bp = kt + (8 * n + gi) * FA_KS + 8 * k + gj;
+                    mma16_f16(qa[k], bp[0], bp[4], sc[n]);
+                }
+            }
+            float mx[2] = {NEG_INF, NEG_INF};
+            #pragma unroll
+            for (uint n = 0; n < 4; n++) {
+                #pragma unroll
+                for (uint e = 0; e < 4; e++) {
+                    uint h = e / 2, p = base + 8 * n + 2 * gj + e % 2;
+                    float v = p < vis[h] ? sc[n][e] * sl : NEG_INF;
+                    sc[n][e] = v;
+                    mx[h] = fmaxf(mx[h], v);
+                }
+            }
+            float corr[2];
+            #pragma unroll
+            for (uint h = 0; h < 2; h++) {
+                mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffff, mx[h], 1));
+                mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffff, mx[h], 2));
+                float mn = fmaxf(m[h], mx[h]);
+                corr[h] = exp2f(m[h] - mn);
+                m[h] = mn;
+                l[h] *= corr[h];
+            }
+            #pragma unroll
+            for (uint n = 0; n < 4; n++) {
+                #pragma unroll
+                for (uint e = 0; e < 4; e++) {
+                    float pe = exp2f(sc[n][e] - m[e / 2]);
+                    sc[n][e] = pe;
+                    l[e / 2] += pe;
+                }
+            }
+            #pragma unroll
+            for (uint o = 0; o < HD / 8; o++) {
+                acc[o][0] *= corr[0];
+                acc[o][1] *= corr[0];
+                acc[o][2] *= corr[1];
+                acc[o][3] *= corr[1];
+            }
+            #pragma unroll
+            for (uint kh = 0; kh < 2; kh++) {
+                uint a[4] = {
+                    f2h(sc[2 * kh][0]) | ((uint)f2h(sc[2 * kh][1]) << 16),
+                    f2h(sc[2 * kh][2]) | ((uint)f2h(sc[2 * kh][3]) << 16),
+                    f2h(sc[2 * kh + 1][0]) | ((uint)f2h(sc[2 * kh + 1][1]) << 16),
+                    f2h(sc[2 * kh + 1][2]) | ((uint)f2h(sc[2 * kh + 1][3]) << 16),
+                };
+                #pragma unroll
+                for (uint o = 0; o < HD / 8; o++) {
+                    const uint* bp = vt + (8 * o + gi) * FA_VS + 8 * kh + gj;
+                    mma16_f16(a, bp[0], bp[4], acc[o]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        l[h] += __shfl_xor_sync(0xffffffff, l[h], 1);
+        l[h] += __shfl_xor_sync(0xffffffff, l[h], 2);
+    }
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        uint r = 16 * warp + gi + 8 * h;
+        if (rt[h] >= n_tok) continue;
+        float inv = 1.0f / l[h];
+        ulong row = ((ulong)rt[h] * n_head + head0 + r % g_n) * HD;
+        #pragma unroll
+        for (uint o = 0; o < HD / 8; o++) {
+            #pragma unroll
+            for (uint e = 0; e < 2; e++) {
+                ulong at = row + 8 * o + 2 * gj + e;
+                float v = acc[o][2 * h + e] * inv;
+                out[at] = v;
+                if (half) oh[at] = f2h(v);
+            }
+        }
+    }
+}
+
+#define ATTN_FLASH(NAME, HD)                                                                   \
+extern "C" __global__ void __launch_bounds__(128) NAME(                                        \
+    const float* q, const float* kc, const float* vc, float* out, unsigned short* oh,          \
+    uint half, uint n_head, uint n_kv, uint n_pos, uint kv_dim, float scale, uint n_tok) {     \
+    attn_flash<HD>(q, kc, vc, out, oh, half, n_head, n_kv, n_pos, kv_dim, scale, n_tok);       \
+}
+ATTN_FLASH(attn_flash_64, 64)
+ATTN_FLASH(attn_flash_128, 128)
 #else  // the tensor-core kernels of the second compile
 // Tile loading reads everything it needs from global memory into registers before it stores
 // anything: a warp waits for a read only when it uses the result, so the reads of all its rows
@@ -1707,16 +1888,6 @@ MATMUL_MMA(mma_q4_k_t32, 144, 1, 32)
 MATMUL_MMA(mma_q6_k_t32, 210, 0, 32)
 MATMUL_MMA(mma_q4_k_t16, 144, 1, 16)
 MATMUL_MMA(mma_q6_k_t16, 210, 0, 16)
-
-// c += a b^T over 16 columns of f16: lane 4i + j gives columns 2j, 2j + 1 and 8 + 2j, 9 + 2j
-// of rows i and i + 8 and of token i, and receives the sums of rows i and i + 8 with tokens
-// 2j and 2j + 1.
-__device__ inline void mma16_f16(const uint* a, uint b0, uint b1, float* c) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
 
 // y = W x for n_tok tokens, W and x in f16 (rows of cols, a multiple of GE_K). A block of NW
 // warps takes R rows and T tokens, GE_K columns at a time through shared memory; a warp owns
