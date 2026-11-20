@@ -3224,3 +3224,14 @@ prompt, by skipping it (results wrong; Mistral-7B / Llama-3.2-1B): 256 tokens 6.
 512 tokens 7.6% / 13.4%, 1024 tokens 12.9% / 20.8%. Qwen3-30B-A3B's grouped expert tiles
 are 91% padding at 16 tokens, 76% at 64, 66% at 256, 48% at 512 (the busiest expert holds at
 most 6 tiles, so the load is even enough).
+
+## 2026-11-20: skipping f32 results nothing reads (RTX 5090, dropped)
+
+`rmsnorm` (attention norm; FFN norm of a dense layer) and the dense FFN's `swiglu` write
+their result in f32 and, for int8 matmuls, quantized; where the next matmul reads only the
+int8 copy, the f32 store was skipped (a mode bit). Correct (tests three ways, logits from
+`precise` unchanged), but no faster: best of 3 alternating runs, about 3 s each (before /
+after, tok/s): Mistral-7B 64 tokens 8725 / 8775, 256: 12340 / 12314, 512: 12976 / 13047;
+Llama-3.2-1B 64: 31700 / 31788, 256: 57191 / 57151, 512: 61432 / 61525; Qwen3-30B-A3B 64:
+4761 / 4736, 256: 9094 / 9112, 512: 11712 / 11709; Mistral-7B decode 269.9 / 270.1. The
+stores are 4 bytes a value against the matmuls' reads of the same rows; not merged.
