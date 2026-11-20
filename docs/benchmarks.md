@@ -3164,3 +3164,25 @@ link no longer ends it): 256 tokens 9170 / 8557 (1.07), 384: 10758 / 11029 (0.98
 Logits (`dump_logits`, default against `--precise`, max difference): 98 tokens 0.448 (the
 old kernels 0.270), 392 tokens 0.561 (0.629); top-1 the same in all four. Tests on the 5090
 pass by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO_MMA=1` (154 each).
+
+## 2026-11-20: storing the lean matmuls' tiles instead of zeroing y first (dropped)
+
+The lean kernels add into y, so a matmul that doesn't add into the residual stream has y
+zeroed first (`to_f16_zero`, one launch for a layer's results). Skipping that launch (wrong
+results, timing only; `own.py`, tok/s) made prompts faster: Mistral-7B 64 tokens 8745 ->
+8934, 128: 10867 -> 11294, 256: 12218 -> 13008, 512: 12860 -> 13771; Llama-3.2-1B 64: 31872
+-> 32417, 128: 38175 -> 38919, 256: 56535 -> 57903, 512: 59839 -> 63029.
+
+Tried: a block that takes a whole tile stores it; the pieces of a tile split between blocks
+leave their sums in scratch, count themselves on a counter per tile, and the last to finish
+adds the others' and stores (llama.cpp's stream-k fixup, done in the kernel). Correct (tests
+three ways, logits 0.138 and 0.204 from `precise` on Mistral-7B and Llama-3.2-1B, top-1 the
+same), but slower than zeroing on the same build (storing / zeroing): Llama-3.2-1B 64 tokens
+28691 / 31513, 128: 40899 / 43340, 192: 43664 / 45113, 256: 53987 / 56261, 512: 59667 /
+60007; Mistral-7B 64: 8074 / 8522, 128: 10414 / 10781, 192: 10856 / 10940, 256: 12060 /
+12241, 512: 13018 / 12907. A split piece writes a whole tile of sums to scratch and fences;
+with one block per multiprocessor that wait is not hidden. Not merged.
+
+The lean kernels' shared arrays were 16-byte aligned by chance: a 4-byte `__shared__`
+declared before them gave `CUDA_ERROR_MISALIGNED_ADDRESS` on their 16-byte accesses.
+Declare `__align__(16)` on such arrays when changing the kernels.
