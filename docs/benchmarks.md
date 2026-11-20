@@ -3157,8 +3157,9 @@ Against llama.cpp with it (tok/s; the link dropped after 192 tokens):
 | 128 | 5978 | 5097 | 1.17 | 0.91 |
 | 192 | 7770 | 7727 | 1.01 | 0.76 |
 
-256, 384 and 512 tokens from the `own.py` runs against llama.cpp's figures of the morning:
-9099 / 8478 (1.07), 10624 / 10884 (0.98), 11635 / 12626 (0.92).
+Measured side by side afterwards (a job started detached on the machine, so a dropped
+link no longer ends it): 256 tokens 9170 / 8557 (1.07), 384: 10758 / 11029 (0.98), 512:
+11753 / 12912 (0.91).
 
 Logits (`dump_logits`, default against `--precise`, max difference): 98 tokens 0.448 (the
 old kernels 0.270), 392 tokens 0.561 (0.629); top-1 the same in all four. Tests on the 5090
