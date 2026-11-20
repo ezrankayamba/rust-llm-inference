@@ -3307,3 +3307,21 @@ Prompts, best of 2 alternating runs of about 3 s (`ownc.py`; tok/s, SM clock and
 
 The cutover is 16 tokens (`ROUTER_TILED_TOKENS`). Against llama.cpp's numbers from the same
 afternoon: 256 tokens 1.3x (8416), 512 1.02-1.03x (12757), 1024 0.91 (12872).
+
+## 2026-11-20: reading flash attention's next K/V step ahead (RTX 5090, dropped)
+
+`attn_flash` with a step's 32 positions of K and V read into registers while the step
+before them multiplies (one read before the loop, the next after the barrier that follows
+staging). Logits unchanged, tests pass three ways. Prompts, best of 2 alternating runs
+(`ppc.py`; before / after tok/s):
+
+| model | 64 | 512 | 1024 | 2048 |
+|---|---|---|---|---|
+| Qwen3-30B-A3B | 5133 / 5150 | 13305 / 13345 | 12086 / 12051 | 11688 / 11717 |
+| Mistral-7B | 8836 / 8844 | 13397 / 13437 | 12959 / 12984 | 12598 / 12620 |
+| Llama-3.2-1B | 32935 / 33055 | 65592 / 66372 | 64415 / 65300 | 67291 / 67135 |
+
+-0.3% to +0.4% everywhere except Llama-3.2-1B at 512 and 1024 (+1.2%, +1.4%), which is
+-0.2% at 2048, where attention is the largest share: the kernel is not waiting on its K/V
+reads. Mistral-7B runs at the 575 W limit from 64 tokens (2677-2700 MHz from 512); Qwen3
+draws 440-450 W at 1024-2048 where llama.cpp draws 575.
