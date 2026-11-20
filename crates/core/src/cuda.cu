@@ -1136,10 +1136,25 @@ __device__ inline void ldm2(const uint* p, int* b) {
 // AHEAD: 1 reads a step's weights and tokens before the step before it multiplies, 2 only
 // its weights (the 128-token block has no registers left for the tokens: 14336x4096 by 512
 // tokens 246 us without, 290 with all read ahead).
-#define MATMUL_MMK(NAME, T, NTX, AHEAD)                                                        \
-extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, const float* xd,  \
-                                const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
-                                uint row_bytes, uint n_tok, uint parts) {                      \
+// The kernels' parameters: over the tokens of a chunk, or (ID) over the pairs moe_group
+// listed, for stacked experts `stride` bytes apart, where pair p reads activation row
+// p / x_div and writes row p of y: an expert's weights are loaded once for all its pairs.
+#define MMK_SIG                                                                                \
+    const uchar* w, ulong w_off, const uint* xq, const float* xd, const float* xs, float* y,   \
+    ulong y_off, uint rows, uint cols, uint row_bytes, uint n_tok, uint parts
+#define MMK_PRE                                                                                \
+    const uint* perm = 0;                                                                      \
+    const uint* start = 0;                                                                     \
+    ulong stride = 0;                                                                          \
+    uint x_div = 1;
+#define MMK_SIG_ID                                                                             \
+    const uchar* w, ulong w_off, ulong stride, const uint* perm, const uint* start,            \
+    const uint* xq, const float* xd, const float* xs, uint x_div, float* y, ulong y_off,       \
+    uint rows, uint cols, uint row_bytes
+#define MMK_PRE_ID uint n_tok = 0;
+#define MATMUL_MMK(NAME, SIG, PRE, ID, T, NTX, AHEAD)                                          \
+extern "C" __global__ void NAME(SIG) {                                                         \
+    PRE                                                                                        \
     __shared__ uint wq[128 * MK_S];                                                            \
     __shared__ uint tq[T * MK_S];                                                              \
     __shared__ float ws[128 * 4];                                                              \
@@ -1150,14 +1165,20 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
     uint gi = lane / 4, gj = lane % 4;                                                         \
     /* This warp's rows and tokens: 16 NTX from rb, 8 in every 8 NTX from tw. */               \
     uint rb = warp / NTX * 16 * NTX, tw = warp % NTX * 8;                                      \
-    uint nrt = (rows + 127) / 128, nk = cols / 128;                                            \
+    /* ID: block (x, e) takes row tile x of expert e, over the pairs that chose e. */          \
+    uint ey = ID ? blockIdx.y : 0, pb = ID ? start[ey] : 0;                                    \
+    uint np = ID ? start[ey + 1] - pb : n_tok;                                                 \
+    const uchar* wb = w + w_off + ey * stride;                                                 \
+    uint nrt = ID ? 1 : (rows + 127) / 128, nk = cols / 128;                                   \
     /* Rust keeps units times blocks under 2^32. */                                            \
-    uint units = nrt * ((n_tok + T - 1) / T) * nk;                                             \
-    uint u = blockIdx.x * units / gridDim.x, ue = (blockIdx.x + 1) * units / gridDim.x;        \
+    uint units = nrt * ((np + T - 1) / T) * nk;                                                \
+    uint u = ID ? 0 : blockIdx.x * units / gridDim.x;                                          \
+    uint ue = ID ? units : (blockIdx.x + 1) * units / gridDim.x;                               \
     while (u < ue) {                                                                           \
         uint tile = u / nk, k0 = u % nk;                                                       \
         uint k1 = ue - u < nk - k0 ? k0 + (ue - u) : nk;                                       \
-        uint row0 = tile % nrt * 128, t0 = tile / nrt * T, last = n_tok - 1 - t0;              \
+        uint row0 = (ID ? blockIdx.x : tile % nrt) * 128, t0 = tile / nrt * T;                 \
+        uint last = np - 1 - t0;                                                               \
         const uchar* rp[2];                                                                    \
         const uint* xp[T / 32];                                                                \
         const float* dp[T / 32];                                                               \
@@ -1165,12 +1186,13 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
         _Pragma("unroll")                                                                      \
         for (uint i = 0; i < 2; i++) {                                                         \
             uint r = row0 + 16 * warp + 8 * i + gi;                                            \
-            rp[i] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes;                  \
+            rp[i] = wb + (ulong)(r < rows ? r : rows - 1) * row_bytes;                         \
         }                                                                                      \
         _Pragma("unroll")                                                                      \
         for (uint p = 0; p < T / 32; p++) {                                                    \
             uint t = warp * (T / 8) + 4 * p + lane / 8;                                        \
             ulong tok = t0 + (t < last ? t : last);                                            \
+            if (ID) tok = perm[pb + tok] / x_div;                                              \
             xp[p] = xq + tok * (cols / 4) + 4 * (lane % 8);                                    \
             dp[p] = xd + tok * (cols / 32);                                                    \
             sp[p] = xs + tok * (cols / 16);                                                    \
@@ -1282,15 +1304,18 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
             uint t = 8 * NTX * (j / 4 / NTX) + tw + 2 * gj + j % 2;                            \
             uint row = row0 + rb + 16 * (j / 4 % NTX) + gi + 8 * (j / 2 % 2);                  \
             if (t > last || row >= rows) continue;                                             \
-            atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);                       \
+            if (ID) y[y_off + (ulong)perm[pb + t0 + t] * rows + row] = acc[j];                 \
+            else atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);                  \
         }                                                                                      \
         u += k1 - k0;                                                                          \
     }                                                                                          \
 }
 
-MATMUL_MMK(mmk_q4_k_t32, 32, 1, 1)
-MATMUL_MMK(mmk_q4_k_t64, 64, 2, 1)
-MATMUL_MMK(mmk_q4_k_t128, 128, 2, 2)
+MATMUL_MMK(mmk_q4_k_t32, MMK_SIG, MMK_PRE, 0, 32, 1, 1)
+MATMUL_MMK(mmk_q4_k_t64, MMK_SIG, MMK_PRE, 0, 64, 2, 1)
+MATMUL_MMK(mmk_q4_k_t128, MMK_SIG, MMK_PRE, 0, 128, 2, 2)
+MATMUL_MMK(mmk_q4_k_id32, MMK_SIG_ID, MMK_PRE_ID, 1, 32, 1, 1)
+MATMUL_MMK(mmk_q4_k_id64, MMK_SIG_ID, MMK_PRE_ID, 1, 64, 2, 1)
 
 // The same for Q6_K: 16 columns a scale, so twice the multiplies, and no offsets. Its rows
 // lie at even addresses only, so a quant word is read as two halves; a lane takes a word.
@@ -1299,7 +1324,7 @@ __device__ inline void ldm1(const uint* p, int* b) {
 }
 #define MMK6_READ_W(KH)                                                                        \
         {                                                                                      \
-            const uchar* sb = w + w_off + (ulong)((KH) / 2) * 210;                             \
+            const uchar* sb = wb + (ulong)((KH) / 2) * 210;                                    \
             uint hf = (KH) % 2;                                                                \
             _Pragma("unroll")                                                                  \
             for (uint p = 0; p < 16; p++) {                                                    \
@@ -1318,10 +1343,9 @@ __device__ inline void ldm1(const uint* p, int* b) {
             xv[p] = *(const U128*)(xp[p] + (KH) * 32);                                         \
             dv[p] = *(const F128*)(dp[p] + (KH) * 4);                                          \
         }
-#define MATMUL_MMK6(NAME, T, NTX, AHEAD)                                                       \
-extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, const float* xd,  \
-                                const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
-                                uint row_bytes, uint n_tok, uint parts) {                      \
+#define MATMUL_MMK6(NAME, SIG, PRE, ID, T, NTX, AHEAD)                                         \
+extern "C" __global__ void NAME(SIG) {                                                         \
+    PRE                                                                                        \
     __shared__ uint wq[128 * MK_S];                                                            \
     __shared__ uint tq[T * MK_S];                                                              \
     __shared__ int ws[128 * 8];                                                                \
@@ -1330,13 +1354,20 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
     uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
     uint gi = lane / 4, gj = lane % 4;                                                         \
     uint rb = warp / NTX * 16 * NTX, tw = warp % NTX * 8;                                      \
-    uint nrt = (rows + 127) / 128, nk = cols / 128;                                            \
-    uint units = nrt * ((n_tok + T - 1) / T) * nk;                                             \
-    uint u = blockIdx.x * units / gridDim.x, ue = (blockIdx.x + 1) * units / gridDim.x;        \
+    /* ID: block (x, e) takes row tile x of expert e, over the pairs that chose e. */          \
+    uint ey = ID ? blockIdx.y : 0, pb = ID ? start[ey] : 0;                                    \
+    uint np = ID ? start[ey + 1] - pb : n_tok;                                                 \
+    const uchar* wb = w + w_off + ey * stride;                                                 \
+    uint nrt = ID ? 1 : (rows + 127) / 128, nk = cols / 128;                                   \
+    /* Rust keeps units times blocks under 2^32. */                                            \
+    uint units = nrt * ((np + T - 1) / T) * nk;                                                \
+    uint u = ID ? 0 : blockIdx.x * units / gridDim.x;                                          \
+    uint ue = ID ? units : (blockIdx.x + 1) * units / gridDim.x;                               \
     while (u < ue) {                                                                           \
         uint tile = u / nk, k0 = u % nk;                                                       \
         uint k1 = ue - u < nk - k0 ? k0 + (ue - u) : nk;                                       \
-        uint row0 = tile % nrt * 128, t0 = tile / nrt * T, last = n_tok - 1 - t0;              \
+        uint row0 = (ID ? blockIdx.x : tile % nrt) * 128, t0 = tile / nrt * T;                 \
+        uint last = np - 1 - t0;                                                               \
         /* Row 16 warp + p of the tile for quants, and a row to every 8 lanes for scales. */   \
         uint ro[16], rs[4];                                                                    \
         const uint* xp[T / 32];                                                                \
@@ -1355,6 +1386,7 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
         for (uint p = 0; p < T / 32; p++) {                                                    \
             uint t = warp * (T / 8) + 4 * p + lane / 8;                                        \
             ulong tok = t0 + (t < last ? t : last);                                            \
+            if (ID) tok = perm[pb + tok] / x_div;                                              \
             xp[p] = xq + tok * (cols / 4) + 4 * (lane % 8);                                    \
             dp[p] = xd + tok * (cols / 32);                                                    \
         }                                                                                      \
@@ -1464,15 +1496,18 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const uint* xq, con
             uint t = 8 * NTX * (j / 4 / NTX) + tw + 2 * gj + j % 2;                            \
             uint row = row0 + rb + 16 * (j / 4 % NTX) + gi + 8 * (j / 2 % 2);                  \
             if (t > last || row >= rows) continue;                                             \
-            atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);                       \
+            if (ID) y[y_off + (ulong)perm[pb + t0 + t] * rows + row] = acc[j];                 \
+            else atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);                  \
         }                                                                                      \
         u += k1 - k0;                                                                          \
     }                                                                                          \
 }
 
-MATMUL_MMK6(mmk_q6_k_t32, 32, 1, 0)
-MATMUL_MMK6(mmk_q6_k_t64, 64, 2, 0)
-MATMUL_MMK6(mmk_q6_k_t128, 128, 2, 0)
+MATMUL_MMK6(mmk_q6_k_t32, MMK_SIG, MMK_PRE, 0, 32, 1, 0)
+MATMUL_MMK6(mmk_q6_k_t64, MMK_SIG, MMK_PRE, 0, 64, 2, 0)
+MATMUL_MMK6(mmk_q6_k_t128, MMK_SIG, MMK_PRE, 0, 128, 2, 0)
+MATMUL_MMK6(mmk_q6_k_id32, MMK_SIG_ID, MMK_PRE_ID, 1, 32, 1, 0)
+MATMUL_MMK6(mmk_q6_k_id64, MMK_SIG_ID, MMK_PRE_ID, 1, 64, 2, 0)
 #else  // the tensor-core kernels of the second compile
 // Tile loading reads everything it needs from global memory into registers before it stores
 // anything: a warp waits for a read only when it uses the result, so the reads of all its rows

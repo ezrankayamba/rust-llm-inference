@@ -381,7 +381,11 @@ Design points that span files:
   steps) dealt evenly to one block per multiprocessor, each adding into y. Q4_K reads the
   next step before multiplying this one (weights only in the 128-token block, which has no
   registers left); Q6_K is slower for it. `lean_tile` picks the block's tokens: a last tile
-  under half full leaves its blocks idle. Against llama.cpp on the 5090 (`docs/benchmarks.md`,
+  under half full leaves its blocks idle. MoE experts have the same kernels by expert
+  (`mmk_*_id32/64`, through `Batch::matmul_q_id` where `has_lean_id`): a block per row tile and
+  expert over the pairs `moe_group` listed, 64 pairs a block where experts average more than 4
+  (128 was 3-4% slower). Qwen3-30B-A3B prompts of 32 to 192 tokens went from 0.69-0.91 of
+  llama.cpp to 1.01-1.17 (2026-11-20). Against llama.cpp on the 5090 (`docs/benchmarks.md`,
   2026-11-19): prompts of 8 to 32 tokens 1-25% ahead, 48 to 512 between 19% behind and 6%
   ahead (were 15-48% behind); the A100 keeps the kernels above. Windows launches cost 8-10 us
   each alone (WDDM), so benchmark runs must last seconds: short ones leave the GPU at idle

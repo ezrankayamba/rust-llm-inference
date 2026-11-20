@@ -3117,3 +3117,49 @@ Llama-3.2-1B: 2 tokens 1663 / 1818 (0.92), 4: 2881 / 3377 (0.85), 8: 5545 / 4877
 16: 10298 / 8893 (1.16), 32: 18678 / 15398 (1.21); the link to the machine dropped before
 the longer lengths ran. Tests on the 5090 pass by default and with `RLI_CUDA_LEAN=0`;
 `dump_logits --precise` against `ref_forward.py` 6.7e-6 batched, 5.7e-6 per token.
+
+## 2026-11-20: the lean matmuls over MoE experts (RTX 5090, Qwen3-30B-A3B)
+
+The machine is now reached over Tailscale (its network drops UDP, and ZeroTier's TCP
+fallback stopped carrying traffic on 2026-11-19); same GPU, driver and llama.cpp build.
+
+Llama-3.2-1B with the two changes above, against llama.cpp (tok/s, the run cut off on
+2026-11-19): 48 tokens 25533 / 20564 (1.24), 64: 31596 / 24141 (1.31), 96: 38669 / 29046
+(1.33), 128: 38010 / 32575 (1.17), 192: 50993 / 42385 (1.20), 256: 57050 / 47110 (1.21),
+384: 56963 / 54723 (1.04), 512: 62189 / 62017 (1.00), decode 979.4 / 986.9 (0.99).
+
+Qwen3-30B-A3B before this change (the dense matrices lean, the experts on `gemm_*_id`
+and `gemm_*_direct_id`): 2 tokens 530 / 513 (1.03), 4: 775 / 780 (0.99), 8: 1157 / 1108
+(1.04), 16: 1720 / 1775 (0.97), 32: 2098 / 3021 (0.69), 64: 3042 / 4236 (0.72), 96: 3687 /
+4660 (0.79), 128: 4491 / 4951 (0.91), 192: 5778 / 7589 (0.76), 256: 6720 / 8478 (0.79),
+384: 7888 / 10884 (0.72), 512: 8562 / 12626 (0.68), decode 326.6 / 346.9 (0.94).
+`RLI_CUDA_PROF=1`: the expert matmuls were 67% of a 512-token prompt (396 us a launch for
+Q4_K), 75% at 64 tokens (260 us) and 73% at 32 (211 us).
+
+`MATMUL_MMK` and `MATMUL_MMK6` now have a by-expert form (`mmk_*_id32`, `_id64`): the
+same step, a block per (row tile of 128, expert) over the pairs `moe_group` listed for
+the expert, int8 activations. Under the profiler a Q4_K expert launch went 396 -> 269 us
+at 512 tokens (32 pairs a block), 260 -> 102 at 64, 211 -> 140 at 32.
+
+Pairs a block, whole prompts, ours alone (`own.py`, tok/s, 32 / 64): 32 tokens 3073 /
+2972, 64: 4751 / 4748, 128: 5668 / 5938, 256: 8404 / 9074, 512: 10238 / 11635. So 64 where
+experts average more than 4 pairs. 64 / 128 a block: 128 tokens 5886 / 5665, 192: 7747 /
+7430, 256: 9099 / 8804, 384: 10624 / 10604: not kept.
+
+Against llama.cpp with it (tok/s; the link dropped after 192 tokens):
+
+| tokens | ours | llama.cpp | ratio | before |
+|---|---|---|---|---|
+| 16 (not this kernel) | 1720 | 1833 | 0.94 | 0.97 |
+| 32 | 3086 | 3035 | 1.02 | 0.69 |
+| 64 | 4792 | 4314 | 1.11 | 0.72 |
+| 96 | 4865 | 4794 | 1.01 | 0.79 |
+| 128 | 5978 | 5097 | 1.17 | 0.91 |
+| 192 | 7770 | 7727 | 1.01 | 0.76 |
+
+256, 384 and 512 tokens from the `own.py` runs against llama.cpp's figures of the morning:
+9099 / 8478 (1.07), 10624 / 10884 (0.98), 11635 / 12626 (0.92).
+
+Logits (`dump_logits`, default against `--precise`, max difference): 98 tokens 0.448 (the
+old kernels 0.270), 392 tokens 0.561 (0.629); top-1 the same in all four. Tests on the 5090
+pass by default, with `RLI_CUDA_LEAN=0` and with `RLI_CUDA_NO_MMA=1` (154 each).

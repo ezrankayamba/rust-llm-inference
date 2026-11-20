@@ -423,14 +423,18 @@ fn moe(
     let grouped = n >= MOE_GROUP_TOKENS;
     // The down projection is grouped from fewer tokens: see MOE_GROUP_DOWN_TOKENS.
     let d = &e.down;
-    let down_half =
-        n >= MOE_GROUP_DOWN_TOKENS && int8 && b.has_gemm_id(d.ty, d.cols, d.offset, down_stride);
+    // The lean int8 kernels, where the GPU has them, are ahead of the f16 ones.
+    let lean = |b: &Batch<'_>, m: &Weight, stride| b.has_lean_id(m.ty, m.cols, m.offset, stride);
+    let down_half = n >= MOE_GROUP_DOWN_TOKENS
+        && int8
+        && b.has_gemm_id(d.ty, d.cols, d.offset, down_stride)
+        && !(grouped && lean(b, d, down_stride));
     if (grouped || down_half) && wants_q(b, &[&e.gate, &e.up, &e.down], int8) {
         b.moe_group(ids, &s.perm, &s.starts, n * k, ne);
     }
     let groups = (&s.perm, &s.starts);
     let half = |b: &Batch<'_>, m: &Weight, stride| {
-        grouped && int8 && b.has_gemm_id(m.ty, m.cols, m.offset, stride)
+        grouped && int8 && b.has_gemm_id(m.ty, m.cols, m.offset, stride) && !lean(b, m, stride)
     };
     let halves = [half(b, &e.gate, gate_stride), half(b, &e.up, up_stride)];
     if halves != [true; 2] && fed != Fed::Q && wants_q(b, &[&e.gate, &e.up], int8) {
@@ -709,6 +713,7 @@ impl Cuda {
                             n >= MOE_GROUP_TOKENS
                                 && int8
                                 && b.has_gemm_id(m.ty, m.cols, m.offset, stride)
+                                && !b.has_lean_id(m.ty, m.cols, m.offset, stride)
                         };
                         match g.expert_strides {
                             Some([gs, us, _]) if half(&e.gate, gs) && half(&e.up, us) => Fed::Half,

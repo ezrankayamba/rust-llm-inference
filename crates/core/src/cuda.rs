@@ -252,6 +252,8 @@ pub struct Gpu {
     mma: bool,
     /// The lean tensor-core kernels (`mmk_*`) by type and tokens a block; empty where unused.
     mmk: Vec<(GgmlType, usize, CudaFunction)>,
+    /// The same over stacked experts' pairs (`mmk_*_id*`), by type and pairs a block.
+    mmk_id: Vec<(GgmlType, usize, CudaFunction)>,
     /// Per weight type, the kernel that writes a matrix out as f16; `to_f16` for activations;
     /// and the f16 tensor-core product of the two, where the GPU has one.
     dequant: Vec<(GgmlType, CudaFunction)>,
@@ -341,7 +343,7 @@ impl Gpu {
                     >= 12
             }
         };
-        let mut mmk = Vec::new();
+        let (mut mmk, mut mmk_id) = (Vec::new(), Vec::new());
         if mma && lean {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -355,6 +357,10 @@ impl Gpu {
                 for tt in MMK_TOKENS {
                     let n = format!("mmk_{name}_t{tt}");
                     mmk.push((t, tt, module.load_function(&n).map_err(err(&n))?));
+                }
+                for tt in [32, 64] {
+                    let n = format!("mmk_{name}_id{tt}");
+                    mmk_id.push((t, tt, module.load_function(&n).map_err(err(&n))?));
                 }
             }
         }
@@ -521,6 +527,7 @@ impl Gpu {
             ],
             mma,
             mmk,
+            mmk_id,
             dequant,
             dequant_q4_k_any,
             to_f16,
@@ -961,6 +968,8 @@ impl Gpu {
             format!("int8 matmul {t:?}")
         } else if let Some((t, tt, _)) = self.mmk.iter().find(|(.., g)| eq(g)) {
             format!("lean matmul {t:?}, {tt} tokens")
+        } else if let Some((t, tt, _)) = self.mmk_id.iter().find(|(.., g)| eq(g)) {
+            format!("lean matmul by expert {t:?}, {tt} pairs")
         } else if let Some((t, tt, _)) = self.mma_few.iter().find(|(.., g)| eq(g)) {
             format!("int8 matmul {t:?}, {tt} tokens")
         } else if let Some((t, _)) = self.mmq_id.iter().find(|(_, g)| eq(g)) {
@@ -1428,6 +1437,15 @@ impl<'a> Batch<'a> {
         self.launch(l, cfg);
     }
 
+    /// Whether [`Batch::matmul_q_id`] runs this stack on the lean tensor-core kernels, which
+    /// are then ahead of [`Batch::gemm_id`].
+    pub fn has_lean_id(&self, ty: GgmlType, cols: usize, offset: usize, stride: usize) -> bool {
+        self.gpu.mmk_id.iter().any(|(t, ..)| *t == ty)
+            && cols.is_multiple_of(128)
+            && stride.is_multiple_of(16)
+            && self.gpu.has_int8(ty, cols, offset)
+    }
+
     /// Whether [`Batch::gemm_id`] takes a stack of `ty` matrices of `cols` columns at byte
     /// `offset` of the model file, `stride` bytes apart: Q4_K or Q6_K on a GPU with f16 tensor
     /// cores, and for Q4_K every row at a multiple of 16 bytes on the device.
@@ -1798,13 +1816,22 @@ impl<'a> Batch<'a> {
         let row_bytes = ty.row_bytes(cols);
         let span = (n_stack - 1) * stride + rows * row_bytes;
         let w_off = self.gpu.device_offset(offset, span) as u64;
-        let f = &self
-            .gpu
-            .mmq_id
-            .iter()
-            .find(|(t, _)| *t == ty)
-            .expect("checked by has_matmul_q")
-            .1;
+        // Blocks of 64 pairs where an expert has more than 4 on average: Qwen3-30B-A3B on an
+        // RTX 5090, 64 against 32 a block, 32 tokens 3% slower, 64 level, 128 +4%, 256 +8%,
+        // 512 +14%; 128 a block against 64 was 3-4% slower at 128 to 256 tokens, level at 384.
+        let lean = self.has_lean_id(ty, cols, offset, stride);
+        let tt = if n > 4 * n_stack { 64 } else { 32 };
+        let f = if lean {
+            let f = self
+                .gpu
+                .mmk_id
+                .iter()
+                .find(|(t, m, _)| *t == ty && *m == tt);
+            &f.expect("checked by has_lean_id").2
+        } else {
+            let f = self.gpu.mmq_id.iter().find(|(t, _)| *t == ty);
+            &f.expect("checked by has_matmul_q").1
+        };
         let (stride, xd, y_off) = (stride as u64, x_div as u32, y.1 as u64);
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
         let mut a = self.call(f);
@@ -1822,7 +1849,10 @@ impl<'a> Batch<'a> {
             .arg(&rows_u)
             .arg(&cols_u)
             .arg(&rb);
-        self.launch(a, grid2(rows.div_ceil(32), n_stack, 256));
+        self.launch(
+            a,
+            grid2(rows.div_ceil(if lean { 128 } else { 32 }), n_stack, 256),
+        );
     }
 
     /// [`Batch::matvec_id`] over activations quantized by [`Batch::quantize`], for the matrices
