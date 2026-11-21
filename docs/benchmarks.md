@@ -3502,3 +3502,37 @@ Tests pass by default, with `RLI_CUDA_NO_MMA=1` and with `RLI_CUDA_LEAN=0`. Logi
 tokens): Llama-3.2-1B `--precise` 8.6e-6 from NumPy batched, 9.1e-6 per-token, lean 0.170
 from `precise`; Mistral-7B lean 0.163-0.263 over five runs (the atomics' order); Qwen3-30B-A3B
 per-token against batched precise 3.0e-4, int8 0.638. Top-1 unchanged in all.
+
+## 2026-11-21: lean Q4_K token tile read through a 32-bit shared address (RTX 5090)
+
+The SASS of `mmk_q4_k_t128` (ncu `--page source --print-source sass`) showed each of a step's
+8 token groups rebuilding the tile's address in 64 bits from the shared window (`S2UR
+SR_SWINHI`, `IMAD.WIDE`, three `IADD.64`, four `MOV`, two `UMOV`) before its four `ldmatrix`:
+`ldm2` takes a generic pointer. A lane now converts its row of the tile to a shared address
+once a step (`shared_addr`) and `ldm2s` loads at constant offsets from it. `bench_cuda`, us,
+best of two alternated runs (2917-2925 MHz, 209-218 W), before -> after:
+
+| Q4_K shape | 128 tokens | 512 tokens |
+|---|---|---|
+| 4096x4096 | 31.0 -> 30.5 | 75.9 -> 74.1 |
+| 1024x4096 | 18.4 -> 18.4 | 29.6 -> 29.1 |
+| 14336x4096 | 68.7 -> 68.0 | 232.8 -> 226.9 |
+| 4096x14336 | 65.8 -> 63.7 | 219.4 -> 213.3 |
+| 2048x2048 | 18.6 -> 14.7 | 29.2 -> 29.1 |
+| 8192x2048 | 30.8 -> 31.0 | 81.9 -> 80.2 |
+| 2048x8192 | 31.0 -> 31.0 | 74.2 -> 72.2 |
+
+ncu on 14336x4096 by 512 tokens: 187.9 M -> 173.5 M instructions, 604.4 k -> 588.6 k cycles.
+Whole prompts (best of three alternated, tok/s; ratio to llama.cpp's 2026-11-20 numbers):
+
+| model | 128 | 512 | 1024 |
+|---|---|---|---|
+| Mistral-7B | 11347 -> 11530 (+1.6%, 1.13) | 13494 -> 13710 (+1.6%, 0.94) | 13442 -> 13676 (+1.7%, 0.93) |
+| Llama-3.2-1B | 37864 -> 38057 (+0.5%) | 62794 -> 63533 (+1.2%) | 66381 -> 66931 (+0.8%) |
+| Qwen3-30B-A3B | 7761 -> 7902 (+1.8%) | 13332 -> 13568 (+1.8%, 1.06) | 12878 -> 13082 (+1.6%, 1.01) |
+
+Llama-3.2-1B ran 3-5% below the day's earlier runs in both builds (GPU 76-80% busy where it
+was 81-83%), so it has no ratio here. Tests pass by default, with `RLI_CUDA_NO_MMA=1` and with
+`RLI_CUDA_LEAN=0`. Logits: Llama-3.2-1B `--precise` 8.6e-6 from NumPy batched, 9.1e-6
+per-token, lean 0.220; Mistral-7B lean 0.170-0.192 over five runs; Qwen3-30B-A3B per-token
+against batched precise 1.05e-5, int8 0.638. Top-1 unchanged in all.

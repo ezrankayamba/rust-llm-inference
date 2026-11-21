@@ -1127,6 +1127,19 @@ __device__ inline void ldm2(const uint* p, int* b) {
                  : "=r"(b[0]), "=r"(b[1])
                  : "l"(p));
 }
+// The same from a 32-bit shared-memory address (shared_addr): from a generic pointer, each
+// use rebuilt the address in 64 bits from the shared window (12 instructions where the
+// lean Q4_K block reads its tokens, 8 times a step).
+__device__ inline uint shared_addr(const void* p) {
+    uint a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+__device__ inline void ldm2s(uint a, int* b) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                 : "=r"(b[0]), "=r"(b[1])
+                 : "r"(a));
+}
 #define MK_S 36
 #define MMK_READ_W(KH)                                                                         \
         _Pragma("unroll")                                                                      \
@@ -1280,6 +1293,9 @@ extern "C" __global__ void NAME(SIG) {                                          
                 ma[n] = *(const F128*)(wm + (r + gi) * 4);                                     \
                 mb[n] = *(const F128*)(wm + (r + gi + 8) * 4);                                 \
             }                                                                                  \
+            /* This lane's row of the token tile, as a shared address: the rest are constant   \
+               offsets from it. */                                                             \
+            uint tqa = shared_addr(tq + (tw + lane % 8) * MK_S + 4 * (lane / 8 % 2));          \
             _Pragma("unroll")                                                                  \
             for (uint o = 0; o < T / (8 * NTX); o++) {                                         \
                 uint tb = 8 * NTX * o + tw, ta = tb + 2 * gj;                                  \
@@ -1289,7 +1305,7 @@ extern "C" __global__ void NAME(SIG) {                                          
                 int b[4][2];                                                                   \
                 _Pragma("unroll")                                                              \
                 for (uint g = 0; g < 4; g++)                                                   \
-                    ldm2(tq + (tb + lane % 8) * MK_S + 8 * g + 4 * (lane / 8 % 2), b[g]);      \
+                    ldm2s(tqa + 4 * (8 * NTX * o * MK_S + 8 * g), b[g]);                       \
                 /* A row group's four products are issued before any is used: converting each \
                    as it came waited out the multiply (4.7% of the stall samples under ncu). */ \
                 _Pragma("unroll")                                                              \
