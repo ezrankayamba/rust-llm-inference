@@ -380,8 +380,9 @@ fn check_expert(name: &str, e: &Expert, n_ff: usize, n_embd: usize) -> Result<()
     check_shape(&format!("{name} down"), &e.down, n_embd, n_ff)
 }
 
-/// A stacked expert tensor, with its per-expert `.scale` values (all 1 when it has none).
-fn stacked(g: &Gguf, name: &str, n_expert: usize) -> Result<(Weight, Vec<f32>)> {
+/// A stacked expert tensor, with its per-expert `.scale` values if it has them. Nothing is
+/// allocated from `n_expert` without them: it is checked against the shapes only later.
+fn stacked(g: &Gguf, name: &str, n_expert: usize) -> Result<(Weight, Option<Vec<f32>>)> {
     let t = g
         .tensor(name)
         .ok_or_else(|| Error::Missing(format!("tensor {name}")))?;
@@ -393,15 +394,14 @@ fn stacked(g: &Gguf, name: &str, n_expert: usize) -> Result<(Weight, Vec<f32>)> 
         offset: t.offset,
         scale: 1.0,
     };
-    let scales = tensor_scales(g, name, &w, n_expert)?.unwrap_or_else(|| vec![1.0; n_expert]);
-    Ok((w, scales))
+    Ok((w, tensor_scales(g, name, &w, n_expert)?))
 }
 
 /// Splits stacked 3-D expert tensors (`[n_expert][rows][cols]`) into per-expert views.
 fn split_experts(
-    (gate, gs): (Weight, Vec<f32>),
-    (up, us): (Weight, Vec<f32>),
-    (down, ds): (Weight, Vec<f32>),
+    (gate, gs): (Weight, Option<Vec<f32>>),
+    (up, us): (Weight, Option<Vec<f32>>),
+    (down, ds): (Weight, Option<Vec<f32>>),
     n_expert: usize,
 ) -> Result<Vec<Expert>> {
     let (n_ff, n_embd) = (gate.rows / n_expert, down.rows / n_expert);
@@ -416,18 +416,19 @@ fn split_experts(
             gate.rows, down.rows
         )));
     }
+    let at = |s: &Option<Vec<f32>>, e: usize| s.as_ref().map_or(1.0, |s| s[e]);
     Ok((0..n_expert)
         .map(|e| Expert {
             gate: Weight {
-                scale: gs[e],
+                scale: at(&gs, e),
                 ..gate.rows_slice(e * n_ff, n_ff)
             },
             up: Weight {
-                scale: us[e],
+                scale: at(&us, e),
                 ..up.rows_slice(e * n_ff, n_ff)
             },
             down: Weight {
-                scale: ds[e],
+                scale: at(&ds, e),
                 ..down.rows_slice(e * n_embd, n_embd)
             },
         })
