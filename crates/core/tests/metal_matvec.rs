@@ -519,3 +519,29 @@ fn moe_topk_matches_cpu_routing_with_many_experts() {
         assert!((got_w[k] - sigmoid).abs() < 1e-6);
     }
 }
+
+/// NaN router logits pick no expert; the ids must still index the stack, since the expert
+/// kernels read at id * stride with no bounds check.
+#[test]
+fn moe_topk_with_nan_logits_stays_inside_the_stack() {
+    use rli_core::metal::At;
+    let mut mem = Pages::new(PAGE);
+    let gpu = unsafe { Gpu::new(mem.bytes(), std::slice::from_ref(&(0..PAGE))) }.unwrap();
+    let (ne, k) = (64, 4);
+    let (lx, sg) = (gpu.upload(&vec![f32::NAN; ne]), gpu.upload(&[0.0]));
+    let (ids, w) = (gpu.alloc(k), gpu.alloc(k));
+    let mut b = gpu.batch();
+    b.moe_topk(
+        At(&lx, 0),
+        At(&sg, 0),
+        At(&ids, 0),
+        At(&w, 0),
+        ne,
+        k,
+        true,
+        false,
+    );
+    b.finish();
+    let got: Vec<u32> = unsafe { ids.as_slice().iter().map(|v| v.to_bits()).collect() };
+    assert!(got.iter().all(|&e| (e as usize) < ne), "{got:?}");
+}

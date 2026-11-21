@@ -765,6 +765,13 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
             w.ty, w.cols
         )));
     }
+    // `moe_topk` marks the experts it took in one 64-bit word per lane.
+    if c.n_expert > 32 * 64 {
+        return Err(BackendError(format!(
+            "{} experts; Metal routes at most 2048",
+            c.n_expert
+        )));
+    }
     // The widest FFN among the layers. Not the output head, which has n_embd columns too:
     // counting its rows made the gate and up scratch a chunk of vocabulary-sized rows each
     // (622 MB on Qwen3-30B-A3B).

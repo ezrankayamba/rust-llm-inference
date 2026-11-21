@@ -1124,11 +1124,11 @@ kernel void moe_topk(device const float* logits [[buffer(0)]],
         }
         float best = simd_max(bv);
         uint win = simd_min(bv == best ? be : UINT_MAX);
-        if (win == be) taken |= 1ul << (win / 32);
+        if (win == be && win < p.n_expert) taken |= 1ul << (win / 32);
         float wi = exp(best - mx) / sum;
         chosen += wi;
         if (lane == 0) {
-            ids[i] = win;
+            ids[i] = win < p.n_expert ? win : 0;  // no winner (NaN logits): stay inside the stack
             w[i] = wi;
         }
     }

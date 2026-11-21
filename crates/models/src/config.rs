@@ -115,6 +115,14 @@ impl Config {
                 return bad(format!("{name} is 0"));
             }
         }
+        for (name, v) in [
+            ("attention.layer_norm_rms_epsilon", self.rms_eps),
+            ("rope.freq_base", self.rope_theta),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return bad(format!("{name} is {v}"));
+            }
+        }
         if self.n_layer > n_tensors {
             return bad(format!(
                 "{} layers but only {n_tensors} tensors",

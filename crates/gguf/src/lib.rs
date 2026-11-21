@@ -271,8 +271,11 @@ impl Gguf {
         let align = match metadata.get("general.alignment") {
             Some(v) => v
                 .as_u64()
-                .filter(|a| a.is_power_of_two())
-                .ok_or_else(|| Error::Format("general.alignment must be a power of two".into()))?,
+                // The spec requires a multiple of 8; GPU kernels read tensors as float and half.
+                .filter(|a| a.is_power_of_two() && *a >= 8)
+                .ok_or_else(|| {
+                    Error::Format("general.alignment must be a power of two of at least 8".into())
+                })?,
             None => DEFAULT_ALIGNMENT,
         };
         let data_start = (c.pos as u64).div_ceil(align) * align;
@@ -419,6 +422,16 @@ mod tests {
             m.data.as_ptr() as usize % 32,
             g.mapped_bytes().as_ptr() as usize % 32
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_alignment_below_eight() {
+        let path = tmp_path("align");
+        let mut wr = Writer::new();
+        wr.kv("general.alignment", Value::U32(4));
+        wr.write(&path).unwrap();
+        assert!(matches!(Gguf::open(&path), Err(Error::Format(_))));
         std::fs::remove_file(path).unwrap();
     }
 

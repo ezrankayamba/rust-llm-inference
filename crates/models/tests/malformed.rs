@@ -249,6 +249,26 @@ fn rejects_more_experts_used_than_exist() {
     });
 }
 
+fn set_f32_metadata(bytes: &mut [u8], key: &str, v: f32) {
+    let at = after(bytes, key) + 4;
+    bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+#[test]
+fn rejects_non_finite_or_non_positive_float_metadata() {
+    // NaN here makes every hidden state NaN; on Metal that once routed to no expert at all.
+    for (key, v) in [
+        ("llama.attention.layer_norm_rms_epsilon", f32::NAN),
+        ("llama.attention.layer_norm_rms_epsilon", -1e30),
+        ("llama.rope.freq_base", f32::INFINITY),
+        ("llama.rope.freq_base", 0.0),
+    ] {
+        assert_load_error("float-meta", key.trim_start_matches("llama."), |b| {
+            set_f32_metadata(b, key, v)
+        });
+    }
+}
+
 #[test]
 fn rejects_embedding_size_that_disagrees_with_tensors() {
     // Corrupting this alone used to size buffers from the wrong value.
