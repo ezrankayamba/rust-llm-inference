@@ -149,8 +149,12 @@ Design points that span files:
   while under 60% of its recent guesses stand (`MIN_DRAFT_RATE`): shrinking to one guess after a
   miss still cost Swahili prose 23-65%. The last layer then computes the rows from `lo`, whose
   batched attention must start at `pos + lo` (a 2-row check was 0.47 off before that was fixed;
-  `logits_for_the_last_rows_match_per_token` catches it only with `--features metal`). CUDA keeps
-  `logit_rows() == 1`, so `set_draft` refuses there. `examples/spec_accept.rs` measures how often a
+  `logits_for_the_last_rows_match_per_token` catches it only with `--features metal`). On CUDA every
+  row of the last layer keeps its attention, so only the output projection, FFN and head take
+  the rows from `lo`; a pass of several rows has its graph keyed by length and rows. Its checks
+  run the int8 matmul kernels where decode runs the int8 matvecs, so a near-tie at temperature 0
+  can go the other way: on the 5090 one of 12 eval replies (an open-ended greeting) diverged
+  partway through its text; the tool calls were identical. `examples/spec_accept.rs` measures how often a
   draft's guesses would stand on the tool-call cases.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there

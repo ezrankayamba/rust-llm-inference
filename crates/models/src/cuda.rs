@@ -6,7 +6,9 @@
 //! instead of matvec, one sync per chunk), unless an offloaded layer is routed on the CPU.
 
 use crate::backend::BackendError;
-use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
+use crate::model::{
+    Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each, rows_in,
+};
 use rli_core::cuda::{
     ATTN_THREADS, At, AttnParams, Batch, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf, GpuIds, GpuQ,
     Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
@@ -127,6 +129,9 @@ struct Cuda {
     /// length has run before: `[0]` for chunks that return no logits, `[1]` for those that do
     /// (the last of a prompt, whose last layer and output head launch other kernels).
     graph: Mutex<[[GraphSlot; GRAPH_TOKENS]; 2]>,
+    /// The same for chunks that return the logits of more than their last token (speculative
+    /// decoding's checks), keyed by length and rows, at most [`GRAPH_ROWS_MAX`] of them.
+    graph_rows: Mutex<Vec<((usize, usize), GraphSlot)>>,
     gpu: Gpu,
     layers: Vec<GpuLayer>,
     output_norm: GpuBuf,
@@ -595,7 +600,8 @@ fn moe(
 impl Cuda {
     /// Runs the offloaded layers over the tokens of `xs` (row-major embeddings, in place) at
     /// positions `pos..`; `s` must hold that many tokens. More than one token needs
-    /// `self.batchable`. Returns whether it filled `logits` (the last token's).
+    /// `self.batchable`. Returns whether it filled `logits` (those of the last
+    /// `logits.len() / n_vocab` tokens).
     fn pass(
         &self,
         model: &Model,
@@ -614,6 +620,16 @@ impl Cuda {
             pos + n - 1,
             kv.max_ctx
         );
+        let want_logits = self.covers_all && logits.is_some();
+        let vocab = model.output.rows;
+        let rows = match &logits {
+            Some(l) if want_logits => l.len() / vocab,
+            _ => 0,
+        };
+        assert!(rows <= n, "{rows} logit rows of a {n}-token chunk");
+        if s.logits.len() < rows * vocab {
+            s.logits = self.gpu.alloc(rows * vocab);
+        }
         self.gpu.write(&mut s.x, xs);
         // A decoded token's launches read its position from the device, and its keys and
         // values go to scratch, from which the rotation stores them into the cache: the
@@ -642,7 +658,6 @@ impl Cuda {
             pos_dev: dev.then_some((&s.pos, pos)),
             store: None,
         };
-        let want_logits = self.covers_all && logits.is_some();
         let queue = |b: &mut Batch<'_>| {
             for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
                 let (k_at, v_at) = match dev {
@@ -654,12 +669,12 @@ impl Cuda {
                     ..rope
                 };
                 let (xb, eps) = (At(&s.xb, 0), c.rms_eps);
-                // After the last layer of the model only the row the logits come from is read:
-                // there the rows before `lo` get their keys and values (and, since the kernels
-                // take queries and keys together, their attention), but no output projection
-                // and no FFN, which are nine tenths of a layer.
+                // After the last layer of the model only the rows the logits come from are
+                // read: there the rows before `lo` get their keys and values (and, since the
+                // kernels take queries and keys together, their attention), but no output
+                // projection and no FFN, which are nine tenths of a layer.
                 let m = if self.covers_all && l + 1 == self.layers.len() {
-                    usize::from(want_logits)
+                    rows
                 } else {
                     n
                 };
@@ -806,20 +821,20 @@ impl Cuda {
                 }
             }
             if want_logits {
-                let last = At(&s.x, (n - 1) * n_embd);
+                let last = At(&s.x, (n - rows) * n_embd);
                 let (xb, out) = (At(&s.xb, 0), [&model.output]);
-                let f = fed(b, &out, 1, int8);
+                let f = fed(b, &out, rows, int8);
                 b.rmsnorm(
                     last,
                     xb,
                     &self.output_norm,
-                    1,
+                    rows,
                     n_embd,
                     c.rms_eps,
                     f.q(s),
                     f.half(s),
                 );
-                mm_each(b, s, &out, xb, &[At(&s.logits, 0)], 1, int8, f);
+                mm_each(b, s, &out, xb, &[At(&s.logits, 0)], rows, int8, f);
             }
         };
         // A short chunk's launches are replayed as a graph, which costs less per launch and
@@ -827,6 +842,7 @@ impl Cuda {
         // so a length other than one token gets its graph the second time it comes up. A
         // layer routed on the CPU reads back mid-pass, so it can't be.
         let mut graphs = self.graph.lock().unwrap_or_else(|p| p.into_inner());
+        let mut by_rows = self.graph_rows.lock().unwrap_or_else(|p| p.into_inner());
         let long = graphs
             .iter()
             .flat_map(|g| &g[GRAPH_SHORT..])
@@ -837,9 +853,21 @@ impl Cuda {
         // Qwen3-30B-A3B on an RTX 5090).
         let graph = &mut graphs[usize::from(want_logits)];
         let room = |g: &GraphSlot| n <= GRAPH_SHORT || g.0.is_some() || long < GRAPH_LONG_MAX;
-        let slot = graph
-            .get_mut(n.wrapping_sub(1))
-            .filter(|g| self.batchable && room(g));
+        // A pass's launches depend on its logit rows too: one replayed against a graph of
+        // other rows would be captured anew every time.
+        let slot = if rows > 1 {
+            let at = match by_rows.iter().position(|(k, _)| *k == (n, rows)) {
+                None if by_rows.len() < GRAPH_ROWS_MAX => {
+                    by_rows.push(((n, rows), (None, false)));
+                    Some(by_rows.len() - 1)
+                }
+                i => i,
+            };
+            at.map(|i| &mut by_rows[i].1)
+        } else {
+            graph.get_mut(n.wrapping_sub(1)).filter(|g| room(g))
+        }
+        .filter(|_| self.batchable);
         if let Some((g, seen)) = slot
             && (n == 1 || std::mem::replace(seen, true))
             && !rli_core::cuda::profiling()
@@ -853,7 +881,7 @@ impl Cuda {
         // The caller has no use for x once it has the logits, or when no layer is left for
         // the CPU.
         if want_logits && let Some(out) = logits {
-            self.gpu.read(&s.logits, out);
+            self.gpu.read(&s.logits, &mut out[..rows * vocab]);
         } else if !self.covers_all {
             self.gpu.read(&s.x, xs);
         }
@@ -873,6 +901,9 @@ const GRAPH_TOKENS: usize = BATCH_CHUNK;
 /// launch, and a server sees many lengths. The lengths that come up first keep theirs.
 const GRAPH_LONG_MAX: usize = 64;
 const GRAPH_SHORT: usize = 32;
+/// Most graphs kept for chunks with several logit rows: speculative decoding's checks come in
+/// a few lengths (the draft's tokens and one), each with as many rows.
+const GRAPH_ROWS_MAX: usize = 16;
 
 impl Accelerator for Cuda {
     fn name(&self) -> &str {
@@ -885,6 +916,10 @@ impl Accelerator for Cuda {
 
     fn prompt_slice(&self) -> usize {
         BATCH_CHUNK
+    }
+
+    fn logit_rows(&self) -> usize {
+        usize::MAX
     }
 
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send> {
@@ -926,7 +961,7 @@ impl Accelerator for Cuda {
         state: &mut (dyn Any + Send),
         xs: &mut [f32],
         pos: usize,
-        mut logits: Option<&mut [f32]>,
+        logits: Option<&mut [f32]>,
     ) -> bool {
         let n_embd = model.cfg.n_embd;
         if !self.batchable || xs.len() == n_embd {
@@ -949,15 +984,26 @@ impl Accelerator for Cuda {
             };
             Scratch::new(&self.gpu, &model.cfg, self.sizes, logits, BATCH_CHUNK)
         });
-        let n_chunks = xs.len().div_ceil(BATCH_CHUNK * n_embd);
+        let (n, vocab) = (xs.len() / n_embd, model.output.rows);
+        let mut logits = logits.filter(|_| self.covers_all);
+        let rows = logits.as_ref().map_or(0, |l| l.len() / vocab);
         let mut done = false;
         for (i, chunk) in xs.chunks_mut(BATCH_CHUNK * n_embd).enumerate() {
-            let l = if i + 1 == n_chunks {
-                logits.take()
-            } else {
-                None
+            let start = i * BATCH_CHUNK;
+            // The chunks that hold some of the last `rows` tokens fill their share.
+            let r = rows_in(start, start + chunk.len() / n_embd, n, rows);
+            let l = match logits.take() {
+                Some(l) if r > 0 => {
+                    let (this, rest) = l.split_at_mut(r * vocab);
+                    logits = Some(rest);
+                    Some(this)
+                }
+                l => {
+                    logits = l;
+                    None
+                }
             };
-            done = self.pass(model, kv, s, chunk, pos + i * BATCH_CHUNK, l);
+            done = self.pass(model, kv, s, chunk, pos + start, l);
         }
         done
     }
@@ -1056,6 +1102,7 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         graph: Mutex::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| (None, false))
         })),
+        graph_rows: Mutex::new(Vec::new()),
         batch: Mutex::new(None),
         gpu,
     };
