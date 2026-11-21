@@ -204,9 +204,41 @@ fn run(a: Args) -> Result<(), String> {
         }
         messages.push(Message::new("user", line.trim()));
         // The session keeps the previous turns' KV cache; only the new suffix is evaluated.
-        let tokens = engine.chat_tokens(&messages);
+        let budget = sess
+            .max_ctx
+            .saturating_sub(a.params.max_tokens.min(sess.max_ctx / 2));
+        let (tokens, dropped) = fit_history(&engine, &mut messages, budget);
+        if dropped > 0 {
+            eprintln!("[context full: dropped the {dropped} oldest messages]");
+        }
+        if tokens.len() >= sess.max_ctx {
+            eprintln!(
+                "[message is {} tokens; context size is {}]",
+                tokens.len(),
+                sess.max_ctx
+            );
+            messages.pop();
+            continue;
+        }
         let reply = generate(&tokens, &mut sess);
         messages.push(Message::new("assistant", reply.trim()));
+    }
+}
+
+/// Drops the oldest turns after any system message until the chat fits `budget` tokens or only
+/// the latest message is left. Returns the prompt and how many messages were dropped.
+fn fit_history(engine: &Engine, messages: &mut Vec<Message>, budget: usize) -> (Vec<u32>, usize) {
+    let first = usize::from(messages.first().is_some_and(|m| m.role == "system"));
+    let mut dropped = 0;
+    loop {
+        let tokens = engine.chat_tokens(messages);
+        if tokens.len() <= budget || messages.len() - first <= 1 {
+            return (tokens, dropped);
+        }
+        // A user message and the reply to it, so the history still alternates.
+        let n = 2.min(messages.len() - first - 1);
+        messages.drain(first..first + n);
+        dropped += n;
     }
 }
 

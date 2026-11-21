@@ -161,14 +161,21 @@ impl Engine {
         is_cancelled: impl Fn() -> bool,
         mut on_text: impl FnMut(&str) -> bool,
     ) -> GenOutput {
-        // Before truncating: a request cancelled while queued must not evict the cached prefix.
-        if is_cancelled() {
+        // Before truncating: a request cancelled while queued, or one that can't fit, must not
+        // evict the cached prefix.
+        let fits = !prompt.is_empty() && prompt.len() <= sess.max_ctx;
+        let cancelled = is_cancelled();
+        if cancelled || !fits {
             return GenOutput {
                 text: String::new(),
                 prompt_tokens: prompt.len(),
                 prompt_evaluated: 0,
                 completion_tokens: 0,
-                finish: Finish::Cancelled,
+                finish: if cancelled {
+                    Finish::Cancelled
+                } else {
+                    Finish::Length
+                },
                 prefill_secs: 0.0,
                 decode_secs: 0.0,
             };
@@ -193,10 +200,6 @@ impl Engine {
             prefill_secs: 0.0,
             decode_secs: 0.0,
         };
-        if prompt.len() > sess.max_ctx || prompt.is_empty() {
-            return out;
-        }
-
         let t0 = Instant::now();
         let to_eval = &prompt[keep..];
         let mut evaluated = 0;
@@ -237,13 +240,7 @@ impl Engine {
             }
             out.completion_tokens += 1;
             self.tokenizer.decode_bytes(next, &mut pending);
-            let valid = match std::str::from_utf8(&pending) {
-                Ok(s) => s.len(),
-                // An incomplete trailing sequence waits for the next token; invalid bytes are
-                // emitted lossily so a bad token can't stall output forever.
-                Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => pending.len(),
-            };
+            let valid = complete_utf8(&pending);
             if valid > 0 {
                 let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
@@ -283,5 +280,36 @@ impl Engine {
         }
         out.decode_secs = t1.elapsed().as_secs_f64();
         out
+    }
+}
+
+/// How many leading bytes of `pending` can be emitted: everything but an incomplete trailing
+/// sequence, which waits for the next token. Invalid bytes are emitted (lossily) so a bad token
+/// can't stall output, but only up to the end of the last one: a character that starts after it
+/// and is still incomplete keeps waiting.
+fn complete_utf8(pending: &[u8]) -> usize {
+    let mut n = 0;
+    loop {
+        match std::str::from_utf8(&pending[n..]) {
+            Ok(s) => return n + s.len(),
+            Err(e) => match e.error_len() {
+                None => return n + e.valid_up_to(),
+                Some(bad) => n += e.valid_up_to() + bad,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_utf8;
+
+    #[test]
+    fn complete_utf8_holds_back_an_unfinished_character_after_an_invalid_byte() {
+        // 0x80 is invalid; E6 97 starts "日" (E6 97 A5) and must wait for its last byte.
+        assert_eq!(complete_utf8(&[b'a', 0x80, 0xE6, 0x97]), 2);
+        assert_eq!(complete_utf8("日".as_bytes()), 3);
+        assert_eq!(complete_utf8(&[0xE6, 0x97]), 0);
+        assert_eq!(complete_utf8(&[0x80, 0x80]), 2);
     }
 }
