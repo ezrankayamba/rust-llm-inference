@@ -244,7 +244,7 @@ impl Engine {
         let mut pending: Vec<u8> = Vec::new();
         let mut stops = StopMatcher::new(&params.stop);
         let mut stopped = false;
-        loop {
+        'tokens: loop {
             if out.completion_tokens >= params.max_tokens || sess.len() >= sess.max_ctx {
                 out.finish = Finish::Length;
                 break;
@@ -264,10 +264,21 @@ impl Engine {
                 out.finish = Finish::Stop;
                 break;
             }
-            out.completion_tokens += 1;
-            self.tokenizer.decode_bytes(next, &mut pending);
-            let valid = complete_utf8(&pending);
-            if valid > 0 {
+            // Inside a tool call, the text the schema leaves no choice over follows the token
+            // sampled, all evaluated in one pass.
+            let mut batch = vec![next];
+            if let Some(c) = &mut constraint {
+                let room = (params.max_tokens - out.completion_tokens - 1)
+                    .min(sess.max_ctx - sess.len() - 1);
+                batch.extend(c.jump(|s| self.tokenizer.encode(s, false, false), room));
+            }
+            for (i, &id) in batch.iter().enumerate() {
+                out.completion_tokens += 1;
+                self.tokenizer.decode_bytes(id, &mut pending);
+                let valid = complete_utf8(&pending);
+                if valid == 0 {
+                    continue;
+                }
                 let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
                 let (ready, hit) = stops.push(&chunk);
@@ -276,18 +287,18 @@ impl Engine {
                 if hit {
                     out.finish = Finish::Stop;
                     stopped = true;
-                    break;
+                    break 'tokens;
                 }
                 if !wanted {
                     out.finish = Finish::Cancelled;
                     // Keep the KV cache consistent with the tokens actually produced.
-                    self.model.forward(sess, next, false);
-                    break;
+                    self.model.forward_batch(sess, &batch[..=i], false);
+                    break 'tokens;
                 }
             }
             logits = self
                 .model
-                .forward(sess, next, true)
+                .forward_batch(sess, &batch, true)
                 .expect("logits requested");
         }
         if !stopped {

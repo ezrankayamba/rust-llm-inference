@@ -1,7 +1,7 @@
 """Accuracy and latency of tool calls through a running rli-server, on short English, Swahili and
 mixed utterances against a voice-app schema (navigate, fill_field, submit_form).
 
-usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json] [--think]
+usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json] [--think] [--save out.json]
 
 A case is {"text": ..., "expect": [[name, {args}], ...], "optional": [[name, {args}], ...]}:
 the reply must hold exactly the expected calls in any order, plus any of the optional ones.
@@ -105,10 +105,11 @@ def main():
     ap.add_argument("--cases")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--think", action="store_true", help="let Qwen3 reason before answering")
+    ap.add_argument("--save", help="write every reply's calls and text here, to compare runs")
     a = ap.parse_args()
     cases = json.load(open(a.cases)) if a.cases else CASES
     post(a.url, "hello", 8)
-    right, secs, toks = 0, [], []
+    right, secs, toks, saved = 0, [], [], []
     for c in cases:
         resp, dt = post(a.url, c["text"], a.max_tokens, a.think)
         msg = resp["choices"][0]["message"]
@@ -120,9 +121,14 @@ def main():
         right += ok
         secs.append(dt)
         toks.append(resp["usage"]["completion_tokens"])
+        saved.append({"text": c["text"], "calls": [[t["function"]["name"], t["function"]["arguments"]]
+                                                   for t in msg.get("tool_calls") or []],
+                      "content": msg.get("content"), "ok": ok})
         print(f"{'ok  ' if ok else 'MISS'} {dt:5.2f}s {toks[-1]:3d} tok  {c['text']}")
         if not ok:
             print(f"       got {got or msg.get('content')!r}")
+    if a.save:
+        json.dump(saved, open(a.save, "w"), ensure_ascii=False, indent=1)
     print(f"\n{right}/{len(cases)} right; latency mean {statistics.mean(secs):.2f}s, "
           f"median {statistics.median(secs):.2f}s, max {max(secs):.2f}s; "
           f"reply tokens mean {statistics.mean(toks):.0f}")

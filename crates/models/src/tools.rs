@@ -671,6 +671,75 @@ impl<'a> Constraint<'a> {
         bits
     }
 
+    /// The one byte the grammar allows in `s`, if there is only one.
+    fn only_byte(&self, s: St) -> Option<u8> {
+        let mut ok = (0..=255u8).filter(|&b| self.g.step(s, b).is_some());
+        let b = ok.next()?;
+        ok.next().is_none().then_some(b)
+    }
+
+    /// The bytes the grammar allows only one way from here, up to where the model has a choice,
+    /// with the optional space after `:` and `,` and the newlines around the call written as
+    /// Qwen writes them. `true` when the call is then complete.
+    fn forced(&self) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let Some(mut s) = self.state else {
+            return (out, false);
+        };
+        loop {
+            let b = match s {
+                St::EndNl => break,
+                St::Start | St::End => b'\n',
+                St::Lit { lit, pos, .. } if LITS[lit as usize][pos as usize] == 0 => b' ',
+                _ => match self.only_byte(s) {
+                    Some(b) => b,
+                    None => break,
+                },
+            };
+            s = self.g.step(s, b).expect("a forced byte is allowed");
+            out.push(b);
+        }
+        // Stop short of a character the model still has a choice inside.
+        let valid = std::str::from_utf8(&out).map_or_else(|e| e.valid_up_to(), |_| out.len());
+        let done = s == St::EndNl && valid == out.len();
+        out.truncate(valid);
+        (out, done)
+    }
+
+    /// The tokens of what the grammar leaves no choice over from here, for the caller to
+    /// evaluate in one batch instead of sampling one at a time: at most `room` of them, and
+    /// the constraint already advanced past them. `encode` tokenizes text. The forced text's
+    /// last token is left to the model, which may write it merged with what it chooses next,
+    /// unless `</tool_call>` follows.
+    pub fn jump(&mut self, encode: impl Fn(&str) -> Vec<u32>, room: usize) -> Vec<u32> {
+        let (bytes, done) = self.forced();
+        let text = std::str::from_utf8(&bytes).expect("trimmed to whole characters");
+        let mut ids = if text.is_empty() {
+            Vec::new()
+        } else {
+            encode(text)
+        };
+        // A tokenizer that adds to the text (SentencePiece's leading space) wrote something else.
+        let mut back = Vec::new();
+        for &id in &ids {
+            back.extend_from_slice(self.t.bytes.get(id as usize).map_or(&[], |b| b));
+        }
+        if back != bytes {
+            return Vec::new();
+        }
+        match self.t.close {
+            Some(close) if done => ids.push(close),
+            _ => {
+                ids.pop();
+            }
+        }
+        ids.truncate(room);
+        for &id in &ids {
+            self.advance(id);
+        }
+        ids
+    }
+
     /// Whether a call is being written.
     pub fn in_call(&self) -> bool {
         self.state.is_some()
@@ -966,12 +1035,103 @@ mod tests {
         (v, n - 2, n - 1)
     }
 
+    /// The longest token at each point, as a stand-in tokenizer over [`vocab`].
+    fn greedy(bytes: &[Vec<u8>], text: &str) -> Vec<u32> {
+        let mut rest = text.as_bytes();
+        let mut ids = Vec::new();
+        while !rest.is_empty() {
+            let (id, len) = (0..bytes.len())
+                .filter(|&i| !bytes[i].is_empty() && rest.starts_with(&bytes[i]))
+                .map(|i| (i as u32, bytes[i].len()))
+                .max_by_key(|&(_, len)| len)
+                .unwrap();
+            ids.push(id);
+            rest = &rest[len..];
+        }
+        ids
+    }
+
+    fn feed(c: &mut Constraint, text: &str) {
+        for b in text.bytes() {
+            c.advance(b as u32);
+        }
+    }
+
+    #[test]
+    fn forced_text_runs_to_the_next_choice() {
+        let g = Grammar::new(&tools2());
+        let (bytes, open, close) = vocab();
+        let t = TokenTable::from_bytes(bytes, Some(open), Some(close));
+        let mut c = Constraint::new(&g, &t);
+        assert_eq!(c.forced(), (Vec::new(), false));
+        c.advance(open);
+        // Two functions: the name is the model's choice.
+        assert_eq!(c.forced(), (b"\n{\"name\": \"".to_vec(), false));
+        feed(&mut c, "\n{\"name\": \"f");
+        // form_id and field_id share an `f`, value doesn't.
+        assert_eq!(c.forced().0, b"ill_field\", \"arguments\": {\"");
+        feed(&mut c, "ill_field\", \"arguments\": {\"fo");
+        // A one-value enum and the comma are forced; field_id or value is a choice.
+        assert_eq!(c.forced().0, b"rm_id\": \"loan_application\", \"");
+        feed(&mut c, "rm_id\":\"loan_application\",\"value\":\"5\",\"fi");
+        assert_eq!(c.forced().0, b"eld_id\": \"");
+        feed(&mut c, "eld_id\": \"amount\"");
+        assert_eq!(c.forced(), (b"}}\n".to_vec(), true));
+        // Inside a free string nothing is forced.
+        let mut c = Constraint::new(&g, &t);
+        c.advance(open);
+        feed(
+            &mut c,
+            "{\"name\": \"fill_field\", \"arguments\": {\"value\": \"",
+        );
+        assert_eq!(c.forced(), (Vec::new(), false));
+    }
+
+    #[test]
+    fn jump_leaves_the_last_forced_token_to_the_model_except_before_the_close() {
+        let g = Grammar::new(&tools2());
+        let (bytes, open, close) = vocab();
+        let t = TokenTable::from_bytes(bytes.clone(), Some(open), Some(close));
+        let text = |ids: &[u32]| -> String {
+            ids.iter()
+                .map(|&i| String::from_utf8_lossy(&bytes[i as usize]).into_owned())
+                .collect()
+        };
+        let mut c = Constraint::new(&g, &t);
+        c.advance(open);
+        let ids = c.jump(|s| greedy(&bytes, s), usize::MAX);
+        // `\n`, `{"`, `name`, then `": "` is left.
+        assert_eq!(text(&ids), "\n{\"name");
+        assert_eq!(c.forced().0, b"\": \"");
+        // At most `room` tokens, and the constraint advanced past only those.
+        let mut c = Constraint::new(&g, &t);
+        c.advance(open);
+        assert_eq!(text(&c.jump(|s| greedy(&bytes, s), 2)), "\n{\"");
+        assert_eq!(c.forced().0, b"name\": \"");
+        // The end of a call: everything up to and including `</tool_call>`.
+        feed(&mut c, "name\": \"go_back\", \"arguments\": {");
+        let ids = c.jump(|s| greedy(&bytes, s), usize::MAX);
+        assert_eq!(ids.last(), Some(&close));
+        assert_eq!(text(&ids[..ids.len() - 1]), "}}\n");
+        assert!(!c.in_call());
+        // A tokenizer that doesn't give back the same bytes is not used.
+        let mut c = Constraint::new(&g, &t);
+        c.advance(open);
+        assert!(
+            c.jump(|s| greedy(&bytes, &format!(" {s}")), usize::MAX)
+                .is_empty()
+        );
+        assert_eq!(c.forced().0, b"\n{\"name\": \"");
+    }
+
     /// Generates with the constraint and `pick` choosing among the logits it leaves, from
-    /// `<tool_call>` until `</tool_call>` or `steps` tokens. Returns the call's text if it closed.
+    /// `<tool_call>` until `</tool_call>` or `steps` tokens, jumping over forced text if `jump`.
+    /// Returns the call's text if it closed.
     fn run(
         g: &Grammar,
         t: &TokenTable,
         steps: usize,
+        jump: bool,
         mut pick: impl FnMut(&[f32]) -> u32,
     ) -> Option<String> {
         let (bytes, open, close) = vocab();
@@ -996,6 +1156,15 @@ mod tests {
             out.extend(&bytes[id as usize]);
             c.advance(id);
             assert!(c.in_call());
+            if jump {
+                for id in c.jump(|s| greedy(&bytes, s), usize::MAX) {
+                    if id == close {
+                        assert!(!c.in_call());
+                        return Some(String::from_utf8(out).expect("utf-8"));
+                    }
+                    out.extend(&bytes[id as usize]);
+                }
+            }
         }
         None
     }
@@ -1029,11 +1198,12 @@ mod tests {
         let (bytes, open, close) = vocab();
         let t = TokenTable::from_bytes(bytes.clone(), Some(open), Some(close));
         let mut closed = 0;
-        for seed in 1..=300u64 {
+        for seed in 1..=600u64 {
+            let jump = seed > 300;
             let mut r = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             // Random scores, the forbidden tokens far ahead of the rest, the close token and
             // closing quotes favoured often enough that strings end.
-            let text = run(&g, &t, 400, |logits| {
+            let text = run(&g, &t, 400, jump, |logits| {
                 let mut best = (f32::NEG_INFINITY, 0);
                 for (i, &l) in logits.iter().enumerate() {
                     r ^= r << 13;
@@ -1066,7 +1236,7 @@ mod tests {
                 closed += 1;
             }
         }
-        assert!(closed > 250, "only {closed} calls closed");
+        assert!(closed > 500, "only {closed} calls closed");
     }
 
     #[test]

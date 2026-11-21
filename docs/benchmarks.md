@@ -3,6 +3,44 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: evaluating the text a tool call's schema forces in one batch (M4)
+
+Inside a `<tool_call>` block, `Constraint::jump` collects the bytes the grammar allows only one
+way (the JSON between values, the rest of a name, key or enum value once its prefix is unique,
+a one-value enum, the comma after a value; the optional spaces and the newlines around a call
+as Qwen writes them), tokenizes them, and `Engine::generate` evaluates them in one
+`forward_batch` with the token sampled before them. The last token of the forced text is left
+for the model to sample, so it can merge it with what it chooses next as it would have; only
+the `</tool_call>` at the end is inserted after it.
+
+Accuracy: `scripts/eval_tool_calls.py --save`, before and after, gave the same calls and the
+same text on all 12 cases for Qwen3-8B and Qwen3-14B (24 of 24 replies identical).
+
+Speed: the old build (`2fb1bf3`) and the new one alternately, 30 s apart, with
+a Docker VM running alongside (4 GB, ~40% of a core; 3 GB of swap in use), so the absolute
+times are slower than the entries below. The 11 cases with calls, `max_tokens` 256:
+
+| model | build | right | mean | median | max |
+|---|---|---|---|---|---|
+| Qwen3-8B | old | 8/11 | 3.49 s, 3.26 s | 2.75 s, 2.66 s | 9.22 s, 8.98 s |
+| Qwen3-8B | new | 8/11 | 2.07 s, 1.85 s | 1.86 s, 1.55 s | 4.73 s, 4.05 s |
+| Qwen3-14B | old | 7/11 | 8.43 s, 9.52 s | 6.88 s, 8.37 s | 25.78 s, 24.88 s |
+| Qwen3-14B | new | 7/11 | 5.13 s, 4.62 s | 4.49 s, 4.30 s | 10.40 s, 9.18 s |
+
+The README's request (one tool, so the function name is forced too; 78 reply tokens, the same
+two calls from both builds), Qwen3-8B:
+
+| backend | build | cold | warm | decode (warm) |
+|---|---|---|---|---|
+| Metal | old | 8.71 s | 5.03 s | 4.96 s |
+| Metal | new | 4.39 s | 2.29 s | 2.23 s |
+| CPU | old | 11.36 s | 6.02 s | 5.95 s |
+| CPU | new | 8.42 s | 3.02 s | 2.95 s |
+
+A batch of 8 tokens costs about one decoded token here (`bench --pp 8 --tg 16`: Qwen3-8B 75 ms
+against 83, Qwen3-14B 154 against 170), so a forced run costs what one sampled token does.
+`timings.predicted_per_second` counts the forced tokens as predicted.
+
 ## 2026-11-21: tool-call accuracy and latency by Qwen3 size (M4, Metal)
 
 `scripts/eval_tool_calls.py` against `rli-server` (default flags, all layers offloaded where they

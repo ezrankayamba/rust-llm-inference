@@ -103,10 +103,12 @@ JSON
 ```
 
 With Qwen3-8B Q4_K_M this returns two calls, `fill_field` with `full_name` = `Asha Juma` and with
-`amount` = `500000` (`finish_reason: "tool_calls"`). On an M4 Mac the request takes 5.7 s on
-Metal and 9.4 s on the CPU, or 4.0 and 4.7 s once the system prompt and tools are in the KV cache.
-Nearly all of it is decoding the 78-token reply at 17-20 tokens/s; the constraint adds about
-0.1 ms a token (`docs/benchmarks.md`, 2026-11-21).
+`amount` = `500000` (`finish_reason: "tool_calls"`). On an M4 Mac the request takes 2.3 s on
+Metal and 3.0 s on the CPU once the system prompt and tools are in the KV cache, nearly all of
+it the 78-token reply. Inside a call, the text the schemas leave no choice over (the JSON around
+the values, here the function name too) is evaluated in one batch instead of a token at a time,
+which halved that; the constraint itself adds about 0.1 ms a token (`docs/benchmarks.md`,
+2026-11-21).
 
 ## Performance
 
