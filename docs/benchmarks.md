@@ -17,6 +17,16 @@ from the voice engine's traffic.
 | Qwen3-4B Q4_K_M | 7/12 | 1.01 s | 1.41 s | 3.85 s | 41 |
 | Qwen3-8B Q4_K_M | 9/12 | 2.24 s | 3.55 s | 13.69 s | 64 |
 | Qwen3-30B-A3B Q4_K_M | 7/12 | 2.66 s | 3.06 s | 9.86 s | 48 |
+| Qwen3-14B Q4_K_M | 8/12 | 4.60 s | 5.57 s | 12.90 s | 51 |
+| Qwen3-8B Q4_K_M, thinking | 8/12 | 16.09 s | 22.86 s | 80.29 s | 359 |
+| Qwen3-14B Q4_K_M, thinking | 10/12 | 33.58 s | 43.63 s | 171.51 s | 295 |
+
+Thinking is `chat_template_kwargs: {"enable_thinking": true}` (`--think`), with
+`max_tokens` 2048. It cost the 8B a case and gained the 14B two: only the 14B thinking turned
+"elfu hamsini" into 50000, submitted on "Tuma fomu" and filled the name from "Jina langu ni
+John Mwangi". Every run sent "Mipangilio tafadhali" somewhere other than settings. The 14B
+thinking's other miss reasoned for 1096 tokens and then asked for a phone number. With 12
+cases a difference of one is within noise.
 
 Qwen3-30B-A3B ran 47 of its 48 layers on the GPU (the last did not fit Metal's working set
 here), and decoded at about 16 tokens/s, not the 43 it reaches fully offloaded. The 8B's misses:
