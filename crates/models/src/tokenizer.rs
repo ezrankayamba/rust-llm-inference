@@ -5,7 +5,8 @@
 //!   (hand-written here to avoid a regex engine with look-ahead).
 
 use rli_gguf::{Error, Gguf, Result, Value};
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 
 const TYPE_CONTROL: i32 = 3;
@@ -255,8 +256,9 @@ impl Tokenizer {
         let mut from = 0;
         // SPM prefixes a space only at the very start of the text, not after each special token.
         let mut at_start = true;
+        let mut found = vec![Found::Unknown; self.specials.len()];
         while from < text.len() {
-            let special = self.find_special(text, from, &allow);
+            let special = self.find_special(text, from, &allow, &mut found);
             let plain = &text[from..special.as_ref().map_or(text.len(), |(span, _)| span.start)];
             if !plain.is_empty() {
                 self.encode_plain(plain, at_start, &mut out);
@@ -270,27 +272,41 @@ impl Tokenizer {
     }
 
     /// The earliest allowed special at or after `from` (the longest, if several start there).
+    /// `found` remembers each special's next allowed match from earlier calls, whose `from` was
+    /// no later: searching every special from `from` each time was quadratic in the text.
     fn find_special(
         &self,
         text: &str,
         from: usize,
         allow: &impl Fn(Range<usize>, u32) -> bool,
+        found: &mut [Found],
     ) -> Option<(Range<usize>, u32)> {
         let mut best: Option<(Range<usize>, u32)> = None;
-        for (s, id) in &self.specials {
-            let mut start = from;
-            while let Some(i) = text[start..].find(s.as_str()) {
-                let pos = start + i;
-                if allow(pos..pos + s.len(), *id) {
-                    if best.as_ref().is_none_or(|(b, _)| {
-                        pos < b.start || (pos == b.start && pos + s.len() > b.end)
-                    }) {
-                        best = Some((pos..pos + s.len(), *id));
+        for ((s, id), f) in self.specials.iter().zip(found.iter_mut()) {
+            let pos = match *f {
+                Found::None => continue,
+                Found::At(pos) if pos >= from => pos,
+                _ => {
+                    *f = Found::None;
+                    let mut start = from;
+                    while let Some(i) = text[start..].find(s.as_str()) {
+                        let pos = start + i;
+                        if allow(pos..pos + s.len(), *id) {
+                            *f = Found::At(pos);
+                            break;
+                        }
+                        // Occurrences can overlap: step one character, not past the whole match.
+                        start = pos + text[pos..].chars().next().map_or(1, char::len_utf8);
                     }
-                    break;
+                    let Found::At(pos) = *f else { continue };
+                    pos
                 }
-                // Occurrences can overlap: step one character, not past the whole match.
-                start = pos + text[pos..].chars().next().map_or(1, char::len_utf8);
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(b, _)| pos < b.start || (pos == b.start && pos + s.len() > b.end))
+            {
+                best = Some((pos..pos + s.len(), *id));
             }
         }
         best
@@ -328,25 +344,48 @@ impl Tokenizer {
         }
     }
 
+    /// Merges the adjacent pair whose union is the highest-scoring token, the leftmost on a tie,
+    /// until none is a token. Symbols are byte spans of `text`; a heap holds the candidate pairs,
+    /// so a long word costs n log n, not n² (one request of a long word could hold a core).
     fn spm_encode(&self, text: &str, out: &mut Vec<u32>) {
-        let mut syms: Vec<String> = text.chars().map(String::from).collect();
-        loop {
-            let mut best: Option<(usize, f32)> = None;
-            for i in 0..syms.len().saturating_sub(1) {
-                let cand = format!("{}{}", syms[i], syms[i + 1]);
-                if let Some(&id) = self.token_id.get(&cand) {
-                    let score = self.scores[id as usize];
-                    if best.is_none_or(|(_, s)| score > s) {
-                        best = Some((i, score));
-                    }
-                }
+        // Symbol i is text[start[i]..end[i]]; next[i] == n ends the list.
+        let start: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let n = start.len();
+        let mut end: Vec<usize> = start[1..].iter().copied().chain([text.len()]).collect();
+        let mut next: Vec<usize> = (1..=n).collect();
+        let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+        let mut alive = vec![true; n];
+        // (score, leftmost first, left, right, end of right when pushed)
+        let mut heap = BinaryHeap::new();
+        let push = |heap: &mut BinaryHeap<_>, l: usize, r: usize, end: &[usize]| {
+            if let Some(&id) = self.token_id.get(&text[start[l]..end[r]]) {
+                let score = self.scores[id as usize];
+                heap.push((TotalF32(score), Reverse(l), r, end[r]));
             }
-            let Some((i, _)) = best else { break };
-            let right = syms.remove(i + 1);
-            syms[i].push_str(&right);
+        };
+        for i in 1..n {
+            push(&mut heap, i - 1, i, &end);
         }
+        while let Some((_, Reverse(l), r, r_end)) = heap.pop() {
+            if !alive[l] || next[l] != r || end[r] != r_end {
+                continue;
+            }
+            end[l] = end[r];
+            alive[r] = false;
+            next[l] = next[r];
+            if next[l] < n {
+                prev[next[l]] = l;
+                push(&mut heap, l, next[l], &end);
+            }
+            if prev[l] < n {
+                push(&mut heap, prev[l], l, &end);
+            }
+        }
+        let syms = (0..n)
+            .filter(|&i| alive[i])
+            .map(|i| &text[start[i]..end[i]]);
         for s in syms {
-            match self.token_id.get(&s) {
+            match self.token_id.get(s) {
                 Some(&id) => out.push(id),
                 None => {
                     for b in s.bytes() {
@@ -433,18 +472,70 @@ fn spm_words(s: &str) -> Vec<&str> {
     words
 }
 
-/// Applies BPE merges in rank order until none apply.
-fn bpe_merge(syms: &mut Vec<u32>, merges: &HashMap<(u32, u32), (u32, u32)>) {
-    loop {
-        let best = syms
-            .windows(2)
-            .enumerate()
-            .filter_map(|(i, w)| merges.get(&(w[0], w[1])).map(|&(rank, id)| (rank, i, id)))
-            .min();
-        let Some((_, i, id)) = best else { break };
-        syms[i] = id;
-        syms.remove(i + 1);
+/// A special token's next allowed match, as far as `find_special` has searched.
+#[derive(Clone, Copy)]
+enum Found {
+    Unknown,
+    None,
+    At(usize),
+}
+
+/// `f32` ordered by `total_cmp`, for the SPM merge heap (scores come from the file).
+struct TotalF32(f32);
+impl PartialEq for TotalF32 {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == Ordering::Equal
     }
+}
+impl Eq for TotalF32 {}
+impl PartialOrd for TotalF32 {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for TotalF32 {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.0.total_cmp(&o.0)
+    }
+}
+
+/// Applies BPE merges in rank order, the leftmost pair on a tie, until none apply. A heap of
+/// candidate pairs over a linked list of symbols: n log n for a word of n bytes, not n².
+fn bpe_merge(syms: &mut Vec<u32>, merges: &HashMap<(u32, u32), (u32, u32)>) {
+    let n = syms.len();
+    let mut next: Vec<usize> = (1..=n).collect();
+    let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+    let mut alive = vec![true; n];
+    // Reverse((rank, left, right, the pair's symbols when pushed))
+    let mut heap = BinaryHeap::new();
+    let push = |heap: &mut BinaryHeap<_>, syms: &[u32], l: usize, r: usize| {
+        if let Some(&(rank, _)) = merges.get(&(syms[l], syms[r])) {
+            heap.push(Reverse((rank, l, r, syms[l], syms[r])));
+        }
+    };
+    for i in 1..n {
+        push(&mut heap, syms, i - 1, i);
+    }
+    while let Some(Reverse((_, l, r, a, b))) = heap.pop() {
+        if !alive[l] || next[l] != r || syms[l] != a || syms[r] != b {
+            continue;
+        }
+        syms[l] = merges[&(a, b)].1;
+        alive[r] = false;
+        next[l] = next[r];
+        if next[l] < n {
+            prev[next[l]] = l;
+            push(&mut heap, syms, l, next[l]);
+        }
+        if prev[l] < n {
+            push(&mut heap, syms, prev[l], l);
+        }
+    }
+    let mut i = 0;
+    syms.retain(|_| {
+        i += 1;
+        alive[i - 1]
+    });
 }
 
 fn is_letter(c: char) -> bool {
@@ -712,6 +803,65 @@ mod tests {
         let mut syms = vec![0, 1, 2];
         bpe_merge(&mut syms, &merges);
         assert_eq!(syms, [0, 4]);
+    }
+
+    #[test]
+    fn bpe_merge_breaks_rank_ties_leftmost() {
+        // a=0 aa=1: "aaa" -> [aa, a].
+        let merges = HashMap::from([((0, 0), (0, 1))]);
+        let mut syms = vec![0, 0, 0];
+        bpe_merge(&mut syms, &merges);
+        assert_eq!(syms, [1, 0]);
+    }
+
+    /// A word of 200k bytes: the rescan-per-merge loop this replaced took hours here, and the
+    /// server tokenizes client text before checking its length.
+    #[test]
+    fn bpe_merge_of_a_long_word_is_not_quadratic() {
+        // a=0 aa=1 aaaa=2
+        let merges = HashMap::from([((0, 0), (0, 1)), ((1, 1), (1, 2))]);
+        let mut syms = vec![0; 200_000];
+        bpe_merge(&mut syms, &merges);
+        assert_eq!(syms, vec![2; 50_000]);
+    }
+
+    /// `tok()` plus `a` and `aa`, `aa` scoring higher.
+    fn tok_with_a() -> Tokenizer {
+        let mut t = tok();
+        for (s, score) in [("a", -2.0), ("aa", -1.0)] {
+            t.token_id.insert(s.into(), t.tokens.len() as u32);
+            t.tokens.push(s.into());
+            t.types.push(1);
+            t.scores.push(score);
+        }
+        t
+    }
+
+    #[test]
+    fn spm_merge_breaks_score_ties_leftmost() {
+        let t = tok_with_a();
+        let (a, aa) = (t.token_id("a").unwrap(), t.token_id("aa").unwrap());
+        assert_eq!(t.encode("aaa", false, false), [aa, a]);
+    }
+
+    #[test]
+    fn spm_encode_of_a_long_word_is_not_quadratic() {
+        let t = tok_with_a();
+        let aa = t.token_id("aa").unwrap();
+        assert_eq!(
+            t.encode(&"a".repeat(200_000), false, false),
+            vec![aa; 100_000]
+        );
+    }
+
+    #[test]
+    fn many_specials_in_a_long_text_are_not_quadratic() {
+        let t = tok();
+        let text = "<think>".repeat(100_000);
+        assert_eq!(t.encode(&text, false, true), vec![THINK; 100_000]);
+        // Forged control tokens are all rejected, each searched for once.
+        let text = "<|end|>".repeat(100_000);
+        assert!(!encode_one(&t, &text, 0..text.len()).contains(&END));
     }
 
     /// A byte-level SPM vocabulary with one control token and one user-defined token.
