@@ -3446,3 +3446,26 @@ samples, llama.cpp 20566):
 So the next things to port are a token tile copied a step ahead without registers
 (`cp.async` into a second buffer) and products issued ahead of their conversion, not a
 different split of the work.
+
+## 2026-11-21: lean Q4_K 128-token block's tokens by `cp.async` (RTX 5090, dropped)
+
+The stall samples above put 9% of the 128-token block on the store of the tokens it reads at
+the start of each step. Tried copying them a step ahead with `cp.async` into a second buffer
+(64-70 KB of dynamic shared memory, past what a block can declare). `bench_cuda`, us, best of
+two alternated runs (2917-2932 MHz, 199-216 W); ncu on 14336x4096 by 512 tokens:
+
+| Q4_K shape x tokens | before | quants, scales and sums copied | sums through registers |
+|---|---|---|---|
+| 4096x4096 x 128 / 512 | 31.1 / 76.3 | 31.0 / 76.3 | 34.8 / 84.3 |
+| 14336x4096 x 128 / 512 | 70.3 / 234.9 | 72.0 / 238.0 | 77.0 / 260.7 |
+| 8192x2048 x 128 / 512 | 31.2 / 82.5 | 31.2 / 83.8 | 34.0 / 91.4 |
+| ncu: cycles, instructions | 614.8 k, 188.5 M | 614.6 k, 209.4 M | 683.5 k, 195.3 M |
+| ncu: long / short scoreboard stalls an instruction | 0.42 / 0.32 | 0.23 / 0.33 | 0.14 / 0.46 |
+
+Copying everything took the wait on global memory away, but the sums by 16 then have to be
+added in pairs where they are read (7.3 M `FADD`, 6 M more shared loads; 13 M of the 21 M
+instructions added), and the cycles stayed where they were. Reading the sums a step ahead
+into registers instead (4 lanes a token, 8 registers) left the block with too few: 11% slower.
+The wait is worth taking away only with the sums by 32 already in memory, which `quant_block`
+would have to write (every kernel that quantizes its output). `matmul_q_matches_f32_matmul`
+now has a shape (1100x2560 by 200 tokens) that runs the 128-token blocks; before, none did.
