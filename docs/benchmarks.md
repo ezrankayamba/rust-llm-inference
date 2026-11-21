@@ -3,6 +3,29 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: spoken amounts as digits before the request, and Qwen3-14B on the 60 cases (M4, Metal)
+
+Most misses left were arithmetic on Swahili amounts (elfu ishirini as 2000 or 12000, laki
+mbili as 2000000). `scripts/number_words.py` rewrites spoken amounts holding a scale word
+(mia, elfu, laki, milioni; hundred, thousand, million) as digits, as a voice client would
+before sending; `eval_tool_calls.py --digits` applies it. It rewrites all 17 amounts in the 60
+cases correctly and nothing else (`python3 -m unittest scripts/test_number_words.py`).
+
+v3 prompt, `--draft Qwen3-0.6B-Q8_0 --draft-tokens 6`, thinking off, `--max-tokens 512`, one
+run each (a Docker VM alongside, 1.3-1.9 GB of swap in use during the 14B runs):
+
+| model | digits | tune | held out | mean | median |
+|---|---|---|---|---|---|
+| Qwen3-8B | no | 26/30 | 27/30 | 1.59 s | 1.08 s |
+| Qwen3-8B | yes | 28/30 | 28/30 | 1.21 s | 0.93 s |
+| Qwen3-14B | no | 28/30 | 28/30 | 1.92 s | 1.47 s |
+| Qwen3-14B | yes | 30/30 | 29/30 | 2.51 s | 1.84 s |
+
+Every amount is right with digits, on both models. What is left: Qwen3-14B once fills the
+fields without opening the form the request names ("Fomu ya mkopo, kiasi laki moja, simu ...");
+Qwen3-8B does that too, misses the opening in "Nifungulie fomu ya mkopo, ...", answers
+"Naitwa Salma Hassan" (my name is) in text and "Make it 300000" in text.
+
 ## 2026-11-21: Qwen3-14B with thinking, with and without the draft (M4, Metal)
 
 The 12 built-in cases with the v3 prompt, `--think`, Qwen3-14B Q4_K_M, one run each (draft off

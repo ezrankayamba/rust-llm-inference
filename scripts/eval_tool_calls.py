@@ -2,11 +2,12 @@
 mixed utterances against a voice-app schema (navigate, fill_field, submit_form).
 
 usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json]
-       [--split tune|held] [--system prompt.txt] [--think] [--save out.json]
+       [--split tune|held] [--system prompt.txt] [--digits] [--think] [--save out.json]
 
 `scripts/tool_cases.json` holds 60 written cases (not real users' utterances): a "tune" half,
 which includes the 12 built in, to adjust the system prompt against, and a "held" half of the
-same kinds of request, to check the change on cases it was not made for.
+same kinds of request, to check the change on cases it was not made for. `--digits` rewrites
+spoken amounts as digits first (`number_words.py`), as a client would before sending.
 
 A case is {"text": ..., "expect": [[name, {args}], ...], "optional": [[name, {args}], ...]}:
 the reply must hold exactly the expected calls in any order, plus any of the optional ones.
@@ -20,6 +21,8 @@ import re
 import statistics
 import time
 import urllib.request
+
+from number_words import to_digits
 
 SYSTEM = "\n".join([
     'You operate a mobile loan app by calling tools. Pages: home, profile, settings, loan_application. The loan_application form has the fields amount, full_name and phone. The user may speak English, Swahili or both.',
@@ -116,6 +119,8 @@ def main():
     ap.add_argument("--save", help="write every reply's calls and text here, to compare runs")
     ap.add_argument("--split", help="only the cases of this split (tune or held)")
     ap.add_argument("--system", help="file holding a system prompt to use instead of SYSTEM")
+    ap.add_argument("--digits", action="store_true",
+                    help="write spoken amounts as digits before sending (number_words.py)")
     a = ap.parse_args()
     cases = json.load(open(a.cases)) if a.cases else CASES
     if a.split:
@@ -124,7 +129,8 @@ def main():
     post(a.url, "hello", 8)
     right, secs, toks, saved = 0, [], [], []
     for c in cases:
-        resp, dt = post(a.url, c["text"], a.max_tokens, a.think, system)
+        text = to_digits(c["text"]) if a.digits else c["text"]
+        resp, dt = post(a.url, text, a.max_tokens, a.think, system)
         msg = resp["choices"][0]["message"]
         got = [norm([t["function"]["name"], json.loads(t["function"]["arguments"])])
                for t in msg.get("tool_calls") or []]
