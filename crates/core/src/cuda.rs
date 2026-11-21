@@ -2806,6 +2806,8 @@ mod tests {
             (131, 512, 4),
             (130, 512, 13),
             (130, 768, 30),
+            // Enough work for the lean kernels' 128-token blocks on up to 180 multiprocessors.
+            (1100, 2560, 200),
         ]
         .into_iter()
         .flat_map(|size| types.map(|t| (size, t)))
