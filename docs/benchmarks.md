@@ -3,6 +3,38 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: the tool-call configuration on the RTX 5090, and several users at once
+
+Qwen3-14B Q4_K_M, thinking off, the v3 prompt, amounts as digits (`--digits`), the 60 cases,
+`--max-tokens 512`, on the RTX 5090 under Windows (CUDA, all layers; idle before at 742 MHz,
+63 W, 27 C; during the runs 2902-2910 MHz SM, 13801 MHz memory, 85-95%, 396-448 W, 44-54 C):
+
+| draft | right | mean | median | max |
+|---|---|---|---|---|
+| off | 59/60 | 0.23 s | 0.18 s | 3.63 s |
+| Qwen3-0.6B-Q8_0, 6 | 59/60 | 0.18 s | 0.14 s | 0.74 s |
+
+The same miss as on the Mac (the form not opened in "Fomu ya mkopo, kiasi laki moja, simu
+..."). Every tool call is the same with and without the draft and on the Mac's Metal run; three
+text replies differ in wording (two Swahili thank-you and "what can you do" answers), int8
+rounding between the kernels.
+
+Several users (`python3 scripts/load_tool_calls.py --users 1,2,4,8 --requests 12 --digits`): each
+user sends 12 requests in a row, all users at once. The server answers one request at a time, but
+the users share the cached system prompt and tools, so a request evaluates only its own 17-41
+prompt tokens.
+
+| users | 5090 median | p90 | max | req/s | M4 median | p90 | max | req/s |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.16 s | 0.36 s | 0.44 s | 5.47 | 1.25 s | 4.13 s | 4.13 s | 0.57 |
+| 2 | 0.22 s | 0.47 s | 0.58 s | 6.88 | 3.24 s | 4.35 s | 5.57 s | 0.60 |
+| 4 | 0.56 s | 0.74 s | 0.84 s | 7.20 | 6.93 s | 8.19 s | 9.25 s | 0.60 |
+| 8 | 1.14 s | 1.39 s | 1.55 s | 6.68 | | | | |
+
+(The M4 with 6 requests per user, the Docker VM alongside.) Throughput stays at what one request
+at a time gives, so latency grows with the users waiting: the 5090 keeps 8 simultaneous speakers
+near 1 s, about 7 requests a second; the M4 is past 3 s from 2.
+
 ## 2026-11-21: spoken amounts as digits before the request, and Qwen3-14B on the 60 cases (M4, Metal)
 
 Most misses left were arithmetic on Swahili amounts (elfu ishirini as 2000 or 12000, laki
