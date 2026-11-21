@@ -3,6 +3,28 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: tool-call accuracy and latency by Qwen3 size (M4, Metal)
+
+`scripts/eval_tool_calls.py` against `rli-server` (default flags, all layers offloaded where they
+fit), 12 short English, Swahili and mixed requests to a voice-app schema (navigate, fill_field,
+submit_form), `temperature: 0`, constrained decoding on, one run each after a warm-up request
+(the system prompt and tools are then in the KV cache). The cases are hand-written, not taken
+from the voice engine's traffic.
+
+| model | right | median | mean | max | reply tokens (mean) |
+|---|---|---|---|---|---|
+| Qwen3-1.7B Q8_0 | 3/12 | 0.54 s | 1.05 s | 3.51 s | 47 |
+| Qwen3-4B Q4_K_M | 7/12 | 1.01 s | 1.41 s | 3.85 s | 41 |
+| Qwen3-8B Q4_K_M | 9/12 | 2.24 s | 3.55 s | 13.69 s | 64 |
+| Qwen3-30B-A3B Q4_K_M | 7/12 | 2.66 s | 3.06 s | 9.86 s | 48 |
+
+Qwen3-30B-A3B ran 47 of its 48 layers on the GPU (the last did not fit Metal's working set
+here), and decoded at about 16 tokens/s, not the 43 it reaches fully offloaded. The 8B's misses:
+"Mipangilio tafadhali" answered in text, "elfu hamsini" written as 5000, "Tuma fomu" opened the
+form instead of submitting it; its 13.69 s was a 256-token text answer to a greeting (the
+request's `max_tokens`). The 4B and 1.7B wrote empty amounts (`""`) for Swahili numbers and
+filled `phone` with numbers nobody said; the 1.7B mostly answered in text.
+
 ## 2026-11-21: constrained tool-call decoding, cost per token (M4, CPU)
 
 Inside a `<tool_call>` block the logits are masked to the tokens `tools::Grammar` allows. The
