@@ -53,8 +53,10 @@ Workspace crates (dependencies flow downward only):
   parsing, and the byte-level grammar that masks logits inside a call; `Constraint::jump` gives the text
   it forces, which `Engine::generate` evaluates in one batch with the token sampled before it), and `engine.rs` (the generation API the
   binaries share, including KV prefix reuse, `stop.rs`'s stop strings, and speculative decoding with an
-  optional draft model at temperature 0: the draft guesses, `Model::forward_rows` gives the logits of
-  every guess in one pass, and the guesses the model would have sampled stand). `metal.rs` / `cuda.rs` implement `Accelerator`, and
+  optional draft model: the draft guesses, `Model::forward_rows` gives the logits of every guess in
+  one pass; at temperature 0 the guesses the model would have picked stand, above it each stands
+  with probability min(1, p/q) and a rejection is redrawn from max(0, p - q) (`Sampler::verify`),
+  which keeps the model's distribution; the draft samples from its own seed stream). `metal.rs` / `cuda.rs` implement `Accelerator`, and
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a

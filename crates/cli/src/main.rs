@@ -25,6 +25,10 @@ usage: rli -m <model.gguf> [options]
                             about their size in extra memory
       --coarse-acts         CPU prompts: one activation scale per 256 values, not per 32;
                             faster for K-quant models on ARM, less accurate
+      --draft <path>        speculate with a smaller model of the same vocabulary: replies
+                            stay the model's own (the same text at temperature 0, the same
+                            distribution above it), only faster or slower
+      --draft-tokens <n>    tokens the draft guesses a pass (default 4)
   -t, --threads <n>         CPU threads (default: one per logical core)
       --info               print model metadata and exit
 ";
@@ -39,6 +43,8 @@ struct Args {
     gpu_layers: Option<usize>,
     repack: bool,
     coarse_acts: bool,
+    draft: Option<String>,
+    draft_tokens: usize,
     params: GenParams,
 }
 
@@ -55,6 +61,8 @@ fn parse_args() -> Result<Args, String> {
         gpu_layers: None,
         repack: false,
         coarse_acts: false,
+        draft: None,
+        draft_tokens: 4,
         params: GenParams {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
@@ -91,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
             "--repack" => a.repack = true,
             "--coarse-acts" => a.coarse_acts = true,
+            "--draft" => a.draft = Some(it.next().ok_or("--draft needs a value")?),
+            "--draft-tokens" => a.draft_tokens = num(&flag, it.next())?,
             "-t" | "--threads" => rli_models::set_threads(num(&flag, it.next())?)?,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -139,6 +149,18 @@ fn run(a: Args) -> Result<(), String> {
         && let Some(w) = &engine.template_warning
     {
         eprintln!("warning: {w}");
+    }
+    if let Some(path) = &a.draft {
+        let mut d = Engine::load(path).map_err(|e| format!("{path}: {e}"))?;
+        if let Some(w) = rli_models::backend::attach_default(&mut d.model, a.gpu_layers)
+            .map_err(|e| e.to_string())?
+        {
+            eprintln!("warning: draft: {w}");
+        }
+        d.model.coarse_acts = a.coarse_acts;
+        engine
+            .set_draft(d, a.draft_tokens)
+            .map_err(|e| format!("--draft: {e}"))?;
     }
     if a.info {
         print_info(&engine);

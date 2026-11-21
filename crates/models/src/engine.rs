@@ -2,7 +2,7 @@
 
 use crate::chat::{self, ChatDefaults, ChatTemplate, Message, RenderOpts, Rendered};
 use crate::model::{Model, Session};
-use crate::sampler::{Sampler, SamplerConfig};
+use crate::sampler::{Dist, Sampler, SamplerConfig};
 use crate::stop::StopMatcher;
 use crate::tokenizer::Tokenizer;
 use crate::tools::{Constraint, Grammar, TokenTable};
@@ -26,7 +26,7 @@ pub struct Engine {
 }
 
 /// A smaller model with the same vocabulary, whose guesses at the next tokens
-/// [`Engine::generate`] checks in one pass of the main model, at temperature 0.
+/// [`Engine::generate`] checks in one pass of the main model.
 struct Draft {
     model: Model,
     /// The most tokens it guesses a pass.
@@ -145,9 +145,10 @@ impl Engine {
         })
     }
 
-    /// Speculates with `draft` (loaded, its backend attached) when sampling at temperature 0:
-    /// it guesses `tokens` tokens a pass, and the replies stay what this model alone writes,
-    /// up to float rounding (a batch is evaluated in a different order than one token).
+    /// Speculates with `draft` (loaded, its backend attached): it guesses `tokens` tokens a
+    /// pass. At temperature 0 the replies stay what this model alone writes, up to float
+    /// rounding (a batch is evaluated in a different order than one token); above it they are
+    /// drawn from the same distribution, though not the same text for a seed.
     pub fn set_draft(&mut self, draft: Engine, tokens: usize) -> std::result::Result<(), String> {
         let (a, b) = (&self.tokenizer, &draft.tokenizer);
         let same = a.vocab_size() == b.vocab_size()
@@ -183,18 +184,26 @@ impl Engine {
         s
     }
 
-    /// Up to `room` tokens the draft expects after `tokens` and `batch` (which its session is
-    /// brought up to first): `d.tokens` of its own choosing (`true`), each followed by the text
-    /// a tool call's grammar then forces (`false`), as `generate` would add it.
+    /// Up to `room` tokens the draft expects after `tokens` and `batch` (which its session `ds`
+    /// is brought up to first): `d.tokens` of its own choosing (`true`), each followed by the
+    /// text a tool call's grammar then forces (`false`), as `generate` would add it. None
+    /// without a draft.
+    ///
+    /// With no `sampler` the guesses are the draft's argmax. With one, each is drawn from the
+    /// draft's distribution after the sampler's transforms, which is returned with it, and a
+    /// stop token drawn ends the guesses as the last of them, for `generate` to check too.
     fn propose(
         &self,
-        d: &Draft,
         ds: &mut Session,
         mut c: Option<&mut Constraint>,
+        mut sampler: Option<&mut Sampler>,
         tokens: &[u32],
         batch: &[u32],
         room: usize,
-    ) -> Vec<(u32, bool)> {
+    ) -> (Vec<(u32, bool)>, Vec<Dist>) {
+        let Some(d) = &self.draft else {
+            return (Vec::new(), Vec::new());
+        };
         let all = || tokens.iter().chain(batch).copied();
         let total = tokens.len() + batch.len();
         let common = ds.tokens.iter().zip(all()).take_while(|(a, b)| **a == *b);
@@ -206,11 +215,32 @@ impl Engine {
             .forward_batch(ds, &rest, true)
             .expect("logits requested");
         let mut out = Vec::new();
+        let mut dists = Vec::new();
+        let mut history: Vec<u32> = match sampler {
+            Some(_) => all().collect(),
+            None => Vec::new(),
+        };
         for i in 0..d.tokens {
             if let Some(c) = c.as_deref_mut() {
                 c.mask(&mut logits);
             }
-            let t = argmax(&logits);
+            let t = match sampler.as_deref_mut() {
+                None => argmax(&logits),
+                Some(s) => {
+                    // Whether a position gets a guess must not depend on the guess drawn.
+                    if out.len() >= room {
+                        break;
+                    }
+                    let q = s.probs(&mut logits, &history);
+                    let t = s.pick(&q);
+                    dists.push(q);
+                    if self.is_stop(t) {
+                        out.push((t, true));
+                        break;
+                    }
+                    t
+                }
+            };
             if out.len() >= room || self.is_stop(t) {
                 break;
             }
@@ -222,6 +252,9 @@ impl Engine {
                 out.extend(forced.iter().map(|&f| (f, false)));
                 fresh.extend(forced);
             }
+            if sampler.is_some() {
+                history.extend(&fresh);
+            }
             // The last guess needs no logits; the next pass brings the session up to date.
             if i + 1 < d.tokens && out.len() < room {
                 logits = d
@@ -230,7 +263,7 @@ impl Engine {
                     .expect("logits requested");
             }
         }
-        out
+        (out, dists)
     }
 
     /// The chat prompt for `messages`, with today's date (UTC) where the template wants one.
@@ -343,11 +376,18 @@ impl Engine {
         let mut pending: Vec<u8> = Vec::new();
         let mut stops = StopMatcher::new(&params.stop);
         let mut stopped = false;
-        let draft = self
-            .draft
-            .as_ref()
-            .filter(|_| params.sampler.temperature <= 0.0);
-        let mut draft_sess = draft.and(sess.draft.take());
+        let mut draft_sess = self.draft.as_ref().and(sess.draft.take());
+        // Above temperature 0 the draft samples its guesses, from a stream of its own, and the
+        // target keeps or replaces each by speculative sampling (`Sampler::verify`), so what is
+        // written is distributed as without a draft. At 0 it guesses argmax, kept if the
+        // target's argmax agrees.
+        let sampling = params.sampler.temperature > 0.0;
+        let mut draft_sampler = Sampler::new(SamplerConfig {
+            seed: params.sampler.seed ^ 0xD1B5_4A32_D192_ED03,
+            ..params.sampler.clone()
+        });
+        // A token already chosen for the next position, by a rejection's residual draw.
+        let mut chosen = None;
         let mut draft_constraint = params
             .tools
             .as_deref()
@@ -369,10 +409,15 @@ impl Engine {
                 out.finish = Finish::Cancelled;
                 break;
             }
-            if let Some(c) = &mut constraint {
-                c.mask(&mut logits);
-            }
-            let next = sampler.sample(&mut logits, &sess.tokens);
+            let next = match chosen.take() {
+                Some(t) => t,
+                None => {
+                    if let Some(c) = &mut constraint {
+                        c.mask(&mut logits);
+                    }
+                    sampler.sample(&mut logits, &sess.tokens)
+                }
+            };
             if let Some(c) = &mut constraint {
                 c.advance(next);
             }
@@ -392,27 +437,33 @@ impl Engine {
             let room = room + 1 - batch.len();
             let drafting = pause == 0;
             pause = pause.saturating_sub(1);
-            let drafts = match (draft, draft_sess.as_deref_mut()) {
-                (Some(d), Some(ds)) if room > 0 && drafting => {
+            let (drafts, dists) = match draft_sess.as_deref_mut() {
+                Some(ds) if room > 0 && drafting => {
                     if let (Some(dc), Some(c)) = (&mut draft_constraint, &constraint) {
                         dc.follow(c);
                     }
                     let dc = draft_constraint.as_mut();
-                    self.propose(d, ds, dc, &sess.tokens, &batch, room)
+                    let ds_sampler = sampling.then_some(&mut draft_sampler);
+                    self.propose(ds, dc, ds_sampler, &sess.tokens, &batch, room)
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), Vec::new()),
             };
+            // A stop token the draft drew is checked against the last row, not evaluated.
+            let evaluated =
+                drafts.len() - usize::from(drafts.last().is_some_and(|d| self.is_stop(d.0)));
             let base = sess.len();
             let mut seq = batch.clone();
-            seq.extend(drafts.iter().map(|d| d.0));
+            seq.extend(drafts[..evaluated].iter().map(|d| d.0));
             let rows = self
                 .model
-                .forward_rows(sess, &seq, 1 + drafts.len())
+                .forward_rows(sess, &seq, 1 + evaluated)
                 .expect("logits requested");
-            // A guess stands if the model would have chosen it there; the text forced after it
-            // stands with it. Row j is the logits after `seq[batch.len() - 1 + j]`.
+            // A guess stands if the model would have chosen it there (at temperature 0), or
+            // if `Sampler::verify` keeps it; the text forced after it stands with it. Row j is
+            // the logits after `seq[batch.len() - 1 + j]`.
             let mut kept = batch.len();
             let (mut missed, mut hits) = (false, 0);
+            let mut q = dists.iter();
             for &(tok, guessed) in &drafts {
                 if guessed {
                     let row = kept - batch.len();
@@ -420,7 +471,21 @@ impl Engine {
                     if let Some(c) = &mut constraint {
                         c.mask(&mut l);
                     }
-                    if sampler.sample(&mut l, &sess.tokens[..base + kept]) != tok {
+                    let history = &sess.tokens[..base + kept];
+                    if sampling {
+                        let p = sampler.probs(&mut l, history);
+                        let q = q.next().expect("a distribution per guess");
+                        if let Some(t) = sampler.verify(&p, q, tok) {
+                            chosen = Some(t);
+                            missed = true;
+                            break;
+                        }
+                        if self.is_stop(tok) {
+                            chosen = Some(tok);
+                            hits += 1;
+                            break;
+                        }
+                    } else if sampler.sample(&mut l, history) != tok {
                         missed = true;
                         break;
                     }

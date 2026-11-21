@@ -745,3 +745,87 @@ fn speculating_with_a_draft_gives_the_same_tokens() {
         }
     }
 }
+
+/// The first `n` tokens written for each of `seeds`, counted by sequence.
+fn sampled_sequences(
+    e: &Engine,
+    n: usize,
+    seeds: std::ops::Range<u64>,
+) -> std::collections::HashMap<Vec<u32>, usize> {
+    let prompt = &prompt()[..12];
+    let mut s = e.new_session(1024);
+    let mut counts = std::collections::HashMap::new();
+    for seed in seeds {
+        let params = GenParams {
+            sampler: SamplerConfig {
+                temperature: 1.0,
+                top_k: 3,
+                top_p: 0.95,
+                repeat_penalty: 1.3,
+                repeat_last_n: 64,
+                seed,
+            },
+            ..greedy(n)
+        };
+        e.generate(&mut s, prompt, &params, || false, |_| true);
+        *counts.entry(s.tokens[prompt.len()..].to_vec()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Pearson's two-sample chi-square over sequences (cells seen under 10 times in all pooled
+/// into one), and its critical value at p = 1e-4 (Wilson-Hilferty).
+fn chi_square(
+    a: &std::collections::HashMap<Vec<u32>, usize>,
+    b: &std::collections::HashMap<Vec<u32>, usize>,
+) -> (f64, f64) {
+    let keys: std::collections::BTreeSet<&Vec<u32>> = a.keys().chain(b.keys()).collect();
+    let (mut cells, mut pooled) = (Vec::new(), (0.0, 0.0));
+    for k in keys {
+        let count = |m: &std::collections::HashMap<Vec<u32>, usize>| *m.get(k).unwrap_or(&0) as f64;
+        let (x, y) = (count(a), count(b));
+        if x + y < 10.0 {
+            pooled = (pooled.0 + x, pooled.1 + y);
+        } else {
+            cells.push((x, y));
+        }
+    }
+    if pooled.0 + pooled.1 > 0.0 {
+        cells.push(pooled);
+    }
+    let stat = cells.iter().map(|(x, y)| (x - y).powi(2) / (x + y)).sum();
+    let df = (cells.len() - 1) as f64;
+    let z = 3.72;
+    let crit = df * (1.0 - 2.0 / (9.0 * df) + z * (2.0 / (9.0 * df)).sqrt()).powi(3);
+    (stat, crit)
+}
+
+/// Above temperature 0 a draft samples its guesses and the model keeps or replaces each by
+/// speculative sampling, so the text written has the model's own distribution: over many
+/// seeds, the first tokens (all but the first of them drafted) come out as often with a draft
+/// as without. The draft's own distribution is far enough from the model's for the test to
+/// tell them apart.
+#[test]
+fn speculative_sampling_keeps_the_models_distribution() {
+    // 1000 runs: the draft alone is already rejected at 200.
+    let (n, runs) = (4, 1000);
+    let want = sampled_sequences(&engine(0), n, 0..runs);
+    let draft = || {
+        let mut d = Engine::load(model_path("llama", 4, 2, false)).expect("load");
+        d.model.precise = true;
+        rli_models::backend::attach(&mut d.model, 0).expect("attach");
+        d
+    };
+    let mut e = engine(0);
+    e.set_draft(draft(), 3).expect("same vocabulary");
+    let (stat, crit) = chi_square(&want, &sampled_sequences(&e, n, runs..2 * runs));
+    assert!(
+        stat < crit,
+        "with a draft: chi-square {stat:.1}, critical {crit:.1}"
+    );
+    let (stat, crit) = chi_square(&want, &sampled_sequences(&draft(), n, runs..2 * runs));
+    assert!(
+        stat > crit,
+        "the draft alone: chi-square {stat:.1}, critical {crit:.1}"
+    );
+}

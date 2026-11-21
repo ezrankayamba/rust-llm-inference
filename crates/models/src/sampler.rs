@@ -27,6 +27,9 @@ impl Default for SamplerConfig {
     }
 }
 
+/// A distribution over tokens: candidate ids with weights, not normalized (masked ones weigh 0).
+pub type Dist = Vec<(u32, f32)>;
+
 /// Candidates sorted on the first top-p pass; more are sorted only if they fall short.
 const NUCLEUS_FIRST: usize = 64;
 
@@ -50,26 +53,95 @@ impl Sampler {
 
     /// Picks the next token. `history` is the token sequence so far (for repetition penalty).
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
-        if self.cfg.repeat_penalty != 1.0 {
-            let start = history.len().saturating_sub(self.cfg.repeat_last_n);
-            let mut seen = std::collections::HashSet::new();
-            for &t in &history[start..] {
-                if seen.insert(t)
-                    && let Some(l) = logits.get_mut(t as usize)
-                {
-                    // Same rule as llama.cpp / CTRL: shrink positive logits, push negative ones down.
-                    *l = if *l > 0.0 {
-                        *l / self.cfg.repeat_penalty
-                    } else {
-                        *l * self.cfg.repeat_penalty
-                    };
-                }
-            }
-        }
+        self.penalize(logits, history);
         if self.cfg.temperature <= 0.0 {
             return argmax(logits);
         }
+        let cand = self.weights(logits);
+        self.pick(&cand)
+    }
 
+    /// The distribution `sample` draws from at temperature > 0: candidate ids with weights
+    /// (not normalized; masked tokens weigh 0), after the penalty, top-k, temperature and top-p.
+    pub fn probs(&self, logits: &mut [f32], history: &[u32]) -> Dist {
+        self.penalize(logits, history);
+        self.weights(logits)
+    }
+
+    /// Draws a token from `cand` (as [`Sampler::probs`] returns) with this sampler's stream.
+    pub fn pick(&mut self, cand: &[(u32, f32)]) -> u32 {
+        // Masked tokens (-inf, weight 0) are never picked while any other remains: not by a
+        // draw of exactly 0, nor by the fallback when rounding leaves `r` above 0 at the end.
+        let total: f32 = cand.iter().map(|c| c.1).sum();
+        let mut r = self.uniform() * total;
+        for &(id, p) in cand {
+            r -= p;
+            if p > 0.0 && r <= 0.0 {
+                return id;
+            }
+        }
+        cand.iter()
+            .rev()
+            .find(|c| c.1 > 0.0)
+            .or(cand.last())
+            .expect("at least one candidate")
+            .0
+    }
+
+    /// One step of speculative sampling: `x` was drawn from `q`, and the target distribution
+    /// is `p` (both as [`Sampler::probs`] returns). `x` stands with probability
+    /// min(1, p(x)/q(x)) (`None`); otherwise the token returned is drawn from max(0, p - q),
+    /// normalized, so that whichever is taken is distributed as `p`, whatever `q` is.
+    pub fn verify(&mut self, p: &[(u32, f32)], q: &[(u32, f32)], x: u32) -> Option<u32> {
+        let mass = |d: &[(u32, f32)], id: u32| d.iter().find(|c| c.0 == id).map_or(0.0, |c| c.1);
+        let p_sum: f32 = p.iter().map(|c| c.1).sum();
+        let q_sum: f32 = q.iter().map(|c| c.1).sum();
+        let (px, qx) = (mass(p, x) / p_sum, mass(q, x) / q_sum);
+        if self.uniform() * qx < px {
+            return None;
+        }
+        let mut qn: Vec<(u32, f32)> = q.iter().map(|&(id, w)| (id, w / q_sum)).collect();
+        qn.sort_unstable_by_key(|c| c.0);
+        let residual: Vec<(u32, f32)> = p
+            .iter()
+            .map(|&(id, w)| {
+                let qi = qn
+                    .binary_search_by_key(&id, |c| c.0)
+                    .map_or(0.0, |i| qn[i].1);
+                (id, (w / p_sum - qi).max(0.0))
+            })
+            .collect();
+        // A rejection means q(x) > p(x), so the residual has mass q(x) - p(x) or more; only
+        // rounding can leave it none, with p and q all but equal, and then p is what it is.
+        if residual.iter().any(|c| c.1 > 0.0) {
+            Some(self.pick(&residual))
+        } else {
+            Some(self.pick(p))
+        }
+    }
+
+    fn penalize(&self, logits: &mut [f32], history: &[u32]) {
+        if self.cfg.repeat_penalty == 1.0 {
+            return;
+        }
+        let start = history.len().saturating_sub(self.cfg.repeat_last_n);
+        let mut seen = std::collections::HashSet::new();
+        for &t in &history[start..] {
+            if seen.insert(t)
+                && let Some(l) = logits.get_mut(t as usize)
+            {
+                // Same rule as llama.cpp / CTRL: shrink positive logits, push negative ones down.
+                *l = if *l > 0.0 {
+                    *l / self.cfg.repeat_penalty
+                } else {
+                    *l * self.cfg.repeat_penalty
+                };
+            }
+        }
+    }
+
+    /// Top-k, temperature and top-p over penalized logits (temperature > 0).
+    fn weights(&self, logits: &[f32]) -> Dist {
         let mut cand: Vec<(u32, f32)> = logits
             .iter()
             .enumerate()
@@ -116,23 +188,7 @@ impl Sampler {
                 m = (2 * m).min(cand.len());
             }
         }
-
-        // Masked tokens (-inf, weight 0) are never picked while any other remains: not by a
-        // draw of exactly 0, nor by the fallback when rounding leaves `r` above 0 at the end.
-        let total: f32 = cand.iter().map(|c| c.1).sum();
-        let mut r = self.uniform() * total;
-        for &(id, p) in &cand {
-            r -= p;
-            if p > 0.0 && r <= 0.0 {
-                return id;
-            }
-        }
-        cand.iter()
-            .rev()
-            .find(|c| c.1 > 0.0)
-            .or(cand.last())
-            .expect("at least one candidate")
-            .0
+        cand
     }
 }
 
@@ -281,5 +337,44 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(s.sample(&mut [3.0, 2.0], &[0]), 1);
+    }
+
+    #[test]
+    fn verify_of_draws_from_q_is_distributed_as_p() {
+        // q favours token 0, which p barely wants; p wants token 3, which q never proposes, and
+        // token 4 is masked in both. Whatever q proposes, what is taken must follow p.
+        let p = [(0, 0.1), (1, 0.2), (2, 0.3), (3, 0.4), (4, 0.0)];
+        let q = [(4, 0.0), (2, 1.0), (0, 6.0), (1, 2.0), (5, 1.0)];
+        let cfg = |seed| SamplerConfig {
+            seed,
+            ..Default::default()
+        };
+        let (mut target, mut draft) = (Sampler::new(cfg(1)), Sampler::new(cfg(2)));
+        let n = 200_000;
+        let mut seen = [0usize; 6];
+        for _ in 0..n {
+            let x = draft.pick(&q);
+            let t = target.verify(&p, &q, x).unwrap_or(x);
+            seen[t as usize] += 1;
+        }
+        assert_eq!(seen[4] + seen[5], 0, "{seen:?}");
+        for &(id, w) in &p[..4] {
+            let (got, w) = (seen[id as usize] as f64 / n as f64, w as f64);
+            // 4 standard deviations of a share of n draws.
+            let sd = (w * (1.0 - w) / n as f64).sqrt();
+            assert!(
+                (got - w).abs() < 4.0 * sd,
+                "token {id}: {got} for {w}, {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_keeps_a_guess_p_wants_more_than_q() {
+        let mut s = Sampler::new(SamplerConfig::default());
+        let (p, q) = ([(0, 3.0), (1, 1.0)], [(0, 1.0), (1, 1.0)]);
+        for _ in 0..100 {
+            assert_eq!(s.verify(&p, &q, 0), None);
+        }
     }
 }

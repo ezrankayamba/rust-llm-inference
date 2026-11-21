@@ -23,9 +23,10 @@ extra memory.
 --coarse-acts quantizes CPU prompt activations with one scale per 256 values, not per 32: faster
 for K-quant models on ARM, less accurate.
 --threads defaults to one CPU thread per logical core.
---draft speculates with a smaller model of the same vocabulary (Qwen3-0.6B for a larger Qwen3)
-on requests at temperature 0: it guesses --draft-tokens tokens a pass, which the model checks in
-one pass. Replies stay the model's own; only their speed changes.
+--draft speculates with a smaller model of the same vocabulary (Qwen3-0.6B for a larger Qwen3):
+it guesses --draft-tokens tokens a pass, which the model checks in one pass. Replies stay the
+model's own (at temperature 0 the same text, above it the same distribution); only their speed
+changes.
 
 Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/completions,
 POST /v1/completions
