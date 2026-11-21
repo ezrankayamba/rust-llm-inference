@@ -229,7 +229,7 @@ impl Tool {
 }
 
 /// A `<tool_call>` block's JSON, if it is `{"name": string, "arguments": object}`.
-fn parse_call(body: &str) -> Option<ToolCall> {
+pub fn parse_call(body: &str) -> Option<ToolCall> {
     let v: Value = serde_json::from_str(body.trim()).ok()?;
     let m = v.as_object()?;
     let name = m.get("name")?.as_str()?;

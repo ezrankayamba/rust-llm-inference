@@ -2,6 +2,7 @@
 //! `/` serves a small chat page for trying a model by hand.
 
 use crate::http::{self, Request};
+use crate::tool_stream::{Delta, ToolStream};
 use rli_models::tools::{self, Grammar, Tool};
 use rli_models::{
     Engine, Finish, GenOutput, GenParams, Message, RenderOpts, SamplerConfig, Session,
@@ -308,6 +309,24 @@ fn tool_choice(out: &GenOutput) -> Value {
     json!({"index": 0, "message": message, "finish_reason": finish})
 }
 
+/// A streamed piece of a tools reply as OpenAI's chunk deltas: a call is its name, then its
+/// arguments, as clients accumulate them.
+fn delta_json(d: Delta) -> Vec<Value> {
+    match d {
+        Delta::Reasoning(s) => vec![json!({"reasoning_content": s})],
+        Delta::Content(s) => vec![json!({"content": s})],
+        Delta::Call(i, c) => vec![
+            json!({"tool_calls": [{
+                "index": i,
+                "id": format!("call_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+                "type": "function",
+                "function": {"name": c.name, "arguments": ""},
+            }]}),
+            json!({"tool_calls": [{"index": i, "function": {"arguments": c.arguments}}]}),
+        ],
+    }
+}
+
 fn finish_reason(f: Finish) -> &'static str {
     match f {
         Finish::Stop | Finish::Cancelled => "stop",
@@ -370,11 +389,12 @@ fn complete(
             );
         }
     };
+    // Off for tools requests unless asked for: it costs a reply's worth of tokens.
+    let think = thinking.unwrap_or(tool_req.is_none());
     let tokens = if chat {
         let opts = RenderOpts {
             tools: tool_req.iter().flatten().map(Tool::to_json).collect(),
-            // Off for tools requests unless asked for: it costs a reply's worth of tokens.
-            no_think: e.chat_defaults.thinking && !thinking.unwrap_or(tool_req.is_none()),
+            no_think: e.chat_defaults.thinking && !think,
         };
         match parse_messages(&req) {
             Ok(m) => e.chat_tokens_with(&m, &opts),
@@ -409,9 +429,6 @@ fn complete(
         Ok(s) => s,
         Err(msg) => return bad(w, &msg),
     };
-    if stream && tool_req.is_some() {
-        return bad(w, "`stream` is not supported with `tools`");
-    }
     let include_usage = req
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
@@ -433,7 +450,7 @@ fn complete(
         if out.finish == Finish::Cancelled {
             return Ok(());
         }
-        let choice = if tool_req.as_ref().is_some_and(|t| !t.is_empty()) {
+        let choice = if params.tools.is_some() {
             tool_choice(&out)
         } else if chat {
             json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": finish_reason(out.finish)})
@@ -464,14 +481,40 @@ fn complete(
     if chat {
         http::sse_event(w, &chunk(json!({"role": "assistant", "content": ""}), None))?;
     }
+    let mut calls = params
+        .tools
+        .is_some()
+        .then(|| ToolStream::new(e.chat_defaults.thinking && think));
+    let send = |w: &mut _, d: Delta| {
+        delta_json(d)
+            .into_iter()
+            .try_for_each(|d| http::sse_event(w, &chunk(d, None)))
+    };
     // A failed write means the client went away: stop generating.
-    let out = e.generate(&mut app.session(), &tokens, &params, gone, |t| {
-        http::sse_event(w, &chunk(json!({"content": t}), None)).is_ok()
-    });
+    let out = e.generate(
+        &mut app.session(),
+        &tokens,
+        &params,
+        gone,
+        |t| match &mut calls {
+            Some(c) => c.push(t).into_iter().all(|d| send(w, d).is_ok()),
+            None => http::sse_event(w, &chunk(json!({"content": t}), None)).is_ok(),
+        },
+    );
     if out.finish == Finish::Cancelled {
         return Ok(());
     }
-    http::sse_event(w, &chunk(json!({}), Some(finish_reason(out.finish))))?;
+    let finish = match calls {
+        Some(mut c) => {
+            c.finish().into_iter().try_for_each(|d| send(w, d))?;
+            match out.finish {
+                Finish::Stop if c.calls > 0 => "tool_calls",
+                f => finish_reason(f),
+            }
+        }
+        None => finish_reason(out.finish),
+    };
+    http::sse_event(w, &chunk(json!({}), Some(finish)))?;
     if include_usage {
         let last = json!({"id": id, "object": chunk_object, "created": created, "model": model,
             "choices": [], "usage": usage(&out), "timings": timings(&out)});
@@ -597,6 +640,92 @@ mod tests {
         assert!(c["message"].get("tool_calls").is_none());
         let broken = tool_choice(&reply("<tool_call>{oops</tool_call>", Finish::Stop));
         assert_eq!(broken["message"]["content"], "<tool_call>{oops</tool_call>");
+    }
+
+    /// A streamed tools reply, joined, is the reply `tool_choice` gives for the whole text,
+    /// however the text is split.
+    #[test]
+    fn streamed_tool_reply_joins_to_the_whole_reply() {
+        let texts = [
+            (false, "Sawa."),
+            (false, "  \n"),
+            (
+                false,
+                "Let me.\n<tool_call>\n{\"name\": \"open_form\", \"arguments\": {\"form_id\": \"loan\"}}\n</tool_call>\n\
+                 and <tool_call>{oops</tool_call> then\n<tool_call>{\"name\": \"b\", \"arguments\": {\"v\": \"é\"}}</tool_call>\n",
+            ),
+            (
+                false,
+                "<tool_call>{\"name\": \"a\", \"arguments\": {}}</tool_call><tool_call>{\"name\"",
+            ),
+            (
+                true,
+                "<think>\nHmm <tool_call>{\"name\": \"x\", \"arguments\": {}}</tool_call>\n</think>\n\n\
+                 <tool_call>\n{\"name\": \"navigate\", \"arguments\": {\"page\": \"home\"}}\n</tool_call>",
+            ),
+            (true, "<think>\n\n</think>\n\nJust text <tool"),
+        ];
+        let strip_ids = |mut c: Value| {
+            let calls = c["message"]
+                .get_mut("tool_calls")
+                .and_then(Value::as_array_mut);
+            for call in calls.into_iter().flatten() {
+                call["id"] = Value::Null;
+            }
+            c
+        };
+        for (thinking, text) in texts {
+            let want = strip_ids(tool_choice(&reply(text, Finish::Stop)));
+            for n in 1..=text.len() {
+                let mut p = ToolStream::new(thinking);
+                let mut deltas = Vec::new();
+                let mut start = 0;
+                while start < text.len() {
+                    let mut end = (start + n).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    deltas.extend(p.push(&text[start..end]));
+                    start = end;
+                }
+                deltas.extend(p.finish());
+                let (mut reasoning, mut content, mut calls) =
+                    (String::new(), String::new(), Vec::new());
+                for d in deltas.into_iter().flat_map(delta_json) {
+                    if let Some(s) = d["reasoning_content"].as_str() {
+                        reasoning += s;
+                    }
+                    if let Some(s) = d["content"].as_str() {
+                        content += s;
+                    }
+                    if let Some(c) = d["tool_calls"].get(0) {
+                        let i = c["index"].as_u64().unwrap() as usize;
+                        if c.get("id").is_some() {
+                            assert_eq!(i, calls.len());
+                            assert_eq!(c["function"]["arguments"], "");
+                            calls.push(json!({"id": null, "type": c["type"],
+                                "function": {"name": c["function"]["name"], "arguments": ""}}));
+                        } else {
+                            let a = &mut calls[i]["function"]["arguments"];
+                            *a = json!(
+                                a.as_str().unwrap().to_owned()
+                                    + c["function"]["arguments"].as_str().unwrap()
+                            );
+                        }
+                    }
+                }
+                let mut message = json!({"role": "assistant", "content": (!content.is_empty()).then_some(content)});
+                if !reasoning.is_empty() {
+                    message["reasoning_content"] = json!(reasoning);
+                }
+                if !calls.is_empty() {
+                    message["tool_calls"] = Value::Array(calls);
+                }
+                let finish = if p.calls > 0 { "tool_calls" } else { "stop" };
+                let got = json!({"index": 0, "message": message, "finish_reason": finish});
+                assert_eq!(got, want, "{text:?} in pieces of {n}");
+            }
+        }
     }
 
     #[test]

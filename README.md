@@ -40,8 +40,9 @@ Useful flags: `--gpu-layers N` (`0` keeps everything on the CPU), `--threads N`,
 
 On models whose chat template has Qwen's tool format (Qwen2.5, Qwen3), `/v1/chat/completions`
 takes OpenAI `tools` and returns `tool_calls`. Function parameters are limited to an object of
-required strings, each optionally an `enum`; anything else, `tool_choice` other than `"auto"` or
-`"none"`, and `stream` with tools are rejected with a 400. While the model writes a call, its
+required strings, each optionally an `enum`; anything else and `tool_choice` other than `"auto"`
+or `"none"` are rejected with a 400. With `stream`, calls arrive as OpenAI's `delta.tool_calls`
+once each block closes, and Qwen3 reasoning as `delta.reasoning_content`. While the model writes a call, its
 sampling is constrained so the call can only name a listed function, give each of its keys once
 and pick enum values from their lists. Qwen3 answers tools requests without thinking first.
 

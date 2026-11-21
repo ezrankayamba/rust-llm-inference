@@ -574,6 +574,68 @@ fn tools_request_returns_an_openai_shaped_reply() {
     }
 }
 
+/// A streamed tools request is well-formed SSE that joins to the reply the same request gives
+/// whole (greedy, so the text is the same).
+#[test]
+fn streamed_tools_request_joins_to_the_whole_reply() {
+    let srv = start_with(&tools_model(), 2048);
+    let body = tools_body(json!({"max_tokens": 48, "stream_options": {"include_usage": true}}));
+    let (st, whole) = request(&srv.addr, "POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(st, 200, "{whole}");
+    let whole: Value = serde_json::from_str(&whole).unwrap();
+
+    let mut streamed = body.clone();
+    streamed["stream"] = json!(true);
+    let (st, sse) = request(&srv.addr, "POST", "/v1/chat/completions", Some(&streamed));
+    assert_eq!(st, 200, "{sse}");
+    let events: Vec<&str> = sse
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .collect();
+    assert_eq!(events.last(), Some(&"[DONE]"), "{sse}");
+    let chunks: Vec<Value> = events[..events.len() - 1]
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    let (usage, chunks) = chunks.split_last().unwrap();
+    // The same counts; the second request reuses the first's cached prompt.
+    assert_eq!(
+        usage["usage"]["total_tokens"],
+        whole["usage"]["total_tokens"]
+    );
+    assert!(usage["timings"].is_object());
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    let (mut content, mut calls) = (String::new(), Vec::<Value>::new());
+    for c in chunks {
+        assert_eq!(c["object"], "chat.completion.chunk");
+        let delta = &c["choices"][0]["delta"];
+        content += delta["content"].as_str().unwrap_or("");
+        for t in delta["tool_calls"].as_array().into_iter().flatten() {
+            let i = t["index"].as_u64().unwrap() as usize;
+            if i == calls.len() {
+                assert_eq!(t["type"], "function");
+                assert!(t["id"].as_str().unwrap().starts_with("call_"));
+                calls.push(json!({"name": t["function"]["name"], "arguments": ""}));
+            }
+            let a = calls[i]["arguments"].as_str().unwrap().to_owned();
+            calls[i]["arguments"] = json!(a + t["function"]["arguments"].as_str().unwrap());
+        }
+    }
+    let msg = &whole["choices"][0]["message"];
+    assert_eq!(content, msg["content"].as_str().unwrap_or(""));
+    let want: Vec<Value> = msg["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| c["function"].clone())
+        .collect();
+    assert_eq!(calls, want);
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        whole["choices"][0]["finish_reason"]
+    );
+}
+
 #[test]
 fn tool_definitions_cannot_inject_special_tokens() {
     let srv = start_with(&tools_model(), 2048);
@@ -604,7 +666,6 @@ fn tools_requests_outside_the_supported_subset_get_400() {
     let mut number = tools_body(json!({}));
     number["tools"][0]["function"]["parameters"]["properties"]["value"] = json!({"type": "number"});
     for (what, body) in [
-        ("stream", tools_body(json!({"stream": true}))),
         ("required", tools_body(json!({"tool_choice": "required"}))),
         (
             "named",

@@ -2,6 +2,7 @@
 
 mod api;
 mod http;
+mod tool_stream;
 
 use api::App;
 use rli_models::Engine;
