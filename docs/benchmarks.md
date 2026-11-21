@@ -3,6 +3,65 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: against llama.cpp on every backend, fresh (v0.3.0, 2c93106)
+
+The runs behind `docs/verdict.md`. llama.cpp v0.9.0 (cd959ba) throughout; ratios are rli / llama.cpp.
+
+**RTX 5090** (Windows, CUDA 12.9, driver 610.60; `cmpc.py`: `bench --pp N --tg 0 --gpu-layers 999`
+against `llama-bench -ngl 99 -p N -n 0`, repetitions for about 4 s a run, two alternating rounds
+averaged, decode `--tg 128 --reps 10`; GPU at 2.68-2.90 GHz, 13801 MHz memory, 74-99% busy,
+355-577 W, 58-74 C). tok/s, rli / llama.cpp, ratio:
+
+| model | pp8 | pp16 | pp32 | pp64 | pp128 | pp256 | pp512 | pp1024 | pp2048 | tg128 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Mistral-7B | 1628 / 1564 1.04 | 3144 / 2842 1.11 | 5860 / 4946 1.18 | 9114 / 7688 1.19 | 11345 / 10197 1.11 | 12817 / 12508 1.02 | 13689 / 14631 0.94 | 13550 / 14712 0.92 | 13042 / 14044 0.93 | 269.8 / 280.4 0.96 |
+| Llama-3.2-1B | 5822 / 4878 1.19 | 10654 / 8894 1.20 | 19476 / 15380 1.27 | 33104 / 23950 1.38 | 38746 / 32528 1.19 | 59934 / 46918 1.28 | 63786 / 61164 1.04 | 67744 / 64825 1.05 | 70630 / 60742 1.16 | 987.5 / 996.9 0.99 |
+| Qwen3-30B-A3B | 1181 / 1150 1.03 | 1764 / 1840 0.96 | 3310 / 3040 1.09 | 5281 / 4295 1.23 | 7876 / 5094 1.55 | 11279 / 8432 1.34 | 13570 / 12775 1.06 | 13038 / 12872 1.01 | 12254 / 12182 1.01 | 333.6 / 351.1 0.95 |
+
+Mistral-7B from 512 tokens runs at the 575 W limit in both; Qwen3-30B-A3B at 512 draws 499 W
+where llama.cpp draws 575. Decode, last compared on the A100 (10-16% ahead), is 1-5% behind here.
+Someone was using the PC (an AnyDesk session, Chrome) during the run; the two rounds of a cell
+agreed within 1% except Llama-3.2-1B pp128 (1.16, 1.22).
+
+**Apple M4, Metal** (`bench --pp N --tg 0 --reps 5 --gpu-layers 999` against `llama-bench -ngl 99
+-p N -n 0 -r 5`, decode `--tg 128 --reps 3`, one round, 35 s rests; a Docker VM alongside, 0.2-1.9
+GB free):
+
+| model | pp16 | pp64 | pp512 | tg128 |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 892.7 / 648.2 1.38 | 1294.9 / 1316.1 0.98 | 1483.1 / 1453.5 1.02 | 107.2 / 108.6 0.99 |
+| Mistral-7B Q4_K_M | 147.9 / 146.1 1.01 | 207.0 / 204.1 1.01 | 203.3 / 195.1 1.04 | 21.4 / 21.3 1.01 |
+| Qwen2.5-0.5B Q4_K_M | | 2534.7 / 2905.1 0.87 | 3389.4 / 3394.1 1.00 | 184.1 / 177.1 1.04 |
+| SmolLM2-135M Q8_0 | | 4235.4 / 5373.2 0.79 | 8080.4 / 9545.1 0.85 | 362.2 / 314.7 1.15 |
+
+Qwen3-30B-A3B (18.6 GB) could not be measured: with the VM's memory in use swap reached 3.9 GB and
+the model paged from disk (0.51 at 64 tokens, rli run first), so it is left out.
+
+**Apple M4 CPU** (llama.cpp built with `-DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF`;
+`bench --pp 256 --tg 64 --reps 3 --threads T --gpu-layers 0` against `llama-bench -ngl 0 -t T`):
+
+| model | threads | prompt | decode |
+|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 1 | 106.2 / 113.7 0.93 | 39.5 / 44.8 0.88 |
+| Llama-3.2-1B Q4_K_M | 4 | 337.1 / 383.9 0.88 | 84.2 / 83.8 1.00 |
+| Qwen2.5-0.5B Q4_K_M | 1 | 271.2 / 115.6 2.35 | 80.5 / 79.2 1.02 |
+| Qwen2.5-0.5B Q4_K_M | 4 | 864.8 / 373.3 2.32 | 160.5 / 148.5 1.08 |
+
+**x86** (the `Benchmark` workflow, one thread, prompt 256 and decode 64 tokens, 3 reps; rli
+default against llama.cpp's native build; runs 44918152019, 44920013216, 44920005872):
+
+| CPU | model | prompt | decode | peak RSS rli / llama.cpp |
+|---|---|---|---|---|
+| Xeon 6975P-C (AMX) | Qwen2.5-0.5B | 238.4 / 137.0 1.74 | 32.1 / 20.7 1.55 | 452 / 761 MiB |
+| Xeon 6975P-C (AMX) | Llama-3.2-1B | 126.4 / 140.9 0.90 | 16.3 / 11.8 1.38 | 862 / 1661 MiB |
+| Xeon 8573C (AMX) | Qwen2.5-0.5B | 190.6 / 103.8 1.84 | 24.8 / 18.8 1.32 | 452 / 580 MiB |
+| Xeon 8573C (AMX) | Llama-3.2-1B | 100.8 / 71.3 1.41 | 12.7 / 10.1 1.26 | 862 / 1331 MiB |
+| EPYC 7763 (Zen 3) | Qwen2.5-0.5B | 119.4 / 77.9 1.53 | 32.0 / 29.1 1.10 | 452 / 580 MiB |
+| EPYC 7763 (Zen 3) | Llama-3.2-1B | 52.0 / 48.3 1.08 | 17.9 / 17.3 1.03 | 862 / 1331 MiB |
+
+The 6975P-C and 8573C runs used rli's AMX kernel with the tile-register fix (`35c0d24`); its
+output was not checked there (CI's tests run on AMD runners). No Zen 4 or Zen 5 runner came up.
+
 ## 2026-11-21: the tool-call configuration on the RTX 5090, and several users at once
 
 Qwen3-14B Q4_K_M, thinking off, the v3 prompt, amounts as digits (`--digits`), the 60 cases,

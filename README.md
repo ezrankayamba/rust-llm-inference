@@ -129,23 +129,33 @@ grows with use, to 0.47 GB at 4096 positions).
 
 ## Performance
 
-One thread, Llama-3.2-1B Q4_K_M, against llama.cpp built natively on the same machine (measured
-2026-11-13). These are
-GitHub-hosted runners, whose CPUs vary from run to run, so compare within a row only.
+Against llama.cpp v0.9.0 on the same machines (`docs/verdict.md`, 2026-11-21), rli runs at
+1.13x its speed on a weighted average, 1.07x without one outlier, ahead in 37 of 64 cases and
+behind in 13. Speed ratios, rli / llama.cpp:
 
-| CPU | rli decode tok/s | rli `--repack` | llama.cpp | rli peak memory | llama.cpp peak memory |
-|---|---:|---:|---:|---:|---:|
-| EPYC 9V74 (Zen 4) | 25.4 | 30.1 | 29.9 | 864 MiB | 1331 MiB |
-| EPYC 9V45 (Zen 5) | 33.7 | 36.1 | 36.6 | 864 MiB | 1331 MiB |
-| EPYC 7763 (Zen 3) | 17.4 | 18.9 | 17.1 | 866 MiB | 1330 MiB |
-| Xeon 8573C | 12.6 | 12.6 | 10.3 | 864 MiB | 1331 MiB |
+| Backend | Prompts | Decode |
+|---|---:|---:|
+| CUDA (RTX 5090) | 1.12 | 0.97 |
+| Metal (Apple M4) | 0.97 | 1.04 |
+| Apple M4 CPU | 1.45 | 0.99 |
+| x86 CPU (two Xeons with AMX, an EPYC 7763) | 1.37 | 1.26 |
+
+One thread, Llama-3.2-1B Q4_K_M, on GitHub-hosted runners (CPUs vary from run to run, so
+compare within a row only):
+
+| CPU | rli prompt tok/s | llama.cpp | rli decode tok/s | llama.cpp | rli peak memory | llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| Xeon 6975P-C | 126.4 | 140.9 | 16.3 | 11.8 | 862 MiB | 1661 MiB |
+| Xeon 8573C | 100.8 | 71.3 | 12.7 | 10.1 | 862 MiB | 1331 MiB |
+| EPYC 7763 (Zen 3) | 52.0 | 48.3 | 17.9 | 17.3 | 862 MiB | 1331 MiB |
 
 By default the weights stay in the file mapping, which is why `rli` needs less memory. `--repack`
-copies the Q4_K weights into an interleaved layout at load, as llama.cpp does: decode speeds up on
-AMD CPUs, and memory use rises to about llama.cpp's (1322 MiB in these runs).
+copies the Q4_K weights into an interleaved layout at load, as llama.cpp does: one-thread decode
+on Zen 4 and Zen 5 gains up to 18%, and memory use rises to about llama.cpp's.
 
-The largest remaining gap is prompt processing for Llama-3.2-1B on Intel Xeons with AMX, where
-llama.cpp has a dedicated kernel and `rli` has none.
+Where rli is behind: Metal prompts on very small models (SmolLM2-135M 15-21%), Llama-3.2-1B on
+the M4 CPU (prompts 7-12%, one-thread decode 12%), long Mistral-7B prompts on the RTX 5090 (6-8%
+from 512 tokens), and CUDA decode (1-5%).
 
 Every number, the run that produced it, and the experiments that did not work are in
 [docs/benchmarks.md](docs/benchmarks.md).
