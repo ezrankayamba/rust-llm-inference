@@ -49,7 +49,8 @@ Workspace crates (dependencies flow downward only):
 - **rli-models** (`crates/models`): `config.rs` (`Arch`: Llama, Qwen2, Qwen3, Qwen2Moe, Qwen3Moe),
   `model.rs` (decoder forward, KV `Session`, MoE routing, the `Accelerator` trait), `tokenizer.rs`
   (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers), `chat.rs` (format chosen by
-  fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, and `engine.rs` (the generation API the
+  fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, `tools.rs` (OpenAI tools in Qwen's Hermes format: schema subset, rendering, `<tool_call>`
+  parsing, and the byte-level grammar that masks logits inside a call), and `engine.rs` (the generation API the
   binaries share, including KV prefix reuse and `stop.rs`'s stop strings). `metal.rs` / `cuda.rs` implement `Accelerator`, and
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is

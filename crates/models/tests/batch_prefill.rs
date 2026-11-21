@@ -409,6 +409,7 @@ fn greedy(max_tokens: usize) -> GenParams {
             repeat_last_n: 0,
             seed: 0,
         },
+        tools: None,
     }
 }
 

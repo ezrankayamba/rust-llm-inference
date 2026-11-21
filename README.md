@@ -36,6 +36,78 @@ target/release/rli-server -m model.gguf --port 8080
 Useful flags: `--gpu-layers N` (`0` keeps everything on the CPU), `--threads N`, `--ctx N`,
 `--temp F`, and `--repack` (see below). `rli --help` lists the rest.
 
+## Tool calls
+
+On models whose chat template has Qwen's tool format (Qwen2.5, Qwen3), `/v1/chat/completions`
+takes OpenAI `tools` and returns `tool_calls`. Function parameters are limited to an object of
+required strings, each optionally an `enum`; anything else, `tool_choice` other than `"auto"` or
+`"none"`, and `stream` with tools are rejected with a 400. While the model writes a call, its
+sampling is constrained so the call can only name a listed function, give each of its keys once
+and pick enum values from their lists. Qwen3 answers tools requests without thinking first.
+
+```sh
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d @- <<'JSON'
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You operate a loan app by calling tools. The loan_application form has the fields amount, full_name and phone. The user may speak English, Swahili or both. Write amounts as digits (elfu = 1000, laki = 100000, milioni = 1000000)."
+    },
+    {
+      "role": "user",
+      "content": "Nifungulie fomu ya mkopo, jina ni Asha Juma, kiasi laki tano"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "fill_field",
+        "description": "Fill one field of a form.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "form_id": {
+              "type": "string",
+              "enum": [
+                "loan_application"
+              ]
+            },
+            "field_id": {
+              "type": "string",
+              "enum": [
+                "amount",
+                "full_name",
+                "phone"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "form_id",
+            "field_id",
+            "value"
+          ],
+          "additionalProperties": false
+        },
+        "strict": true
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "temperature": 0
+}
+JSON
+```
+
+With Qwen3-8B Q4_K_M this returns two calls, `fill_field` with `full_name` = `Asha Juma` and with
+`amount` = `500000` (`finish_reason: "tool_calls"`). On an M4 Mac the request takes 5.7 s on
+Metal and 9.4 s on the CPU, or 4.0 and 4.7 s once the system prompt and tools are in the KV cache.
+Nearly all of it is decoding the 78-token reply at 17-20 tokens/s; the constraint adds about
+0.1 ms a token (`docs/benchmarks.md`, 2026-11-21).
+
 ## Performance
 
 One thread, Llama-3.2-1B Q4_K_M, against llama.cpp built natively on the same machine (measured

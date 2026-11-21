@@ -117,15 +117,22 @@ impl Sampler {
             }
         }
 
+        // Masked tokens (-inf, weight 0) are never picked while any other remains: not by a
+        // draw of exactly 0, nor by the fallback when rounding leaves `r` above 0 at the end.
         let total: f32 = cand.iter().map(|c| c.1).sum();
         let mut r = self.uniform() * total;
         for &(id, p) in &cand {
             r -= p;
-            if r <= 0.0 {
+            if p > 0.0 && r <= 0.0 {
                 return id;
             }
         }
-        cand.last().expect("at least one candidate").0
+        cand.iter()
+            .rev()
+            .find(|c| c.1 > 0.0)
+            .or(cand.last())
+            .expect("at least one candidate")
+            .0
     }
 }
 
@@ -245,6 +252,25 @@ mod tests {
             picks.iter().any(|&p| p as usize > 2 * NUCLEUS_FIRST),
             "nucleus was cut short"
         );
+    }
+
+    #[test]
+    fn masked_tokens_are_never_sampled() {
+        // One allowed token at the far end of the vocabulary; the rest masked out. The fallback
+        // used to return the last candidate, and a zero draw the first, whatever their weight.
+        for seed in 0..200 {
+            let mut s = Sampler::new(SamplerConfig {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+                repeat_penalty: 1.0,
+                seed,
+                ..Default::default()
+            });
+            let mut logits = vec![f32::NEG_INFINITY; 1000];
+            logits[500] = 0.0;
+            assert_eq!(s.sample(&mut logits, &[]), 500);
+        }
     }
 
     #[test]

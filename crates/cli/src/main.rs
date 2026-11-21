@@ -59,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
             max_tokens: 256,
             sampler: SamplerConfig::default(),
             stop: Vec::new(),
+            tools: None,
         },
     };
     fn num<T: std::str::FromStr>(flag: &str, v: Option<String>) -> Result<T, String> {

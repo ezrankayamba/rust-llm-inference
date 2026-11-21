@@ -3,6 +3,38 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: constrained tool-call decoding, cost per token (M4, CPU)
+
+Inside a `<tool_call>` block the logits are masked to the tokens `tools::Grammar` allows. The
+mask for a state is computed on first use, from the tokens starting with a byte the state
+accepts (in a free string, the precomputed set of tokens without a quote, backslash or control
+byte, plus the rest walked), and cached for the request.
+
+`cargo run --release -p rli-models --example bench_tool_grammar -- models/Qwen3-8B-Q4_K_M.gguf`
+(152k-token vocabulary, a reply of three calls, 93 of its tokens inside calls):
+
+| | mean | worst | per reply |
+|---|---|---|---|
+| token table (once per model) | | | 9.5 ms |
+| mask, cache cold (a request's first call) | 101 us | 379 us | 9.4 ms |
+| mask, cache warm | 60 us | 74 us | 5.6 ms |
+
+Against decode on the same machine, Qwen3-8B Q4_K_M: 59 ms a token on the CPU (4634 ms for 78
+tokens), 50 ms on Metal (3918 ms). The mask is 0.1-0.2% of a token. The warm cost is the pass
+over 152k logits that applies it.
+
+The README's request (`rli-server`, `temperature: 0`, two `fill_field` calls, 308 prompt and
+78 reply tokens), each cold (empty KV cache) then warm (system prompt and tools cached):
+
+| backend | cold | warm |
+|---|---|---|
+| Metal, 36 layers | 5.65 s (prompt 1.72 s) | 3.97 s |
+| CPU | 9.41 s (prompt 5.01 s) | 4.69 s |
+
+Without the amount hint in its system prompt the model wrote `"5"` for "laki tano", with the
+constraint on and off alike (same 73 tokens): the constraint did not change it. Under 1 s a turn
+would need under ~20 decoded tokens on this machine with an 8B model.
+
 ## 2026-11-17: NEON Q6_K row kernel with a super-block in integers
 
 One-thread decode on the M4 is 92% `dot_rows_q8` (`sample`), and the Q6_K output head is about

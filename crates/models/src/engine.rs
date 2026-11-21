@@ -5,8 +5,10 @@ use crate::model::{Model, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::stop::StopMatcher;
 use crate::tokenizer::Tokenizer;
+use crate::tools::{Constraint, Grammar, TokenTable};
 use rli_gguf::{Error, Gguf, Result};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Engine {
@@ -18,14 +20,18 @@ pub struct Engine {
     pub template_warning: Option<String>,
     pub model_name: String,
     stop: Vec<u32>,
+    /// The vocabulary as bytes, for constrained tool calls; built on first use.
+    token_table: OnceLock<TokenTable>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GenParams {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
     /// Generation ends before the first of these appears in the output.
     pub stop: Vec<String>,
+    /// Restricts what `<tool_call>` blocks in the reply can contain to calls of these tools.
+    pub tools: Option<Arc<Grammar>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +125,7 @@ impl Engine {
             template_warning,
             model_name,
             stop,
+            token_table: OnceLock::new(),
         })
     }
 
@@ -144,6 +151,11 @@ impl Engine {
         let p = self.render_chat(messages, opts);
         self.tokenizer
             .encode_rendered(&p.text, self.tokenizer.add_bos, &p.untrusted, &p.opaque)
+    }
+
+    pub fn token_table(&self) -> &TokenTable {
+        self.token_table
+            .get_or_init(|| TokenTable::new(&self.tokenizer))
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
@@ -225,6 +237,10 @@ impl Engine {
 
         let t1 = Instant::now();
         let mut sampler = Sampler::new(params.sampler.clone());
+        let mut constraint = params
+            .tools
+            .as_deref()
+            .map(|g| Constraint::new(g, self.token_table()));
         let mut pending: Vec<u8> = Vec::new();
         let mut stops = StopMatcher::new(&params.stop);
         let mut stopped = false;
@@ -237,7 +253,13 @@ impl Engine {
                 out.finish = Finish::Cancelled;
                 break;
             }
+            if let Some(c) = &mut constraint {
+                c.mask(&mut logits);
+            }
             let next = sampler.sample(&mut logits, &sess.tokens);
+            if let Some(c) = &mut constraint {
+                c.advance(next);
+            }
             if self.is_stop(next) {
                 out.finish = Finish::Stop;
                 break;

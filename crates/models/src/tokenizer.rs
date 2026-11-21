@@ -219,6 +219,14 @@ impl Tokenizer {
         self.types.get(id as usize) == Some(&TYPE_CONTROL)
     }
 
+    /// Control and user-defined tokens: the ones matched verbatim rather than built from text.
+    pub fn is_special(&self, id: u32) -> bool {
+        matches!(
+            self.types.get(id as usize),
+            Some(&(TYPE_CONTROL | TYPE_USER_DEFINED))
+        )
+    }
+
     /// Encodes `text`. With `parse_special`, control tokens written literally (e.g. `<|im_end|>`)
     /// become their single ids; otherwise they are tokenized as plain text.
     pub fn encode(&self, text: &str, add_bos: bool, parse_special: bool) -> Vec<u32> {

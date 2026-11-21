@@ -2,14 +2,14 @@
 //! `/` serves a small chat page for trying a model by hand.
 
 use crate::http::{self, Request};
-use rli_models::tools::{self, Tool};
+use rli_models::tools::{self, Grammar, Tool};
 use rli_models::{
     Engine, Finish, GenOutput, GenParams, Message, RenderOpts, SamplerConfig, Session,
 };
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct App {
@@ -151,6 +151,7 @@ pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
             seed: whole(req, "seed")?
                 .unwrap_or_else(|| NEXT_ID.fetch_add(1, Ordering::Relaxed) ^ now()),
         },
+        tools: None,
     })
 }
 
@@ -362,10 +363,15 @@ fn complete(
             ),
         );
     }
-    let params = match gen_params(&req, app.max_ctx - tokens.len()) {
+    let mut params = match gen_params(&req, app.max_ctx - tokens.len()) {
         Ok(p) => p,
         Err(msg) => return bad(w, &msg),
     };
+    // A call the model writes can only be one the schemas allow.
+    params.tools = tool_req
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| Arc::new(Grammar::new(t)));
     let stream = match boolean(&req, "stream") {
         Ok(s) => s,
         Err(msg) => return bad(w, &msg),

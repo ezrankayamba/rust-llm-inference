@@ -135,6 +135,7 @@ fn exercise(path: &std::path::Path) -> bool {
                 repeat_last_n: 8,
                 seed: 1,
             },
+            tools: None,
         };
         let mut sess = e.new_session(32);
         e.generate(&mut sess, &tokens, &params, || false, |_| true);
