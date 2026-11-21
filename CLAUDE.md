@@ -52,7 +52,9 @@ Workspace crates (dependencies flow downward only):
   fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, `tools.rs` (OpenAI tools in Qwen's Hermes format: schema subset, rendering, `<tool_call>`
   parsing, and the byte-level grammar that masks logits inside a call; `Constraint::jump` gives the text
   it forces, which `Engine::generate` evaluates in one batch with the token sampled before it), and `engine.rs` (the generation API the
-  binaries share, including KV prefix reuse and `stop.rs`'s stop strings). `metal.rs` / `cuda.rs` implement `Accelerator`, and
+  binaries share, including KV prefix reuse, `stop.rs`'s stop strings, and speculative decoding with an
+  optional draft model at temperature 0: the draft guesses, `Model::forward_rows` gives the logits of
+  every guess in one pass, and the guesses the model would have sampled stand). `metal.rs` / `cuda.rs` implement `Accelerator`, and
   `backend::attach` picks the one compiled in.
 - **rli** (`crates/cli`) and **rli-server** (`crates/server`): thin binaries. The server is
   std-only HTTP (one thread per connection, `Connection: close`) with one shared session behind a
@@ -141,6 +143,15 @@ Design points that span files:
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
   route each row, then run each used expert once over the rows that picked it.
+- **Speculative decoding checks a batch, which costs more than a token.** A pass of 2-5 rows ran
+  1.75-2.1x a one-token pass on Qwen3-14B (Metal: a batch takes the prompt kernels, a token the
+  fused decode ones), so a draft guesses its full `--draft-tokens` every pass and drafting pauses
+  while under 60% of its recent guesses stand (`MIN_DRAFT_RATE`): shrinking to one guess after a
+  miss still cost Swahili prose 23-65%. The last layer then computes the rows from `lo`, whose
+  batched attention must start at `pos + lo` (a 2-row check was 0.47 off before that was fixed;
+  `logits_for_the_last_rows_match_per_token` catches it only with `--features metal`). CUDA keeps
+  `logit_rows() == 1`, so `set_draft` refuses there. `examples/spec_accept.rs` measures how often a
+  draft's guesses would stand on the tool-call cases.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there
   (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep

@@ -10,7 +10,9 @@
 
 use crate::backend::BackendError;
 use crate::config::Config;
-use crate::model::{Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each};
+use crate::model::{
+    Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each, rows_in,
+};
 use rli_core::metal::{
     At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs, attention_part_len,
 };
@@ -58,6 +60,8 @@ struct Scratch {
     /// Three equal parts (see `Metal::moe`): each gathered row's token, each token's gathered
     /// rows (both u32 bits), and the weights. GPU-routed decode keeps ids and weights in halves.
     route: GpuBuf,
+    /// Room for this many rows of logits.
+    logit_rows: usize,
     logits: GpuBuf,
 }
 
@@ -116,7 +120,15 @@ impl Kv {
 }
 
 impl Scratch {
-    fn new(gpu: &Gpu, c: &Config, max_ff: usize, logits: usize, cap: usize) -> Self {
+    /// `vocab` is 0 when the offload doesn't reach the output head.
+    fn new(
+        gpu: &Gpu,
+        c: &Config,
+        max_ff: usize,
+        vocab: usize,
+        cap: usize,
+        logit_rows: usize,
+    ) -> Self {
         // An MoE layer keeps a row per token and chosen expert.
         let pairs = cap * c.n_expert_used;
         Scratch {
@@ -136,7 +148,8 @@ impl Scratch {
             gx: gpu.alloc(pairs * c.n_embd),
             // Each token is in n_expert_used expert lists, plus the shared expert's list.
             route: gpu.alloc(3 * cap * (c.n_expert_used + 1)),
-            logits: gpu.alloc(logits),
+            logit_rows,
+            logits: gpu.alloc(logit_rows * vocab),
         }
     }
 }
@@ -193,10 +206,11 @@ fn ffn(b: &mut Batch<'_>, s: &Scratch, e: &Expert, x: At<'_>, out: At<'_>, n: us
 }
 
 impl Metal {
-    /// Runs the offloaded layers on the `n` token rows in `s.x` (positions `pos..pos + n`) and,
-    /// when `want_logits`, the output head on the last row into `s.logits`. Waits for the GPU.
-    fn run(&self, model: &Model, kv: &Kv, s: &Scratch, n: usize, pos: usize, want_logits: bool) {
-        assert!(n >= 1 && n <= s.cap);
+    /// Runs the offloaded layers on the `n` token rows in `s.x` (positions `pos..pos + n`) and
+    /// the output head on the last `rows` of them into `s.logits`. Waits for the GPU.
+    fn run(&self, model: &Model, kv: &Kv, s: &Scratch, n: usize, pos: usize, rows: usize) {
+        assert!(n >= 1 && n <= s.cap && rows <= n.min(s.logit_rows));
+        assert!(rows == 0 || self.covers_all);
         assert!(pos + n <= kv.cap, "KV cache not reserved");
         let c = &model.cfg;
         let (hd, kv_dim, n_embd) = (c.head_dim, c.kv_dim(), c.n_embd);
@@ -218,10 +232,10 @@ impl Metal {
             }
             let (k_at, v_at) = (At(&s.k, 0), At(&s.v, 0));
             // The rows whose queries, attention and FFN this layer computes, `lo..`: all of
-            // them, but after the last layer of the model only the row the logits come from
-            // is read, so there the others get just their keys and values.
+            // them, but after the last layer of the model only the rows the logits come from
+            // are read, so there the others get just their keys and values.
             let m = if self.covers_all && l + 1 == self.layers.len() {
-                usize::from(want_logits)
+                rows
             } else {
                 n
             };
@@ -299,11 +313,13 @@ impl Metal {
                 };
                 b.attention(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), &kv.part, &p);
             } else {
+                // The queries are rows `lo..`: after the last layer, only those the logits
+                // come from.
                 let p = BatchAttnParams {
                     n_head: c.n_head as u32,
                     n_kv: c.n_head_kv as u32,
                     head_dim: hd as u32,
-                    pos: pos as u32,
+                    pos: (pos + lo) as u32,
                     kv_dim: kv_dim as u32,
                     scale: 1.0 / (hd as f32).sqrt(),
                 };
@@ -350,10 +366,17 @@ impl Metal {
                 },
             }
         }
-        if want_logits {
-            let last = At(&s.x, (n - 1) * n_embd);
-            b.rmsnorm(last, At(&s.xb, 0), &self.output_norm, 1, n_embd, c.rms_eps);
-            mm(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0), 1);
+        if rows > 0 {
+            let last = At(&s.x, (n - rows) * n_embd);
+            b.rmsnorm(
+                last,
+                At(&s.xb, 0),
+                &self.output_norm,
+                rows,
+                n_embd,
+                c.rms_eps,
+            );
+            mm(&mut b, &model.output, At(&s.xb, 0), At(&s.logits, 0), rows);
         }
         b.finish();
     }
@@ -559,18 +582,20 @@ impl Metal {
         logits: Option<&mut [f32]>,
     ) -> bool {
         let n = xs.len() / model.cfg.n_embd;
-        let want_logits = self.covers_all && logits.is_some();
+        let logits = logits.filter(|_| self.covers_all);
+        let rows = logits.as_ref().map_or(0, |l| l.len() / model.output.rows);
         // SAFETY: callers hold the scratch lock and no GPU work is in flight.
         unsafe { s.x.as_mut_slice()[..xs.len()].copy_from_slice(xs) };
-        self.run(model, kv, s, n, pos, want_logits);
+        self.run(model, kv, s, n, pos, rows);
         // SAFETY: `run` waited for the GPU.
         unsafe {
             xs.copy_from_slice(&s.x.as_slice()[..xs.len()]);
-            if want_logits && let Some(out) = logits {
+            if let Some(out) = logits {
                 out.copy_from_slice(&s.logits.as_slice()[..out.len()]);
+                return true;
             }
         }
-        want_logits
+        false
     }
 }
 
@@ -585,6 +610,10 @@ impl Accelerator for Metal {
 
     fn prompt_slice(&self) -> usize {
         BATCH_CHUNK
+    }
+
+    fn logit_rows(&self) -> usize {
+        usize::MAX
     }
 
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send> {
@@ -613,7 +642,7 @@ impl Accelerator for Metal {
         state: &mut (dyn Any + Send),
         xs: &mut [f32],
         pos: usize,
-        mut logits: Option<&mut [f32]>,
+        logits: Option<&mut [f32]>,
     ) -> bool {
         let n_embd = model.cfg.n_embd;
         if !self.batchable || xs.len() == n_embd {
@@ -622,35 +651,49 @@ impl Accelerator for Metal {
         let kv: &mut Kv = state
             .downcast_mut()
             .expect("state created by this accelerator");
-        kv.reserve(self, pos + xs.len() / n_embd);
+        let n = xs.len() / n_embd;
+        kv.reserve(self, pos + n);
+        let vocab = model.output.rows;
+        let mut logits = logits.filter(|_| self.covers_all);
+        let rows = logits.as_ref().map_or(0, |l| l.len() / vocab);
         let mut guard = self.batch.lock().unwrap_or_else(|p| p.into_inner());
         // Sized for the longest chunk seen: an MoE layer's rows per token and chosen expert
-        // come to 92 MB for 512 tokens of Qwen3-30B-A3B.
-        let need = (xs.len() / n_embd).min(BATCH_CHUNK);
-        if guard.as_ref().is_none_or(|s| s.cap < need) {
-            let logits = if self.covers_all {
-                model.output.rows
-            } else {
-                0
-            };
+        // come to 92 MB for 512 tokens of Qwen3-30B-A3B. Logits likewise, for the most rows
+        // asked for (152k floats a row).
+        let need = n.min(BATCH_CHUNK);
+        let need_rows = rows.clamp(1, BATCH_CHUNK);
+        if guard
+            .as_ref()
+            .is_none_or(|s| s.cap < need || s.logit_rows < need_rows)
+        {
+            let (cap, have) = guard.as_ref().map_or((0, 0), |s| (s.cap, s.logit_rows));
+            let vocab = if self.covers_all { vocab } else { 0 };
             *guard = Some(Scratch::new(
                 &self.gpu,
                 &model.cfg,
                 self.max_ff,
-                logits,
-                need,
+                vocab,
+                need.max(cap),
+                need_rows.max(have),
             ));
         }
         let s = guard.as_ref().expect("allocated above");
-        let n_chunks = xs.len().div_ceil(BATCH_CHUNK * n_embd);
         let mut done = false;
         for (i, chunk) in xs.chunks_mut(BATCH_CHUNK * n_embd).enumerate() {
-            let l = if i + 1 == n_chunks {
-                logits.take()
-            } else {
-                None
+            let start = i * BATCH_CHUNK;
+            let r = rows_in(start, start + chunk.len() / n_embd, n, rows);
+            let l = match logits.take() {
+                Some(l) if r > 0 => {
+                    let (this, rest) = l.split_at_mut(r * vocab);
+                    logits = Some(rest);
+                    Some(this)
+                }
+                l => {
+                    logits = l;
+                    None
+                }
             };
-            done = self.pass(model, kv, s, chunk, pos + i * BATCH_CHUNK, l);
+            done = self.pass(model, kv, s, chunk, pos + start, l);
         }
         done
     }
@@ -801,7 +844,7 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
         })
         .collect();
     let logits = if covers_all { model.output.rows } else { 0 };
-    let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1);
+    let scratch = Scratch::new(&gpu, &c, max_ff, logits, 1, 1);
     let batchable = c.head_dim.is_multiple_of(8) && c.head_dim <= 256;
     let accel = Metal {
         batchable,

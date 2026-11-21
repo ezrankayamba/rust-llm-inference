@@ -3,6 +3,70 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: speculative decoding with Qwen3-0.6B as the draft (M4, Metal)
+
+`rli-server --draft models/Qwen3-0.6B-Q8_0.gguf --draft-tokens 6`: at temperature 0 the draft
+guesses up to 6 tokens (skipping, as the main model does, the text a tool call's schema forces),
+the main model gives logits for every guess in one `forward_rows` pass, and the guesses it would
+have sampled itself stand, plus its own token after them. Drafting pauses (1, 2, 4 ... 16 passes)
+while under 60% of the recent guesses stand.
+
+How often the draft would be right (`cargo run --release -p rli-models --features metal --example
+spec_accept -- models/Qwen3-8B-Q4_K_M.gguf models/Qwen3-0.6B-Q8_0.gguf cases.json`, the eval's 12
+requests): 86.2% of the 464 tokens Qwen3-8B sampled (301 more were forced), from 73% on a Swahili
+text reply to 100%; with 4 guesses a pass that would be 3.34 tokens a pass, 4.34 with 8.
+
+Cost per pass, measured alone (`bench --pp N --tg 16`): Qwen3-0.6B 7.9 ms a token; Qwen3-8B 53 ms
+a token, 73 ms for 8 rows; Qwen3-14B 104 ms a token, 134 for 8. Under load later, Qwen3-14B 2 rows
+1.75x one, 5 rows 2.1x, which is why a draft that guesses badly must stop rather than guess less:
+with guesses shrunk to one after a miss (and later with a pause only after misses at one guess),
+the two Swahili text replies, where Qwen3-0.6B guesses ~35%, ran 23-65% slower than without it.
+
+Accuracy: every run with the draft gave the same calls and text as without it, on all 12
+requests, for Qwen3-8B and Qwen3-14B (15 runs compared, among them the 2048-token greeting reply).
+A bug found by `logits_for_the_last_rows_match_per_token` (Metal's last layer gave its batched
+attention the batch's first position, not that of its first query row, so checks after forced
+text were computed with a wrong mask) was present in the timing runs below; after the fix the
+replies were again identical (8B and 14B, 12 of 12), at the same speed.
+
+Times: same binary with and without `--draft`, alternately, 30 s apart, a Docker VM using 0.4-2.6
+cores and up to 6 GB alongside (0.2-0.7 GB free, the 14B's weights read back from disk at up to
+250 MB/s when reloaded), so absolute times vary by run; compare pairs.
+
+| model | draft | right | mean | median | max |
+|---|---|---|---|---|---|
+| Qwen3-14B | off | 8/12 | 6.59 s | 5.68 s | 17.45 s |
+| Qwen3-14B | 6 | 8/12 | 4.47 s | 2.91 s | 15.13 s |
+| Qwen3-14B | off | 8/12 | 6.35 s | 5.31 s | 14.98 s |
+| Qwen3-14B | 6 | 8/12 | 4.56 s | 2.96 s | 15.02 s |
+| Qwen3-8B | off | 9/12 | 19.37 s | 1.80 s | 210.47 s |
+| Qwen3-8B | 6 | 9/12 | 7.49 s | 1.08 s | 75.30 s |
+| Qwen3-8B | off | 9/12 | 17.62 s | 1.52 s | 192.77 s |
+| Qwen3-8B | 6 | 9/12 | 7.56 s | 1.07 s | 76.81 s |
+
+(The 8B's max is its 2048-token answer to the greeting.) Per request, time with the draft over
+time without, the two pairs averaged:
+
+| request | 14B | 8B |
+|---|---|---|
+| Nifungulie fomu ya mkopo, jina ni Asha Juma, kiasi laki tano | 0.69 | 0.77 |
+| Open the loan application and put my phone as 0712345678 | 0.47 | 0.61 |
+| Nenda kwenye ukurasa wa mwanzo | 0.68 | 0.89 |
+| Take me to my profile | 0.60 | 0.86 |
+| Mipangilio tafadhali (a Swahili text reply) | 0.88 | 0.73 |
+| Jina langu ni John Mwangi (a Swahili text reply on the 14B) | 0.87 | 0.73 |
+| Weka kiasi elfu hamsini | 0.74 | 0.82 |
+| Change the amount to two million shillings | 0.45 | 0.54 |
+| Namba yangu ya simu ni 0754 111 222 | 0.37 | 0.49 |
+| Tuma fomu | 0.55 | 0.79 |
+| Nataka mkopo wa shilingi milioni moja, jina ni Fatuma Ali, then submit it | 0.54 | 0.73 |
+| Habari, unaweza kunisaidia nini? (a text reply) | 0.93 | 0.38 |
+
+The README's request on Qwen3-8B, cold (308 prompt tokens; the draft evaluates them too, in its
+first pass) then warm, twice each: without the draft 6.62 / 2.90 s and 4.33 / 2.15 s, with it
+5.71 / 1.25 s and 3.45 / 1.16 s, the same two calls every time. Memory: the draft's 0.64 GB of weights, plus its KV cache
+(28 layers x 1024 x K and V in f16: 112 KB a position, 0.47 GB at 4096), not measured.
+
 ## 2026-11-21: evaluating the text a tool call's schema forces in one batch (M4)
 
 Inside a `<tool_call>` block, `Constraint::jump` collects the bytes the grammar allows only one

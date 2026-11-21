@@ -740,6 +740,11 @@ impl<'a> Constraint<'a> {
         ids
     }
 
+    /// Takes up where `other` is (another model's constraint for the same request).
+    pub fn follow(&mut self, other: &Constraint) {
+        self.state = other.state;
+    }
+
     /// Whether a call is being written.
     pub fn in_call(&self) -> bool {
         self.state.is_some()

@@ -28,9 +28,14 @@ fn start() -> Server {
 }
 
 fn start_with(model: &str, ctx: usize) -> Server {
+    start_args(model, ctx, &[])
+}
+
+fn start_args(model: &str, ctx: usize, extra: &[&str]) -> Server {
     let ctx = ctx.to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_rli-server"))
         .args(["-m", model, "--port", "0", "--ctx", &ctx])
+        .args(extra)
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn server");
@@ -630,4 +635,41 @@ fn tools_need_a_template_with_a_tool_format() {
         Some(&tools_body(json!({}))),
     );
     assert_eq!(st, 400, "{resp}");
+}
+
+/// At temperature 0 a draft changes only the speed: the same tools request gives the same
+/// reply with and without one (here the model itself, so every guess stands).
+#[test]
+fn a_draft_model_leaves_replies_unchanged() {
+    let model = tools_model();
+    let body = tools_body(json!({"max_tokens": 48}));
+    let reply = |extra: &[&str]| {
+        let srv = start_args(&model, 2048, extra);
+        let (st, resp) = request(&srv.addr, "POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(st, 200, "{resp}");
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        (
+            v["choices"].clone(),
+            v["usage"]["completion_tokens"].clone(),
+        )
+    };
+    assert_eq!(
+        reply(&["--draft", &model, "--draft-tokens", "3"]),
+        reply(&[])
+    );
+}
+
+#[test]
+fn a_draft_with_another_vocabulary_is_refused() {
+    let draft = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/tests/fixtures/tiny_mixtral.gguf"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rli-server"))
+        .args(["-m", &tools_model(), "--port", "0", "--draft", draft])
+        .output()
+        .expect("run server");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("vocabulary"), "{err}");
 }

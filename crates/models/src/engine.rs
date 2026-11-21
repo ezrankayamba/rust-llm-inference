@@ -22,6 +22,15 @@ pub struct Engine {
     stop: Vec<u32>,
     /// The vocabulary as bytes, for constrained tool calls; built on first use.
     token_table: OnceLock<TokenTable>,
+    draft: Option<Draft>,
+}
+
+/// A smaller model with the same vocabulary, whose guesses at the next tokens
+/// [`Engine::generate`] checks in one pass of the main model, at temperature 0.
+struct Draft {
+    model: Model,
+    /// The most tokens it guesses a pass.
+    tokens: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -55,6 +64,12 @@ pub struct GenOutput {
     pub prefill_secs: f64,
     pub decode_secs: f64,
 }
+
+/// The share of a draft's recent guesses that must stand for [`Engine::generate`] to keep
+/// drafting: about where a batch pass of 1.6-2x a token's time pays for itself.
+const MIN_DRAFT_RATE: f32 = 0.6;
+/// Most passes it goes without the draft while the draft keeps missing.
+const MAX_DRAFT_PAUSE: usize = 16;
 
 /// End-of-turn markers used by common chat formats, in addition to the declared EOS/EOT.
 const STOP_TOKENS: [&str; 6] = [
@@ -126,12 +141,96 @@ impl Engine {
             model_name,
             stop,
             token_table: OnceLock::new(),
+            draft: None,
         })
     }
 
+    /// Speculates with `draft` (loaded, its backend attached) when sampling at temperature 0:
+    /// it guesses `tokens` tokens a pass, and the replies stay what this model alone writes,
+    /// up to float rounding (a batch is evaluated in a different order than one token).
+    pub fn set_draft(&mut self, draft: Engine, tokens: usize) -> std::result::Result<(), String> {
+        let (a, b) = (&self.tokenizer, &draft.tokenizer);
+        let same = a.vocab_size() == b.vocab_size()
+            && draft.model.n_vocab() == self.model.n_vocab()
+            && (0..a.vocab_size() as u32)
+                .all(|i| a.token_str(i) == b.token_str(i) && a.is_special(i) == b.is_special(i));
+        if !same {
+            return Err(format!(
+                "{} doesn't have {}'s vocabulary",
+                draft.model_name, self.model_name
+            ));
+        }
+        if self.model.logit_rows() < 2 {
+            return Err("this backend can't check drafted tokens in one pass".into());
+        }
+        if tokens == 0 {
+            return Err("a draft must guess at least one token".into());
+        }
+        self.draft = Some(Draft {
+            model: draft.model,
+            tokens,
+        });
+        Ok(())
+    }
+
     pub fn new_session(&self, max_ctx: usize) -> Session {
-        self.model
-            .new_session(max_ctx.min(self.model.cfg.n_ctx_train))
+        let max_ctx = max_ctx.min(self.model.cfg.n_ctx_train);
+        let mut s = self.model.new_session(max_ctx);
+        s.draft = self
+            .draft
+            .as_ref()
+            .map(|d| Box::new(d.model.new_session(max_ctx)));
+        s
+    }
+
+    /// Up to `room` tokens the draft expects after `tokens` and `batch` (which its session is
+    /// brought up to first): `d.tokens` of its own choosing (`true`), each followed by the text
+    /// a tool call's grammar then forces (`false`), as `generate` would add it.
+    fn propose(
+        &self,
+        d: &Draft,
+        ds: &mut Session,
+        mut c: Option<&mut Constraint>,
+        tokens: &[u32],
+        batch: &[u32],
+        room: usize,
+    ) -> Vec<(u32, bool)> {
+        let all = || tokens.iter().chain(batch).copied();
+        let total = tokens.len() + batch.len();
+        let common = ds.tokens.iter().zip(all()).take_while(|(a, b)| **a == *b);
+        let keep = common.count().min(total - 1);
+        ds.truncate(keep, d.model.cfg.kv_dim());
+        let rest: Vec<u32> = all().skip(keep).collect();
+        let mut logits = d
+            .model
+            .forward_batch(ds, &rest, true)
+            .expect("logits requested");
+        let mut out = Vec::new();
+        for i in 0..d.tokens {
+            if let Some(c) = c.as_deref_mut() {
+                c.mask(&mut logits);
+            }
+            let t = argmax(&logits);
+            if out.len() >= room || self.is_stop(t) {
+                break;
+            }
+            out.push((t, true));
+            let mut fresh = vec![t];
+            if let Some(c) = c.as_deref_mut() {
+                c.advance(t);
+                let forced = c.jump(|s| self.tokenizer.encode(s, false, false), room - out.len());
+                out.extend(forced.iter().map(|&f| (f, false)));
+                fresh.extend(forced);
+            }
+            // The last guess needs no logits; the next pass brings the session up to date.
+            if i + 1 < d.tokens && out.len() < room {
+                logits = d
+                    .model
+                    .forward_batch(ds, &fresh, true)
+                    .expect("logits requested");
+            }
+        }
+        out
     }
 
     /// The chat prompt for `messages`, with today's date (UTC) where the template wants one.
@@ -244,6 +343,23 @@ impl Engine {
         let mut pending: Vec<u8> = Vec::new();
         let mut stops = StopMatcher::new(&params.stop);
         let mut stopped = false;
+        let draft = self
+            .draft
+            .as_ref()
+            .filter(|_| params.sampler.temperature <= 0.0);
+        let mut draft_sess = draft.and(sess.draft.take());
+        let mut draft_constraint = params
+            .tools
+            .as_deref()
+            .map(|g| Constraint::new(g, self.token_table()));
+        let vocab = self.model.n_vocab();
+        // Checking guesses costs a batch pass, nearly the same for 2 rows as for 6 (Qwen3-14B
+        // on Metal: 1.75x a one-token pass, 2.1x for 5), so a draft guesses all it may, and
+        // only while enough of its recent guesses stand to pay for that: below that it waits
+        // `backoff` passes, doubled each time it is still below, before trying again. Qwen3-0.6B
+        // guesses ~86% of Qwen3-14B's tool calls and ~35% of its Swahili prose.
+        let mut rate = 1.0f32;
+        let (mut pause, mut backoff) = (0usize, 1);
         'tokens: loop {
             if out.completion_tokens >= params.max_tokens || sess.len() >= sess.max_ctx {
                 out.finish = Finish::Length;
@@ -266,13 +382,73 @@ impl Engine {
             }
             // Inside a tool call, the text the schema leaves no choice over follows the token
             // sampled, all evaluated in one pass.
+            let room =
+                (params.max_tokens - out.completion_tokens).min(sess.max_ctx - sess.len()) - 1;
             let mut batch = vec![next];
             if let Some(c) = &mut constraint {
-                let room = (params.max_tokens - out.completion_tokens - 1)
-                    .min(sess.max_ctx - sess.len() - 1);
                 batch.extend(c.jump(|s| self.tokenizer.encode(s, false, false), room));
             }
-            for (i, &id) in batch.iter().enumerate() {
+            // And the draft's guesses at what comes next, checked in the same pass.
+            let room = room + 1 - batch.len();
+            let drafting = pause == 0;
+            pause = pause.saturating_sub(1);
+            let drafts = match (draft, draft_sess.as_deref_mut()) {
+                (Some(d), Some(ds)) if room > 0 && drafting => {
+                    if let (Some(dc), Some(c)) = (&mut draft_constraint, &constraint) {
+                        dc.follow(c);
+                    }
+                    let dc = draft_constraint.as_mut();
+                    self.propose(d, ds, dc, &sess.tokens, &batch, room)
+                }
+                _ => Vec::new(),
+            };
+            let base = sess.len();
+            let mut seq = batch.clone();
+            seq.extend(drafts.iter().map(|d| d.0));
+            let rows = self
+                .model
+                .forward_rows(sess, &seq, 1 + drafts.len())
+                .expect("logits requested");
+            // A guess stands if the model would have chosen it there; the text forced after it
+            // stands with it. Row j is the logits after `seq[batch.len() - 1 + j]`.
+            let mut kept = batch.len();
+            let (mut missed, mut hits) = (false, 0);
+            for &(tok, guessed) in &drafts {
+                if guessed {
+                    let row = kept - batch.len();
+                    let mut l = rows[row * vocab..(row + 1) * vocab].to_vec();
+                    if let Some(c) = &mut constraint {
+                        c.mask(&mut l);
+                    }
+                    if sampler.sample(&mut l, &sess.tokens[..base + kept]) != tok {
+                        missed = true;
+                        break;
+                    }
+                    hits += 1;
+                }
+                if let Some(c) = &mut constraint {
+                    c.advance(tok);
+                }
+                kept += 1;
+            }
+            if !drafts.is_empty() {
+                // Of the guesses checked: those that stood, and the one that didn't.
+                rate = (rate + hits as f32 / (hits + usize::from(missed)) as f32) / 2.0;
+                if rate < MIN_DRAFT_RATE {
+                    pause = backoff;
+                    backoff = (2 * backoff).min(MAX_DRAFT_PAUSE);
+                } else {
+                    backoff = 1;
+                }
+            }
+            sess.truncate(base + kept, kv_dim);
+            logits = if drafts.is_empty() {
+                rows
+            } else {
+                let row = kept - batch.len();
+                rows[row * vocab..(row + 1) * vocab].to_vec()
+            };
+            for (i, &id) in seq[..kept].iter().enumerate() {
                 out.completion_tokens += 1;
                 self.tokenizer.decode_bytes(id, &mut pending);
                 let valid = complete_utf8(&pending);
@@ -287,19 +463,20 @@ impl Engine {
                 if hit {
                     out.finish = Finish::Stop;
                     stopped = true;
+                    // The token that completed the stop is counted but not kept.
+                    sess.truncate(base + i, kv_dim);
                     break 'tokens;
                 }
                 if !wanted {
                     out.finish = Finish::Cancelled;
                     // Keep the KV cache consistent with the tokens actually produced.
-                    self.model.forward_batch(sess, &batch[..=i], false);
+                    sess.truncate(base + i + 1, kv_dim);
                     break 'tokens;
                 }
             }
-            logits = self
-                .model
-                .forward_batch(sess, &batch, true)
-                .expect("logits requested");
+        }
+        if draft_sess.is_some() {
+            sess.draft = draft_sess;
         }
         if !stopped {
             let rest = String::from_utf8_lossy(&pending).into_owned();
@@ -318,6 +495,16 @@ impl Engine {
         out.decode_secs = t1.elapsed().as_secs_f64();
         out
     }
+}
+
+fn argmax(l: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &v) in l.iter().enumerate() {
+        if v > l[best] {
+            best = i;
+        }
+    }
+    best as u32
 }
 
 /// How many leading bytes of `pending` can be emitted: everything but an incomplete trailing

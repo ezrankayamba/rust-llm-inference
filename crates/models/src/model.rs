@@ -59,6 +59,11 @@ pub trait Accelerator: Send + Sync {
     }
     /// Per-session state, e.g. the KV cache of the accelerated layers.
     fn new_state(&self, max_ctx: usize) -> Box<dyn Any + Send>;
+    /// Most tokens of one [`Accelerator::forward_batch`] pass it fills logits for (when it
+    /// covers every layer).
+    fn logit_rows(&self) -> usize {
+        1
+    }
     /// Runs the accelerated layers on the embedding `x` (in place) at position `pos`. When it
     /// covers all layers and `logits` is given, it also fills the logits and returns `true`.
     fn forward(
@@ -70,8 +75,9 @@ pub trait Accelerator: Send + Sync {
         logits: Option<&mut [f32]>,
     ) -> bool;
     /// Like [`Accelerator::forward`] for `xs.len() / n_embd` consecutive tokens (row-major
-    /// embeddings, in place) at positions `pos..`; `logits` are for the last token. The default
-    /// runs them one at a time.
+    /// embeddings, in place) at positions `pos..`; `logits` are for the last
+    /// `logits.len() / n_vocab` tokens (at most [`Accelerator::logit_rows`]). The default runs
+    /// them one at a time.
     fn forward_batch(
         &self,
         model: &Model,
@@ -117,15 +123,26 @@ pub(crate) fn forward_each<A: Accelerator + ?Sized>(
     state: &mut (dyn Any + Send),
     xs: &mut [f32],
     pos: usize,
-    mut logits: Option<&mut [f32]>,
+    logits: Option<&mut [f32]>,
 ) -> bool {
     let n = xs.len() / model.cfg.n_embd;
+    let vocab = model.output.rows;
+    let mut rows = logits.map(|l| l.chunks_exact_mut(vocab));
+    let first = n - rows.as_ref().map_or(0, |r| r.len());
     let mut done = false;
     for (i, x) in xs.chunks_exact_mut(model.cfg.n_embd).enumerate() {
-        let l = if i + 1 == n { logits.take() } else { None };
+        let l = rows
+            .as_mut()
+            .filter(|_| i >= first)
+            .and_then(Iterator::next);
         done = accel.forward(model, state, x, pos + i, l);
     }
     done
+}
+
+/// How many of the rows `start..end` of an `n`-row batch are among its last `rows`.
+pub(crate) fn rows_in(start: usize, end: usize, n: usize, rows: usize) -> usize {
+    end.saturating_sub(start.max(n - rows))
 }
 
 pub(crate) struct Expert {
@@ -255,6 +272,8 @@ pub struct Session {
     pub max_ctx: usize,
     /// The accelerator's per-session state (its layers' KV cache), created on first use.
     accel: Option<Box<dyn Any + Send>>,
+    /// The draft model's session, when generation speculates with one (`Engine::new_session`).
+    pub draft: Option<Box<Session>>,
 }
 
 impl Session {
@@ -503,6 +522,7 @@ impl Model {
             tokens: Vec::new(),
             max_ctx,
             accel: None,
+            draft: None,
         }
     }
 
@@ -610,6 +630,26 @@ impl Model {
         tokens: &[u32],
         want_logits: bool,
     ) -> Option<Vec<f32>> {
+        self.forward_rows(sess, tokens, usize::from(want_logits))
+    }
+
+    /// Most rows [`Model::forward_rows`] gives logits for in one pass.
+    pub fn logit_rows(&self) -> usize {
+        match &self.accel {
+            Some(a) if a.layers() == self.layers.len() => a.logit_rows(),
+            _ => usize::MAX,
+        }
+    }
+
+    /// Like [`Model::forward_batch`], with the logits of the last `rows` tokens (row-major,
+    /// `rows * n_vocab`; none when `rows` is 0), `rows` at most [`Model::logit_rows`].
+    pub fn forward_rows(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        rows: usize,
+    ) -> Option<Vec<f32>> {
+        assert!(rows <= tokens.len() && rows <= self.logit_rows());
         // A pass that runs wholly on the accelerator has nothing for the pool to do, and
         // handing it over costs a thread wake-up per token.
         if self
@@ -617,17 +657,18 @@ impl Model {
             .as_ref()
             .is_some_and(|a| a.layers() == self.layers.len())
         {
-            return self.forward_batch_in_pool(sess, tokens, want_logits);
+            return self.forward_batch_in_pool(sess, tokens, rows);
         }
-        crate::pool().install(|| self.forward_batch_in_pool(sess, tokens, want_logits))
+        crate::pool().install(|| self.forward_batch_in_pool(sess, tokens, rows))
     }
 
     fn forward_batch_in_pool(
         &self,
         sess: &mut Session,
         tokens: &[u32],
-        want_logits: bool,
+        rows: usize,
     ) -> Option<Vec<f32>> {
+        let want_logits = rows > 0;
         let n_embd = self.cfg.n_embd;
         let pos = sess.len();
         if tokens.is_empty() {
@@ -638,11 +679,7 @@ impl Model {
         for (x, &t) in xs.chunks_exact_mut(n_embd).zip(tokens) {
             embd.dequantize_row_into(t as usize, x);
         }
-        let mut logits = if want_logits {
-            vec![0.0; self.output.rows]
-        } else {
-            Vec::new()
-        };
+        let mut logits = vec![0.0; rows * self.output.rows];
         let mut first_cpu_layer = 0;
         if let Some(a) = &self.accel {
             let state = sess.accel.get_or_insert_with(|| a.new_state(sess.max_ctx));
@@ -659,26 +696,29 @@ impl Model {
                 return Some(logits);
             }
         }
-        let n_chunks = tokens.len().div_ceil(CPU_CHUNK);
+        let n = tokens.len();
         for (i, chunk) in xs.chunks_mut(CPU_CHUNK * n_embd).enumerate() {
-            let tail = usize::from(want_logits && i + 1 == n_chunks);
-            self.cpu_layers(sess, chunk, pos + i * CPU_CHUNK, first_cpu_layer, tail);
+            let start = i * CPU_CHUNK;
+            let tail = rows_in(start, start + chunk.len() / n_embd, n, rows);
+            self.cpu_layers(sess, chunk, pos + start, first_cpu_layer, tail);
         }
         sess.tokens.extend_from_slice(tokens);
         if !want_logits {
             return None;
         }
-        let x = &xs[(tokens.len() - 1) * n_embd..];
-        let mut xb = vec![0.0; n_embd];
-        ops::rmsnorm(&mut xb, x, &self.output_norm, self.cfg.rms_eps);
-        self.matvec(&self.output, &xb, &mut logits);
+        let x = &xs[(n - rows) * n_embd..];
+        let mut xb = vec![0.0; rows * n_embd];
+        for (o, r) in xb.chunks_exact_mut(n_embd).zip(x.chunks_exact(n_embd)) {
+            ops::rmsnorm(o, r, &self.output_norm, self.cfg.rms_eps);
+        }
+        self.matmul(&self.output, &xb, &mut logits, rows);
         Some(logits)
     }
 
     /// Runs layers `first..` on the CPU for the token rows in `xs` (positions `pos..`, in
     /// place), appending to their KV cache. Rows are processed together, so each weight matrix
-    /// is read once per call; one row is the decode case. Only the last `tail` rows (0 or 1)
-    /// are needed after the last layer, which then computes just its keys and values for the
+    /// is read once per call; one row is the decode case. Only the last `tail` rows are needed
+    /// after the last layer, which then computes just its keys and values for the
     /// others: a prompt saves most of a layer.
     fn cpu_layers(
         &self,

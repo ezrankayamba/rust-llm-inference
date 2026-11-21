@@ -665,3 +665,83 @@ fn short_chunk_repeated_matches_its_first_run() {
         }
     }
 }
+
+/// Logits for the last `rows` tokens of a batch, which speculative decoding verifies drafts
+/// with, against the same tokens run one at a time; the session then decodes on as usual.
+fn check_rows(moe: bool) {
+    let path = model_path("llama", 4, 2, moe);
+    let prompt = prompt();
+    let mut configs = vec![0];
+    if rli_models::backend::HAS_GPU {
+        configs.extend([LAYERS, 1]);
+    }
+    for gpu_layers in configs {
+        let m = load(&path, gpu_layers);
+        let vocab = m.n_vocab();
+        let mut seq = m.new_session(1024);
+        let each: Vec<Vec<f32>> = prompt
+            .iter()
+            .map(|&t| m.forward(&mut seq, t, true).expect("logits"))
+            .collect();
+        let after = m.forward(&mut seq, 7, true).expect("logits");
+        for rows in [1, 2, 5, prompt.len()] {
+            let mut s = m.new_session(1024);
+            let got = m.forward_rows(&mut s, &prompt, rows).expect("logits");
+            assert_eq!(got.len(), rows * vocab);
+            for (j, row) in got.chunks_exact(vocab).enumerate() {
+                let d = max_diff(row, &each[prompt.len() - rows + j]);
+                assert!(
+                    d < 1e-3,
+                    "{gpu_layers} GPU layers, {rows} rows: row {j}: {d}"
+                );
+            }
+            let d = max_diff(&m.forward(&mut s, 7, true).expect("logits"), &after);
+            assert!(
+                d < 1e-3,
+                "{gpu_layers} GPU layers, {rows} rows: next token: {d}"
+            );
+        }
+    }
+}
+
+#[test]
+fn logits_for_the_last_rows_match_per_token() {
+    check_rows(false);
+}
+
+#[test]
+fn logits_for_the_last_rows_match_per_token_moe() {
+    check_rows(true);
+}
+
+/// At temperature 0 a draft changes nothing but speed: a draft that is another model (most
+/// guesses rejected) and one that is the same model (all accepted) both give the tokens the
+/// model writes alone, and a second request reuses the cached prefix as before.
+#[test]
+fn speculating_with_a_draft_gives_the_same_tokens() {
+    let prompt = &prompt()[..40];
+    let follow_up: Vec<u32> = prompt.iter().chain(&[5, 6, 7]).copied().collect();
+    for gpu_layers in gpu_layer_counts() {
+        let alone = engine(gpu_layers);
+        let reply = |e: &Engine| {
+            let mut s = e.new_session(1024);
+            e.generate(&mut s, prompt, &greedy(60), || false, |_| true);
+            let first = s.tokens.clone();
+            let out = e.generate(&mut s, &follow_up, &greedy(30), || false, |_| true);
+            (first, s.tokens.clone(), out.prompt_evaluated, out.text)
+        };
+        let want = reply(&alone);
+        for (draft_heads, tokens) in [(2, 1), (2, 4), (4, 3)] {
+            let mut e = engine(gpu_layers);
+            let mut d = Engine::load(model_path("llama", 4, draft_heads, false)).expect("load");
+            d.model.precise = true;
+            rli_models::backend::attach(&mut d.model, gpu_layers).expect("attach");
+            e.set_draft(d, tokens).expect("same vocabulary");
+            assert_eq!(
+                reply(&e),
+                want,
+                "gpu_layers={gpu_layers}, draft with {draft_heads} kv heads, {tokens} a pass"
+            );
+        }
+    }
+}

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
-                  [--threads N] [--repack] [--coarse-acts]
+                  [--threads N] [--repack] [--coarse-acts] [--draft <small.gguf>] [--draft-tokens 4]
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
 --repack copies Q4_K weights into a layout x86 decodes faster from, for about their size in
@@ -22,6 +22,9 @@ extra memory.
 --coarse-acts quantizes CPU prompt activations with one scale per 256 values, not per 32: faster
 for K-quant models on ARM, less accurate.
 --threads defaults to one CPU thread per logical core.
+--draft speculates with a smaller model of the same vocabulary (Qwen3-0.6B for a larger Qwen3)
+on requests at temperature 0: it guesses --draft-tokens tokens a pass, which the model checks in
+one pass. Replies stay the model's own; only their speed changes.
 
 Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/completions,
 POST /v1/completions
@@ -45,6 +48,8 @@ struct Args {
     gpu_layers: Option<usize>,
     repack: bool,
     coarse_acts: bool,
+    draft: Option<String>,
+    draft_tokens: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -57,6 +62,8 @@ fn parse_args() -> Result<Args, String> {
         gpu_layers: None,
         repack: false,
         coarse_acts: false,
+        draft: None,
+        draft_tokens: 4,
     };
     let mut model = None;
     while let Some(flag) = it.next() {
@@ -71,6 +78,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--repack" => a.repack = true,
             "--coarse-acts" => a.coarse_acts = true,
+            "--draft" => a.draft = Some(val()?),
+            "--draft-tokens" => {
+                a.draft_tokens = val()?
+                    .parse()
+                    .map_err(|_| "--draft-tokens: invalid value")?
+            }
             "-t" | "--threads" => {
                 let n = val()?.parse().map_err(|_| "--threads: invalid value")?;
                 rli_models::set_threads(n)?
@@ -160,6 +173,20 @@ fn run(a: Args) -> Result<(), String> {
     if let Some(w) = &engine.template_warning {
         eprintln!("warning: {w}");
     }
+    let mut draft_name = String::new();
+    if let Some(path) = &a.draft {
+        let mut d = Engine::load(path).map_err(|e| format!("{path}: {e}"))?;
+        if let Some(w) = rli_models::backend::attach_default(&mut d.model, a.gpu_layers)
+            .map_err(|e| e.to_string())?
+        {
+            eprintln!("warning: draft: {w}");
+        }
+        d.model.coarse_acts = a.coarse_acts;
+        draft_name = format!(", draft {} ({} a pass)", d.model_name, a.draft_tokens);
+        engine
+            .set_draft(d, a.draft_tokens)
+            .map_err(|e| format!("--draft: {e}"))?;
+    }
     let session = engine.new_session(a.ctx);
     let app = Arc::new(App {
         max_ctx: session.max_ctx,
@@ -175,7 +202,7 @@ fn run(a: Args) -> Result<(), String> {
         .accelerator()
         .map_or("cpu".into(), |(n, l)| format!("{n}, {l} layers"));
     eprintln!(
-        "serving {} [{backend}] on http://{addr}",
+        "serving {} [{backend}{draft_name}] on http://{addr}",
         app.engine.model_name
     );
     let open = Arc::new(AtomicUsize::new(0));

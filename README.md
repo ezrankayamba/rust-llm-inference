@@ -110,6 +110,14 @@ the values, here the function name too) is evaluated in one batch instead of a t
 which halved that; the constraint itself adds about 0.1 ms a token (`docs/benchmarks.md`,
 2026-11-21).
 
+At temperature 0, `--draft models/Qwen3-0.6B-Q8_0.gguf --draft-tokens 6` speculates with the
+smaller model: it guesses the next tokens and the main model checks them in one pass, keeping
+those it would have chosen itself, so replies stay the same (they did on every request of the
+tool-call eval, `scripts/eval_tool_calls.py`). The request above then takes about 1.2 s warm on
+Metal, and tool-call requests about half their time on Qwen3-8B and Qwen3-14B. The draft stops
+guessing while too few of its guesses stand (Qwen3-0.6B at Swahili prose). It needs its 0.64 GB
+of weights in memory, plus its KV cache (up to 0.47 GB at 4096 positions).
+
 ## Performance
 
 One thread, Llama-3.2-1B Q4_K_M, against llama.cpp built natively on the same machine (measured
