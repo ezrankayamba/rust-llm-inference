@@ -18,12 +18,16 @@ pub struct Request {
 pub enum ParseError {
     Malformed(&'static str),
     TooLarge,
+    /// A body sent with `Transfer-Encoding`, which this server doesn't decode.
+    LengthRequired,
     /// The peer closed before sending a request line.
     Closed,
 }
 
 pub fn read_request(stream: impl Read) -> Result<Request, ParseError> {
-    let mut r = BufReader::new(stream);
+    // The limit applies while a line is read: checked after it, a line that never ends would
+    // grow without bound.
+    let mut r = BufReader::new(stream.take(MAX_HEADER_BYTES as u64 + 1));
     let mut header_bytes = 0;
     let mut line = String::new();
     let mut next_line = |r: &mut BufReader<_>, line: &mut String| -> Result<usize, ParseError> {
@@ -49,6 +53,7 @@ pub fn read_request(stream: impl Read) -> Result<Request, ParseError> {
     let path = target.split('?').next().unwrap_or(target).to_owned();
 
     let mut content_length = 0usize;
+    let mut encoded = false;
     loop {
         if next_line(&mut r, &mut line)? == 0 {
             return Err(ParseError::Malformed("headers not terminated"));
@@ -57,18 +62,27 @@ pub fn read_request(stream: impl Read) -> Result<Request, ParseError> {
         if l.is_empty() {
             break;
         }
-        if let Some((k, v)) = l.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        if k.eq_ignore_ascii_case("content-length") {
             content_length = v
                 .trim()
                 .parse()
                 .map_err(|_| ParseError::Malformed("bad Content-Length"))?;
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            encoded = true;
         }
+    }
+    if encoded {
+        return Err(ParseError::LengthRequired);
     }
     if content_length > MAX_BODY_BYTES {
         return Err(ParseError::TooLarge);
     }
+    // What is buffered past the headers counts towards the body as well.
+    r.get_mut().set_limit(content_length as u64);
     let mut body = vec![0; content_length];
     r.read_exact(&mut body)
         .map_err(|_| ParseError::Malformed("body shorter than Content-Length"))?;
@@ -97,7 +111,10 @@ fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        411 => "Length Required",
         413 => "Payload Too Large",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     }
 }
@@ -182,5 +199,25 @@ mod tests {
             Err(ParseError::Malformed(_))
         ));
         assert_eq!(read_request(&b""[..]).unwrap_err(), ParseError::Closed);
+    }
+
+    /// A header line that never ends: an unbounded reader stands in for a client trickling it.
+    #[test]
+    fn rejects_an_endless_header_line_without_reading_it_all() {
+        let endless = std::io::repeat(b'a');
+        let head = &b"GET / HTTP/1.1\r\nX: "[..];
+        assert_eq!(
+            read_request(head.chain(endless)).unwrap_err(),
+            ParseError::TooLarge
+        );
+    }
+
+    #[test]
+    fn rejects_chunked_bodies_as_length_required() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n";
+        assert_eq!(
+            read_request(&raw[..]).unwrap_err(),
+            ParseError::LengthRequired
+        );
     }
 }

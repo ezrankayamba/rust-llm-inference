@@ -362,3 +362,31 @@ fn usage_reports_cached_prompt_tokens() {
     );
     assert_eq!(again["timings"]["prompt_n"], 1);
 }
+
+#[test]
+fn chunked_body_gets_411_as_openai_json() {
+    let srv = start();
+    let mut s = TcpStream::connect(&srv.addr).unwrap();
+    s.write_all(
+        b"POST /v1/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 411"), "{head}");
+    let v: Value = serde_json::from_str(body).unwrap();
+    assert!(v["error"]["message"].is_string(), "{body}");
+}
+
+#[test]
+fn wrongly_typed_max_tokens_is_rejected() {
+    let srv = start();
+    let (st, body) = request(
+        &srv.addr,
+        "POST",
+        "/v1/completions",
+        Some(&json!({"prompt": "hi", "max_tokens": "5"})),
+    );
+    assert_eq!(st, 400, "{body}");
+}

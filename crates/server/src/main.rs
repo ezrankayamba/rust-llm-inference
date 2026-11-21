@@ -5,10 +5,12 @@ mod http;
 
 use api::App;
 use rli_models::Engine;
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
@@ -25,7 +27,12 @@ Endpoints: GET / (chat page), GET /healthz, GET /v1/models, POST /v1/chat/comple
 POST /v1/completions
 ";
 
+/// For the whole request, not each read: a client sending a byte every few seconds would
+/// otherwise hold its thread indefinitely.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connections served at once, each a thread; those waiting for the session hold their body.
+/// More are answered 503 at once.
+const MAX_CONNECTIONS: usize = 64;
 /// A client that stops reading fails its next write after this long, which ends its generation
 /// and frees the shared session.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -76,20 +83,59 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// Reads `stream` until `until`, each read's timeout set to the time left.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+/// A connection's place under `MAX_CONNECTIONS`, given back when its thread ends, panicking or not.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn serve(app: &App, mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
         eprintln!("connection error: {e}");
         return;
     }
-    let result = match http::read_request(&stream) {
+    let deadline = Deadline {
+        stream: &stream,
+        until: Instant::now() + READ_TIMEOUT,
+    };
+    let json = "application/json";
+    let result = match http::read_request(deadline) {
         Ok(req) => api::handle(app, req, &mut &stream, || http::peer_gone(&stream)),
         Err(http::ParseError::Closed) => Ok(()),
-        Err(http::ParseError::TooLarge) => {
-            http::respond(&mut stream, 413, "text/plain", b"request too large")
-        }
+        Err(http::ParseError::TooLarge) => http::respond(
+            &mut stream,
+            413,
+            json,
+            &api::error_body("request too large"),
+        ),
+        Err(http::ParseError::LengthRequired) => http::respond(
+            &mut stream,
+            411,
+            json,
+            &api::error_body("send the body with Content-Length, not Transfer-Encoding"),
+        ),
         Err(http::ParseError::Malformed(m)) => {
-            http::respond(&mut stream, 400, "text/plain", m.as_bytes())
+            http::respond(&mut stream, 400, json, &api::error_body(m))
         }
     };
     if let Err(e) = result {
@@ -132,11 +178,27 @@ fn run(a: Args) -> Result<(), String> {
         "serving {} [{backend}] on http://{addr}",
         app.engine.model_name
     );
+    let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => {
-                let app = Arc::clone(&app);
-                std::thread::spawn(move || serve(&app, s));
+            Ok(mut s) => {
+                if open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    open.fetch_sub(1, Ordering::AcqRel);
+                    // A few bytes into a fresh socket's buffer: this doesn't block the loop.
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = http::respond(
+                        &mut s,
+                        503,
+                        "application/json",
+                        &api::error_body("too many connections"),
+                    );
+                    continue;
+                }
+                let (app, slot) = (Arc::clone(&app), Slot(Arc::clone(&open)));
+                std::thread::spawn(move || {
+                    let _slot = slot;
+                    serve(&app, s);
+                });
             }
             Err(e) => eprintln!("accept failed: {e}"),
         }

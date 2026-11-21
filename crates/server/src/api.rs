@@ -47,8 +47,8 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn error_body(msg: &str) -> Vec<u8> {
-    json!({"error": {"message": msg, "type": "invalid_request_error"}})
+pub fn error_body(msg: &str) -> Vec<u8> {
+    json!({"error": {"message": msg, "type": "invalid_request_error", "param": null, "code": null}})
         .to_string()
         .into_bytes()
 }
@@ -79,28 +79,74 @@ fn parse_stop(req: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// A field that is absent or null, or else must be a number. A value of the wrong type is an
+/// error, not the default: `"max_tokens": "100"` must not mean the whole context.
+fn number(req: &Value, k: &str) -> Result<Option<f64>, String> {
+    match req.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or(format!("`{k}` must be a number")),
+    }
+}
+
+fn whole(req: &Value, k: &str) -> Result<Option<u64>, String> {
+    match req.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or(format!("`{k}` must be a non-negative integer")),
+    }
+}
+
+fn boolean(req: &Value, k: &str) -> Result<bool, String> {
+    match req.get(k) {
+        None | Some(Value::Null) => Ok(false),
+        Some(v) => v.as_bool().ok_or(format!("`{k}` must be a boolean")),
+    }
+}
+
 /// Sampling parameters with OpenAI's defaults (temperature 1, top_p 1, no penalty).
 /// `top_k`, `repeat_penalty` and `seed` are accepted as extensions.
 pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
-    let f = |k: &str| req.get(k).and_then(Value::as_f64);
-    let u = |k: &str| req.get(k).and_then(Value::as_u64);
-    let max_tokens = u("max_completion_tokens")
-        .or_else(|| u("max_tokens"))
-        .map_or(room, |n| (n as usize).min(room));
-    let temperature = f("temperature").unwrap_or(1.0) as f32;
+    let max_tokens = match whole(req, "max_completion_tokens")? {
+        Some(n) => Some(n),
+        None => whole(req, "max_tokens")?,
+    };
+    let max_tokens = match max_tokens {
+        Some(0) => return Err("`max_tokens` must be at least 1".into()),
+        Some(n) => usize::try_from(n).unwrap_or(usize::MAX).min(room),
+        None => room,
+    };
+    if whole(req, "n")?.is_some_and(|n| n != 1) {
+        return Err("`n` must be 1".into());
+    }
+    let temperature = number(req, "temperature")?.unwrap_or(1.0) as f32;
     if !(0.0..=2.0).contains(&temperature) {
         return Err("temperature must be between 0 and 2".into());
+    }
+    let top_p = number(req, "top_p")?.unwrap_or(1.0) as f32;
+    if !(0.0..=1.0).contains(&top_p) {
+        return Err("top_p must be between 0 and 1".into());
+    }
+    // 0 makes every penalized logit infinite, and the sampler NaN.
+    let repeat_penalty = number(req, "repeat_penalty")?.unwrap_or(1.0) as f32;
+    if !(repeat_penalty.is_finite() && repeat_penalty > 0.0) {
+        return Err("repeat_penalty must be a positive number".into());
     }
     Ok(GenParams {
         stop: parse_stop(req)?,
         max_tokens,
         sampler: SamplerConfig {
             temperature,
-            top_p: f("top_p").unwrap_or(1.0) as f32,
-            top_k: u("top_k").unwrap_or(0) as usize,
-            repeat_penalty: f("repeat_penalty").unwrap_or(1.0) as f32,
+            top_p,
+            top_k: whole(req, "top_k")?.map_or(0, |k| usize::try_from(k).unwrap_or(usize::MAX)),
+            repeat_penalty,
             repeat_last_n: 64,
-            seed: u("seed").unwrap_or_else(|| NEXT_ID.fetch_add(1, Ordering::Relaxed) ^ now()),
+            seed: whole(req, "seed")?
+                .unwrap_or_else(|| NEXT_ID.fetch_add(1, Ordering::Relaxed) ^ now()),
         },
     })
 }
@@ -134,6 +180,8 @@ pub fn parse_messages(req: &Value) -> Result<Vec<Message>, String> {
                     })
                     .collect::<Vec<_>>()
                     .join(""),
+                // An assistant turn that only called tools, replayed by the client.
+                Some(Value::Null) if role == "assistant" => String::new(),
                 _ => return Err("each message needs `content`".to_string()),
             };
             Ok(Message::new(role, &content))
@@ -235,7 +283,10 @@ fn complete(
         Ok(p) => p,
         Err(msg) => return bad(w, &msg),
     };
-    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = match boolean(&req, "stream") {
+        Ok(s) => s,
+        Err(msg) => return bad(w, &msg),
+    };
     let include_usage = req
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
@@ -320,6 +371,36 @@ mod tests {
             (1.0, 1.0, 0, 3)
         );
         assert!(gen_params(&json!({"temperature": 5}), 10).is_err());
+    }
+
+    #[test]
+    fn gen_params_reject_values_of_the_wrong_type_or_range() {
+        for bad in [
+            json!({"max_tokens": -1}),
+            json!({"max_tokens": "100"}),
+            json!({"max_tokens": 0}),
+            json!({"max_completion_tokens": 2.5}),
+            json!({"temperature": "hot"}),
+            json!({"top_p": 1.5}),
+            json!({"repeat_penalty": 0}),
+            json!({"repeat_penalty": -1}),
+            json!({"seed": -3}),
+            json!({"n": 2}),
+        ] {
+            assert!(gen_params(&bad, 10).is_err(), "{bad}");
+        }
+        let p = gen_params(&json!({"max_tokens": null, "n": 1, "top_p": 0}), 10).unwrap();
+        assert_eq!((p.max_tokens, p.sampler.top_p), (10, 0.0));
+    }
+
+    #[test]
+    fn messages_accept_null_content_on_assistant_tool_calls_only() {
+        let m = parse_messages(&json!({"messages": [
+            {"role": "assistant", "content": null, "tool_calls": []}
+        ]}))
+        .unwrap();
+        assert_eq!(m, [Message::new("assistant", "")]);
+        assert!(parse_messages(&json!({"messages": [{"role": "user", "content": null}]})).is_err());
     }
 
     #[test]
