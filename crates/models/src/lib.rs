@@ -7,8 +7,9 @@ pub mod model;
 pub mod sampler;
 mod stop;
 pub mod tokenizer;
+pub mod tools;
 
-pub use chat::{ChatDefaults, ChatTemplate, Message, Rendered};
+pub use chat::{ChatDefaults, ChatTemplate, Message, RenderOpts, Rendered};
 pub use engine::{Engine, Finish, GenOutput, GenParams};
 pub use model::{Accelerator, Model, Session, Weight};
 pub use sampler::SamplerConfig;

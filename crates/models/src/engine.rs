@@ -1,6 +1,6 @@
 //! Model + tokenizer + chat template, and the token generation loop shared by the CLI and server.
 
-use crate::chat::{self, ChatDefaults, ChatTemplate, Message, Rendered};
+use crate::chat::{self, ChatDefaults, ChatTemplate, Message, RenderOpts, Rendered};
 use crate::model::{Model, Session};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::stop::StopMatcher;
@@ -128,18 +128,22 @@ impl Engine {
     }
 
     /// The chat prompt for `messages`, with today's date (UTC) where the template wants one.
-    pub fn render_chat(&self, messages: &[Message]) -> Rendered {
+    pub fn render_chat(&self, messages: &[Message], opts: &RenderOpts) -> Rendered {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         self.template
-            .render(messages, &self.chat_defaults, &chat::format_date(now))
+            .render_with(messages, &self.chat_defaults, &chat::format_date(now), opts)
     }
 
     pub fn chat_tokens(&self, messages: &[Message]) -> Vec<u32> {
-        let prompt = self.render_chat(messages);
+        self.chat_tokens_with(messages, &RenderOpts::default())
+    }
+
+    pub fn chat_tokens_with(&self, messages: &[Message], opts: &RenderOpts) -> Vec<u32> {
+        let p = self.render_chat(messages, opts);
         self.tokenizer
-            .encode_untrusted(&prompt.text, self.tokenizer.add_bos, &prompt.untrusted)
+            .encode_rendered(&p.text, self.tokenizer.add_bos, &p.untrusted, &p.opaque)
     }
 
     pub fn is_stop(&self, id: u32) -> bool {

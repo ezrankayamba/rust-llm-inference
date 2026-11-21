@@ -17,7 +17,7 @@ fn main() {
                 .iter()
                 .map(|m| rli_models::Message::new(&field(m, "role"), &field(m, "content")))
                 .collect();
-            e.render_chat(&msgs).text
+            e.render_chat(&msgs, &Default::default()).text
         })
         .collect();
     println!("{}", serde_json::to_string(&rendered).expect("json"));

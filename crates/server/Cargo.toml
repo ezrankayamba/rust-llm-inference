@@ -13,3 +13,7 @@ cuda = ["rli-models/cuda"]
 [dependencies]
 rli-models.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Writes the tiny tool-calling model the server tests run.
+rli-gguf.workspace = true

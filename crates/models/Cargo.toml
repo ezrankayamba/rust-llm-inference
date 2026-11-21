@@ -12,6 +12,5 @@ cuda = ["rli-core/cuda"]
 rli-core.workspace = true
 rli-gguf.workspace = true
 rayon.workspace = true
-
-[dev-dependencies]
+# Tool definitions and calls are JSON (`tools.rs`).
 serde_json.workspace = true

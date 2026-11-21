@@ -2,7 +2,10 @@
 //! `/` serves a small chat page for trying a model by hand.
 
 use crate::http::{self, Request};
-use rli_models::{Engine, Finish, GenOutput, GenParams, Message, SamplerConfig, Session};
+use rli_models::tools::{self, Tool};
+use rli_models::{
+    Engine, Finish, GenOutput, GenParams, Message, RenderOpts, SamplerConfig, Session,
+};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +154,50 @@ pub fn gen_params(req: &Value, room: usize) -> Result<GenParams, String> {
     })
 }
 
+/// The request's tools, if it has any and `tool_choice` lets the model call them. `None` when it
+/// has none; `Some(empty)` for `tool_choice: "none"`, which keeps the request a tools request
+/// (thinking stays off) but shows the model no tools.
+pub fn parse_tool_request(req: &Value, engine: &Engine) -> Result<Option<Vec<Tool>>, String> {
+    let Some(v) = req.get("tools").filter(|v| !v.is_null()) else {
+        if req
+            .get("tool_choice")
+            .is_some_and(|c| !c.is_null() && c != "none" && c != "auto")
+        {
+            return Err("`tool_choice` needs `tools`".into());
+        }
+        return Ok(None);
+    };
+    if !engine.chat_defaults.tools {
+        return Err("this model's chat template has no tool-call format".into());
+    }
+    let tools = tools::parse_tools(v)?;
+    let show = match req.get("tool_choice") {
+        None | Some(Value::Null) => true,
+        Some(c) if c == "auto" => true,
+        Some(c) if c == "none" => false,
+        Some(_) => return Err("`tool_choice` must be \"auto\" or \"none\"".into()),
+    };
+    match req.get("parallel_tool_calls") {
+        None | Some(Value::Null | Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => {
+            return Err("`parallel_tool_calls: false` is not supported".into());
+        }
+        Some(_) => return Err("`parallel_tool_calls` must be a boolean".into()),
+    }
+    // The template's tool-response turns aren't rendered: a client can't send results back.
+    let msgs = req.get("messages").and_then(Value::as_array);
+    if msgs.is_some_and(|m| {
+        m.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                || m.get("tool_calls")
+                    .is_some_and(|c| c.as_array().is_none_or(|c| !c.is_empty()))
+        })
+    }) {
+        return Err("messages with tool calls or tool results are not supported".into());
+    }
+    Ok(Some(if show { tools } else { Vec::new() }))
+}
+
 pub fn parse_messages(req: &Value) -> Result<Vec<Message>, String> {
     let msgs = req
         .get("messages")
@@ -212,6 +259,32 @@ fn timings(out: &GenOutput) -> Value {
     })
 }
 
+/// A reply to a tools request: its `<tool_call>` blocks as `tool_calls`, the rest as `content`
+/// (null when there is none).
+fn tool_choice(out: &GenOutput) -> Value {
+    let (content, calls) = tools::extract_calls(&out.text);
+    let finish = match out.finish {
+        Finish::Stop if !calls.is_empty() => "tool_calls",
+        f => finish_reason(f),
+    };
+    let mut message =
+        json!({"role": "assistant", "content": (!content.is_empty()).then_some(content)});
+    if !calls.is_empty() {
+        let calls: Vec<Value> = calls
+            .into_iter()
+            .map(|c| {
+                json!({
+                    "id": format!("call_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments},
+                })
+            })
+            .collect();
+        message["tool_calls"] = Value::Array(calls);
+    }
+    json!({"index": 0, "message": message, "finish_reason": finish})
+}
+
 fn finish_reason(f: Finish) -> &'static str {
     match f {
         Finish::Stop | Finish::Cancelled => "stop",
@@ -258,9 +331,19 @@ fn complete(
         _ => return bad(w, "request body must be a JSON object"),
     };
     let e = &app.engine;
+    let tool_req = match parse_tool_request(&req, e) {
+        Ok(t) if chat || t.is_none() => t,
+        Ok(_) => return bad(w, "`tools` needs /v1/chat/completions"),
+        Err(msg) => return bad(w, &msg),
+    };
     let tokens = if chat {
+        let opts = RenderOpts {
+            tools: tool_req.iter().flatten().map(Tool::to_json).collect(),
+            // Latency matters more than reasoning for a tool call.
+            no_think: tool_req.is_some() && e.chat_defaults.thinking,
+        };
         match parse_messages(&req) {
-            Ok(m) => e.chat_tokens(&m),
+            Ok(m) => e.chat_tokens_with(&m, &opts),
             Err(msg) => return bad(w, &msg),
         }
     } else {
@@ -287,6 +370,9 @@ fn complete(
         Ok(s) => s,
         Err(msg) => return bad(w, &msg),
     };
+    if stream && tool_req.is_some() {
+        return bad(w, "`stream` is not supported with `tools`");
+    }
     let include_usage = req
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
@@ -308,7 +394,9 @@ fn complete(
         if out.finish == Finish::Cancelled {
             return Ok(());
         }
-        let choice = if chat {
+        let choice = if tool_req.as_ref().is_some_and(|t| !t.is_empty()) {
+            tool_choice(&out)
+        } else if chat {
             json!({"index": 0, "message": {"role": "assistant", "content": out.text}, "finish_reason": finish_reason(out.finish)})
         } else {
             json!({"index": 0, "text": out.text, "finish_reason": finish_reason(out.finish)})
@@ -413,6 +501,46 @@ mod tests {
         assert_eq!(m, [Message::new("user", "hi"), Message::new("user", "ab")]);
         assert!(parse_messages(&json!({"messages": []})).is_err());
         assert!(parse_messages(&json!({"messages": [{"content": "x"}]})).is_err());
+    }
+
+    fn reply(text: &str, finish: Finish) -> GenOutput {
+        GenOutput {
+            text: text.into(),
+            prompt_tokens: 1,
+            prompt_evaluated: 1,
+            completion_tokens: 1,
+            finish,
+            prefill_secs: 0.0,
+            decode_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn tool_reply_carries_calls_and_null_content() {
+        let text = "<tool_call>\n{\"name\": \"open_form\", \"arguments\": {\"form_id\": \"loan_application\"}}\n</tool_call>\n\
+                    <tool_call>\n{\"name\": \"fill_field\", \"arguments\": {\"value\": \"Asha Juma\"}}\n</tool_call>";
+        let c = tool_choice(&reply(text, Finish::Stop));
+        assert_eq!(c["finish_reason"], "tool_calls");
+        assert!(c["message"]["content"].is_null());
+        let calls = c["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "open_form");
+        assert_eq!(
+            calls[1]["function"]["arguments"],
+            r#"{"value":"Asha Juma"}"#
+        );
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+    }
+
+    #[test]
+    fn tool_reply_without_calls_is_plain_text() {
+        let c = tool_choice(&reply("Sawa.", Finish::Stop));
+        assert_eq!(c["finish_reason"], "stop");
+        assert_eq!(c["message"]["content"], "Sawa.");
+        assert!(c["message"].get("tool_calls").is_none());
+        let broken = tool_choice(&reply("<tool_call>{oops</tool_call>", Finish::Stop));
+        assert_eq!(broken["message"]["content"], "<tool_call>{oops</tool_call>");
     }
 
     #[test]

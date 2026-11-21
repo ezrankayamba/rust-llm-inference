@@ -18,11 +18,15 @@ pub enum ChatTemplate {
     Zephyr,
 }
 
-/// A rendered prompt and the byte ranges of `text` that hold message content.
+/// A rendered prompt and the byte ranges of `text` that hold client-supplied text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rendered {
     pub text: String,
+    /// Message content: no control token parses here (user-defined ones still do, so a reply
+    /// containing `<think>` replays as generated).
     pub untrusted: Vec<Range<usize>>,
+    /// Tool definitions: no special token at all parses here, `<tool_call>` included.
+    pub opaque: Vec<Range<usize>>,
 }
 
 impl Rendered {
@@ -31,7 +35,30 @@ impl Rendered {
         self.text += content;
         self.untrusted.push(start..self.text.len());
     }
+
+    fn push_opaque(&mut self, content: &str) {
+        let start = self.text.len();
+        self.text += content;
+        self.opaque.push(start..self.text.len());
+    }
 }
+
+/// What a request adds to the conversation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderOpts {
+    /// Tool definitions as JSON (`Tool::to_json`), written into the system turn. Only ChatML
+    /// templates with a Hermes tools block (`ChatDefaults::tools`) take them.
+    pub tools: Vec<String>,
+    /// Opens the reply with an empty think block, as Qwen3's template does for
+    /// `enable_thinking=false`, so the model answers without reasoning first.
+    pub no_think: bool,
+}
+
+const TOOLS_HEAD: &str = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+     You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+const TOOLS_TAIL: &str = "\n</tools>\n\nFor each function call, return a json object with function name and \
+     arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
+     {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -55,6 +82,10 @@ pub struct ChatDefaults {
     pub system: Option<String>,
     /// Llama 3.x always writes a system turn with this cutoff and today's date.
     pub knowledge_cutoff: Option<String>,
+    /// The template has Qwen's (Hermes) tools block: `<tools>` definitions, `<tool_call>` replies.
+    pub tools: bool,
+    /// The template can open a reply with an empty think block (Qwen3's `enable_thinking`).
+    pub thinking: bool,
 }
 
 impl ChatDefaults {
@@ -66,6 +97,10 @@ impl ChatDefaults {
             knowledge_cutoff: (template == ChatTemplate::Llama3)
                 .then(|| llama3_cutoff(jinja))
                 .flatten(),
+            tools: template == ChatTemplate::ChatMl
+                && jinja.contains("<tools>")
+                && jinja.contains("<tool_call>"),
+            thinking: template == ChatTemplate::ChatMl && jinja.contains("enable_thinking"),
         }
     }
 }
@@ -150,12 +185,44 @@ impl ChatTemplate {
     /// Renders the conversation, ending with the assistant turn opener. BOS is not included:
     /// the tokenizer adds it when the model requests one. `today` goes in Llama 3.x's date line.
     pub fn render(self, messages: &[Message], defaults: &ChatDefaults, today: &str) -> Rendered {
+        self.render_with(messages, defaults, today, &RenderOpts::default())
+    }
+
+    /// [`render`](Self::render) with tools and a think switch, which only ChatML applies.
+    pub fn render_with(
+        self,
+        messages: &[Message],
+        defaults: &ChatDefaults,
+        today: &str,
+        opts: &RenderOpts,
+    ) -> Rendered {
         let mut r = Rendered::default();
         match self {
             Self::ChatMl => {
-                let first = messages.first().map(|m| m.role.as_str());
-                if let Some(sys) = &defaults.system
-                    && !matches!(first, Some("system" | "developer"))
+                let mut messages = messages;
+                let first_is_system = messages
+                    .first()
+                    .is_some_and(|m| matches!(m.role.as_str(), "system" | "developer"));
+                if !opts.tools.is_empty() {
+                    // Qwen's tools branch: the system text (the client's, else the default),
+                    // then the definitions, all in one system turn.
+                    r.text += "<|im_start|>system\n";
+                    if first_is_system {
+                        r.push_untrusted(&messages[0].content);
+                        r.text += "\n\n";
+                        messages = &messages[1..];
+                    } else if let Some(sys) = &defaults.system {
+                        r.text += sys;
+                        r.text += "\n\n";
+                    }
+                    r.text += TOOLS_HEAD;
+                    for t in &opts.tools {
+                        r.text += "\n";
+                        r.push_opaque(t);
+                    }
+                    r.text += TOOLS_TAIL;
+                } else if let Some(sys) = &defaults.system
+                    && !first_is_system
                 {
                     r.text += &format!("<|im_start|>system\n{sys}<|im_end|>\n");
                 }
@@ -165,6 +232,9 @@ impl ChatTemplate {
                     r.text += "<|im_end|>\n";
                 }
                 r.text += "<|im_start|>assistant\n";
+                if opts.no_think {
+                    r.text += "<think>\n\n</think>\n\n";
+                }
             }
             Self::Llama3 => {
                 let mut messages = messages;
@@ -443,6 +513,7 @@ mod tests {
         let d = ChatDefaults {
             system: Some("D".into()),
             knowledge_cutoff: None,
+            ..Default::default()
         };
         let user = [Message::new("user", "U")];
         assert_eq!(
@@ -465,6 +536,7 @@ mod tests {
         let d = ChatDefaults {
             system: Some("D".into()),
             knowledge_cutoff: None,
+            ..Default::default()
         };
         let r = ChatTemplate::ChatMl.render(&[Message::new("user", "U")], &d, "");
         let got: Vec<&str> = r.untrusted.iter().map(|x| &r.text[x.clone()]).collect();
@@ -476,6 +548,7 @@ mod tests {
         let d = ChatDefaults {
             system: None,
             knowledge_cutoff: Some("December 2023".into()),
+            ..Default::default()
         };
         let head = "<|start_header_id|>system<|end_header_id|>\n\n\
                     Cutting Knowledge Date: December 2023\nToday Date: 09 Nov 2026\n\n";
@@ -501,5 +574,69 @@ mod tests {
         ] {
             assert_eq!(format_date(secs), want);
         }
+    }
+
+    fn tools_opts() -> RenderOpts {
+        RenderOpts {
+            tools: vec![r#"{"type": "function", "function": {"name": "go"}}"#.into()],
+            no_think: true,
+        }
+    }
+
+    #[test]
+    fn chatml_renders_qwen_tools_block_and_empty_think() {
+        let msgs = [Message::new("system", "S"), Message::new("user", "U")];
+        let r =
+            ChatTemplate::ChatMl.render_with(&msgs, &ChatDefaults::default(), "", &tools_opts());
+        assert_eq!(
+            r.text,
+            "<|im_start|>system\nS\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+             You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n\
+             {\"type\": \"function\", \"function\": {\"name\": \"go\"}}\n</tools>\n\n\
+             For each function call, return a json object with function name and arguments within \
+             <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": \
+             <args-json-object>}\n</tool_call><|im_end|>\n\
+             <|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        let opaque: Vec<&str> = r.opaque.iter().map(|x| &r.text[x.clone()]).collect();
+        assert_eq!(
+            opaque,
+            [r#"{"type": "function", "function": {"name": "go"}}"#]
+        );
+        let untrusted: Vec<&str> = r.untrusted.iter().map(|x| &r.text[x.clone()]).collect();
+        assert_eq!(untrusted, ["S", "U"]);
+    }
+
+    #[test]
+    fn chatml_tools_block_takes_the_default_system_text_or_none() {
+        let user = [Message::new("user", "U")];
+        let bare =
+            ChatTemplate::ChatMl.render_with(&user, &ChatDefaults::default(), "", &tools_opts());
+        assert!(
+            bare.text.starts_with("<|im_start|>system\n# Tools\n\n"),
+            "{}",
+            bare.text
+        );
+        let d = ChatDefaults {
+            system: Some("D".into()),
+            ..Default::default()
+        };
+        let with = ChatTemplate::ChatMl.render_with(&user, &d, "", &tools_opts());
+        assert!(
+            with.text
+                .starts_with("<|im_start|>system\nD\n\n# Tools\n\n"),
+            "{}",
+            with.text
+        );
+    }
+
+    #[test]
+    fn detects_qwen3_tools_and_thinking_switch() {
+        let qwen3 = "{%- if tools %}<tools></tools><tool_call>{%- if enable_thinking is defined %}<|im_start|>";
+        let d = ChatDefaults::from_jinja(ChatTemplate::ChatMl, qwen3);
+        assert!(d.tools && d.thinking);
+        let smol = "{{'<|im_start|>' + message['role']}}";
+        let d = ChatDefaults::from_jinja(ChatTemplate::ChatMl, smol);
+        assert!(!d.tools && !d.thinking);
     }
 }

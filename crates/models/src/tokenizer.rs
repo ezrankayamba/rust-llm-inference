@@ -235,11 +235,25 @@ impl Tokenizer {
         add_bos: bool,
         untrusted: &[Range<usize>],
     ) -> Vec<u32> {
+        self.encode_rendered(text, add_bos, untrusted, &[])
+    }
+
+    /// [`encode_untrusted`](Self::encode_untrusted), and no special token of any kind parses
+    /// where it touches a range in `opaque` (tool definitions: `<tool_call>` is user-defined).
+    pub fn encode_rendered(
+        &self,
+        text: &str,
+        add_bos: bool,
+        untrusted: &[Range<usize>],
+        opaque: &[Range<usize>],
+    ) -> Vec<u32> {
+        let touches = |span: &Range<usize>, ranges: &[Range<usize>]| {
+            ranges
+                .iter()
+                .any(|r| span.start < r.end && r.start < span.end)
+        };
         self.encode_where(text, add_bos, |span, id| {
-            !self.is_control(id)
-                || !untrusted
-                    .iter()
-                    .any(|r| span.start < r.end && r.start < span.end)
+            !touches(&span, opaque) && (!self.is_control(id) || !touches(&span, untrusted))
         })
     }
 
@@ -929,6 +943,17 @@ mod tests {
     fn encode_untrusted_still_parses_user_defined_tokens_in_content() {
         let t = tok();
         assert_eq!(encode_one(&t, "<think>", 0..7), [THINK]);
+    }
+
+    #[test]
+    fn encode_rendered_parses_no_special_token_in_opaque_ranges() {
+        let t = tok();
+        let text = "<think><|end|><think>";
+        // The middle and last tokens are tool text: neither parses, user-defined or not.
+        let ids = t.encode_rendered(text, false, &[], std::slice::from_ref(&(7..text.len())));
+        assert_eq!(ids[0], THINK);
+        assert!(!ids[1..].contains(&THINK) && !ids.contains(&END), "{ids:?}");
+        assert_eq!(t.decode(&ids), text);
     }
 
     #[test]

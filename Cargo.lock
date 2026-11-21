@@ -241,6 +241,7 @@ dependencies = [
 name = "rli-server"
 version = "0.2.0"
 dependencies = [
+ "rli-gguf",
  "rli-models",
  "serde_json",
 ]
