@@ -9,6 +9,7 @@ struct Params {
     uint cols;
     uint row_bytes;
     uint add;         // 0: y = W x, 1: y += W x (the residual stream), 2: y = W x + bias
+    float scale;      // an NVFP4 tensor's scale (its decoders read it); 1 otherwise
 };
 
 inline float mv_base(uint add, device const float* y, device const float* bias, uint row) {
@@ -30,6 +31,17 @@ inline float chunk_f16(device const uchar* r, uint c, device const float* x) {
     device const half* w = (device const half*)r + c * 32;
     float s = 0;
     for (uint i = 0; i < 32; i++) s += float(w[i]) * x[i];
+    return s;
+}
+
+// A bf16 is the upper half of an f32.
+inline float4 bf16x4(ushort4 v) { return as_type<float4>(uint4(v) << 16); }
+
+inline float chunk_bf16(device const uchar* r, uint c, device const float* x) {
+    device const packed_ushort4* w = (device const packed_ushort4*)(r + c * 64);
+    device const packed_float4* xs = (device const packed_float4*)x;
+    float s = 0;
+    for (uint i = 0; i < 8; i++) s += dot(bf16x4(ushort4(w[i])), float4(xs[i]));
     return s;
 }
 
@@ -310,6 +322,7 @@ MATVEC_SWIGLU(matvec_swiglu_q8_0, two_q8_0, 32)
 
 MATVEC(matvec_f32, chunk_f32)
 MATVEC(matvec_f16, chunk_f16)
+MATVEC(matvec_bf16, chunk_bf16)
 MATVEC2(matvec_q4_0, two_q4_0, 32)
 MATVEC2(matvec_q5_0, two_q5_0, 32)
 MATVEC2(matvec_q8_0, two_q8_0, 32)
@@ -520,6 +533,11 @@ inline void deq16_f16(device const uchar* r, uint c, uint o, thread float4* w) {
     for (uint i = 0; i < 4; i++) w[i] = float4(half4(s[i]));
 }
 
+inline void deq16_bf16(device const uchar* r, uint c, uint o, thread float4* w) {
+    device const packed_ushort4* s = (device const packed_ushort4*)(r + (c * 32 + o) * 2);
+    for (uint i = 0; i < 4; i++) w[i] = bf16x4(ushort4(s[i]));
+}
+
 // A block's weights 0..16 are the low nibbles of its 16 bytes and 16..32 the high ones.
 inline void deq16_q4_0(device const uchar* r, uint c, uint o, thread float4* w) {
     device const uchar* b = r + c * 18;
@@ -544,6 +562,55 @@ inline void deq16_q8_0(device const uchar* r, uint c, uint o, thread float4* w) 
     for (uint i = 0; i < 4; i++)
         w[i] = d * float4(char4(*(device const packed_char4*)(b + 2 + o + 4 * i)));
 }
+
+// NVFP4: 64 weights a block, a UE4M3 scale byte for each 16, then 32 bytes of E2M1 codes; a
+// sub-block's weights 0..8 are the low nibbles of its 8 bytes and 8..16 the high ones. The
+// values are doubled (whole numbers) and the scale halved, as in ggml.
+constant float FP4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+inline float ue4m3(uint x) {
+    uint e = (x >> 3) & 15, m = x & 7;
+    if (x == 0 || x == 0x7f) return 0.0f;
+    // (1 + m/8) 2^(e-7), halved; subnormal m 2^-9, halved.
+    return e == 0 ? float(m) * (1.0f / 1024.0f) : as_type<float>(((e + 119) << 23) | (m << 20));
+}
+
+inline float4 fp4x4(uint v) {
+    return float4(FP4[v & 15], FP4[(v >> 8) & 15], FP4[(v >> 16) & 15], FP4[v >> 24]);
+}
+
+// 16 weights of chunk c (32 weights) from offset o (0 or 16): one sub-block, times `s`, the
+// tensor's scale. The kernel macros call the decoder names below, which pass their params'.
+inline void deq16_nvfp4s(device const uchar* r, uint c, uint o, thread float4* w, float s) {
+    uint sub = 2 * (c % 2) + o / 16;
+    device const uchar* b = r + (c / 2) * 36;
+    float d = ue4m3(b[sub]) * s;
+    uint lo = word4(b + 4 + 8 * sub), hi = word4(b + 8 + 8 * sub);
+    w[0] = d * fp4x4(lo & 0x0F0F0F0Fu);
+    w[1] = d * fp4x4(hi & 0x0F0F0F0Fu);
+    w[2] = d * fp4x4((lo >> 4) & 0x0F0F0F0Fu);
+    w[3] = d * fp4x4((hi >> 4) & 0x0F0F0F0Fu);
+}
+
+inline float chunk_nvfp4s(device const uchar* r, uint c, device const float* x, float s) {
+    float4 w[4];
+    float acc = 0;
+    device const packed_float4* x4 = (device const packed_float4*)x;
+    for (uint h = 0; h < 2; h++) {
+        deq16_nvfp4s(r, c, 16 * h, w, s);
+        for (uint i = 0; i < 4; i++) acc += dot(w[i], float4(x4[4 * h + i]));
+    }
+    return acc;
+}
+
+#define deq16_nvfp4(r, c, o, w) deq16_nvfp4s(r, c, o, w, p.scale)
+#define deq16_nvfp4_x2(r, c, o, w)                                                            \
+    do {                                                                                      \
+        deq16_nvfp4s(r, c, o, w, p.scale);                                                    \
+        deq16_nvfp4s(r, (c) + 1, o, (w) + 4, p.scale);                                        \
+    } while (0)
+#define chunk_nvfp4(r, c, x) chunk_nvfp4s(r, c, x, p.scale)
+MATVEC(matvec_nvfp4, chunk_nvfp4)
 
 #define DEQ16_VIA32(NAME, DEQ)                                                                \
 inline void NAME(device const uchar* r, uint c, uint o, thread float4* w) {                   \
@@ -573,6 +640,7 @@ struct MatmulParams {
     uint n;           // tokens in x
     uint add;         // add into y instead of overwriting it
     uint nsg;         // matmul_few: simdgroups per threadgroup
+    float scale;      // as in Params
 };
 
 // A tile step's weights for one thread: 16 of chunk c and the same 16 of chunk c + 1 (c even).
@@ -583,6 +651,7 @@ inline void DEQ##_x2(device const uchar* r, uint c, uint o, thread float4* w) { 
 }
 DEQ_X2(deq16_f32)
 DEQ_X2(deq16_f16)
+DEQ_X2(deq16_bf16)
 DEQ_X2(deq16_q4_0)
 DEQ_X2(deq16_q5_0)
 DEQ_X2(deq16_q8_0)
@@ -719,12 +788,15 @@ MATMUL(NAME##_t64, DEQ, T, M, 64, 4, 4)
 
 MATMUL_TILES(matmul_f32, deq16_f32, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_f16, deq16_f16, float, simdgroup_float8x8)
+MATMUL_TILES(matmul_bf16, deq16_bf16, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q4_0, deq16_q4_0, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q5_0, deq16_q5_0, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q8_0, deq16_q8_0, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q4_k, deq16_q4_k, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q5_k, deq16_q5_k, float, simdgroup_float8x8)
 MATMUL_TILES(matmul_q6_k, deq16_q6_k, float, simdgroup_float8x8)
+MATMUL_TILES(matmul_nvfp4, deq16_nvfp4, float, simdgroup_float8x8)
+MATMUL_TILES(matmul_h_nvfp4, deq16_nvfp4, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q4_0, deq16_q4_0, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q5_0, deq16_q5_0, half, simdgroup_half8x8)
 MATMUL_TILES(matmul_h_q8_0, deq16_q8_0, half, simdgroup_half8x8)
@@ -1008,12 +1080,14 @@ MATMUL_FEW(NAME##_r3, DEQ, 3)
 
 MATMUL_FEW_SHAPES(matmul_few_f32, deq16_f32)
 MATMUL_FEW_SHAPES(matmul_few_f16, deq16_f16)
+MATMUL_FEW_SHAPES(matmul_few_bf16, deq16_bf16)
 MATMUL_FEW_SHAPES(matmul_few_q4_0, deq16_q4_0)
 MATMUL_FEW_SHAPES(matmul_few_q5_0, deq16_q5_0)
 MATMUL_FEW_SHAPES(matmul_few_q8_0, deq16_q8_0)
 MATMUL_FEW_SHAPES(matmul_few_q4_k, deqf_q4_k)
 MATMUL_FEW_SHAPES(matmul_few_q5_k, deq16_q5_k)
 MATMUL_FEW_SHAPES(matmul_few_q6_k, deqf_q6_k)
+MATMUL_FEW_SHAPES(matmul_few_nvfp4, deq16_nvfp4)
 
 // ---- Elementwise / normalization / attention kernels for running whole layers on the GPU ----
 

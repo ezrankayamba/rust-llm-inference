@@ -1,5 +1,7 @@
 //! Tiny random MoE models (written by scripts/make_tiny_moe.py with the reference `gguf` writer)
 //! checked against logits from the independent NumPy forward pass in scripts/ref_forward.py.
+//! `tiny_nvfp4` has NVFP4 attention and expert weights, each with its tensor scale (per expert
+//! for the stacks).
 
 use rli_models::Engine;
 
@@ -50,12 +52,17 @@ fn qwen2moe_with_shared_expert_matches_reference_logits() {
     check("tiny_qwen2moe");
 }
 
+#[test]
+fn nvfp4_with_tensor_scales_matches_reference_logits() {
+    check("tiny_nvfp4");
+}
+
 /// Full and partial (1 of 2 layers) GPU offload must reproduce the same logits. With the `cuda`
 /// feature this needs an NVIDIA GPU, so CI doesn't run it.
 #[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 #[test]
 fn gpu_offload_matches_reference_logits() {
-    for name in ["tiny_mixtral", "tiny_qwen2moe"] {
+    for name in ["tiny_mixtral", "tiny_qwen2moe", "tiny_nvfp4"] {
         check_with(name, 2);
         check_with(name, 1);
     }

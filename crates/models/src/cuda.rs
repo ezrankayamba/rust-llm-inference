@@ -216,7 +216,7 @@ impl Fed {
 
 /// What [`mm_each`] will read the input of `ws` as, for `n` tokens.
 fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
-    let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
+    let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let dense = |w: &&&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
     if int8 && (rest.is_empty() || (!rest.iter().any(float) && b.has_gemm(ws[0].cols, n))) {
@@ -231,7 +231,9 @@ fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
 /// [`fed`] for [`mm_add`].
 fn fed_add(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> Fed {
     let dense = int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
-    let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
+    let gemm = int8
+        && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+        && b.has_gemm(w.cols, n);
     let q = n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm);
     if !dense && q && wants_q(b, &[w], int8) {
         Fed::Q
@@ -256,7 +258,7 @@ fn mm_each(
 ) {
     // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
     // are. F32 and F16 weights are the reference path and keep f32 activations.
-    let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16);
+    let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     // Shorter ones too, for the matrices with a kernel that decodes the weights on the way
     // into the tensor cores. Its blocks add into y, which the launch that converts x zeroes.
     let dense = |w: &Weight| int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
@@ -331,14 +333,16 @@ fn mm_add(
         b.gemm_dense(w.ty, w.rows, w.cols, w.offset, &s.xh, x, n, true);
         return;
     }
-    let gemm = int8 && !matches!(w.ty, GgmlType::F32 | GgmlType::F16) && b.has_gemm(w.cols, n);
+    let gemm = int8
+        && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+        && b.has_gemm(w.cols, n);
     if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], int8) {
         if fed != Fed::Q {
             b.quantize(src, n * w.cols, &s.xq);
         }
         b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, x, n, true);
     } else if int8
-        && !matches!(w.ty, GgmlType::F32 | GgmlType::F16)
+        && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
         && b.has_gemm_add(w.rows, w.cols, n)
     {
         // As in `mm_each`, by the kernel that adds.
@@ -414,7 +418,9 @@ fn moe(
         let o = At(&s.router, 0);
         b.to_f16_zero(xb, 0, &s.xh, &[(o, n * router.rows)]);
         b.matmul_f32_add(router.rows, router.cols, router.offset, xb, o, n);
-    } else if n <= ROUTER_MATVEC_TOKENS && matches!(router.ty, GgmlType::F32 | GgmlType::F16) {
+    } else if n <= ROUTER_MATVEC_TOKENS
+        && matches!(router.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+    {
         // One matrix, so the ids (whatever the last layer left) are multiplied by no stride.
         let (r, o) = (router, At(&s.router, 0));
         b.matvec_id(
@@ -1043,7 +1049,10 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         )));
     }
     let ranges: Vec<(usize, usize)> = weights.iter().map(|w| (w.offset, w.n_bytes())).collect();
-    let gpu = Gpu::new(model.gguf().mapped_bytes(), &ranges).map_err(BackendError)?;
+    let mut gpu = Gpu::new(model.gguf().mapped_bytes(), &ranges).map_err(BackendError)?;
+    for w in weights.iter().filter(|w| w.ty == GgmlType::NVFP4) {
+        gpu.set_scale(w.offset, w.scale);
+    }
     // The widest feed-forward activation among the offloaded layers' experts.
     let max_ff = model.layers[..n]
         .iter()
@@ -1062,8 +1071,15 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
             bv: opt(&l.bv),
             q_norm: opt(&l.q_norm),
             k_norm: opt(&l.k_norm),
+            // NVFP4 experts have no id kernels (each expert has its own tensor scale), so they
+            // are routed on the CPU and run one at a time.
             expert_strides: match &l.ffn {
-                Ffn::Moe { experts, .. } if experts.len() <= MOE_MAX_EXPERTS => {
+                Ffn::Moe { experts, .. }
+                    if experts.len() <= MOE_MAX_EXPERTS
+                        && [experts[0].gate, experts[0].up, experts[0].down]
+                            .iter()
+                            .all(|w| w.ty != GgmlType::NVFP4) =>
+                {
                     expert_strides(experts)
                 }
                 _ => None,

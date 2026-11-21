@@ -17,8 +17,17 @@ r = GGUFReader(path)
 kv = {f.name: f.contents() for f in r.fields.values()}
 T = {t.name: t for t in r.tensors}
 arch = kv["general.architecture"]
-W = lambda n: dequantize(T[n].data, T[n].tensor_type).astype(np.float32).reshape(
-    [int(d) for d in reversed(T[n].shape)])
+
+
+def W(n):
+    w = dequantize(T[n].data, T[n].tensor_type).astype(np.float32).reshape(
+        [int(d) for d in reversed(T[n].shape)])
+    # An NVFP4 tensor's second-level scale (one per expert for stacked experts).
+    s = n.removesuffix(".weight") + ".scale"
+    if s in T:
+        w = w * T[s].data.astype(np.float32).reshape((-1,) + (1,) * (w.ndim - 1))
+    return w
+
 
 n_head, n_kv = kv[f"{arch}.attention.head_count"], kv[f"{arch}.attention.head_count_kv"]
 d = kv[f"{arch}.embedding_length"]

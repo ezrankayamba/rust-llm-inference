@@ -12,7 +12,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchArgs,
     LaunchConfig, PinnedHostSlice, PushKernelArg, sys,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const SOURCE: &str = include_str!("cuda.cu");
@@ -51,15 +51,17 @@ const WEIGHT_ALIGN: usize = 256;
 /// unaligned blocks as whole 16-byte words.
 const WEIGHT_SLACK: usize = 16;
 
-const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
+const MATVEC_KERNELS: [(GgmlType, &str); 10] = [
     (GgmlType::F32, "matvec_f32"),
     (GgmlType::F16, "matvec_f16"),
+    (GgmlType::BF16, "matvec_bf16"),
     (GgmlType::Q4_0, "matvec_q4_0"),
     (GgmlType::Q5_0, "matvec_q5_0"),
     (GgmlType::Q8_0, "matvec_q8_0"),
     (GgmlType::Q4_K, "matvec_q4_k"),
     (GgmlType::Q5_K, "matvec_q5_k"),
     (GgmlType::Q6_K, "matvec_q6_k"),
+    (GgmlType::NVFP4, "matvec_nvfp4"),
 ];
 /// Weight types with an int8 matmul kernel, which needs whole 256-weight super-blocks.
 const MMQ_KERNELS: [(GgmlType, &str); 2] =
@@ -268,6 +270,8 @@ struct Placed {
 }
 
 pub struct Gpu {
+    /// The tensor scale of each NVFP4 matrix, by file offset ([`Gpu::set_scale`]).
+    scales: HashMap<usize, f32>,
     stream: Arc<CudaStream>,
     /// Page-locked host memory that large downloads land in, and its length.
     pinned: Mutex<Option<(PinnedHostSlice<f32>, usize)>>,
@@ -595,7 +599,26 @@ impl Gpu {
             zero_id,
             no_q,
             name,
+            scales: HashMap::new(),
         })
+    }
+
+    /// Records the tensor scale of the NVFP4 matrix at file `offset`, which the kernels that
+    /// read it multiply their results by. Every NVFP4 matrix must have one (1 when the file has
+    /// no `.scale` for it).
+    pub fn set_scale(&mut self, offset: usize, scale: f32) {
+        self.scales.insert(offset, scale);
+    }
+
+    /// The scale the kernels for the `ty` matrix at `offset` take.
+    fn scale(&self, ty: GgmlType, offset: usize) -> f32 {
+        if ty != GgmlType::NVFP4 {
+            return 1.0;
+        }
+        *self
+            .scales
+            .get(&offset)
+            .unwrap_or_else(|| panic!("NVFP4 matrix at {offset} has no scale set"))
     }
 
     pub fn name(&self) -> &str {
@@ -1284,6 +1307,7 @@ impl<'a> Batch<'a> {
         );
         let (x_off, y_off) = (x.1 as u64, y.1 as u64);
         let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
+        let scale = self.gpu.scale(ty, offset);
         let mut a = self.call(f);
         a.arg(&self.gpu.weights)
             .arg(&w_off)
@@ -1294,7 +1318,8 @@ impl<'a> Batch<'a> {
             .arg(&rows_u)
             .arg(&cols_u)
             .arg(&row_bytes)
-            .arg(&nt);
+            .arg(&nt)
+            .arg(&scale);
         self.launch(
             a,
             grid2(
@@ -1433,6 +1458,10 @@ impl<'a> Batch<'a> {
             (GgmlType::Q6_K, _) => (f, rows * cols / 256),
             _ => (f, rows * cols / 32),
         };
+        // The kernels of the DEQUANT macro take the matrix's tensor scale; the wide Q4_K and
+        // the Q6_K ones have none (only NVFP4 matrices do).
+        let scaled = !matches!((ty, wide), (GgmlType::Q4_K, true) | (GgmlType::Q6_K, _));
+        let scale = gpu.scale(ty, offset);
         let mut l = self.call(f);
         l.arg(&gpu.weights)
             .arg(&w_off)
@@ -1440,6 +1469,9 @@ impl<'a> Batch<'a> {
             .arg(&rows_u)
             .arg(&cols_u)
             .arg(&rb);
+        if scaled {
+            l.arg(&scale);
+        }
         self.launch(l, grid(warps.div_ceil(8), 256));
     }
 
@@ -2135,6 +2167,13 @@ impl<'a> Batch<'a> {
         );
         let (x_off, y_off, id_stride) = (x.1 as u64, y.1 as u64, stride as u64);
         let (rows_u, cols_u) = (rows as u32, cols as u32);
+        // Only a plain matvec of an NVFP4 matrix: a stack's matrices would each need their
+        // own scale (`models::cuda` routes NVFP4 experts one at a time).
+        assert!(
+            ty != GgmlType::NVFP4 || n_stack == 1,
+            "NVFP4 stacks have no id kernels"
+        );
+        let scale = self.gpu.scale(ty, offset);
         let (xs, xd, ys) = (x_stride as u32, x_div as u32, y_stride as u32);
         let mut a = self.call(f);
         a.arg(&self.gpu.weights)
@@ -2150,9 +2189,11 @@ impl<'a> Batch<'a> {
             .arg(&id_stride)
             .arg(&xs)
             .arg(&xd)
-            .arg(&ys);
+            .arg(&ys)
+            .arg(&scale);
         // A small f32 matrix (a MoE router) gets a block of 8 warps per row: see MATVEC.
-        let wide = matches!(ty, GgmlType::F32 | GgmlType::F16) && rows <= MATVEC_WIDE_ROWS;
+        let wide = matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+            && rows <= MATVEC_WIDE_ROWS;
         let cfg = if wide {
             grid2(rows, n, 256)
         } else {
@@ -3024,6 +3065,12 @@ mod tests {
                         .0
                         .iter_mut()
                         .for_each(|c| c[1] = 0x24 | (c[1] & 0x83)),
+                    // bf16 in [2^-7, 2^-5).
+                    GgmlType::BF16 => w
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .for_each(|c| c[1] = 0x3c | (c[1] & 0x80)),
                     GgmlType::Q4_K | GgmlType::Q5_K => {
                         for b in w.chunks_exact_mut(ty.block_bytes()) {
                             (b[1], b[3]) = (0x24 | (b[1] & 3), 0x24 | (b[3] & 3));
@@ -3034,6 +3081,11 @@ mod tests {
                         .0
                         .iter_mut()
                         .for_each(|b| b[209] = 0x24 | (b[209] & 3)),
+                    GgmlType::NVFP4 => {
+                        for b in w.chunks_exact_mut(ty.block_bytes()) {
+                            b[..4].iter_mut().for_each(|d| *d = 0x20 | (*d & 15));
+                        }
+                    }
                     _ => {
                         for b in w.chunks_exact_mut(ty.block_bytes()) {
                             b[1] = 0x24 | (b[1] & 3);
@@ -3043,7 +3095,8 @@ mod tests {
                 let x: Vec<f32> = (0..n * cols)
                     .map(|_| next() as f32 / 8388608.0 - 1.0)
                     .collect();
-                let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+                let mut gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+                gpu.set_scale(0, 0.37);
                 let xb = gpu.upload(&x);
                 let (wh, xh) = (gpu.alloc_half(rows * cols), gpu.alloc_half(n * cols));
                 let (y_f32, y_h) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
@@ -3092,6 +3145,70 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// NVFP4's kernels against the CPU's f32 reference times the tensor scale they take from
+    /// `Gpu::set_scale`: a matvec, the matmul (a token tile and a part-filled one) and the
+    /// dequantized matrix the f16 GEMM reads. Needs an NVIDIA GPU.
+    #[test]
+    fn nvfp4_kernels_match_the_cpu_with_their_tensor_scale() {
+        let (ty, rows, cols, scale) = (GgmlType::NVFP4, 37, 576, 0.37f32);
+        let mut seed = 11u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        let mut w: Vec<u8> = (0..rows * ty.row_bytes(cols))
+            .map(|_| next() as u8)
+            .collect();
+        for b in w.chunks_exact_mut(ty.block_bytes()) {
+            b[..4].iter_mut().for_each(|d| *d = 0x20 | (*d & 15));
+        }
+        let m = crate::QMatrix::new(ty, rows, cols, &w);
+        let mut gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+        gpu.set_scale(0, scale);
+        for n in [1, 5, 40] {
+            let x: Vec<f32> = (0..n * cols)
+                .map(|_| next() as f32 / 8388608.0 - 1.0)
+                .collect();
+            let mut want = vec![0f32; n * rows];
+            for (xt, yt) in x.chunks_exact(cols).zip(want.chunks_exact_mut(rows)) {
+                m.matvec_with(xt, yt, true);
+            }
+            want.iter_mut().for_each(|v| *v *= scale);
+            let (xb, y) = (gpu.upload(&x), gpu.alloc(n * rows));
+            let mut b = gpu.batch();
+            b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y, 0), n);
+            b.finish();
+            let mut got = vec![0f32; n * rows];
+            gpu.read(&y, &mut got);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+                    "{n} tokens [{i}]: {g} vs {w}"
+                );
+            }
+        }
+        let wh = gpu.alloc_half(rows * cols);
+        let mut b = gpu.batch();
+        b.dequant(ty, rows, cols, 0, &wh);
+        b.finish();
+        let got: Vec<f32> = gpu
+            .stream
+            .clone_dtoh(&wh.0)
+            .expect("download")
+            .into_iter()
+            .map(crate::half::f16_to_f32)
+            .collect();
+        let mut want = vec![0f32; rows * cols];
+        crate::quant::dequantize_row(ty, &w, &mut want);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let w = w * scale;
+            assert!(
+                (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
+                "dequant [{i}]: {g} vs {w}"
+            );
         }
     }
 

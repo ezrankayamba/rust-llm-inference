@@ -14,7 +14,7 @@ use objc2_metal::{
     MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
@@ -63,25 +63,29 @@ fn id_add_kernel(ty: GgmlType) -> Option<&'static str> {
         _ => None,
     }
 }
-const MATVEC_KERNELS: [(GgmlType, &str); 8] = [
+const MATVEC_KERNELS: [(GgmlType, &str); 10] = [
     (GgmlType::F32, "matvec_f32"),
     (GgmlType::F16, "matvec_f16"),
+    (GgmlType::BF16, "matvec_bf16"),
     (GgmlType::Q4_0, "matvec_q4_0"),
     (GgmlType::Q5_0, "matvec_q5_0"),
     (GgmlType::Q8_0, "matvec_q8_0"),
     (GgmlType::Q4_K, "matvec_q4_k"),
     (GgmlType::Q5_K, "matvec_q5_k"),
     (GgmlType::Q6_K, "matvec_q6_k"),
+    (GgmlType::NVFP4, "matvec_nvfp4"),
 ];
-const MATMUL_KERNELS: [(GgmlType, &str); 8] = [
+const MATMUL_KERNELS: [(GgmlType, &str); 10] = [
     (GgmlType::F32, "matmul_f32"),
     (GgmlType::F16, "matmul_f16"),
+    (GgmlType::BF16, "matmul_bf16"),
     (GgmlType::Q4_0, "matmul_q4_0"),
     (GgmlType::Q5_0, "matmul_q5_0"),
     (GgmlType::Q8_0, "matmul_q8_0"),
     (GgmlType::Q4_K, "matmul_q4_k"),
     (GgmlType::Q5_K, "matmul_q5_k"),
     (GgmlType::Q6_K, "matmul_q6_k"),
+    (GgmlType::NVFP4, "matmul_nvfp4"),
 ];
 const MATVEC_ID_KERNELS: [(GgmlType, &str); 8] = [
     (GgmlType::F32, "matvec_id_f32"),
@@ -341,6 +345,8 @@ pub struct Gpu {
     /// Each pipeline's address and kernel name, for the profile.
     kernels: Vec<(usize, String)>,
     name: String,
+    /// The tensor scale of each NVFP4 matrix, by file offset ([`Gpu::set_scale`]).
+    scales: HashMap<usize, f32>,
 }
 
 static PROFILE: OnceLock<bool> = OnceLock::new();
@@ -397,6 +403,7 @@ struct MatvecParams {
     cols: u32,
     row_bytes: u32,
     add: u32,
+    scale: f32,
 }
 #[repr(C)]
 struct SwigluParams {
@@ -437,6 +444,7 @@ struct MatmulParams {
     n: u32,
     add: u32,
     nsg: u32,
+    scale: f32,
 }
 #[repr(C)]
 struct IdParams {
@@ -644,7 +652,7 @@ impl Gpu {
             .collect::<Result<_, String>>()?;
         let matmul_half = MATMUL_KERNELS
             .iter()
-            .filter(|(t, _)| !matches!(t, GgmlType::F32 | GgmlType::F16))
+            .filter(|(t, _)| !matches!(t, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16))
             .map(|&(t, n)| Ok((t, tiles(&n.replace("matmul_", "matmul_h_"))?)))
             .collect::<Result<_, String>>()?;
         let matmul_few = MATMUL_KERNELS
@@ -683,6 +691,7 @@ impl Gpu {
             other,
             kernels: kernels.into_inner(),
             name,
+            scales: HashMap::new(),
         })
     }
 
@@ -702,6 +711,29 @@ impl Gpu {
 
     pub fn supports(&self, ty: GgmlType) -> bool {
         self.matvec.iter().any(|(t, _)| *t == ty)
+    }
+
+    /// Whether [`Batch::matvec_id`] has a kernel for `ty`, which a stack of experts routed on
+    /// the GPU needs. NVFP4 has none: each expert would need its own tensor scale.
+    pub fn has_matvec_id(&self, ty: GgmlType) -> bool {
+        self.matvec_id.iter().any(|(t, _)| *t == ty)
+    }
+
+    /// Records the tensor scale of the NVFP4 matrix at file `offset`, which its kernels multiply
+    /// by. Every NVFP4 matrix must have one (1 when the file has no `.scale` for it).
+    pub fn set_scale(&mut self, offset: usize, scale: f32) {
+        self.scales.insert(offset, scale);
+    }
+
+    /// The scale the kernels for the `ty` matrix at `offset` take.
+    fn scale(&self, ty: GgmlType, offset: usize) -> f32 {
+        if ty != GgmlType::NVFP4 {
+            return 1.0;
+        }
+        *self
+            .scales
+            .get(&offset)
+            .unwrap_or_else(|| panic!("NVFP4 matrix at {offset} has no scale set"))
     }
 
     /// A zeroed shared buffer of `n` f32s.
@@ -968,6 +1000,7 @@ impl Batch<'_> {
             "matvec buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
+        let scale = self.gpu.scale(ty, offset);
         let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
         // Rows a simdgroup takes: see `MATVEC2` and `MATVEC4` in metal.metal.
         let tall = rows >= MATVEC4_MIN_ROWS;
@@ -1000,6 +1033,7 @@ impl Batch<'_> {
                 cols: cols as u32,
                 row_bytes: row_bytes as u32,
                 add,
+                scale,
             },
         );
         self.dispatch(
@@ -1120,10 +1154,11 @@ impl Batch<'_> {
             "matmul buffer too small"
         );
         let row_bytes = ty.row_bytes(cols);
+        let scale = self.gpu.scale(ty, offset);
         let (wbuf, offset) = self.gpu.weight_buf(offset, rows * row_bytes);
         // F32 and F16 weights keep f32 tiles: on them the activations' rounding would be the
         // only error there is.
-        let half = self.half && !matches!(ty, GgmlType::F32 | GgmlType::F16);
+        let half = self.half && !matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
         let kernels = if half {
             &self.gpu.matmul_half
         } else {
@@ -1198,6 +1233,7 @@ impl Batch<'_> {
                     n: end as u32,
                     add: add as u32,
                     nsg: groups as u32,
+                    scale,
                 },
             );
             let grid = (rows.div_ceil(tile_rows), (end - tok0).div_ceil(tile_tokens));

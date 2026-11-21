@@ -16,7 +16,7 @@ use crate::model::{
 use rli_core::metal::{
     At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs, attention_part_len,
 };
-use rli_core::ops;
+use rli_core::{GgmlType, ops};
 use std::any::Any;
 use std::ops::Range;
 use std::sync::Mutex;
@@ -794,11 +794,14 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
     let mapped = model.gguf().mapped_bytes();
     // SAFETY: the GPU views the model's own mapping, and `Model` drops its accelerator before
     // the mapping (field order), so the view never outlives it.
-    let gpu = match cap {
+    let mut gpu = match cap {
         None => unsafe { Gpu::new(mapped, &units) },
         Some(max) => unsafe { Gpu::new_capped(mapped, &units, max) },
     }
     .map_err(BackendError)?;
+    for w in weights.iter().filter(|w| w.ty == GgmlType::NVFP4) {
+        gpu.set_scale(w.offset, w.scale);
+    }
     if let Some(w) = weights
         .iter()
         .find(|w| !gpu.supports(w.ty) || w.cols % 32 != 0)
@@ -837,9 +840,16 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
             bv: opt(&l.bv),
             q_norm: opt(&l.q_norm),
             k_norm: opt(&l.k_norm),
+            // Experts of a type without id kernels (NVFP4, BF16) take the CPU-routed path.
             expert_strides: match &l.ffn {
-                Ffn::Moe { experts, .. } => expert_strides(experts),
-                Ffn::Dense(_) => None,
+                Ffn::Moe { experts, .. }
+                    if [experts[0].gate, experts[0].up, experts[0].down]
+                        .iter()
+                        .all(|w| gpu.has_matvec_id(w.ty)) =>
+                {
+                    expert_strides(experts)
+                }
+                _ => None,
             },
         })
         .collect();

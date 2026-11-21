@@ -31,6 +31,9 @@ pub struct Weight {
     pub cols: usize,
     /// Absolute byte offset in the GGUF file.
     pub offset: usize,
+    /// Multiplies `W x`: an NVFP4 tensor's second-level scale (its `.scale` tensor, one per
+    /// expert for stacked experts), 1 for every other weight.
+    pub scale: f32,
 }
 
 impl Weight {
@@ -305,12 +308,39 @@ fn weight(g: &Gguf, name: &str) -> Result<Weight> {
         .tensor(name)
         .ok_or_else(|| Error::Missing(format!("tensor {name}")))?;
     let cols = t.dims[0] as usize;
-    Ok(Weight {
+    let mut w = Weight {
         ty: t.ty()?,
         rows: t.n_elements() / cols,
         cols,
         offset: t.offset,
-    })
+        scale: 1.0,
+    };
+    if let Some(s) = tensor_scales(g, name, &w, 1)? {
+        w.scale = s[0];
+    }
+    Ok(w)
+}
+
+/// The `n` values of the `.scale` tensor that goes with weight `name` (llama.cpp's name for an
+/// NVFP4 tensor's per-tensor scale), if there is one. The GPU kernels apply it to NVFP4 weights
+/// only, so on another type it is an error unless it is 1.
+fn tensor_scales(g: &Gguf, name: &str, w: &Weight, n: usize) -> Result<Option<Vec<f32>>> {
+    let Some(base) = name.strip_suffix(".weight") else {
+        return Ok(None);
+    };
+    let s = opt_vector(g, &format!("{base}.scale"), n)?;
+    if let Some(s) = &s {
+        if let Some(v) = s.iter().find(|v| !v.is_finite()) {
+            return Err(Error::Format(format!("{base}.scale: {v} is not finite")));
+        }
+        if w.ty != GgmlType::NVFP4 && s.iter().any(|&v| v != 1.0) {
+            return Err(Error::Format(format!(
+                "{base}.scale: a tensor scale on a {:?} weight",
+                w.ty
+            )));
+        }
+    }
+    Ok(s)
 }
 
 /// An f32 copy of a vector tensor that must have `len` elements. Checked first, so a bad file
@@ -350,8 +380,30 @@ fn check_expert(name: &str, e: &Expert, n_ff: usize, n_embd: usize) -> Result<()
     check_shape(&format!("{name} down"), &e.down, n_embd, n_ff)
 }
 
+/// A stacked expert tensor, with its per-expert `.scale` values (all 1 when it has none).
+fn stacked(g: &Gguf, name: &str, n_expert: usize) -> Result<(Weight, Vec<f32>)> {
+    let t = g
+        .tensor(name)
+        .ok_or_else(|| Error::Missing(format!("tensor {name}")))?;
+    let cols = t.dims[0] as usize;
+    let w = Weight {
+        ty: t.ty()?,
+        rows: t.n_elements() / cols,
+        cols,
+        offset: t.offset,
+        scale: 1.0,
+    };
+    let scales = tensor_scales(g, name, &w, n_expert)?.unwrap_or_else(|| vec![1.0; n_expert]);
+    Ok((w, scales))
+}
+
 /// Splits stacked 3-D expert tensors (`[n_expert][rows][cols]`) into per-expert views.
-fn split_experts(gate: Weight, up: Weight, down: Weight, n_expert: usize) -> Result<Vec<Expert>> {
+fn split_experts(
+    (gate, gs): (Weight, Vec<f32>),
+    (up, us): (Weight, Vec<f32>),
+    (down, ds): (Weight, Vec<f32>),
+    n_expert: usize,
+) -> Result<Vec<Expert>> {
     let (n_ff, n_embd) = (gate.rows / n_expert, down.rows / n_expert);
     if n_ff == 0
         || n_embd == 0
@@ -366,9 +418,18 @@ fn split_experts(gate: Weight, up: Weight, down: Weight, n_expert: usize) -> Res
     }
     Ok((0..n_expert)
         .map(|e| Expert {
-            gate: gate.rows_slice(e * n_ff, n_ff),
-            up: up.rows_slice(e * n_ff, n_ff),
-            down: down.rows_slice(e * n_embd, n_embd),
+            gate: Weight {
+                scale: gs[e],
+                ..gate.rows_slice(e * n_ff, n_ff)
+            },
+            up: Weight {
+                scale: us[e],
+                ..up.rows_slice(e * n_ff, n_ff)
+            },
+            down: Weight {
+                scale: ds[e],
+                ..down.rows_slice(e * n_embd, n_embd)
+            },
         })
         .collect())
 }
@@ -384,10 +445,11 @@ impl Model {
             let w = |s: &str| weight(g, &p(s));
             let ffn = if cfg.n_expert > 0 {
                 let experts = if g.tensor(&p("ffn_gate_exps.weight")).is_some() {
+                    let s = |n: &str| stacked(g, &p(n), cfg.n_expert);
                     split_experts(
-                        w("ffn_gate_exps.weight")?,
-                        w("ffn_up_exps.weight")?,
-                        w("ffn_down_exps.weight")?,
+                        s("ffn_gate_exps.weight")?,
+                        s("ffn_up_exps.weight")?,
+                        s("ffn_down_exps.weight")?,
                         cfg.n_expert,
                     )?
                 } else {
@@ -581,6 +643,7 @@ impl Model {
             Some(p) if !self.precise => self.mat(w).matvec_packed(p, x, y),
             _ => self.mat(w).matvec_with(x, y, self.precise),
         }
+        apply_scale(w, y);
     }
 
     fn matmul(&self, w: &Weight, xs: &[f32], ys: &mut [f32], n: usize) {
@@ -588,9 +651,11 @@ impl Model {
             return self.matvec(w, xs, ys);
         }
         if self.coarse_acts && !self.precise {
-            return self.mat(w).matmul_coarse(xs, ys, n);
+            self.mat(w).matmul_coarse(xs, ys, n);
+        } else {
+            self.mat(w).matmul_with(xs, ys, n, self.precise);
         }
-        self.mat(w).matmul_with(xs, ys, n, self.precise);
+        apply_scale(w, ys);
     }
 
     /// SwiGLU FFN of `n` rows of `x` into `out`.
@@ -678,6 +743,7 @@ impl Model {
         let mut xs = vec![0.0; tokens.len() * n_embd];
         for (x, &t) in xs.chunks_exact_mut(n_embd).zip(tokens) {
             embd.dequantize_row_into(t as usize, x);
+            apply_scale(&self.embd, x);
         }
         let mut logits = vec![0.0; rows * self.output.rows];
         let mut first_cpu_layer = 0;
@@ -887,6 +953,13 @@ impl Model {
                 axpy(o, 1.0 / (1.0 + (-g).exp()), r);
             }
         }
+    }
+}
+
+/// Multiplies a product of `w` by its tensor scale.
+fn apply_scale(w: &Weight, y: &mut [f32]) {
+    if w.scale != 1.0 {
+        y.iter_mut().for_each(|v| *v *= w.scale);
     }
 }
 

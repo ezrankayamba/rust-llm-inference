@@ -6,7 +6,7 @@
 //! sub-block. This is the fast path; `quant::dot_row` (f32) is its reference.
 
 use crate::half::f16_to_f32;
-use crate::quant::{GgmlType, QK_K};
+use crate::quant::{FP4_VALUES, GgmlType, QK_K, ue4m3};
 
 const QK: usize = 32;
 
@@ -384,6 +384,21 @@ pub fn dot_row_q8_portable(ty: GgmlType, row: &[u8], a: &Q8Act) -> f32 {
                             + s1 * idot(&w[16..], &xq[16..]) as f32;
                         sum += d * a.d[xb] * dot;
                     }
+                }
+            }
+        }
+        GgmlType::NVFP4 => {
+            // A block's four sub-blocks of 16 are the two halves of activation chunks 2i, 2i+1.
+            for (i, b) in row.chunks_exact(bb).enumerate() {
+                for s in 0..4 {
+                    let qs = &b[4 + 8 * s..12 + 8 * s];
+                    for j in 0..8 {
+                        w[j] = FP4_VALUES[(qs[j] & 0xf) as usize];
+                        w[j + 8] = FP4_VALUES[(qs[j] >> 4) as usize];
+                    }
+                    let (c, at) = (2 * i + s / 2, 16 * (s % 2));
+                    let xq = &a.qs[c * QK + at..c * QK + at + 16];
+                    sum += ue4m3(b[s]) * a.d[c] * idot(&w[..16], xq) as f32;
                 }
             }
         }
@@ -2854,6 +2869,15 @@ mod tests {
             GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => &[0],
             GgmlType::Q4_1 | GgmlType::Q5_1 | GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
             GgmlType::Q6_K => &[208],
+            GgmlType::NVFP4 => {
+                // UE4M3 scale bytes of 2^-6 to 2^-3 (exponent fields 2 to 5).
+                for blk in row.chunks_exact_mut(ty.block_bytes()) {
+                    for d in &mut blk[..4] {
+                        *d = 0x10 + (*d & 0x1f);
+                    }
+                }
+                return row;
+            }
             _ => unreachable!(),
         };
         for blk in row.chunks_exact_mut(ty.block_bytes()) {
@@ -2913,6 +2937,7 @@ mod tests {
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
+            GgmlType::NVFP4,
         ] {
             let row = random_row(ty, n, &mut rng);
             let acts: Vec<Q8Act> = (0..MAX_TOKENS).map(|_| Q8Act::new(&rng.vec(n))).collect();
@@ -2930,7 +2955,7 @@ mod tests {
         }
     }
 
-    const INT_TYPES: [GgmlType; 8] = [
+    const INT_TYPES: [GgmlType; 9] = [
         GgmlType::Q4_0,
         GgmlType::Q4_1,
         GgmlType::Q5_0,
@@ -2939,6 +2964,7 @@ mod tests {
         GgmlType::Q4_K,
         GgmlType::Q5_K,
         GgmlType::Q6_K,
+        GgmlType::NVFP4,
     ];
 
     /// Whether this CPU has a block kernel for `ty`.
@@ -3096,9 +3122,13 @@ mod tests {
                 let offs: &[usize] = match ty {
                     GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => &[0],
                     GgmlType::Q6_K => &[208],
+                    GgmlType::NVFP4 => &[],
                     _ => &[0, 2],
                 };
                 for blk in row.chunks_exact_mut(ty.block_bytes()) {
+                    if ty == GgmlType::NVFP4 {
+                        blk[..4].fill(0x40); // UE4M3 2.0, which decodes to 1 for doubled values
+                    }
                     for &o in offs {
                         blk[o..o + 2].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
                     }
@@ -3208,6 +3238,7 @@ mod tests {
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
+            GgmlType::NVFP4,
         ] {
             for _ in 0..20 {
                 let row = random_row(ty, n, &mut rng);

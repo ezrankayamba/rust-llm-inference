@@ -28,9 +28,10 @@ impl Drop for Pages {
 
 const ROWS: usize = 37; // not a multiple of the 4-row threadgroup
 const COLS: usize = 512;
-const TYPES: [GgmlType; 8] = [
+const TYPES: [GgmlType; 9] = [
     GgmlType::F32,
     GgmlType::F16,
+    GgmlType::BF16,
     GgmlType::Q4_0,
     GgmlType::Q5_0,
     GgmlType::Q8_0,
@@ -73,6 +74,19 @@ fn fixture_of(rows: usize, cols: usize, types: &[GgmlType]) -> (Pages, Vec<usize
             GgmlType::F16 => region.as_chunks_mut::<2>().0.iter_mut().for_each(|c| {
                 c.copy_from_slice(&f32_to_f16((rnd() % 2000) as f32 / 1000.0 - 1.0).to_le_bytes())
             }),
+            GgmlType::BF16 => region.as_chunks_mut::<2>().0.iter_mut().for_each(|c| {
+                let v = (rnd() % 2000) as f32 / 1000.0 - 1.0;
+                c.copy_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes())
+            }),
+            GgmlType::NVFP4 => {
+                region.iter_mut().for_each(|b| *b = rnd() as u8);
+                // UE4M3 scale bytes of about 0.06 to 0.23 (exponent fields 4 and 5).
+                for blk in region.chunks_exact_mut(ty.block_bytes()) {
+                    blk[..4]
+                        .iter_mut()
+                        .for_each(|d| *d = 0x20 + (rnd() % 16) as u8);
+                }
+            }
             _ => {
                 region.iter_mut().for_each(|b| *b = rnd() as u8);
                 let scale_offs: &[usize] = match ty {
@@ -284,6 +298,9 @@ fn metal_matvec_id_and_swiglu_id_match_cpu() {
     // SAFETY: nothing is in flight.
     unsafe { ids.write_u32(0, &chosen) };
     for (&ty, &off) in TYPES.iter().zip(&offsets) {
+        if !gpu.has_matvec_id(ty) {
+            continue;
+        }
         let row_bytes = ty.row_bytes(COLS);
         let stride = 12 * row_bytes;
         let want = cpu_matvec(buf, ty, off, &x);
@@ -544,4 +561,67 @@ fn moe_topk_with_nan_logits_stays_inside_the_stack() {
     b.finish();
     let got: Vec<u32> = unsafe { ids.as_slice().iter().map(|v| v.to_bits()).collect() };
     assert!(got.iter().all(|&e| (e as usize) < ne), "{got:?}");
+}
+
+/// NVFP4's kernels against the CPU, with the tensor scale they take from `Gpu::set_scale`: a
+/// matvec, one adding into its output, one adding a bias, and the matmul tiles (f32 and half;
+/// whole 64-row tiles and edge ones) for the token counts that reach each kernel.
+#[test]
+fn metal_nvfp4_kernels_match_cpu_with_their_tensor_scale() {
+    let ty = GgmlType::NVFP4;
+    for (rows, cols, scale) in [(ROWS, COLS, 0.37f32), (64 * 2 + 5, 256, 1.0)] {
+        let (mut mem, offsets) = fixture_of(rows, cols, &[ty]);
+        let buf = mem.bytes();
+        let off = offsets[0];
+        let mut gpu =
+            unsafe { Gpu::new(buf, std::slice::from_ref(&(0..buf.len()))) }.expect("Metal device");
+        gpu.set_scale(off, scale);
+        let want = |x: &[f32]| -> Vec<f32> {
+            cpu_matvec_of(buf, ty, off, rows, x)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect()
+        };
+        let x: Vec<f32> = input(1).into_iter().take(cols).collect();
+        let base: Vec<f32> = (0..rows).map(|r| r as f32 * 0.25 - 4.0).collect();
+        let w1 = want(&x);
+        let sum: Vec<f32> = w1.iter().zip(&base).map(|(w, b)| w + b).collect();
+        let (xb, bias) = (gpu.upload(&x), gpu.upload(&base));
+        let (plain, added, biased) = (gpu.alloc(rows), gpu.upload(&base), gpu.alloc(rows));
+        let mut b = gpu.batch();
+        b.matvec(ty, rows, cols, off, (&xb).into(), (&plain).into());
+        b.matvec_add(ty, rows, cols, off, (&xb).into(), (&added).into());
+        b.matvec_bias(
+            ty,
+            rows,
+            cols,
+            off,
+            (&xb).into(),
+            (&biased).into(),
+            (&bias).into(),
+        );
+        b.finish();
+        // SAFETY: the batch has finished.
+        let (plain, added, biased) =
+            unsafe { (plain.as_slice(), added.as_slice(), biased.as_slice()) };
+        assert_close(ty, "matvec", plain, &w1);
+        assert_close(ty, "matvec_add", added, &sum);
+        assert_close(ty, "matvec_bias", biased, &sum);
+        for (n, half) in [2, 12, 20, 30, 40, 64, 70]
+            .into_iter()
+            .flat_map(|n| [(n, false), (n, true)])
+        {
+            let x: Vec<f32> = (0..n * cols)
+                .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
+                .collect();
+            let mut got = vec![0.0; n * rows];
+            gpu.matmul(ty, rows, cols, off, &x, &mut got, n, half);
+            let tol = if half { 0.1 } else { 1e-3 };
+            for t in 0..n {
+                let label = format!("{rows} rows, n={n} half={half} token {t}");
+                let w = want(&x[t * cols..(t + 1) * cols]);
+                assert_close_to(ty, &label, &got[t * rows..(t + 1) * rows], &w, tol);
+            }
+        }
+    }
 }

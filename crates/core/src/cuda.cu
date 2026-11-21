@@ -47,6 +47,11 @@ __device__ inline float wt_f16(const uchar* r, uint c, uint l) {
     return h(r + (c * 32 + l) * 2);
 }
 
+// A bf16 is the upper half of an f32.
+__device__ inline float wt_bf16(const uchar* r, uint c, uint l) {
+    return __uint_as_float((uint)((const unsigned short*)r)[c * 32 + l] << 16);
+}
+
 __device__ inline float wt_q4_0(const uchar* r, uint c, uint l) {
     const uchar* b = r + c * 18;
     uchar q = b[2 + (l & 15)];
@@ -107,6 +112,30 @@ __device__ inline float wt_q6_k(const uchar* r, uint c, uint l) {
     return h(b + 208) * sc * (float)q;
 }
 
+// NVFP4: 64 weights a block, a UE4M3 scale byte per 16, then 32 bytes of E2M1 codes; a
+// sub-block's weights 0..8 are the low nibbles of its 8 bytes, 8..16 the high ones. The codes
+// decode doubled (whole numbers) and the scale halved, as in ggml. The tensor's own scale is
+// the kernels' `scale`, applied to their results.
+__device__ inline float fp4(uint q) {
+    // E2M1 doubled: exponent e and mantissa bit m give m (e = 0) or (2 + m) << (e - 1).
+    uint e = (q >> 1) & 3, m = q & 1;
+    float v = (float)(e == 0 ? m : (2 + m) << (e - 1));
+    return q & 8 ? -v : v;
+}
+
+__device__ inline float ue4m3(uint x) {
+    uint e = (x >> 3) & 15, m = x & 7;
+    if (x == 0 || x == 0x7f) return 0.0f;
+    return e == 0 ? (float)m * (1.0f / 1024.0f) : __uint_as_float(((e + 119) << 23) | (m << 20));
+}
+
+__device__ inline float wt_nvfp4(const uchar* r, uint c, uint l) {
+    uint sub = 2 * (c % 2) + l / 16, j = l % 16;
+    const uchar* b = r + (c / 2) * 36;
+    uchar q = b[4 + 8 * sub + j % 8];
+    return ue4m3(b[sub]) * fp4(j < 8 ? q & 15 : q >> 4);
+}
+
 // y = W x, one grid row (y) per matrix of a stack: row e uses the matrix ids[e] * id_stride
 // bytes after w_off, x at (e / x_div) * x_stride and y at e * y_stride. A plain matvec is one
 // row with ids[0] = 0. MoE layers run every token's chosen experts as rows: x_div experts read
@@ -115,7 +144,7 @@ __device__ inline float wt_q6_k(const uchar* r, uint c, uint l) {
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulong x_off,      \
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
                                 const uint* ids, ulong id_stride, uint x_stride,               \
-                                uint x_div, uint y_stride) {                                   \
+                                uint x_div, uint y_stride, float scale) {                      \
     /* A block of 128 threads takes 4 rows, a warp each. One of 256 takes a single row, its */ \
     /* 8 warps every 8th step of it: a small matrix (a MoE router) is all memory latency,   */ \
     /* and that leaves each warp fewer rounds of reads.                                     */ \
@@ -151,13 +180,14 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
         for (uint i = 0; i < 8; i++) acc += red[i];                                            \
         if (warp) return;                                                                      \
     }                                                                                          \
-    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
+    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc * scale;                         \
 }
 
 // The tensor-core compile (RLI_MMA, see MATMUL_MMA) builds only its own kernels.
 #ifndef RLI_MMA
 MATVEC(matvec_f32, wt_f32)
 MATVEC(matvec_f16, wt_f16)
+MATVEC(matvec_bf16, wt_bf16)
 #endif
 
 // Two bytes at p (even address) as a little-endian u16.
@@ -257,13 +287,25 @@ __device__ inline float sb_q6_k(const uchar* b, const float* x, uint lane) {
     return h(b + 208) * s;
 }
 
+// 256 weights are 4 NVFP4 blocks: a lane takes half a sub-block, 8 weights from 4 bytes (their
+// low nibbles are weights i..i+4 and the high ones i+8..i+12 of the sub-block).
+__device__ inline float sb_nvfp4(const uchar* b, const float* x, uint lane) {
+    uint sub = lane / 2, i = 4 * (lane % 2);  // sub-block 0..16 of the 256 weights
+    const uchar* blk = b + 36 * (sub / 4);
+    const uchar* q = blk + 4 + 8 * (sub % 4) + i;
+    const float* x0 = x + 16 * sub + i;
+    float s = 0;
+    for (uint k = 0; k < 4; k++) s += fp4(q[k] & 15) * x0[k] + fp4(q[k] >> 4) * x0[k + 8];
+    return ue4m3(blk[sub % 4]) * s;
+}
+
 // SB_BYTES is the size of 256 weights. Columns past the last whole 256 (a 32-weight format
 // can have some) go one weight per lane, as in MATVEC.
 #define MATVEC_SB(NAME, SB, SB_BYTES, WT)                                                      \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulong x_off,      \
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
                                 const uint* ids, ulong id_stride, uint x_stride,               \
-                                uint x_div, uint y_stride) {                                   \
+                                uint x_div, uint y_stride, float scale) {                      \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     if (row >= rows) return;                                                                   \
@@ -274,7 +316,7 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
     for (uint c = 0; c < cols / 256; c++) acc += SB(r + c * SB_BYTES, xs + c * 256, lane);     \
     for (uint c = cols / 256 * 8; c < cols / 32; c++) acc += WT(r, c, lane) * xs[c * 32 + lane]; \
     acc = warp_sum(acc);                                                                       \
-    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc;                                 \
+    if (lane == 0) y[y_off + (ulong)e * y_stride + row] = acc * scale;                         \
 }
 
 #ifndef RLI_MMA
@@ -284,6 +326,7 @@ MATVEC_SB(matvec_q8_0, sb_q8_0, 8 * 34, wt_q8_0)
 MATVEC_SB(matvec_q4_k, sb_q4_k, 144, wt_q4_k)
 MATVEC_SB(matvec_q5_k, sb_q5_k, 176, wt_q5_k)
 MATVEC_SB(matvec_q6_k, sb_q6_k, 210, wt_q6_k)
+MATVEC_SB(matvec_nvfp4, sb_nvfp4, 4 * 36, wt_nvfp4)
 #endif
 
 // Y = X W^T for n_tok tokens: x is n_tok rows of cols, y is n_tok rows of `rows`. Grid: x over
@@ -293,7 +336,7 @@ MATVEC_SB(matvec_q6_k, sb_q6_k, 210, wt_q6_k)
 #define MATMUL(NAME, WT)                                                                       \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulong x_off,      \
                                 float* y, ulong y_off, uint rows, uint cols, uint row_bytes,   \
-                                uint n_tok) {                                                  \
+                                uint n_tok, float scale) {                                     \
     uint row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / 32;                                 \
     uint lane = threadIdx.x % 32;                                                              \
     uint t0 = blockIdx.y * TILE;                                                               \
@@ -312,19 +355,21 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const float* x, ulo
     }                                                                                          \
     for (uint t = 0; t < TILE; t++) {                                                          \
         float a = warp_sum(acc[t]);                                                            \
-        if (lane == 0 && t <= last) y[y_off + (ulong)(t0 + t) * rows + row] = a;               \
+        if (lane == 0 && t <= last) y[y_off + (ulong)(t0 + t) * rows + row] = a * scale;       \
     }                                                                                          \
 }
 
 #ifndef RLI_MMA
 MATMUL(matmul_f32, wt_f32)
 MATMUL(matmul_f16, wt_f16)
+MATMUL(matmul_bf16, wt_bf16)
 MATMUL(matmul_q4_0, wt_q4_0)
 MATMUL(matmul_q5_0, wt_q5_0)
 MATMUL(matmul_q8_0, wt_q8_0)
 MATMUL(matmul_q4_k, wt_q4_k)
 MATMUL(matmul_q5_k, wt_q5_k)
 MATMUL(matmul_q6_k, wt_q6_k)
+MATMUL(matmul_nvfp4, wt_nvfp4)
 #endif
 
 // ---- f16 GEMM for long prompts: weights dequantized to f16 once per matmul ----
@@ -361,21 +406,23 @@ extern "C" __global__ void to_f16_zero(const float* x, ulong x_off, unsigned sho
 // A warp per 32 weights of a row.
 #define DEQUANT(NAME, WT)                                                                      \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, unsigned short* out, uint rows, uint cols, \
-                                uint row_bytes) {                                              \
+                                uint row_bytes, float scale) {                                 \
     uint lane = threadIdx.x % 32;                                                              \
     ulong chunk = (ulong)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;                    \
     uint row = (uint)(chunk / (cols / 32)), c = (uint)(chunk % (cols / 32));                   \
     if (row >= rows) return;                                                                   \
     float v = WT(w + w_off + (ulong)row * row_bytes, c, lane);                                 \
-    out[(ulong)row * cols + c * 32 + lane] = f2h(v);                                           \
+    out[(ulong)row * cols + c * 32 + lane] = f2h(v * scale);                                   \
 }
 
 DEQUANT(dequant_f32, wt_f32)
 DEQUANT(dequant_f16, wt_f16)
+DEQUANT(dequant_bf16, wt_bf16)
 DEQUANT(dequant_q4_0, wt_q4_0)
 DEQUANT(dequant_q5_0, wt_q5_0)
 DEQUANT(dequant_q8_0, wt_q8_0)
 DEQUANT(dequant_q5_k, wt_q5_k)
+DEQUANT(dequant_nvfp4, wt_nvfp4)
 #endif
 
 // ---- Int8 matmul: activations quantized to int8, 4 products per dp4a ----

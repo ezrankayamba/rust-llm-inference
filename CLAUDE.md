@@ -15,7 +15,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 | Foundation | From scratch: own tensor type, own CPU SIMD / Metal / CUDA kernels |
 | Backends | CPU SIMD (baseline, always built) → Apple Metal → CUDA |
 | Weight format | GGUF only, memory-mapped |
-| Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0) |
+| Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels) |
 | Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE) |
 | Interfaces | CLI and an OpenAI-compatible HTTP server (`/v1/chat/completions`, SSE streaming) |
 | Layout | Cargo workspace; GPU backends behind cargo features |

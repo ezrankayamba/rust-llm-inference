@@ -3,6 +3,56 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: NVFP4 weights, first support (generic kernels)
+
+nvidia/Qwen3-8B-NVFP4 (ModelOpt) converted with llama.cpp v0.9.0's `convert_hf_to_gguf.py`:
+252 NVFP4 matrices with a tensor scale each, token embedding and `lm_head` BF16 (6.4 GB; the
+Q4_K_M file is 5.0 GB). NVFP4 runs the generic kernels on every backend: the portable CPU dot
+over int8 activations, Metal's plain matvec and f32/half/few-token tiles, CUDA's f32 matvec and
+matmul. Experts in NVFP4 are routed on the CPU.
+
+**Accuracy.** `dump_logits --precise` against `scripts/ref_forward.py`, max |logit diff|, top-5
+identical everywhere:
+
+| Prompt | CPU (M4) | Metal batched | Metal per token | CUDA batched | CUDA per token |
+|---|---:|---:|---:|---:|---:|
+| 5 tokens | 3.8e-5 | 1.8e-5 | 5.7e-6 | 9.1e-6 | 6.7e-6 |
+| 69 tokens | 5.4e-5 | 2.7e-5 | 8.6e-6 | 1.3e-5 | 8.6e-6 |
+
+CUDA with default settings: 5.7e-3 (69 tokens; NVFP4 keeps f32 activations there, so only the
+f16 KV cache rounds). `eval_quant` (CPU, README.md, 256 tokens): perplexity f32 16.3267, int8
+16.3263, KL mean 0.000513 (max 0.0188), top-1 agreement 99.22%.
+
+**M4 GPU (Metal)**, `bench --pp 512 --tg 128 --reps 3 --gpu-layers 36`, alternating with 40 s
+rests, second round (the first NVFP4 run came straight after other jobs: 174.0 / 13.9):
+
+| Qwen3-8B | pp512 | tg128 |
+|---|---:|---:|
+| NVFP4 | 196.9 | 14.9 |
+| Q4_K_M | 201.0 | 18.2 |
+
+Decode is weight streaming: NVFP4's layers and its BF16 `lm_head` (1.2 GB a token, Q6_K in the
+Q4_K_M file) are more bytes.
+
+**RTX 5090** (`cmpc.py "16 128 512" "Qwen3-8B-NVFP4.gguf Qwen3-8B-Q4_K_M.gguf" 128`, rli
+against llama.cpp v0.9.0, tok/s, two alternating rounds averaged; GPU state as sampled during
+the rli runs):
+
+| Qwen3-8B | rli | llama.cpp | ratio | GPU (rli) |
+|---|---:|---:|---:|---|
+| NVFP4 pp16 | 304 | 2332 | 0.130 | 2.89 GHz, 13801 MHz, 98%, 517 W, 46-49 C |
+| NVFP4 pp128 | 584 | 10460 | 0.056 | 2.90 GHz, 13801 MHz, 100%, 487 W, 51-52 C |
+| NVFP4 pp512 | 626 | 18901 | 0.033 | 2.90 GHz, 13801 MHz, 100%, 515 W, 59-60 C |
+| NVFP4 tg128 | 135.9 | 236.2 | 0.575 | 2.88 GHz, 13801 MHz, 97%, 513 W, 60-64 C |
+| Q4_K_M pp16 | 2903 | 2571 | 1.129 | 2.89 GHz, 13801 MHz, 89%, 499 W, 63-64 C |
+| Q4_K_M pp128 | 10672 | 9350 | 1.141 | 2.78 GHz, 13801 MHz, 92%, 575 W, 68-69 C |
+| Q4_K_M pp512 | 13389 | 14270 | 0.938 | 2.69 GHz, 13801 MHz, 93-95%, 575 W, 70 C |
+| Q4_K_M tg128 | 242.2 | 253.0 | 0.957 | 2.89 GHz, 13801 MHz, 96%, 475 W, 65-67 C |
+
+llama.cpp runs NVFP4 prompts on Blackwell's FP4 tensor cores, faster than its own Q4_K_M from
+128 tokens (1.12x at 128, 1.32x at 512); NVFP4 here has no int8 or tensor-core kernel yet, which
+is the next change.
+
 ## 2026-11-21: against llama.cpp on every backend, fresh (v0.3.0, 2c93106)
 
 The runs behind `docs/verdict.md`. llama.cpp v0.9.0 (cd959ba) throughout; ratios are rli / llama.cpp.

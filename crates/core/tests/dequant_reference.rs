@@ -44,7 +44,8 @@ fn dequantize_matches_gguf_python_reference() {
             GgmlType::Q8_0,
             GgmlType::Q4_K,
             GgmlType::Q5_K,
-            GgmlType::Q6_K
+            GgmlType::Q6_K,
+            GgmlType::NVFP4
         ]
     );
 }

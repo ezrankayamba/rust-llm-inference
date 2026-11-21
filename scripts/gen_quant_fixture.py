@@ -11,7 +11,7 @@ from gguf import GGMLQuantizationType as T
 from gguf.quants import dequantize
 
 # (type, block bytes, offsets of f16 scale fields)
-TYPES = [(T.Q4_0, 18, [0]), (T.Q4_1, 20, [0, 2]), (T.Q5_0, 22, [0]), (T.Q5_1, 24, [0, 2]), (T.Q8_0, 34, [0]), (T.Q4_K, 144, [0, 2]), (T.Q5_K, 176, [0, 2]), (T.Q6_K, 210, [208])]
+TYPES = [(T.Q4_0, 18, [0]), (T.Q4_1, 20, [0, 2]), (T.Q5_0, 22, [0]), (T.Q5_1, 24, [0, 2]), (T.Q8_0, 34, [0]), (T.Q4_K, 144, [0, 2]), (T.Q5_K, 176, [0, 2]), (T.Q6_K, 210, [208]), (T.NVFP4, 36, [])]
 rng = np.random.default_rng(1234)
 out = bytearray()
 for qtype, bb, scale_offs in TYPES:

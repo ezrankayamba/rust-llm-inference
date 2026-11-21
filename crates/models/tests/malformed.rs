@@ -188,6 +188,11 @@ fn corrupted_qwen2moe_header_never_panics() {
     check("tiny_qwen2moe");
 }
 
+#[test]
+fn corrupted_nvfp4_header_never_panics() {
+    check("tiny_nvfp4");
+}
+
 /// The byte offset just past the first occurrence of `needle` in a header.
 fn after(bytes: &[u8], needle: &str) -> usize {
     let n = needle.as_bytes();
@@ -210,7 +215,11 @@ fn set_dim(bytes: &mut [u8], name: &str, dim: usize, v: u64) {
 }
 
 fn load_error(name: &str, edit: impl Fn(&mut Vec<u8>)) -> String {
-    let mut bytes = std::fs::read(fixture("tiny_mixtral")).expect("read fixture");
+    load_error_of("tiny_mixtral", name, edit)
+}
+
+fn load_error_of(fixture_name: &str, name: &str, edit: impl Fn(&mut Vec<u8>)) -> String {
+    let mut bytes = std::fs::read(fixture(fixture_name)).expect("read fixture");
     edit(&mut bytes);
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("bad_{name}.gguf"));
     std::fs::write(&path, &bytes).expect("write");
@@ -290,4 +299,30 @@ fn rejects_vocabulary_that_disagrees_with_embeddings() {
     assert_load_error("embd-rows", "output", |b| {
         set_dim(b, "token_embd.weight", 1, 256)
     });
+}
+
+#[test]
+fn rejects_nvfp4_tensor_scales_of_the_wrong_size() {
+    // One per expert for a stack of experts, one for any other matrix.
+    for (tensor, n) in [("blk.0.ffn_up_exps.scale", 3), ("blk.0.attn_q.scale", 2)] {
+        let got = load_error_of("tiny_nvfp4", "nvfp4-scale-size", |b| {
+            set_dim(b, tensor, 0, n)
+        });
+        assert!(got.contains(tensor), "{tensor}: {got}");
+    }
+}
+
+#[test]
+fn rejects_non_finite_nvfp4_tensor_scales() {
+    let g = rli_gguf::Gguf::open(fixture("tiny_nvfp4")).expect("open fixture");
+    let at = g.tensor("blk.1.attn_k.scale").expect("scale tensor").offset;
+    for v in [f32::NAN, f32::INFINITY] {
+        let got = load_error_of("tiny_nvfp4", "nvfp4-scale-value", |b| {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes())
+        });
+        assert!(
+            got.contains("blk.1.attn_k.scale") && got.contains("not finite"),
+            "{got}"
+        );
+    }
 }

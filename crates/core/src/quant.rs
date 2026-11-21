@@ -20,6 +20,8 @@ pub enum GgmlType {
     Q4_K,
     Q5_K,
     Q6_K,
+    /// NVIDIA's 4-bit float: E2M1 weights with a UE4M3 scale per 16, 64 to a block.
+    NVFP4,
 }
 
 pub const QK_K: usize = 256;
@@ -39,6 +41,7 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             30 => Self::BF16,
+            40 => Self::NVFP4,
             _ => return None,
         })
     }
@@ -56,6 +59,7 @@ impl GgmlType {
             Self::Q5_K => 13,
             Self::Q6_K => 14,
             Self::BF16 => 30,
+            Self::NVFP4 => 40,
         }
     }
 
@@ -65,6 +69,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => 32,
             Self::Q4_K | Self::Q5_K | Self::Q6_K => QK_K,
+            Self::NVFP4 => 64,
         }
     }
 
@@ -81,6 +86,7 @@ impl GgmlType {
             Self::Q4_K => 2 + 2 + 12 + 128,
             Self::Q5_K => 2 + 2 + 12 + 32 + 128,
             Self::Q6_K => 128 + 64 + 16 + 2,
+            Self::NVFP4 => 4 + 32,
         }
     }
 
@@ -117,6 +123,24 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
             (q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4),
             (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
         )
+    }
+}
+
+/// E2M1 values doubled, by 4-bit code (ggml `kvalues_fp4`): whole numbers, so NVFP4 weights
+/// go into the int8 kernels as they are, and [`ue4m3`] halves the scale to make up for it.
+pub const FP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// An NVFP4 sub-block scale: unsigned E4M3 (bias 7), times 0.5 for [`FP4_VALUES`]. As ggml
+/// decodes it: 0x7f (NaN) is 0 and the top bit is ignored.
+#[inline]
+pub fn ue4m3(x: u8) -> f32 {
+    let (exp, man) = ((x >> 3) & 0xf, (x & 7) as f32);
+    if x == 0 || x == 0x7f {
+        0.0
+    } else if exp == 0 {
+        man * (1.0 / 1024.0)
+    } else {
+        (1.0 + man / 8.0) * f32::from_bits((exp as u32 + 127 - 8) << 23)
     }
 }
 
@@ -235,6 +259,18 @@ pub fn dequantize_block(ty: GgmlType, b: &[u8], y: &mut [f32]) {
                 }
             }
         }
+        GgmlType::NVFP4 => {
+            // Four sub-blocks of 16: a scale byte each, then 8 bytes whose low nibbles are the
+            // sub-block's first 8 weights and high nibbles its last 8.
+            for s in 0..4 {
+                let d = ue4m3(b[s]);
+                let (qs, out) = (&b[4 + 8 * s..12 + 8 * s], &mut y[16 * s..16 * s + 16]);
+                for j in 0..8 {
+                    out[j] = FP4_VALUES[(qs[j] & 0xf) as usize] as f32 * d;
+                    out[j + 8] = FP4_VALUES[(qs[j] >> 4) as usize] as f32 * d;
+                }
+            }
+        }
     }
 }
 
@@ -332,6 +368,14 @@ mod tests {
             GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2],
             GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
             GgmlType::Q6_K => &[208],
+            GgmlType::NVFP4 => {
+                for blk in row.chunks_exact_mut(ty.block_bytes()) {
+                    for d in &mut blk[..4] {
+                        *d = 0x10 + (*d & 0x1f);
+                    }
+                }
+                return row;
+            }
             GgmlType::F16 => {
                 let v: Vec<f32> = rng.vec(n);
                 return v
@@ -359,7 +403,7 @@ mod tests {
         row
     }
 
-    const ALL: [GgmlType; 11] = [
+    const ALL: [GgmlType; 12] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::BF16,
@@ -371,7 +415,40 @@ mod tests {
         GgmlType::Q4_K,
         GgmlType::Q5_K,
         GgmlType::Q6_K,
+        GgmlType::NVFP4,
     ];
+
+    #[test]
+    fn ue4m3_decodes_as_ggml_does() {
+        // ggml_ue4m3_to_fp32: normal (1 + m/8) 2^(e-7), subnormal m 2^-9, both halved.
+        assert_eq!(ue4m3(0x40), 1.0); // 2.0 halved
+        assert_eq!(ue4m3(0x38), 0.5);
+        assert_eq!(ue4m3(0x3c), 0.75);
+        assert_eq!(ue4m3(0x01), 2f32.powi(-10));
+        assert_eq!(ue4m3(0x07), 7.0 * 2f32.powi(-10));
+        assert_eq!(ue4m3(0x7e), 448.0 / 2.0);
+        assert_eq!(ue4m3(0x7f), 0.0);
+        assert_eq!(ue4m3(0x00), 0.0);
+        assert_eq!(ue4m3(0xc0), ue4m3(0x40)); // the top bit is ignored
+    }
+
+    #[test]
+    fn nvfp4_sub_blocks_put_low_nibbles_first() {
+        let mut b = vec![0u8; 36];
+        b[..4].copy_from_slice(&[0x40, 0x48, 0x38, 0x40]); // scales 1, 2, 0.5, 1
+        for (j, q) in b[4..].iter_mut().enumerate() {
+            *q = (j % 8) as u8 | (((j % 8) as u8 + 8) << 4); // low: +codes, high: -codes
+        }
+        let mut y = vec![0.0; 64];
+        dequantize_block(GgmlType::NVFP4, &b, &mut y);
+        for (s, d) in [1.0, 2.0, 0.5, 1.0].into_iter().enumerate() {
+            for j in 0..8 {
+                let v = FP4_VALUES[j] as f32 * d;
+                assert_eq!(y[16 * s + j], v, "sub-block {s} weight {j}");
+                assert_eq!(y[16 * s + 8 + j], -v, "sub-block {s} weight {}", j + 8);
+            }
+        }
+    }
 
     #[test]
     fn dot_row_matches_dequantized_scalar_dot_for_every_type() {
