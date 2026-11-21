@@ -3,6 +3,29 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: tool-call system prompt, 60 written cases with a held-out half (M4, Metal)
+
+`scripts/tool_cases.json`: 60 utterances written by hand (not real users': those are still
+wanted), English, Swahili and mixed, 30 to tune the system prompt against (the 12 built into
+`eval_tool_calls.py` among them) and 30 more of the same kinds of request, never looked at while
+changing it. Qwen3-8B Q4_K_M with `--draft Qwen3-0.6B-Q8_0 --draft-tokens 6`, temperature 0,
+thinking off, `--max-tokens 512`:
+
+    python3 scripts/eval_tool_calls.py --url ... --cases scripts/tool_cases.json --max-tokens 512 [--system prompt.txt]
+
+| prompt | tune | held out | mean | median |
+|---|---|---|---|---|
+| v1 (the earlier `SYSTEM`) | 20/30 | 20/30 | 1.27 s | 0.83 s |
+| v2: Swahili words for the pages and for submitting, number words | 25/30 | 25/30 | 1.47 s | 1.00 s |
+| v3: v2, amounts and phones digits only, fill a given value without being told to open the form | 26/30 | 27/30 | 1.59 s | 1.08 s |
+
+v2 made the model copy number words into values ("laki tano", "milioni 2"), which v3 stops. v3
+is now `SYSTEM`. What v3 still gets wrong: arithmetic (elfu ishirini 2000, laki tatu na elfu
+hamsini 550000, elfu thelathini 3000), "Naitwa ..." (my name is) answered in text, "Make it
+three hundred thousand" answered in text, "Nataka shilingi elfu tano tu" only opening the form,
+and the form not opened when the request starts with opening it. Converting number words in the
+client, or a server-side hint, would take the arithmetic off the model; not tried.
+
 ## 2026-11-21: speculative decoding with Qwen3-0.6B as the draft (M4, Metal)
 
 `rli-server --draft models/Qwen3-0.6B-Q8_0.gguf --draft-tokens 6`: at temperature 0 the draft

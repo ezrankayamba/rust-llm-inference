@@ -1,0 +1,1072 @@
+[
+ {
+  "split": "tune",
+  "text": "Nifungulie fomu ya mkopo, jina ni Asha Juma, kiasi laki tano",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Asha Juma"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "500000"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Open the loan application and put my phone as 0712345678",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0712345678"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Nenda kwenye ukurasa wa mwanzo",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "home"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Take me to my profile",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "profile"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Mipangilio tafadhali",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "settings"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Jina langu ni John Mwangi",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "John Mwangi"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Weka kiasi elfu hamsini",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "50000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Change the amount to two million shillings",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "2000000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Namba yangu ya simu ni 0754 111 222",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0754111222"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Tuma fomu",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Nataka mkopo wa shilingi milioni moja, jina ni Fatuma Ali, then submit it",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "1000000"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Fatuma Ali"
+    }
+   ],
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Habari, unaweza kunisaidia nini?",
+  "expect": []
+ },
+ {
+  "split": "tune",
+  "text": "Go back home",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "home"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Nipeleke kwenye wasifu wangu",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "profile"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Open settings",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "settings"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Nataka kuomba mkopo",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Kiasi ni laki mbili",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "200000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Weka elfu ishirini",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "20000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Make it three hundred thousand",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "300000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Laki tatu na elfu hamsini",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "350000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "My name is Grace Wanjiku",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Grace Wanjiku"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Jina: Baraka Mollel",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Baraka Mollel"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Simu yangu ni 0688 222 333",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0688222333"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Phone number 0765432109",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0765432109"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Submit the application",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Wasilisha ombi langu",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Asante sana",
+  "expect": []
+ },
+ {
+  "split": "tune",
+  "text": "What can you do?",
+  "expect": []
+ },
+ {
+  "split": "tune",
+  "text": "Fungua fomu ya mkopo na uweke kiasi elfu kumi",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "10000"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "tune",
+  "text": "Jina ni Peter Otieno, simu 0711 000 111, kisha tuma",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Peter Otieno"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0711000111"
+    }
+   ],
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Rudi nyumbani",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "home"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Show me the home page",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "home"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Fungua wasifu",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "profile"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "I want to see my profile",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "profile"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Fungua mipangilio",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "settings"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Nenda settings",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "settings"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "I need a loan",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Nifungulie maombi ya mkopo",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Kiasi ni elfu sabini",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "70000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Weka laki nne",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "400000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Milioni moja na laki tano",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "1500000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Set the amount to fifty thousand",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "50000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Nataka shilingi elfu tano tu",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "5000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Amount: 250000",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "250000"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Jina langu ni Mary Akinyi",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Mary Akinyi"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Put my name as Joseph Kimaro",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Joseph Kimaro"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Naitwa Salma Hassan",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Salma Hassan"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Namba ya simu ni 0622 333 444",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0622333444"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "My phone is 0789 555 666",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0789555666"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Weka simu 0744123456",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0744123456"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Tuma ombi",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Send the form",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Wasilisha fomu sasa",
+  "expect": [
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Shukrani",
+  "expect": []
+ },
+ {
+  "split": "held",
+  "text": "Hello",
+  "expect": []
+ },
+ {
+  "split": "held",
+  "text": "Unaweza kufanya nini?",
+  "expect": []
+ },
+ {
+  "split": "held",
+  "text": "Open the loan form, name Daniel Mushi, amount one hundred thousand",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Daniel Mushi"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "100000"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Fomu ya mkopo, kiasi laki moja, simu 0755 999 000",
+  "expect": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "100000"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0755999000"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Jina ni Neema Mrema, kiasi elfu thelathini, kisha wasilisha",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "full_name",
+     "value": "Neema Mrema"
+    }
+   ],
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "amount",
+     "value": "30000"
+    }
+   ],
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ },
+ {
+  "split": "held",
+  "text": "Change my phone to 0713 444 555 and submit",
+  "expect": [
+   [
+    "fill_field",
+    {
+     "form_id": "loan_application",
+     "field_id": "phone",
+     "value": "0713444555"
+    }
+   ],
+   [
+    "submit_form",
+    {
+     "form_id": "loan_application"
+    }
+   ]
+  ],
+  "optional": [
+   [
+    "navigate",
+    {
+     "page": "loan_application"
+    }
+   ]
+  ]
+ }
+]

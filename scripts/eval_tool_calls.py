@@ -1,7 +1,12 @@
 """Accuracy and latency of tool calls through a running rli-server, on short English, Swahili and
 mixed utterances against a voice-app schema (navigate, fill_field, submit_form).
 
-usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json] [--think] [--save out.json]
+usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json]
+       [--split tune|held] [--system prompt.txt] [--think] [--save out.json]
+
+`scripts/tool_cases.json` holds 60 written cases (not real users' utterances): a "tune" half,
+which includes the 12 built in, to adjust the system prompt against, and a "held" half of the
+same kinds of request, to check the change on cases it was not made for.
 
 A case is {"text": ..., "expect": [[name, {args}], ...], "optional": [[name, {args}], ...]}:
 the reply must hold exactly the expected calls in any order, plus any of the optional ones.
@@ -16,13 +21,16 @@ import statistics
 import time
 import urllib.request
 
-SYSTEM = (
-    "You operate a mobile loan app by calling tools. Pages: home, profile, settings, "
-    "loan_application. The loan_application form has the fields amount, full_name and phone. "
-    "The user may speak English, Swahili or both. Write amounts as digits "
-    "(elfu = 1000, laki = 100000, milioni = 1000000) and phone numbers as digits only. "
-    "If the request needs no action, answer briefly in the user's language."
-)
+SYSTEM = "\n".join([
+    'You operate a mobile loan app by calling tools. Pages: home, profile, settings, loan_application. The loan_application form has the fields amount, full_name and phone. The user may speak English, Swahili or both.',
+    '',
+    'Swahili words for the pages: mwanzo or nyumbani = home, wasifu = profile, mipangilio = settings, fomu ya mkopo or maombi ya mkopo = loan_application. Asking for a page by name alone means open it.',
+    'Tuma, wasilisha, send and submit mean submit the form: call submit_form.',
+    'Write amounts as digits: elfu N = N x 1000, laki N = N x 100000, milioni N = N x 1000000, and "na" adds the parts (elfu hamsini = 50000). Swahili numbers: moja 1, mbili 2, tatu 3, nne 4, tano 5, sita 6, saba 7, nane 8, tisa 9, kumi 10, ishirini 20, thelathini 30, arobaini 40, hamsini 50, sitini 60, sabini 70, themanini 80, tisini 90, mia 100.',
+    'The value of amount and of phone is digits only, never words: convert "laki tano" to 500000 and "two million" to 2000000 yourself, and write a phone number without spaces.',
+    'When the user gives an amount, a name or a phone number, call fill_field with it, in any language and without being asked to open the form first.',
+    "If the request needs no action, answer briefly in the user's language.",
+])
 
 TOOLS = [
     {"type": "function", "function": {
@@ -87,8 +95,8 @@ def norm(call):
     return json.dumps([name, out], sort_keys=True)
 
 
-def post(url, text, max_tokens, think=False):
-    body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
+def post(url, text, max_tokens, think=False, system=SYSTEM):
+    body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
             "tools": TOOLS, "tool_choice": "auto", "temperature": 0, "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": think}}
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
@@ -106,12 +114,17 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--think", action="store_true", help="let Qwen3 reason before answering")
     ap.add_argument("--save", help="write every reply's calls and text here, to compare runs")
+    ap.add_argument("--split", help="only the cases of this split (tune or held)")
+    ap.add_argument("--system", help="file holding a system prompt to use instead of SYSTEM")
     a = ap.parse_args()
     cases = json.load(open(a.cases)) if a.cases else CASES
+    if a.split:
+        cases = [c for c in cases if c.get("split") == a.split]
+    system = open(a.system).read().strip() if a.system else SYSTEM
     post(a.url, "hello", 8)
     right, secs, toks, saved = 0, [], [], []
     for c in cases:
-        resp, dt = post(a.url, c["text"], a.max_tokens, a.think)
+        resp, dt = post(a.url, c["text"], a.max_tokens, a.think, system)
         msg = resp["choices"][0]["message"]
         got = [norm([t["function"]["name"], json.loads(t["function"]["arguments"])])
                for t in msg.get("tool_calls") or []]
