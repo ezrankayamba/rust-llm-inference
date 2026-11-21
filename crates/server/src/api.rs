@@ -262,14 +262,36 @@ fn timings(out: &GenOutput) -> Value {
 
 /// A reply to a tools request: its `<tool_call>` blocks as `tool_calls`, the rest as `content`
 /// (null when there is none).
+/// Splits a reply into Qwen3's `<think>` reasoning and the rest, which holds the answer.
+fn split_thinking(text: &str) -> (Option<&str>, &str) {
+    match text.rfind("</think>") {
+        Some(end) => {
+            let thought = text[..end]
+                .trim_start()
+                .trim_start_matches("<think>")
+                .trim();
+            (
+                (!thought.is_empty()).then_some(thought),
+                &text[end + "</think>".len()..],
+            )
+        }
+        None => (None, text),
+    }
+}
+
 fn tool_choice(out: &GenOutput) -> Value {
-    let (content, calls) = tools::extract_calls(&out.text);
+    // Calls are read from the answer only: a model may sketch one while it thinks.
+    let (thought, answer) = split_thinking(&out.text);
+    let (content, calls) = tools::extract_calls(answer);
     let finish = match out.finish {
         Finish::Stop if !calls.is_empty() => "tool_calls",
         f => finish_reason(f),
     };
     let mut message =
         json!({"role": "assistant", "content": (!content.is_empty()).then_some(content)});
+    if let Some(t) = thought {
+        message["reasoning_content"] = json!(t);
+    }
     if !calls.is_empty() {
         let calls: Vec<Value> = calls
             .into_iter()
@@ -337,11 +359,22 @@ fn complete(
         Ok(_) => return bad(w, "`tools` needs /v1/chat/completions"),
         Err(msg) => return bad(w, &msg),
     };
+    // `chat_template_kwargs.enable_thinking`, as vLLM and llama.cpp's server take it.
+    let thinking = match req.pointer("/chat_template_kwargs/enable_thinking") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return bad(
+                w,
+                "`chat_template_kwargs.enable_thinking` must be a boolean",
+            );
+        }
+    };
     let tokens = if chat {
         let opts = RenderOpts {
             tools: tool_req.iter().flatten().map(Tool::to_json).collect(),
-            // Latency matters more than reasoning for a tool call.
-            no_think: tool_req.is_some() && e.chat_defaults.thinking,
+            // Off for tools requests unless asked for: it costs a reply's worth of tokens.
+            no_think: e.chat_defaults.thinking && !thinking.unwrap_or(tool_req.is_none()),
         };
         match parse_messages(&req) {
             Ok(m) => e.chat_tokens_with(&m, &opts),
@@ -537,6 +570,23 @@ mod tests {
             r#"{"value":"Asha Juma"}"#
         );
         assert_ne!(calls[0]["id"], calls[1]["id"]);
+    }
+
+    #[test]
+    fn tool_reply_keeps_reasoning_apart_and_ignores_calls_in_it() {
+        let text = "<think>\nThey want home. <tool_call>{\"name\": \"x\", \"arguments\": {}}</tool_call>\n</think>\n\n\
+                    <tool_call>\n{\"name\": \"navigate\", \"arguments\": {\"page\": \"home\"}}\n</tool_call>";
+        let c = tool_choice(&reply(text, Finish::Stop));
+        let calls = c["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "navigate");
+        assert!(c["message"]["content"].is_null());
+        assert!(
+            c["message"]["reasoning_content"]
+                .as_str()
+                .unwrap()
+                .starts_with("They want home.")
+        );
     }
 
     #[test]

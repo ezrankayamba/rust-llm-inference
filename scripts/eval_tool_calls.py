@@ -1,7 +1,7 @@
 """Accuracy and latency of tool calls through a running rli-server, on short English, Swahili and
 mixed utterances against a voice-app schema (navigate, fill_field, submit_form).
 
-usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json]
+usage: python3 scripts/eval_tool_calls.py [--url http://127.0.0.1:8080] [--cases cases.json] [--think]
 
 A case is {"text": ..., "expect": [[name, {args}], ...], "optional": [[name, {args}], ...]}:
 the reply must hold exactly the expected calls in any order, plus any of the optional ones.
@@ -87,9 +87,10 @@ def norm(call):
     return json.dumps([name, out], sort_keys=True)
 
 
-def post(url, text, max_tokens):
+def post(url, text, max_tokens, think=False):
     body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
-            "tools": TOOLS, "tool_choice": "auto", "temperature": 0, "max_tokens": max_tokens}
+            "tools": TOOLS, "tool_choice": "auto", "temperature": 0, "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": think}}
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     t = time.perf_counter()
@@ -102,13 +103,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--cases")
-    ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--think", action="store_true", help="let Qwen3 reason before answering")
     a = ap.parse_args()
     cases = json.load(open(a.cases)) if a.cases else CASES
     post(a.url, "hello", 8)
     right, secs, toks = 0, [], []
     for c in cases:
-        resp, dt = post(a.url, c["text"], a.max_tokens)
+        resp, dt = post(a.url, c["text"], a.max_tokens, a.think)
         msg = resp["choices"][0]["message"]
         got = [norm([t["function"]["name"], json.loads(t["function"]["arguments"])])
                for t in msg.get("tool_calls") or []]
