@@ -3,6 +3,21 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-21: Qwen3-14B with thinking, with and without the draft (M4, Metal)
+
+The 12 built-in cases with the v3 prompt, `--think`, Qwen3-14B Q4_K_M, one run each (draft off
+first, then `--draft Qwen3-0.6B-Q8_0 --draft-tokens 6`), with the agents' builds and a Docker VM
+(1-2.7 cores) alongside and 1.5-1.9 GB of swap in use:
+
+| draft | right | mean | median | max | reply tokens |
+|---|---|---|---|---|---|
+| off | 12/12 | 50.00 s | 40.85 s | 168.97 s | 304 |
+| 6 | 12/12 | 39.29 s | 27.94 s | 152.10 s | 304 |
+
+Replies identical (12 of 12). Each request is 0.61-0.88 of its time without the draft, less
+gained than on tool calls without thinking, since the reasoning is free text. 12 of 12 (10 of 12
+with the v1 prompt) is the best this set has seen, at about ten times the 3 s target.
+
 ## 2026-11-21: tool-call system prompt, 60 written cases with a held-out half (M4, Metal)
 
 `scripts/tool_cases.json`: 60 utterances written by hand (not real users': those are still
