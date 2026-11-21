@@ -102,8 +102,11 @@ time without, the two pairs averaged:
 
 The README's request on Qwen3-8B, cold (308 prompt tokens; the draft evaluates them too, in its
 first pass) then warm, twice each: without the draft 6.62 / 2.90 s and 4.33 / 2.15 s, with it
-5.71 / 1.25 s and 3.45 / 1.16 s, the same two calls every time. Memory: the draft's 0.64 GB of weights, plus its KV cache
-(28 layers x 1024 x K and V in f16: 112 KB a position, 0.47 GB at 4096), not measured.
+5.71 / 1.25 s and 3.45 / 1.16 s, the same two calls every time. Memory (`/usr/bin/time -l`, `--ctx 4096`, the README request and the greeting at up to
+512 tokens): peak footprint 0.38 GB without the draft, 0.68 GB with it, so the draft adds 0.30
+GB of KV cache and scratch (the Metal cache grows with use: up to 112 KB a position, 0.47 GB at
+4096), plus its 0.64 GB of weights mapped from the file, which the footprint leaves out as it
+does the 8B's 5 GB.
 
 ## 2026-11-21: evaluating the text a tool call's schema forces in one batch (M4)
 

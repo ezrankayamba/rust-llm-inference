@@ -118,7 +118,8 @@ standard speculative sampling keeps the main model's distribution of replies (th
 tool-call eval, `scripts/eval_tool_calls.py`). The request above then takes about 1.2 s warm on
 Metal, and tool-call requests about half their time on Qwen3-8B and Qwen3-14B. The draft stops
 guessing while too few of its guesses stand (Qwen3-0.6B at Swahili prose). It needs its 0.64 GB
-of weights in memory, plus its KV cache (up to 0.47 GB at 4096 positions).
+of weights in memory, plus 0.3 GB measured for its cache and scratch on two requests (the cache
+grows with use, to 0.47 GB at 4096 positions).
 
 ## Performance
 
