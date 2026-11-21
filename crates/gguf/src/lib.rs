@@ -12,6 +12,10 @@ use std::path::Path;
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_DIMS: usize = 4;
+/// Metadata array elements allowed in a file, all arrays together. Each becomes a `Value` of
+/// tens of bytes, so a one-byte element would otherwise cost ~30x its size on disk. Real
+/// tokenizers hold well under this (Llama 3: 537k elements, Qwen3: 455k).
+const MAX_ARRAY_ELEMENTS: usize = 4 << 20;
 
 #[derive(Debug)]
 pub enum Error {
@@ -166,6 +170,8 @@ pub struct Gguf {
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Metadata array elements still allowed (`MAX_ARRAY_ELEMENTS` to start).
+    elements_left: usize,
 }
 
 impl<'a> Cursor<'a> {
@@ -219,6 +225,11 @@ impl<'a> Cursor<'a> {
                     return Err(Error::Format("nested metadata array".into()));
                 }
                 let n = self.len()?;
+                self.elements_left = self.elements_left.checked_sub(n).ok_or_else(|| {
+                    Error::Format(format!(
+                        "metadata arrays exceed {MAX_ARRAY_ELEMENTS} elements in all"
+                    ))
+                })?;
                 Value::Array((0..n).map(|_| self.value(elem_ty)).collect::<Result<_>>()?)
             }
             10 => Value::U64(self.u64()?),
@@ -239,7 +250,11 @@ impl Gguf {
     }
 
     fn parse(mmap: Mmap) -> Result<Self> {
-        let mut c = Cursor { buf: &mmap, pos: 0 };
+        let mut c = Cursor {
+            buf: &mmap,
+            pos: 0,
+            elements_left: MAX_ARRAY_ELEMENTS,
+        };
         if c.take(4)? != MAGIC {
             return Err(Error::Format("bad magic (not a GGUF file)".into()));
         }
@@ -492,6 +507,44 @@ mod tests {
         kv.extend(0u32.to_le_bytes());
         kv.extend(0u64.to_le_bytes());
         assert_malformed("nested", &raw(1, &kv, &[], 0));
+    }
+
+    /// A metadata array of `n` u8 elements under key `key`.
+    fn u8_array(key: &str, n: usize) -> Vec<u8> {
+        let mut kv = (key.len() as u64).to_le_bytes().to_vec();
+        kv.extend(key.as_bytes());
+        kv.extend(9u32.to_le_bytes());
+        kv.extend(0u32.to_le_bytes());
+        kv.extend((n as u64).to_le_bytes());
+        kv.resize(kv.len() + n, 0);
+        kv
+    }
+
+    #[test]
+    fn rejects_metadata_arrays_over_the_element_limit() {
+        // Each array alone is within the limit; together they are one element over it.
+        let half = MAX_ARRAY_ELEMENTS / 2;
+        let mut kv = u8_array("a", half);
+        kv.extend(u8_array("b", half + 1));
+        assert_malformed("array-limit", &raw(2, &kv, &[], 0));
+    }
+
+    #[test]
+    fn accepts_metadata_arrays_at_the_element_limit() {
+        let half = MAX_ARRAY_ELEMENTS / 2;
+        let mut kv = u8_array("a", half);
+        kv.extend(u8_array("b", half));
+        let path = tmp_path("array-limit-ok");
+        std::fs::write(&path, raw(2, &kv, &[], 0)).unwrap();
+        let g = Gguf::open(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            g.unwrap()
+                .get("b")
+                .and_then(Value::as_array)
+                .map(<[_]>::len),
+            Some(half)
+        );
     }
 
     #[test]

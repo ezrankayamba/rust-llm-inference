@@ -2613,34 +2613,50 @@ mod avx2 {
                     let (c, h) = (c0 + step / halves, step % halves);
                     let x = x.add(c * QK + h * QK / 2);
                     let sums: *mut Sums = buf.as_mut_ptr().cast();
-                    std::arch::asm!(
-                        "tileloadd tmm2, [{w} + {line}]",
-                        "tilezero tmm0",
-                        "tileloadd tmm1, [{x} + {token}]",
-                        "tdpbsud tmm0, tmm1, tmm2",
-                        "tilestored [{sums} + {line}], tmm0",
-                        w = in(reg) p.w.as_ptr().add(8 * c + 4 * h),
-                        x = in(reg) x,
-                        token = in(reg) nc * QK,
-                        line = in(reg) 64usize,
-                        sums = in(reg) sums,
-                        out("tmm0") _,
-                        out("tmm1") _,
-                        out("tmm2") _,
-                        options(nostack),
-                    );
+                    let w = p.w.as_ptr().add(8 * c + 4 * h);
+                    // The second group reuses the weights in tmm2, so both groups are one asm
+                    // block: tile registers are clobbers, not operands, and nothing guarantees
+                    // they survive from one asm block to the next.
                     if G == 2 {
                         std::arch::asm!(
+                            "tileloadd tmm2, [{w} + {line}]",
+                            "tilezero tmm0",
+                            "tileloadd tmm1, [{x} + {token}]",
+                            "tdpbsud tmm0, tmm1, tmm2",
+                            "tilestored [{sums} + {line}], tmm0",
                             "tilezero tmm3",
-                            "tileloadd tmm4, [{x} + {token}]",
+                            "tileloadd tmm4, [{x2} + {token}]",
                             "tdpbsud tmm3, tmm4, tmm2",
-                            "tilestored [{sums} + {line}], tmm3",
-                            x = in(reg) x.add(16 * nc * QK),
+                            "tilestored [{sums2} + {line}], tmm3",
+                            w = in(reg) w,
+                            x = in(reg) x,
+                            x2 = in(reg) x.add(16 * nc * QK),
                             token = in(reg) nc * QK,
                             line = in(reg) 64usize,
-                            sums = in(reg) sums.add(1),
+                            sums = in(reg) sums,
+                            sums2 = in(reg) sums.add(1),
+                            out("tmm0") _,
+                            out("tmm1") _,
+                            out("tmm2") _,
                             out("tmm3") _,
                             out("tmm4") _,
+                            options(nostack),
+                        );
+                    } else {
+                        std::arch::asm!(
+                            "tileloadd tmm2, [{w} + {line}]",
+                            "tilezero tmm0",
+                            "tileloadd tmm1, [{x} + {token}]",
+                            "tdpbsud tmm0, tmm1, tmm2",
+                            "tilestored [{sums} + {line}], tmm0",
+                            w = in(reg) w,
+                            x = in(reg) x,
+                            token = in(reg) nc * QK,
+                            line = in(reg) 64usize,
+                            sums = in(reg) sums,
+                            out("tmm0") _,
+                            out("tmm1") _,
+                            out("tmm2") _,
                             options(nostack),
                         );
                     }
