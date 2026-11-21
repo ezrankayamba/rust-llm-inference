@@ -54,8 +54,9 @@ The README's request (`rli-server`, `temperature: 0`, two `fill_field` calls, 30
 | CPU | 9.41 s (prompt 5.01 s) | 4.69 s |
 
 Without the amount hint in its system prompt the model wrote `"5"` for "laki tano", with the
-constraint on and off alike (same 73 tokens): the constraint did not change it. Under 1 s a turn
-would need under ~20 decoded tokens on this machine with an 8B model.
+constraint on and off alike (same 73 tokens): the constraint did not change it. At 50 ms a token,
+a 3 s turn on this machine allows about 55 decoded tokens with an 8B model: one call or two,
+not three.
 
 ## 2026-11-17: NEON Q6_K row kernel with a super-block in integers
 
