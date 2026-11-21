@@ -382,9 +382,11 @@ Design points that span files:
   (`rmsnorm` with 256 threads for a 2048-wide row cost twice a trivial launch). `RLI_CUDA_PROF=1`
   times every launch and prints the totals per kernel when the device is dropped; it is how
   that was found.
-- **An RTX 5090 is short of instructions executed, not of memory or tensor cores.** One
+- **An RTX 5090 is short of instructions issued, not of memory or tensor cores.** One
   block of 8 warps keeps a multiprocessor busy there, so a kernel's step costs what its
-  instruction count does: `MATMUL_MMA`'s 128-column step is 1500 a warp, 16 of them `mma`
+  instruction count does, plus every cycle its 2 warps a scheduler both wait (`ncu`: the lean
+  Q4_K matmul issues 1.80 instructions a cycle, llama.cpp's 2.13, for 3% fewer instructions;
+  `docs/benchmarks.md`, 2026-11-21): `MATMUL_MMA`'s 128-column step is 1500 a warp, 16 of them `mma`
   (replacing those, or the global reads, with nothing changed a step by under 0.1 us of 2.2).
   Count with `nvdisasm` (`nvcc -DRLI_MMA -arch=sm_80 -cubin` on a copy of cuda.cu with the
   alignment attribute spelled for MSVC), not by reasoning. From compute capability 12.0 the

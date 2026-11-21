@@ -3407,3 +3407,42 @@ Q6_K 4096x14336: 95.7 -> 98.3 (128 tokens), 308.0 -> 300.9 (512). The fixup cost
 matmul (up to one 128x128 slot of atomics per block, 170 of them), and the zeroing it saves
 was worth at most 3 us even on the 14336-row matrix: zeroing is not the tall matrices' gap
 to llama.cpp. Not run on whole models.
+
+## 2026-11-21: lean Q4_K matmul against llama.cpp's under Nsight Compute (RTX 5090)
+
+`ncu` (Nsight Compute 2025.2.1, clocks held by it) on `mmk_q4_k_t128` (a temporary example
+launching one `matmul_q` three times, the third profiled) and llama.cpp's `mul_mat_q<Q4_K,
+128>` (`test-backend-ops perf -o MUL_MAT -p ...`, its third launch). Both are 170 blocks of
+256 threads, 255 registers, 8 warps a multiprocessor, L2 hit rate 88-90% at 512 tokens.
+
+| Q4_K shape x tokens | ours: us, SM cycles, instructions | llama.cpp | instructions / cycle (ours, llama.cpp) |
+|---|---|---|---|
+| 14336x4096 x 128 | 92.2, 164.5 k, 48.4 M | 88.7, -, 46.1 M | 1.73, - |
+| 14336x4096 x 512 | 316.1, 614.8 k, 188.5 M | 280.5, 503.0 k, 182.4 M | 1.80, 2.13 |
+| 8192x2048 x 512 | 104.6, 190.5 k, 56.2 M | 91.8, 158.1 k, 53.5 M | 1.74, 1.99 |
+| 4096x4096 x 512 | 103.6, 185.1 k, 55.1 M | 90.3, 155.1 k, 52.6 M | 1.75, 2.00 |
+
+The profiler ran ours at about 2.0 GHz and llama.cpp's at 1.91, so the microseconds hide
+part of it: in cycles ours is 16-22% behind at 512 tokens on every shape, square ones too,
+for 3-6% more instructions. The gap is in how often a warp can issue (4.43 cycles an
+instruction against 3.74). Stall reasons per issued instruction, ours / llama.cpp, on
+14336x4096 x 512: fixed-latency wait 0.78 / 0.57, short scoreboard (shared memory results)
+0.32 / 0.09, dispatch 0.41 / 0.31, MIO throttle 0.28 / 0.20, long scoreboard (global
+memory) 0.42 / 0.35, barrier 0.17 / 0.10, math pipe throttle 0.38 / 0.49 (llama.cpp keeps
+the tensor cores busier).
+
+Warp stall samples per SASS instruction (`--page source --print-source sass`; ours 25183
+samples, llama.cpp 20566):
+
+- One instruction, the first `STS.128` of a step's tokens, holds 9% of ours: it waits on
+  the token reads issued just before it (the 128-token block reads only its weights a step
+  ahead). llama.cpp's equivalent wait is 7.5%, on a shift.
+- `I2FP` (the int sums to float) waiting on the `IMMA` before it: 4.7% of ours, 1.0% of
+  llama.cpp's, which issues its products well before using them.
+- Address and loop arithmetic (`MOV`, `UMOV`, `LEA`, `IADD`, `UIADD3`, `BRA`): 25.5 M
+  instructions and 20% of our samples, about 6.6 M and 5% of llama.cpp's, which spends what
+  that saves on `HADD2` scale arithmetic (18.4 M).
+
+So the next things to port are a token tile copied a step ahead without registers
+(`cp.async` into a second buffer) and products issued ahead of their conversion, not a
+different split of the work.
