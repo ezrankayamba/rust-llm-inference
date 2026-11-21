@@ -3469,3 +3469,36 @@ into registers instead (4 lanes a token, 8 registers) left the block with too fe
 The wait is worth taking away only with the sums by 32 already in memory, which `quant_block`
 would have to write (every kernel that quantizes its output). `matmul_q_matches_f32_matmul`
 now has a shape (1100x2560 by 200 tokens) that runs the 128-token blocks; before, none did.
+
+## 2026-11-21: lean Q4_K products issued before their conversion (RTX 5090)
+
+The stall samples (above) had 4.7% of the lean Q4_K block on `I2FP` waiting for the `IMMA`
+just before it, against 1.0% in llama.cpp's kernel. A warp now loads the tokens of all four
+sub-blocks of a step, then issues a row group's four products before converting any (sums
+added in the same order as before). `bench_cuda`, us, best of two alternated runs
+(2917-2932 MHz, 202-211 W), before -> after:
+
+| Q4_K shape | 128 tokens | 512 tokens |
+|---|---|---|
+| 4096x4096 | 31.1 -> 31.0 | 76.1 -> 75.1 |
+| 1024x4096 | 17.1 -> 15.7 | 31.0 -> 29.2 |
+| 14336x4096 | 70.3 -> 68.5 | 234.8 -> 232.0 |
+| 4096x14336 | 65.9 -> 65.8 | 221.7 -> 219.5 |
+| 2048x2048 | 16.9 -> 14.8 | 30.9 -> 29.3 |
+| 8192x2048 | 31.2 -> 31.0 | 82.7 -> 81.7 |
+| 2048x8192 | 31.4 -> 31.0 | 75.3 -> 74.1 |
+
+ncu on 14336x4096 by 512 tokens: 614.8 k -> 604.4 k cycles, 188.5 M -> 187.9 M instructions,
+the fixed-latency wait 0.78 -> 0.70 an instruction. Whole prompts (`bench --pp N --tg 0`, best
+of three alternated, tok/s; ratio to llama.cpp from 2026-11-20):
+
+| model | 128 | 512 | 1024 |
+|---|---|---|---|
+| Mistral-7B | 11207 -> 11362 (+1.4%, 1.11) | 13576 -> 13716 (+1.0%, 0.94) | 13319 -> 13452 (+1.0%, 0.91) |
+| Llama-3.2-1B | 39117 -> 39475 (+0.9%, 1.21) | 66091 -> 66717 (+0.9%, 1.08) | 67806 -> 68153 (+0.5%, 1.04) |
+| Qwen3-30B-A3B | 7814 -> 7824 (+0.1%) | 13263 -> 13343 (+0.6%, 1.04) | 12731 -> 12876 (+1.1%, 1.00) |
+
+Tests pass by default, with `RLI_CUDA_NO_MMA=1` and with `RLI_CUDA_LEAN=0`. Logits (196-203
+tokens): Llama-3.2-1B `--precise` 8.6e-6 from NumPy batched, 9.1e-6 per-token, lean 0.170
+from `precise`; Mistral-7B lean 0.163-0.263 over five runs (the atomics' order); Qwen3-30B-A3B
+per-token against batched precise 3.0e-4, int8 0.638. Top-1 unchanged in all.

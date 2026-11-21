@@ -1286,20 +1286,27 @@ extern "C" __global__ void NAME(SIG) {                                          
                 if (tb > last) continue;                                                       \
                 F128 d0 = *(const F128*)(td + ta * 4), d1 = *(const F128*)(td + ta * 4 + 4);   \
                 F128 e0 = *(const F128*)(ts + ta * 4), e1 = *(const F128*)(ts + ta * 4 + 4);   \
+                int b[4][2];                                                                   \
                 _Pragma("unroll")                                                              \
-                for (uint g = 0; g < 4; g++) {                                                 \
-                    int b[2];                                                                  \
-                    ldm2(tq + (tb + lane % 8) * MK_S + 8 * g + 4 * (lane / 8 % 2), b);         \
+                for (uint g = 0; g < 4; g++)                                                   \
+                    ldm2(tq + (tb + lane % 8) * MK_S + 8 * g + 4 * (lane / 8 % 2), b[g]);      \
+                /* A row group's four products are issued before any is used: converting each \
+                   as it came waited out the multiply (4.7% of the stall samples under ncu). */ \
+                _Pragma("unroll")                                                              \
+                for (uint n = 0; n < NTX; n++) {                                               \
+                    int c[4][4] = {};                                                          \
                     _Pragma("unroll")                                                          \
-                    for (uint n = 0; n < NTX; n++) {                                           \
-                        int c[4] = {0, 0, 0, 0};                                               \
-                        float* ac = acc + 4 * (NTX * o + n);                                   \
+                    for (uint g = 0; g < 4; g++) {                                             \
                         const int* an = a[n][g];                                               \
-                        mma32_s8(an[0], an[1], an[2], an[3], b[0], b[1], c);                   \
-                        ac[0] = fmaf(sa[n].v[g] * d0.v[g], (float)c[0], ac[0]);                \
-                        ac[1] = fmaf(sa[n].v[g] * d1.v[g], (float)c[1], ac[1]);                \
-                        ac[2] = fmaf(sb[n].v[g] * d0.v[g], (float)c[2], ac[2]);                \
-                        ac[3] = fmaf(sb[n].v[g] * d1.v[g], (float)c[3], ac[3]);                \
+                        mma32_s8(an[0], an[1], an[2], an[3], b[g][0], b[g][1], c[g]);          \
+                    }                                                                          \
+                    float* ac = acc + 4 * (NTX * o + n);                                       \
+                    _Pragma("unroll")                                                          \
+                    for (uint g = 0; g < 4; g++) {                                             \
+                        ac[0] = fmaf(sa[n].v[g] * d0.v[g], (float)c[g][0], ac[0]);             \
+                        ac[1] = fmaf(sa[n].v[g] * d1.v[g], (float)c[g][1], ac[1]);             \
+                        ac[2] = fmaf(sb[n].v[g] * d0.v[g], (float)c[g][2], ac[2]);             \
+                        ac[3] = fmaf(sb[n].v[g] * d1.v[g], (float)c[g][3], ac[3]);             \
                         ac[0] = fmaf(-ma[n].v[g], e0.v[g], ac[0]);                             \
                         ac[1] = fmaf(-ma[n].v[g], e1.v[g], ac[1]);                             \
                         ac[2] = fmaf(-mb[n].v[g], e0.v[g], ac[2]);                             \

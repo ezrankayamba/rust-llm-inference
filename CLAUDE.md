@@ -398,7 +398,8 @@ Design points that span files:
   one load of the tokens at 64 and 128 tokens a block, and the work (a tile's 128-column
   steps) dealt evenly to one block per multiprocessor, each adding into y. Q6_K's lanes
   decode both nibbles of every word they read (two rows a warp's load, llama.cpp's way; the
-  down projection by 128 tokens 12% faster). Q4_K reads the
+  down projection by 128 tokens 12% faster). Q4_K issues a row group's four products before
+  converting any (each converted as it came waited out the multiply; 1-2% a matrix). Q4_K reads the
   next step before multiplying this one (weights only in the 128-token block, which has no
   registers left); Q6_K is slower for it. `lean_tile` picks the block's tokens: a last tile
   under half full leaves its blocks idle. MoE experts have the same kernels by expert
