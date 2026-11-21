@@ -122,12 +122,20 @@ fn widen(
     (lo, hi)
 }
 
+/// Whether row `last`, `row_bytes` long at byte `last * stride`, ends within `rows`. Checked:
+/// in release builds a wrapped product would pass a plain comparison.
+fn rows_fit(rows: &[u8], last: usize, stride: usize, row_bytes: usize) -> bool {
+    last.checked_mul(stride)
+        .and_then(|o| o.checked_add(row_bytes))
+        .is_some_and(|end| end <= rows.len())
+}
+
 /// `out[t] = x · row_t`, row `t` being `x.len()` little-endian halves at byte `t * stride` of
 /// `rows` (attention's scores against cached keys). Each equals [`dot_f16`] of that row exactly;
 /// one call for all rows saves a dispatch per row that cost more than a 64-128 element dot.
 pub fn dot_f16_rows(x: &[f32], rows: &[u8], stride: usize, out: &mut [f32]) {
     if let Some(last) = out.len().checked_sub(1) {
-        assert!(rows.len() >= last * stride + 2 * x.len(), "rows too short");
+        assert!(rows_fit(rows, last, stride, 2 * x.len()), "rows too short");
     }
     let row = |t: usize| {
         // SAFETY: checked above: row `t < out.len()` ends within `rows`.
@@ -251,7 +259,7 @@ unsafe fn axpy_f16_neon(y: &mut [f32], a: f32, w: &[u8]) {
 pub fn weighted_rows_f16(out: &mut [f32], w: &[f32], rows: &[u8], stride: usize) {
     if let Some(last) = w.len().checked_sub(1) {
         assert!(
-            rows.len() >= last * stride + 2 * out.len(),
+            rows_fit(rows, last, stride, 2 * out.len()),
             "rows too short"
         );
     }
@@ -387,8 +395,9 @@ pub(crate) mod x86 {
             std::arch::asm!(
                 "syscall",
                 inlateout("rax") 158i64 => ret,
-                in("rdi") 0x1023,
-                in("rsi") 18,
+                // As u64: an untyped literal is an i32, which leaves the upper half undefined.
+                in("rdi") 0x1023u64,
+                in("rsi") 18u64,
                 lateout("rcx") _,
                 lateout("r11") _,
                 options(nostack),
@@ -685,5 +694,14 @@ mod tests {
                 "n={n} {fast} vs {slow}"
             );
         }
+    }
+
+    /// `last * stride` wraps here in release builds; a plain comparison let this through.
+    #[test]
+    #[should_panic(expected = "rows too short")]
+    fn dot_f16_rows_rejects_a_stride_that_overflows() {
+        let stride = usize::MAX / 3 + 1;
+        // 3 * stride wraps to 2, so the last row "ends" at byte 4 of 4.
+        dot_f16_rows(&[1.0], &[0; 4], stride, &mut [0.0; 4]);
     }
 }

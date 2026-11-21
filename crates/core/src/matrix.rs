@@ -127,6 +127,8 @@ impl<'a> QMatrix<'a> {
             return self.matvec_with(xs, ys, precise);
         }
         let (rb, ty, cols, rows) = (self.row_bytes(), self.ty, self.cols, self.rows);
+        // The scatter below writes a row per `rb` bytes of `data`; the fields are public.
+        assert_eq!(self.data.len(), rows * rb);
         let acts: Option<Vec<Q8Act>> = (!precise && qdot::supports(ty)).then(|| {
             let quantize = if coarse { Q8Act::coarse } else { Q8Act::new };
             xs.par_chunks_exact(cols).map(quantize).collect()
@@ -271,5 +273,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The fields are public, so a matrix can claim fewer rows than its data holds; the extra
+    /// rows were once written past the end of `ys`.
+    #[test]
+    #[should_panic]
+    fn matmul_rejects_data_with_more_rows_than_claimed() {
+        let data = quantize_q8_0(&vec![1.0; 16 * 32]);
+        let m = QMatrix {
+            ty: GgmlType::Q8_0,
+            rows: 1,
+            cols: 32,
+            data: &data,
+        };
+        m.matmul_with(&[1.0; 64], &mut [0.0; 2], 2, false);
     }
 }
