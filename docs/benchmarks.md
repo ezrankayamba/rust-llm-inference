@@ -21,6 +21,11 @@ run each (a Docker VM alongside, 1.3-1.9 GB of swap in use during the 14B runs):
 | Qwen3-14B | no | 28/30 | 28/30 | 1.92 s | 1.47 s |
 | Qwen3-14B | yes | 30/30 | 29/30 | 2.51 s | 1.84 s |
 
+With thinking (`--think`, digits, the draft, `--max-tokens 2048`) Qwen3-14B gets 58/60 (29 tune,
+29 held out): no better than without, at a median of 21.5 s (quartiles 15.5 and 29.7 s; the Mac
+slept twice during the run, so its mean and max are not usable). One of its misses adds a
+`submit_form` nobody asked for. So thinking does not pay here.
+
 Every amount is right with digits, on both models. What is left: Qwen3-14B once fills the
 fields without opening the form the request names ("Fomu ya mkopo, kiasi laki moja, simu ...");
 Qwen3-8B does that too, misses the opening in "Nifungulie fomu ya mkopo, ...", answers

@@ -111,6 +111,12 @@ the values, here the function name too) is evaluated in one batch instead of a t
 which halved that; the constraint itself adds about 0.1 ms a token (`docs/benchmarks.md`,
 2026-11-21).
 
+On 60 written English and Swahili requests (`scripts/tool_cases.json`), Qwen3-14B with thinking
+off and the draft below gets 59 right at a median of 1.8 s on an M4 Mac, Qwen3-8B 56 at 0.9 s,
+when the client first writes spoken amounts as digits (`scripts/number_words.py`); without that
+step the models get amounts wrong (elfu ishirini as 2000). Thinking did not help (58 of 60, about
+21 s). See `docs/benchmarks.md`, 2026-11-21.
+
 `--draft models/Qwen3-0.6B-Q8_0.gguf --draft-tokens 6` (rli-server and rli) speculates with the
 smaller model: it guesses the next tokens and the main model checks them in one pass. At
 temperature 0 it keeps those it would have chosen itself, so replies stay the same; above it,
