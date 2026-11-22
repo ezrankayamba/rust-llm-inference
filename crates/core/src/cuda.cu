@@ -1207,7 +1207,240 @@ __device__ inline void mma16_f16(const uint* a, uint b0, uint b1, float* c) {
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-#ifdef RLI_MMK
+#ifdef RLI_FP4
+// NVFP4 by FP4 tensor cores (compute capability 12.0: a fourth compile, for compute_120a).
+// The activations are quantized to NVFP4 too, in the weights' own block layout: a row of a
+// token is blocks of 64 values, 4 UE4M3 scale bytes (one per 16) and 32 bytes of E2M1 codes,
+// byte j of a sub-block's 8 holding value j (low nibble) and j + 8 (high). As in ggml, each
+// token also has a scale of its own (its largest value / (6 * 448), in xg), so the
+// sub-blocks' scales fit UE4M3's range; each sub-block's scale is the one of the five
+// codes nearest max / 6 that leaves the least squared error.
+
+// p[0..8] as E2M1 codes rounded to nearest, p[n] in nibble n (CUTLASS's conversion).
+__device__ inline uint e2m1x8(const float* p) {
+    uint r;
+    asm("{ .reg .b8 b0, b1, b2, b3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n"
+        "mov.b32 %0, {b0, b1, b2, b3}; }"
+        : "=r"(r)
+        : "f"(p[0]), "f"(p[1]), "f"(p[2]), "f"(p[3]), "f"(p[4]), "f"(p[5]), "f"(p[6]),
+          "f"(p[7]));
+    return r;
+}
+
+// A positive v as UE4M3, rounded to nearest (448 at most).
+__device__ inline uint to_ue4m3(float v) {
+    unsigned short r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.0f), "f"(v));
+    return r & 0x7f;
+}
+
+// The squared error of the 16 values v (already divided by the token's scale) as E2M1 codes
+// under the sub-block scale of code c.
+__device__ inline float fp4_err(const float* v, uint c) {
+    float s = 2.0f * ue4m3(c), inv = s > 0 ? 1.0f / s : 0.0f, e = 0;
+    #pragma unroll
+    for (uint h = 0; h < 2; h++) {
+        float p[8];
+        #pragma unroll
+        for (uint k = 0; k < 8; k++) p[k] = v[8 * h + k] * inv;
+        uint q = e2m1x8(p);
+        #pragma unroll
+        for (uint k = 0; k < 8; k++) {
+            float d = fabsf(v[8 * h + k]) - fabsf(fp4((q >> 4 * k) & 15)) * 0.5f * s;
+            e += d * d;
+        }
+    }
+    return e;
+}
+
+// A block per token: x (rows of cols f32) to NVFP4 rows of cols / 64 * 36 bytes in xf, and
+// the token's scale in xg.
+extern "C" __global__ void __launch_bounds__(256) quant_fp4(const float* x, ulong x_off,
+                                                           uchar* xf, float* xg, uint cols) {
+    __shared__ float part[8];
+    const float* xr = x + x_off + (ulong)blockIdx.x * cols;
+    float mx = 0;
+    for (uint i = threadIdx.x; i < cols; i += 256) mx = fmaxf(mx, fabsf(xr[i]));
+    mx = warp_max(mx);
+    if (threadIdx.x % 32 == 0) part[threadIdx.x / 32] = mx;
+    __syncthreads();
+    mx = part[0];
+    for (uint i = 1; i < 8; i++) mx = fmaxf(mx, part[i]);
+    float g = mx / (6.0f * 448.0f), inv_g = g > 0 ? 1.0f / g : 0.0f;
+    if (threadIdx.x == 0) xg[blockIdx.x] = g;
+    uchar* row = xf + (ulong)blockIdx.x * (cols / 64 * 36);
+    for (uint sb = threadIdx.x; sb < cols / 16; sb += 256) {
+        float v[16], m = 0;
+        #pragma unroll
+        for (uint k = 0; k < 16; k++) {
+            v[k] = xr[16 * sb + k] * inv_g;
+            m = fmaxf(m, fabsf(v[k]));
+        }
+        uint first = to_ue4m3(m / 6.0f), best = first;
+        float best_err = fp4_err(v, first);
+        const int tries[4] = {-1, 1, -2, 2};
+        #pragma unroll
+        for (uint i = 0; i < 4; i++) {
+            int c = (int)first + tries[i];
+            if (c < 0 || c > 0x7e) continue;
+            float e = fp4_err(v, (uint)c);
+            if (e < best_err) {
+                best_err = e;
+                best = (uint)c;
+            }
+        }
+        float s = 2.0f * ue4m3(best), inv = s > 0 ? 1.0f / s : 0.0f;
+        // Byte j of the 8 holds value j and value j + 8.
+        float p0[8], p1[8];
+        #pragma unroll
+        for (uint j = 0; j < 4; j++) {
+            p0[2 * j] = v[j] * inv;
+            p0[2 * j + 1] = v[j + 8] * inv;
+            p1[2 * j] = v[j + 4] * inv;
+            p1[2 * j + 1] = v[j + 12] * inv;
+        }
+        uint q0 = e2m1x8(p0), q1 = e2m1x8(p1);
+        uchar* b = row + (sb / 4) * 36;
+        b[sb % 4] = (uchar)best;
+        uint* c = (uint*)(b + 4 + 8 * (sb % 4));
+        c[0] = q0;
+        c[1] = q1;
+    }
+}
+
+// d += (a * scales of a) (b * scales of b)^T over 64 columns: a is 16 rows (lane 4i + j gives
+// words j and 4 + j of the codes of rows i and i + 8), b 8 tokens (words j and 4 + j of token
+// i), each word 8 codes in nibble order; sa is the 4 scale bytes of row i + 8 (l % 2) and sb
+// those of token i, and lane 4i + j receives the sums of rows i and i + 8 with tokens 2j and
+// 2j + 1.
+__device__ inline void mma_fp4(const uint* a, uint b0, uint b1, uint sa, uint sb, float* d) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1."
+        "e2m1.f32.ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, %10, "
+        "{0, 0}, %11, {0, 0};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa), "r"(sb));
+}
+
+// y = scale * W x (y += with `add`) for n_tok tokens that quant_fp4 wrote to xf and xg. A
+// block takes 128 rows by 64 tokens, 256 columns (4 blocks, 144 bytes a row) a step, staged
+// as they lie in the file, rows MF_W words apart (36: a warp's reads of 8 rows fall in 32
+// banks). Its 8 warps each take 32 rows by 32 tokens. Rows and tokens past the end are
+// staged as the last one, and not written. With `parts` above 1 the grid is that many
+// deep: a block takes its share of the steps and adds its sums into y, which the caller has
+// set (`add` is then ignored).
+#define MF_R 128
+#define MF_T 64
+#define MF_W 36
+extern "C" __global__ void __launch_bounds__(256) mmf_nvfp4(
+    const uchar* w, ulong w_off, const uchar* xf, const float* xg, float* y, ulong y_off,
+    uint rows, uint cols, uint row_bytes, uint n_tok, uint add, float scale, uint parts) {
+    __shared__ uint sw[MF_R * MF_W], sx[MF_T * MF_W];
+    uint tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    uint wr = 32 * (warp % 4), wt = 32 * (warp / 4), g = lane / 4, tg = lane % 4;
+    uint row0 = blockIdx.x * MF_R, tok0 = (blockIdx.y / parts) * MF_T, part = blockIdx.y % parts;
+    float acc[2][4][4];
+    #pragma unroll
+    for (uint m = 0; m < 2; m++)
+        #pragma unroll
+        for (uint t = 0; t < 4; t++)
+            #pragma unroll
+            for (uint i = 0; i < 4; i++) acc[m][t][i] = 0;
+    // Thread tid stages 16-byte words tid, tid + 256, ... of the 128 x 9 of weights and the
+    // 64 x 9 of tokens.
+    const uchar* wp[5];
+    const uchar* xp[3];
+    #pragma unroll
+    for (uint k = 0; k < 5; k++) {
+        uint i = tid + 256 * k, r = row0 + i / 9;
+        wp[k] = w + w_off + (ulong)(r < rows ? r : rows - 1) * row_bytes + 16 * (i % 9);
+    }
+    #pragma unroll
+    for (uint k = 0; k < 3; k++) {
+        uint i = tid + 256 * k, t = tok0 + i / 9;
+        xp[k] = xf + (ulong)(t < n_tok ? t : n_tok - 1) * row_bytes + 16 * (i % 9);
+    }
+    U128 pw[5], px[3];
+    uint all = cols / 256, first = part * all / parts, steps = (part + 1) * all / parts;
+    #pragma unroll
+    for (uint k = 0; k < 5; k++) {
+        wp[k] += (ulong)first * 144;
+        if (tid + 256 * k < MF_R * 9) pw[k] = *(const U128*)wp[k];
+    }
+    #pragma unroll
+    for (uint k = 0; k < 3; k++) {
+        xp[k] += (ulong)first * 144;
+        if (tid + 256 * k < MF_T * 9) px[k] = *(const U128*)xp[k];
+    }
+    steps -= first;
+    for (uint st = 0; st < steps; st++) {
+        #pragma unroll
+        for (uint k = 0; k < 5; k++) {
+            uint i = tid + 256 * k;
+            if (i < MF_R * 9) *(U128*)&sw[(i / 9) * MF_W + 4 * (i % 9)] = pw[k];
+        }
+        #pragma unroll
+        for (uint k = 0; k < 3; k++) {
+            uint i = tid + 256 * k;
+            if (i < MF_T * 9) *(U128*)&sx[(i / 9) * MF_W + 4 * (i % 9)] = px[k];
+        }
+        __syncthreads();
+        // The next step's reads go out before this one multiplies.
+        if (st + 1 < steps) {
+            ulong o = (ulong)(st + 1) * 144;
+            #pragma unroll
+            for (uint k = 0; k < 5; k++)
+                if (tid + 256 * k < MF_R * 9) pw[k] = *(const U128*)(wp[k] + o);
+            #pragma unroll
+            for (uint k = 0; k < 3; k++)
+                if (tid + 256 * k < MF_T * 9) px[k] = *(const U128*)(xp[k] + o);
+        }
+        #pragma unroll
+        for (uint kb = 0; kb < 4; kb++) {
+            uint base = 9 * kb;
+            uint a[2][4], sa[2];
+            #pragma unroll
+            for (uint m = 0; m < 2; m++) {
+                const uint* r = sw + (wr + 16 * m + g) * MF_W + base;
+                a[m][0] = r[1 + tg];
+                a[m][1] = r[8 * MF_W + 1 + tg];
+                a[m][2] = r[5 + tg];
+                a[m][3] = r[8 * MF_W + 5 + tg];
+                sa[m] = r[8 * MF_W * (lane % 2)];
+            }
+            #pragma unroll
+            for (uint t = 0; t < 4; t++) {
+                const uint* x = sx + (wt + 8 * t + g) * MF_W + base;
+                uint b0 = x[1 + tg], b1 = x[5 + tg], sb = x[0];
+                #pragma unroll
+                for (uint m = 0; m < 2; m++) mma_fp4(a[m], b0, b1, sa[m], sb, acc[m][t]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint m = 0; m < 2; m++)
+        #pragma unroll
+        for (uint t = 0; t < 4; t++)
+            #pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                uint r = row0 + wr + 16 * m + g + 8 * (i / 2);
+                uint tk = tok0 + wt + 8 * t + 2 * tg + i % 2;
+                if (r >= rows || tk >= n_tok) continue;
+                float v = acc[m][t][i] * scale * xg[tk];
+                float* yr = y + y_off + (ulong)tk * rows + r;
+                if (parts > 1)
+                    atomicAdd(yr, v);
+                else
+                    *yr = add ? *yr + v : v;
+            }
+}
+
+#elif defined(RLI_MMK)
 // Q4_K by int8 tensor cores, written for instruction count: one block per multiprocessor keeps
 // it busy, so a step costs what its instructions do, and MATMUL_MMA's step is 1500 a warp,
 // most of them loading (a decode that 4 lanes of 32 take part in, words read as two halves).
@@ -1661,6 +1894,159 @@ extern "C" __global__ void NAME(SIG) {                                          
         u += k1 - k0;                                                                          \
     }                                                                                          \
 }
+
+// NVFP4 the same way: a scale per 16 columns, a UE4M3 float that meets each product as a
+// float, and the tensor's scale at the end. A step's 128 columns are two 36-byte blocks of a
+// row; a lane reads one word of codes (8 of them, at 4 bytes' alignment) and fp4x8 turns it
+// into the two int8 words of the columns it holds, which go where MATMUL_MMK6's do.
+#define MMKF_SIG MMK_SIG, float scale
+#define MMKF_READ_W(KH)                                                                        \
+        {                                                                                      \
+            const uchar* sb = wb + (ulong)(KH) * 72;                                           \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 8; p++)                                                       \
+                v0[p] = *(const uint*)(sb + ro[p] + 36 * (tx / 8) + 4 + 4 * (tx % 8));         \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 4; p++) sc[p] = sb[rs[p] + 36 * (lane % 8 / 4) + lane % 4];   \
+        }
+#define MATMUL_MMKF(NAME, T, NTX)                                                              \
+extern "C" __global__ void NAME(MMKF_SIG) {                                                    \
+    MMK_PRE                                                                                    \
+    __shared__ uint wq[128 * MK_S];                                                            \
+    __shared__ uint tq[T * MK_S];                                                              \
+    __shared__ float ws[128 * 8];                                                              \
+    __shared__ float td[T * 4];                                                                \
+    uint lane = threadIdx.x % 32, warp = threadIdx.x / 32;                                     \
+    uint gi = lane / 4, gj = lane % 4;                                                         \
+    uint rb = warp / NTX * 16 * NTX, tw = warp % NTX * 8;                                      \
+    const uchar* wb = w + w_off;                                                               \
+    uint nrt = (rows + 127) / 128, nk = cols / 128;                                            \
+    /* Rust keeps units times blocks under 2^32. */                                            \
+    uint units = nrt * ((n_tok + T - 1) / T) * nk;                                             \
+    uint u = blockIdx.x * units / gridDim.x, ue = (blockIdx.x + 1) * units / gridDim.x;        \
+    while (u < ue) {                                                                           \
+        uint tile = u / nk, k0 = u % nk;                                                       \
+        uint k1 = ue - u < nk - k0 ? k0 + (ue - u) : nk;                                       \
+        uint row0 = tile % nrt * 128, t0 = tile / nrt * T;                                     \
+        uint last = n_tok - 1 - t0;                                                            \
+        /* As in MATMUL_MMK6: rows 16 warp + 2 p + lane / 16 for codes, 16 lanes a row, and a  \
+           row to every 8 lanes for scales. */                                                 \
+        uint ro[8], rs[4];                                                                     \
+        const uint* xp[T / 32];                                                                \
+        const float* dp[T / 32];                                                               \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < 8; p++) {                                                         \
+            uint r = row0 + 16 * warp + 2 * p + lane / 16;                                     \
+            ro[p] = (r < rows ? r : rows - 1) * row_bytes;                                     \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < 4; p++) {                                                         \
+            uint r = row0 + 16 * warp + 4 * p + lane / 8;                                      \
+            rs[p] = (r < rows ? r : rows - 1) * row_bytes;                                     \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint p = 0; p < T / 32; p++) {                                                    \
+            uint t = warp * (T / 8) + 4 * p + lane / 8;                                        \
+            ulong tok = t0 + (t < last ? t : last);                                            \
+            xp[p] = xq + tok * (cols / 4) + 4 * (lane % 8);                                    \
+            dp[p] = xd + tok * (cols / 32);                                                    \
+        }                                                                                      \
+        float acc[T / 2];                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < T / 2; j++) acc[j] = 0;                                           \
+        uint tx = lane % 16, up = lane / 16;                                                   \
+        uint v0[8], sc[4];                                                                     \
+        U128 xv[T / 32];                                                                       \
+        F128 dv[T / 32];                                                                       \
+        for (uint kh = k0; kh < k1; kh++) {                                                    \
+            MMKF_READ_W(kh)                                                                    \
+            MMK6_READ_X(kh, T)                                                                 \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 8; p++) {                                                     \
+                /* Code word tx is block tx / 8, sub-block tx / 2 % 4, its half tx % 2: its    \
+                   low nibbles are int8 word 16 (tx / 8) + 4 (tx / 2 % 4) + tx % 2 of the row, \
+                   its high ones the word 2 after. The second row's lanes store their high     \
+                   word first, so the two halves of the warp write different banks. */         \
+                uint lo, hi;                                                                   \
+                fp4x8(v0[p], &lo, &hi);                                                        \
+                uint* wr = wq + (16 * warp + 2 * p + up) * MK_S + 16 * (tx / 8) +              \
+                           4 * (tx / 2 % 4) + tx % 2;                                          \
+                wr[2 * up] = up ? hi : lo;                                                     \
+                wr[2 - 2 * up] = up ? lo : hi;                                                 \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < 4; p++)                                                       \
+                ws[(16 * warp + 4 * p + lane / 8) * 8 + lane % 8] = ue4m3(sc[p]);              \
+            _Pragma("unroll")                                                                  \
+            for (uint p = 0; p < T / 32; p++) {                                                \
+                uint t = warp * (T / 8) + 4 * p + lane / 8;                                    \
+                *(U128*)(tq + t * MK_S + 4 * (lane % 8)) = xv[p];                              \
+                *(F128*)(td + t * 4) = dv[p];                                                  \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+            int a[NTX][8][2];                                                                  \
+            F128 sa[NTX][2], sd[NTX][2];                                                       \
+            _Pragma("unroll")                                                                  \
+            for (uint n = 0; n < NTX; n++) {                                                   \
+                uint r = rb + 16 * n;                                                          \
+                const uint* am = wq + (r + lane % 8 + 8 * (lane / 8 % 2)) * MK_S;              \
+                _Pragma("unroll")                                                              \
+                for (uint g = 0; g < 8; g++) ldm2(am + 4 * g, a[n][g]);                        \
+                _Pragma("unroll")                                                              \
+                for (uint j = 0; j < 2; j++) {                                                 \
+                    sa[n][j] = *(const F128*)(ws + (r + gi) * 8 + 4 * j);                      \
+                    sd[n][j] = *(const F128*)(ws + (r + gi + 8) * 8 + 4 * j);                  \
+                }                                                                              \
+            }                                                                                  \
+            _Pragma("unroll")                                                                  \
+            for (uint o = 0; o < T / (8 * NTX); o++) {                                         \
+                uint tb = 8 * NTX * o + tw, ta = tb + 2 * gj;                                  \
+                if (tb > last) continue;                                                       \
+                F128 d0 = *(const F128*)(td + ta * 4), d1 = *(const F128*)(td + ta * 4 + 4);   \
+                float f[NTX][4];                                                               \
+                _Pragma("unroll")                                                              \
+                for (uint j = 0; j < 4 * NTX; j++) f[j / 4][j % 4] = 0;                        \
+                _Pragma("unroll")                                                              \
+                for (uint g = 0; g < 8; g += 2) {                                              \
+                    int b0, b1;                                                                \
+                    ldm1(tq + (tb + lane % 8) * MK_S + 4 * g, &b0);                            \
+                    ldm1(tq + (tb + lane % 8) * MK_S + 4 * g + 4, &b1);                        \
+                    _Pragma("unroll")                                                          \
+                    for (uint n = 0; n < NTX; n++) {                                           \
+                        int c[4] = {0, 0, 0, 0}, e[4] = {0, 0, 0, 0};                          \
+                        float s0 = sa[n][g / 4].v[g % 4], s1 = sa[n][g / 4].v[g % 4 + 1];      \
+                        float s2 = sd[n][g / 4].v[g % 4], s3 = sd[n][g / 4].v[g % 4 + 1];      \
+                        mma16_s8(a[n][g][0], a[n][g][1], b0, c);                               \
+                        mma16_s8(a[n][g + 1][0], a[n][g + 1][1], b1, e);                       \
+                        float da = d0.v[g / 2], db = d1.v[g / 2];                              \
+                        f[n][0] = fmaf(da, fmaf((float)c[0], s0, (float)e[0] * s1), f[n][0]);  \
+                        f[n][1] = fmaf(db, fmaf((float)c[1], s0, (float)e[1] * s1), f[n][1]);  \
+                        f[n][2] = fmaf(da, fmaf((float)c[2], s2, (float)e[2] * s3), f[n][2]);  \
+                        f[n][3] = fmaf(db, fmaf((float)c[3], s2, (float)e[3] * s3), f[n][3]);  \
+                    }                                                                          \
+                }                                                                              \
+                _Pragma("unroll")                                                              \
+                for (uint n = 0; n < NTX; n++) {                                               \
+                    float* ac = acc + 4 * (NTX * o + n);                                       \
+                    _Pragma("unroll")                                                          \
+                    for (uint i = 0; i < 4; i++) ac[i] = fmaf(scale, f[n][i], ac[i]);          \
+                }                                                                              \
+            }                                                                                  \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (uint j = 0; j < T / 2; j++) {                                                     \
+            uint t = 8 * NTX * (j / 4 / NTX) + tw + 2 * gj + j % 2;                            \
+            uint row = row0 + rb + 16 * (j / 4 % NTX) + gi + 8 * (j / 2 % 2);                  \
+            if (t > last || row >= rows) continue;                                             \
+            atomicAdd(y + y_off + (ulong)(t0 + t) * rows + row, acc[j]);                       \
+        }                                                                                      \
+        u += k1 - k0;                                                                          \
+    }                                                                                          \
+}
+MATMUL_MMKF(mmk_nvfp4_t32, 32, 1)
+MATMUL_MMKF(mmk_nvfp4_t64, 64, 2)
+MATMUL_MMKF(mmk_nvfp4_t128, 128, 2)
 
 MATMUL_MMK6(mmk_q6_k_t32, MMK_SIG, MMK_PRE, 0, 32, 1, 0)
 MATMUL_MMK6(mmk_q6_k_t64, MMK_SIG, MMK_PRE, 0, 64, 2, 0)

@@ -195,6 +195,10 @@ pub struct Model {
     /// does, instead of one per 32 (`--coarse-acts`): faster for K-quants on ARM (13% per
     /// matmul on an M4), less accurate. Decode is not affected, nor is `precise`.
     pub coarse_acts: bool,
+    /// NVFP4 prompts on FP4 tensor cores, their activations quantized to NVFP4 too
+    /// (`--fp4-acts`; CUDA, compute capability 12.0): llama.cpp's way, faster than int8
+    /// activations over long prompts at about 75 times their KL divergence from f32.
+    pub fp4_acts: bool,
     /// Interleaved copies of weights ([`Model::repack`]), by file offset and row count.
     packed: HashMap<(usize, usize), Vec<u8>>,
 }
@@ -552,6 +556,7 @@ impl Model {
             accel: None,
             precise: false,
             coarse_acts: false,
+            fp4_acts: false,
             packed: HashMap::new(),
         })
     }

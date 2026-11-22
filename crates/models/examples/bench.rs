@@ -1,7 +1,7 @@
 //! Fixed-length throughput benchmark, independent of EOS and sampling.
 //!
 //! usage: bench <model.gguf> [--pp 512] [--tg 128] [--depth 0] [--reps 3] [--gpu-layers N]
-//!        [--threads N] [--precise] [--repack] [--coarse-acts]
+//!        [--threads N] [--precise] [--repack] [--coarse-acts] [--fp4-acts]
 //!
 //! `pp`: prompt processing of N tokens into an empty session (logits for the last one only).
 //! `tg`: N greedy decode steps, ignoring EOS, after `depth` prompt tokens (prefilled untimed),
@@ -41,6 +41,7 @@ fn main() {
     let mut engine = Engine::load(&a[1]).expect("load model");
     engine.model.precise = a.iter().any(|x| x == "--precise");
     engine.model.coarse_acts = a.iter().any(|x| x == "--coarse-acts");
+    engine.model.fp4_acts = a.iter().any(|x| x == "--fp4-acts");
     rli_models::backend::attach(&mut engine.model, gpu_layers).expect("attach backend");
     if a.iter().any(|x| x == "--repack") {
         eprintln!("repacked: {} MiB", engine.model.repack() >> 20);

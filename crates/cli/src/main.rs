@@ -25,6 +25,9 @@ usage: rli -m <model.gguf> [options]
                             about their size in extra memory
       --coarse-acts         CPU prompts: one activation scale per 256 values, not per 32;
                             faster for K-quant models on ARM, less accurate
+      --fp4-acts            NVFP4 prompts on FP4 tensor cores (CUDA, RTX 50 series), their
+                            activations in 4 bits as llama.cpp does: faster over long
+                            prompts, much less accurate than the int8 default
       --draft <path>        speculate with a smaller model of the same vocabulary: replies
                             stay the model's own (the same text at temperature 0, the same
                             distribution above it), only faster or slower
@@ -43,6 +46,7 @@ struct Args {
     gpu_layers: Option<usize>,
     repack: bool,
     coarse_acts: bool,
+    fp4_acts: bool,
     draft: Option<String>,
     draft_tokens: usize,
     params: GenParams,
@@ -61,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
         gpu_layers: None,
         repack: false,
         coarse_acts: false,
+        fp4_acts: false,
         draft: None,
         draft_tokens: 4,
         params: GenParams {
@@ -99,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
             "--gpu-layers" => a.gpu_layers = Some(num(&flag, it.next())?),
             "--repack" => a.repack = true,
             "--coarse-acts" => a.coarse_acts = true,
+            "--fp4-acts" => a.fp4_acts = true,
             "--draft" => a.draft = Some(it.next().ok_or("--draft needs a value")?),
             "--draft-tokens" => a.draft_tokens = num(&flag, it.next())?,
             "-t" | "--threads" => rli_models::set_threads(num(&flag, it.next())?)?,
@@ -139,6 +145,7 @@ fn run(a: Args) -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     engine.model.coarse_acts = a.coarse_acts;
+    engine.model.fp4_acts = a.fp4_acts;
     if a.repack {
         match engine.model.repack() {
             0 => eprintln!("warning: --repack does nothing here: it needs Q4_K weights and AVX2"),
@@ -158,6 +165,7 @@ fn run(a: Args) -> Result<(), String> {
             eprintln!("warning: draft: {w}");
         }
         d.model.coarse_acts = a.coarse_acts;
+        d.model.fp4_acts = a.fp4_acts;
         engine
             .set_draft(d, a.draft_tokens)
             .map_err(|e| format!("--draft: {e}"))?;

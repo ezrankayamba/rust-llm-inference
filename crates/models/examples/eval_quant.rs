@@ -2,10 +2,14 @@
 //! token at a time (the decode path) through the model twice, with f32 activations (`precise`, the
 //! reference) and with the default int8 ones, and compares the next-token distributions.
 //!
-//! usage: eval_quant <model.gguf> <text file> [--tokens 512] [--threads N]
+//! usage: eval_quant <model.gguf> <text file> [--tokens 512] [--threads N] [--gpu-layers N]
+//! [--batch] [--fp4-acts]
 //!
 //! Prints perplexity of the text under each, the mean and largest KL divergence of the int8
-//! distribution from the reference, and how often their top tokens agree. CPU only.
+//! distribution from the reference, and how often their top tokens agree. On the CPU unless
+//! `--gpu-layers` offloads layers (metal/cuda builds) of both. `--batch` runs the int8 side
+//! as one prompt with the logits of every row, so a GPU's prompt kernels are measured
+//! instead of its decode ones.
 
 use rli_models::Engine;
 
@@ -33,6 +37,13 @@ fn main() {
     let mut reference = Engine::load(&a[1]).expect("load model");
     reference.model.precise = true;
     fast.model.precise = false;
+    fast.model.fp4_acts = a.iter().any(|x| x == "--fp4-acts");
+    if let Some(n) = opt("--gpu-layers") {
+        let n = n.parse().expect("--gpu-layers");
+        for e in [&mut reference, &mut fast] {
+            rli_models::backend::attach(&mut e.model, n).expect("attach backend");
+        }
+    }
     let mut tokens = fast.tokenizer.encode(&text, fast.tokenizer.add_bos, false);
     tokens.truncate(n_max + 1);
     assert!(tokens.len() > 1, "text too short");
@@ -41,10 +52,18 @@ fn main() {
         reference.model.new_session(tokens.len()),
         fast.model.new_session(tokens.len()),
     );
+    let batched = a.iter().any(|x| x == "--batch").then(|| {
+        let rows = n.min(fast.model.logit_rows());
+        assert_eq!(rows, n, "the backend gives logits for {rows} rows a pass");
+        fast.model.forward_rows(&mut sf, &tokens[..n], n).unwrap()
+    });
     let (mut nll_ref, mut nll_fast, mut kl_sum, mut kl_max, mut agree) = (0.0, 0.0, 0.0, 0f64, 0);
     for i in 0..n {
         let lr = reference.model.forward(&mut sr, tokens[i], true).unwrap();
-        let lf = fast.model.forward(&mut sf, tokens[i], true).unwrap();
+        let lf = match &batched {
+            Some(all) => all[i * lr.len()..(i + 1) * lr.len()].to_vec(),
+            None => fast.model.forward(&mut sf, tokens[i], true).unwrap(),
+        };
         let (pr, pf) = (log_softmax(&lr), log_softmax(&lf));
         let next = tokens[i + 1] as usize;
         nll_ref -= pr[next];

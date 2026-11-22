@@ -3,6 +3,52 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: NVFP4 prompts on CUDA tensor cores: int8 (default) and FP4 (`--fp4-acts`)
+
+Two kernels for NVFP4 chunks of 8+ tokens on the RTX 5090. `mmk_nvfp4_t*` (lean compile) is
+`MATMUL_MMK6`'s layout over the int8 activations every other type gets: the E2M1 codes become
+int8 as they are staged (`fp4x8`), one `mma` per 16 columns, the UE4M3 sub-block scales applied
+to each product as floats, the tensor scale at the end. `mmf_nvfp4` (a fourth compile, for
+compute_120a) runs Blackwell's block-scaled FP4 `mma` (`kind::mxf4nvf4`, m16n8k64, a UE4M3 scale
+per 16 on both sides) over activations that `quant_fp4` writes in the weights' own block layout
+with a scale per token (largest value / (6 * 448)) and, per 16 values, the best of five scale
+codes around max / 6 (ggml's search); blocks of 128 rows by 64 tokens, 256 columns a step, the
+columns in parts where tiles are few. It is off unless `--fp4-acts` (`Model.fp4_acts`).
+
+**Accuracy** (`eval_quant --gpu-layers 36 --batch`, README.md, 512 tokens as one prompt, against
+`precise` one token at a time):
+
+| Qwen3-8B | KL mean | KL max | top-1 agree | perplexity (f32 12.4145) |
+|---|---:|---:|---:|---:|
+| NVFP4, int8 activations (default) | 0.000524 | 0.0179 | 99.22% | 12.3966 |
+| NVFP4, `--fp4-acts` (run 1) | 0.038892 | 1.4170 | 90.43% | 12.3541 |
+| NVFP4, `--fp4-acts` (run 2; its parts add in a varying order) | 0.041231 | 0.8956 | 90.04% | 12.5549 |
+| NVFP4, decode path (no `--batch`) | 0.000521 | 0.0190 | 99.22% | 12.3951 |
+| Q4_K_M, int8 activations (its own f32 11.3094) | 0.000671 | 0.0237 | 97.27% | 11.3173 |
+
+`dump_logits`, a 100-token prompt, max |logit diff| from `--precise`: int8 0.250 batched, 0.218
+per token; `--fp4-acts` 2.303. Top-5 identical in all three.
+
+**Speed** (`cmpf.py "16 128 512" Qwen3-8B-NVFP4.gguf 128`, alternating with llama.cpp v0.9.0,
+which runs FP4 activations by default; two rounds, GPU as sampled during the rli runs):
+
+| Qwen3-8B-NVFP4 | before | int8 (default) | `--fp4-acts` | llama.cpp | int8 / llama | FP4 / llama | GPU (rli, int8) |
+|---|---:|---:|---:|---:|---:|---:|---|
+| pp16 | 304 | 2440 | 2375 | 2337 | 1.044 | 1.018 | 2.92 GHz, 13801 MHz, 88%, 457 W, 47-49 C |
+| pp128 | 584 | 8104 | 11078 | 10674 | 0.760 | 1.037 | 2.88 GHz, 13801 MHz, 84-85%, 533 W, 54-57 C |
+| pp512 | 626 | 10241 | 15520, 18188 | 19500 | 0.525 | 0.79, 0.93 | 2.85 GHz, 13801 MHz, 84%, 575 W, 61-62 C |
+| tg128 | 229.5 | 229.0 | | 236.5 | 0.968 | | 2.91 GHz, 13801 MHz, 95%, 464-470 W, 58-60 C |
+
+The first `--fp4-acts` pp512 round ran at 63% utilization; the second, 74%, is the one to read.
+llama.cpp with int8 activations too (`GGML_CUDA_MMQ_PREC=q8 llama-bench -p 16,128,512 -r 20`,
+not alternated): 2180, 7703, 11210 tok/s, so the default is 1.12x, 1.05x and 0.91x of the same
+arithmetic there.
+
+`RLI_CUDA_PROF=1 bench --pp 512 --reps 4`: the NVFP4 int8 matmul is 151 us a launch where
+Q4_K_M's Q4_K one is 115 and its Q6_K one 154: it has Q6_K's arithmetic (a multiply per 16
+columns, two scales combined per 32). Tried: converting the products to float with an integer
+add of 2^23 * 1.5 and a float subtract, exact and with no conversion instruction, ran 160 us.
+
 ## 2026-11-22: NVFP4 int8 matvecs on CUDA (decode)
 
 `mvq_nvfp4` and `mvq_nvfp4_pair` (gate and up in one launch, a tensor scale each): int8

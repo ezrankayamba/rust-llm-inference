@@ -319,6 +319,8 @@ pub struct Gpu {
     attn_half: Option<(CudaFunction, CudaFunction)>,
     /// Flash attention (`attn_flash_*`, the lean compile) by head size; empty where unused.
     attn_flash: Vec<(u32, CudaFunction)>,
+    /// NVFP4 on FP4 tensor cores (the compute_120a compile): `quant_fp4` and `mmf_nvfp4`.
+    fp4: Option<(CudaFunction, CudaFunction)>,
     other: Vec<(&'static str, CudaFunction)>,
     /// Zeros: the expert id of a plain matvec, one for each token of an int8 batch too short
     /// for the matmul kernels.
@@ -410,6 +412,14 @@ impl Gpu {
                     mmk_id.push((t, tt, module.load_function(&n).map_err(err(&n))?));
                 }
             }
+            for tt in MMK_TOKENS {
+                let n = format!("mmk_nvfp4_t{tt}");
+                mmk.push((
+                    GgmlType::NVFP4,
+                    tt,
+                    module.load_function(&n).map_err(err(&n))?,
+                ));
+            }
             // Fused attention for prompt chunks; RLI_CUDA_FLASH=0 keeps the three kernels.
             if std::env::var("RLI_CUDA_FLASH").as_deref() != Ok("0") {
                 for hd in [64, 128] {
@@ -418,6 +428,26 @@ impl Gpu {
                 }
             }
         }
+        // On compute capability 12.0 (an RTX 5090) NVFP4 matrices can multiply on FP4 tensor
+        // cores (`Batch::set_fp4_acts`), whose instructions belong to that capability alone
+        // (compute_120a).
+        let cc = ctx
+            .compute_capability()
+            .map_err(err("compute capability"))?;
+        let fp4 = if cc == (12, 0) {
+            let opts = cudarc::nvrtc::CompileOptions {
+                arch: Some("compute_120a"),
+                options: vec!["-DRLI_MMA".into(), "-DRLI_FP4".into()],
+                ..Default::default()
+            };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(SOURCE, opts)
+                .map_err(|e| format!("CUDA FP4 kernel compile failed: {e:?}"))?;
+            let module = ctx.load_module(ptx).map_err(err("load CUDA module"))?;
+            let f = |n| module.load_function(n).map_err(err(n));
+            Some((f("quant_fp4")?, f("mmf_nvfp4")?))
+        } else {
+            None
+        };
         let mmq = if mma {
             let opts = cudarc::nvrtc::CompileOptions {
                 arch: Some("compute_80"),
@@ -595,6 +625,7 @@ impl Gpu {
             gemm_direct_id,
             attn_half,
             attn_flash,
+            fp4,
             gemm_id,
             other,
             zero_id,
@@ -733,6 +764,7 @@ impl Gpu {
         Batch {
             gpu: self,
             mode: Mode::Queue,
+            fp4_acts: false,
         }
     }
 
@@ -892,6 +924,7 @@ impl Gpu {
             let mut b = Batch {
                 gpu: self,
                 mode: Mode::Replay(g, 0),
+                fp4_acts: false,
             };
             f(&mut b);
             let Mode::Replay(g, next) = b.mode else {
@@ -919,6 +952,7 @@ impl Gpu {
         let mut b = Batch {
             gpu: self,
             mode: Mode::Capture(Vec::new()),
+            fp4_acts: false,
         };
         f(&mut b);
         let Mode::Capture(recs) = b.mode else {
@@ -1033,6 +1067,10 @@ impl Gpu {
             "to_f16".into()
         } else if let Some(i) = self.gemm.iter().flatten().position(eq) {
             format!("gemm_f16 {}x{}", GEMM_TILES[i].0, GEMM_TILES[i].1)
+        } else if self.fp4.as_ref().is_some_and(|f| eq(&f.0)) {
+            "quant_fp4".to_string()
+        } else if self.fp4.as_ref().is_some_and(|f| eq(&f.1)) {
+            "fp4 matmul NVFP4".to_string()
         } else if let Some((hd, _)) = self.attn_flash.iter().find(|(_, g)| eq(g)) {
             format!("attn_flash {hd}")
         } else if self.attn_half.as_ref().is_some_and(|h| eq(&h.0)) {
@@ -1264,13 +1302,17 @@ fn grid2(x: usize, y: usize, threads: u32) -> LaunchConfig {
 pub struct Batch<'a> {
     gpu: &'a Gpu,
     mode: Mode<'a>,
+    /// NVFP4 prompts may take FP4 activations ([`Batch::set_fp4_acts`]).
+    fp4_acts: bool,
 }
 
 impl<'a> Batch<'a> {
     /// Whether [`Batch::matmul_q`] takes the matrix over `n_tok` tokens: [`Gpu::has_int8`],
-    /// and for NVFP4 under [`MMQ_MIN_TOKENS`], since it has only the int8 matvecs.
+    /// and for NVFP4 from [`MMQ_MIN_TOKENS`] only on the lean kernels, its one int8 matmul.
     pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
-        self.gpu.has_int8(ty, cols, offset) && (ty != GgmlType::NVFP4 || n_tok < MMQ_MIN_TOKENS)
+        let lean = || self.gpu.mmk.iter().any(|(t, ..)| *t == ty);
+        self.gpu.has_int8(ty, cols, offset)
+            && (ty != GgmlType::NVFP4 || n_tok < MMQ_MIN_TOKENS || lean())
     }
 
     /// `y = W x`, `W` being `rows x cols` of `ty` at byte `offset` of the model file.
@@ -1751,6 +1793,92 @@ impl<'a> Batch<'a> {
         );
     }
 
+    /// Lets NVFP4 matrices over 8+ tokens multiply on FP4 tensor cores, their activations
+    /// quantized to NVFP4 too ([`Batch::has_fp4`]): llama.cpp's default on Blackwell, and 1.8x
+    /// the int8 kernel's speed over 512-token prompts, at about 75 times its KL divergence
+    /// from f32 (`docs/benchmarks.md`, 2026-11-22). Off unless set.
+    pub fn set_fp4_acts(&mut self, on: bool) {
+        self.fp4_acts = on;
+    }
+
+    /// Whether [`Batch::matmul_fp4`] takes the `ty` matrix of `cols` columns at byte `offset`
+    /// of the model file over `n_tok` tokens: with [`Batch::set_fp4_acts`], NVFP4 from
+    /// [`MMQ_MIN_TOKENS`] tokens, on a GPU with FP4 tensor cores, rows at multiples of 16
+    /// bytes (256 columns).
+    pub fn has_fp4(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
+        self.fp4_acts
+            && self.gpu.fp4.is_some()
+            && ty == GgmlType::NVFP4
+            && n_tok >= MMQ_MIN_TOKENS
+            && self.gpu.has_int8(ty, cols, offset)
+    }
+
+    /// Quantizes `n_tok` rows of `cols` at `x` to NVFP4 for [`Batch::matmul_fp4`]: the
+    /// weights' block layout in `out`'s int8 room, a scale per token in its first scales.
+    pub fn quantize_fp4(&mut self, x: At<'_>, n_tok: usize, cols: usize, out: &GpuQ) {
+        let (quant, _) = self.gpu.fp4.as_ref().expect("checked by has_fp4");
+        assert!(cols.is_multiple_of(256) && x.1 + n_tok * cols <= x.0.len());
+        assert!(out.q.len() * 4 >= n_tok * cols && out.d.len() >= n_tok);
+        let (x_off, cols_u) = (x.1 as u64, cols as u32);
+        let mut l = self.call(quant);
+        l.arg(&x.0.0)
+            .arg(&x_off)
+            .arg(&out.q)
+            .arg(&out.d)
+            .arg(&cols_u);
+        self.launch(l, grid(n_tok, 256));
+    }
+
+    /// `y = W x` (`y += W x` with `add`) for the NVFP4 matrix at `offset`, over the `n_tok`
+    /// tokens [`Batch::quantize_fp4`] left in `xf`, on FP4 tensor cores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_fp4(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        xf: &GpuQ,
+        y: At<'_>,
+        n_tok: usize,
+        add: bool,
+    ) {
+        let ty = GgmlType::NVFP4;
+        assert!(self.has_fp4(ty, cols, offset, n_tok) && rows > 0);
+        assert!(xf.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
+        let gpu: &'a Gpu = self.gpu;
+        let (_, f) = gpu.fp4.as_ref().expect("checked by has_fp4");
+        let row_bytes = ty.row_bytes(cols);
+        let w_off = gpu.device_offset(offset, rows * row_bytes) as u64;
+        let (y_off, rows_u, cols_u, rb) = (y.1 as u64, rows as u32, cols as u32, row_bytes as u32);
+        let (nt, add_u, scale) = (n_tok as u32, add as u32, gpu.scale(ty, offset));
+        // Few tiles leave most multiprocessors idle: then each takes a part of the columns
+        // and adds into y, two blocks' worth for every multiprocessor in all.
+        let tiles = rows.div_ceil(128) * n_tok.div_ceil(64);
+        let parts = (2 * gpu.gemm_room.0).div_ceil(tiles).min(cols / 256).max(1);
+        if parts > 1 && !add {
+            self.zero_rows(y, (0, rows, rows), n_tok);
+        }
+        let parts_u = parts as u32;
+        let mut a = self.call(f);
+        a.arg(&gpu.weights)
+            .arg(&w_off)
+            .arg(&xf.q)
+            .arg(&xf.d)
+            .arg(&y.0.0)
+            .arg(&y_off)
+            .arg(&rows_u)
+            .arg(&cols_u)
+            .arg(&rb)
+            .arg(&nt)
+            .arg(&add_u)
+            .arg(&scale)
+            .arg(&parts_u);
+        self.launch(
+            a,
+            grid2(rows.div_ceil(128), n_tok.div_ceil(64) * parts, 256),
+        );
+    }
+
     /// Quantizes the `n` values at `x` (a multiple of 32) to int8 in `out`, a scale per 32.
     pub fn quantize(&mut self, x: At<'_>, n: usize, out: &GpuQ) {
         assert!(n.is_multiple_of(32) && x.1 + n <= x.0.len());
@@ -1840,6 +1968,7 @@ impl<'a> Batch<'a> {
             let blocks = gpu.gemm_room.0.min(units / 2).max(1);
             let (y_off, rb) = (y.1 as u64, row_bytes as u32);
             let (rows_u, cols_u, nt, one) = (rows as u32, cols as u32, n_tok as u32, 1u32);
+            let scale = gpu.scale(ty, offset);
             let mut a = self.call(f);
             a.arg(&gpu.weights)
                 .arg(&w_off)
@@ -1853,6 +1982,9 @@ impl<'a> Batch<'a> {
                 .arg(&rb)
                 .arg(&nt)
                 .arg(&one);
+            if ty == GgmlType::NVFP4 {
+                a.arg(&scale);
+            }
             self.launch(a, grid2(blocks, 1, 256));
             return;
         }
@@ -3233,11 +3365,13 @@ mod tests {
     }
 
     /// The NVFP4 int8 matvecs (one token, a few as a row each, added into y, and the pair
-    /// kernel with a tensor scale per matrix) against the CPU's f32 product. Each 32 activations
-    /// are whole numbers that include 127, which int8 holds exactly, so only float rounding
-    /// separates them. Steps of 8 units of 256 columns are left partly filled. Needs an NVIDIA GPU.
+    /// kernel with a tensor scale per matrix) and, where the GPU has them, the lean int8
+    /// matmuls (every block size, stored then added) against the CPU's f32 product. Each 32
+    /// activations are whole numbers that include 127, which int8 holds exactly, so only float
+    /// rounding separates them. Steps of 8 units of 256 columns and row tiles are left partly
+    /// filled. Needs an NVIDIA GPU.
     #[test]
-    fn nvfp4_int8_matvecs_match_the_cpu() {
+    fn nvfp4_int8_kernels_match_the_cpu() {
         let ty = GgmlType::NVFP4;
         for (rows, cols) in [(37, 768), (6, 2304)] {
             let mut seed = 5u32;
@@ -3254,7 +3388,7 @@ mod tests {
             let mut gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
             gpu.set_scale(0, scales[0]);
             gpu.set_scale(len, scales[1]);
-            let n = 3;
+            let n = 200;
             let x: Vec<f32> = (0..n * cols)
                 .map(|i| match i % 32 {
                     7 => 127.0,
@@ -3272,13 +3406,13 @@ mod tests {
                 })
                 .collect();
             let (xb, xq) = (gpu.upload(&x), gpu.alloc_q(n * cols));
-            let (one, many, pair) = (gpu.alloc(rows), gpu.alloc(n * rows), gpu.alloc(2 * rows));
+            let (one, many, pair) = (gpu.alloc(rows), gpu.alloc(3 * rows), gpu.alloc(2 * rows));
             let mut b = gpu.batch();
             b.quantize(At(&xb, 0), n * cols, &xq);
             b.matmul_q(ty, rows, cols, 0, &xq, At(&one, 0), 1, false);
             // Twice the product: stored, then added.
-            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), n, false);
-            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), n, true);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), 3, false);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), 3, true);
             b.matvec_q_pair(ty, rows, cols, [0, len], &xq, At(&pair, 0));
             b.finish();
             let read = |buf: &GpuBuf, len| {
@@ -3296,10 +3430,115 @@ mod tests {
                 }
             };
             check("one token", &read(&one, rows), &want[0][..rows], 1.0);
-            check("3 tokens, added", &read(&many, n * rows), &want[0], 2.0);
+            check("3 tokens, added", &read(&many, 3 * rows), &want[0], 2.0);
             let p = read(&pair, 2 * rows);
             check("pair, first", &p[..rows], &want[0][..rows], 1.0);
             check("pair, second", &p[rows..], &want[1][..rows], 1.0);
+            if !gpu.mmk.iter().any(|(t, ..)| *t == ty) {
+                eprintln!("no lean NVFP4 matmul: skipped");
+                continue;
+            }
+            for nt in [8, 40, 70, 200] {
+                let y = gpu.alloc(nt * rows);
+                let mut b = gpu.batch();
+                b.matmul_q(ty, rows, cols, 0, &xq, At(&y, 0), nt, false);
+                b.matmul_q(ty, rows, cols, 0, &xq, At(&y, 0), nt, true);
+                b.finish();
+                check(&format!("{nt} tokens"), &read(&y, nt * rows), &want[0], 2.0);
+            }
+        }
+    }
+
+    /// The FP4 tensor-core matmul (stored, then added) against the CPU's f32 product of the
+    /// weights with the activations as `quantize_fp4` left them, which the CPU decodes with the
+    /// weights' own decoder; and those activations against the originals, each within twice
+    /// its sub-block's scale (a value past 6 scales saturates, as the scale search allows).
+    /// Row and token tiles are left partly filled. Needs an RTX 5090 (compute capability 12.0).
+    #[test]
+    fn fp4_matmul_matches_the_cpu_over_its_quantized_activations() {
+        let ty = GgmlType::NVFP4;
+        for (rows, cols, n) in [(200, 768, 70), (64, 256, 8)] {
+            let mut seed = 3u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let mut w: Vec<u8> = (0..rows * ty.row_bytes(cols))
+                .map(|_| next() as u8)
+                .collect();
+            for b in w.chunks_exact_mut(ty.block_bytes()) {
+                b[..4].iter_mut().for_each(|d| *d = 0x20 | (*d & 15));
+            }
+            let scale = 0.37f32;
+            let mut gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            if gpu.fp4.is_none() {
+                eprintln!("no FP4 tensor cores: skipped");
+                return;
+            }
+            gpu.set_scale(0, scale);
+            // Values over a range of sizes, some sub-blocks all zero.
+            let x: Vec<f32> = (0..n * cols)
+                .map(|i| match (i / 16) % 11 {
+                    3 => 0.0,
+                    k => (next() as f32 / 8388608.0 - 1.0) * (1 << k) as f32,
+                })
+                .collect();
+            let (xb, xf, y) = (gpu.upload(&x), gpu.alloc_q(n * cols), gpu.alloc(n * rows));
+            let mut b = gpu.batch();
+            b.set_fp4_acts(true);
+            b.quantize_fp4(At(&xb, 0), n, cols, &xf);
+            b.matmul_fp4(rows, cols, 0, &xf, At(&y, 0), n, false);
+            b.finish();
+            let mut got = vec![0f32; n * rows];
+            gpu.read(&y, &mut got);
+            let q: Vec<u8> = gpu.stream.clone_dtoh(&xf.q).expect("download")[..]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let g = gpu.stream.clone_dtoh(&xf.d).expect("download");
+            let rb = ty.row_bytes(cols);
+            let mut xd = vec![0f32; n * cols];
+            for t in 0..n {
+                let (row, out) = (&q[t * rb..(t + 1) * rb], &mut xd[t * cols..(t + 1) * cols]);
+                crate::quant::dequantize_row(ty, row, out);
+                out.iter_mut().for_each(|v| *v *= g[t]);
+                for (i, (d, v)) in out.iter().zip(&x[t * cols..]).enumerate() {
+                    let sb = row[(i / 64) * 36 + (i % 64) / 16];
+                    // ue4m3 is the scale halved, for FP4_VALUES.
+                    let step = 2.0 * crate::quant::ue4m3(sb) * g[t];
+                    assert!(
+                        (d - v).abs() <= 2.0 * step + 1e-6,
+                        "token {t} value {i}: {d} for {v} (scale {step})"
+                    );
+                }
+            }
+            let mut wd = vec![0f32; rows * cols];
+            crate::quant::dequantize_row(ty, &w, &mut wd);
+            let want: Vec<f32> = (0..n * rows)
+                .map(|i| {
+                    let (t, r) = (i / rows, i % rows);
+                    let dot: f64 = (0..cols)
+                        .map(|k| wd[r * cols + k] as f64 * xd[t * cols + k] as f64)
+                        .sum();
+                    dot as f32 * scale
+                })
+                .collect();
+            let check = |got: &[f32], k: f32| {
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    let w = k * w;
+                    assert!(
+                        (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                        "{rows}x{cols} by {n} [{i}]: {g} vs {w}"
+                    );
+                }
+            };
+            check(&got, 1.0);
+            let mut b = gpu.batch();
+            b.set_fp4_acts(true);
+            b.matmul_fp4(rows, cols, 0, &xf, At(&y, 0), n, true);
+            b.finish();
+            gpu.read(&y, &mut got);
+            check(&got, 2.0);
         }
     }
 

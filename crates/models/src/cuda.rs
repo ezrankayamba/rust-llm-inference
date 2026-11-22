@@ -57,6 +57,8 @@ struct Scratch {
     route_w: GpuBuf,
     /// A matmul's input, quantized to int8.
     xq: GpuQ,
+    /// The same as NVFP4, for the FP4 tensor-core matmul (`Batch::quantize_fp4`).
+    xf: GpuQ,
     /// For the f16 GEMM of long prompts: a matmul's input, and its matrix written out.
     xh: GpuHalf,
     wh: GpuHalf,
@@ -97,6 +99,11 @@ impl Scratch {
             starts: gpu.alloc_ids(c.n_expert + 1),
             route_w: gpu.alloc(n * (k + 1)),
             xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)),
+            xf: gpu.alloc_q(if half {
+                n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)
+            } else {
+                0
+            }),
             xh: gpu.alloc_half(if half {
                 n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)
             } else {
@@ -189,6 +196,11 @@ const ROUTER_MATVEC_TOKENS: usize = 64;
 /// above: 16 tokens +1.2%, 32 +3.2%, 64 +5.3%, 128 +27-29%, 256 +18%, 512 +9-10%, 1024 +7%.
 const ROUTER_TILED_TOKENS: usize = 16;
 
+/// Whether `w` runs on FP4 tensor cores over `n` tokens, its input quantized to NVFP4.
+fn fp4(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> bool {
+    int8 && b.has_fp4(w.ty, w.cols, w.offset, n)
+}
+
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
 fn wants_q(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> bool {
     int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset, n))
@@ -216,6 +228,12 @@ impl Fed {
 
 /// What [`mm_each`] will read the input of `ws` as, for `n` tokens.
 fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
+    // The FP4 matmul quantizes its input itself.
+    let ws: Vec<&Weight> = ws.iter().copied().filter(|w| !fp4(b, w, n, int8)).collect();
+    if ws.is_empty() {
+        return Fed::No;
+    }
+    let ws = &ws[..];
     let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let dense = |w: &&&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
@@ -230,6 +248,9 @@ fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
 
 /// [`fed`] for [`mm_add`].
 fn fed_add(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> Fed {
+    if fp4(b, w, n, int8) {
+        return Fed::No;
+    }
     let dense = int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let gemm = int8
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
@@ -256,6 +277,19 @@ fn mm_each(
     int8: bool,
     fed: Fed,
 ) {
+    // NVFP4 matrices of 8+ tokens run on FP4 tensor cores, over x quantized once for them.
+    let (f4, rest): (Vec<_>, Vec<_>) = ws.iter().zip(ys).partition(|(w, _)| fp4(b, w, n, int8));
+    if !f4.is_empty() {
+        b.quantize_fp4(x, n, ws[0].cols, &s.xf);
+        for &(w, &y) in &f4 {
+            b.matmul_fp4(w.rows, w.cols, w.offset, &s.xf, y, n, false);
+        }
+        if rest.is_empty() {
+            return;
+        }
+    }
+    let (ws, ys): (Vec<&Weight>, Vec<At<'_>>) = rest.into_iter().map(|(&w, &y)| (w, y)).unzip();
+    let (ws, ys) = (&ws[..], &ys[..]);
     // A long prompt's matmuls run on f16 tensor cores, whatever quantized type the weights
     // are. F32 and F16 weights are the reference path and keep f32 activations.
     let float = |w: &&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
@@ -326,6 +360,11 @@ fn mm_add(
     int8: bool,
     fed: Fed,
 ) {
+    if fp4(b, w, n, int8) {
+        b.quantize_fp4(src, n, w.cols, &s.xf);
+        b.matmul_fp4(w.rows, w.cols, w.offset, &s.xf, x, n, true);
+        return;
+    }
     if int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n) {
         if fed != Fed::Half {
             b.to_f16(src, n * w.cols, &s.xh);
@@ -665,6 +704,7 @@ impl Cuda {
             store: None,
         };
         let queue = |b: &mut Batch<'_>| {
+            b.set_fp4_acts(model.fp4_acts && int8);
             for (l, (layer, g)) in model.layers.iter().zip(&self.layers).enumerate() {
                 let (k_at, v_at) = match dev {
                     true => (At(&s.k_new, 0), At(&s.v_new, 0)),

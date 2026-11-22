@@ -15,13 +15,16 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 usage: rli-server -m <model.gguf> [--host 127.0.0.1] [--port 8080] [--ctx 4096] [--gpu-layers N]
-                  [--threads N] [--repack] [--coarse-acts] [--draft <small.gguf>] [--draft-tokens 4]
+                  [--threads N] [--repack] [--coarse-acts] [--fp4-acts] [--draft <small.gguf>]
+                  [--draft-tokens 4]
 
 --gpu-layers defaults to all layers when built with a GPU backend; 0 = CPU only.
 --repack copies Q4_K weights into a layout x86 decodes faster from, for about their size in
 extra memory.
 --coarse-acts quantizes CPU prompt activations with one scale per 256 values, not per 32: faster
 for K-quant models on ARM, less accurate.
+--fp4-acts runs NVFP4 prompts on FP4 tensor cores (CUDA, RTX 50 series) with 4-bit activations,
+as llama.cpp does: faster over long prompts, much less accurate than the int8 default.
 --threads defaults to one CPU thread per logical core.
 --draft speculates with a smaller model of the same vocabulary (Qwen3-0.6B for a larger Qwen3):
 it guesses --draft-tokens tokens a pass, which the model checks in one pass. Replies stay the
@@ -50,6 +53,7 @@ struct Args {
     gpu_layers: Option<usize>,
     repack: bool,
     coarse_acts: bool,
+    fp4_acts: bool,
     draft: Option<String>,
     draft_tokens: usize,
 }
@@ -64,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         gpu_layers: None,
         repack: false,
         coarse_acts: false,
+        fp4_acts: false,
         draft: None,
         draft_tokens: 4,
     };
@@ -80,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--repack" => a.repack = true,
             "--coarse-acts" => a.coarse_acts = true,
+            "--fp4-acts" => a.fp4_acts = true,
             "--draft" => a.draft = Some(val()?),
             "--draft-tokens" => {
                 a.draft_tokens = val()?
@@ -166,6 +172,7 @@ fn run(a: Args) -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     engine.model.coarse_acts = a.coarse_acts;
+    engine.model.fp4_acts = a.fp4_acts;
     if a.repack {
         match engine.model.repack() {
             0 => eprintln!("warning: --repack does nothing here: it needs Q4_K weights and AVX2"),
@@ -184,6 +191,7 @@ fn run(a: Args) -> Result<(), String> {
             eprintln!("warning: draft: {w}");
         }
         d.model.coarse_acts = a.coarse_acts;
+        d.model.fp4_acts = a.fp4_acts;
         draft_name = format!(", draft {} ({} a pass)", d.model_name, a.draft_tokens);
         engine
             .set_draft(d, a.draft_tokens)

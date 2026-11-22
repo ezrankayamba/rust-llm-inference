@@ -15,7 +15,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 | Foundation | From scratch: own tensor type, own CPU SIMD / Metal / CUDA kernels |
 | Backends | CPU SIMD (baseline, always built) → Apple Metal → CUDA |
 | Weight format | GGUF only, memory-mapped |
-| Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels) |
+| Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels; on CUDA, int8 activations unless `--fp4-acts`) |
 | Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE) |
 | Interfaces | CLI and an OpenAI-compatible HTTP server (`/v1/chat/completions`, SSE streaming) |
 | Layout | Cargo workspace; GPU backends behind cargo features |
@@ -300,10 +300,16 @@ Design points that span files:
   chunk's last layer and output head launch other kernels): with one, a prompt of several
   chunks recaptured it every chunk, 3.2 ms of CPU with the GPU idle on Qwen3-30B-A3B (+2-6%
   at 1024 and 2048 tokens on the 5090 for it). Stacked MoE experts run
-  the int8 matvec too (`matvec_q_id`); other weight types stay f32, except NVFP4, which has
-  int8 matvecs only (`mvq_nvfp4`, `_pair`: E2M1 codes to int8 by byte permutes, `fp4x8`), so
-  `Batch::has_int8` takes the chunk's tokens and says no to NVFP4 from `MMQ_MIN_TOKENS`
-  (decode 136 -> 229.5 tok/s on Qwen3-8B, llama.cpp 236.7). `dp4a` has no header
+  the int8 matvec too (`matvec_q_id`); other weight types stay f32, except NVFP4: int8 matvecs
+  (`mvq_nvfp4`, `_pair`: E2M1 codes to int8 by byte permutes, `fp4x8`; decode 136 -> 229.5
+  tok/s on Qwen3-8B, llama.cpp 236.7) and, where the lean kernels run, an int8 matmul
+  (`mmk_nvfp4_t*`, `MATMUL_MMK6`'s arithmetic: a multiply per 16 columns, the UE4M3 scales as
+  floats), so `Batch::has_int8` takes the chunk's tokens. `--fp4-acts` (`Model.fp4_acts`,
+  `Batch::set_fp4_acts`, off by default) runs NVFP4 chunks of 8+ tokens on FP4 tensor cores
+  instead (`quant_fp4`, `mmf_nvfp4`: a fourth compile, for compute_120a, so compute capability
+  12.0 only), over activations quantized to NVFP4 as llama.cpp does: pp512 1.8x the int8 kernel,
+  at about 75 times its KL divergence from f32 (0.04, top-1 agreement 90%; `docs/benchmarks.md`,
+  2026-11-22). Accuracy first, hence the default. `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 128 rows x 64 tokens

@@ -166,6 +166,11 @@ The fast CPU path quantizes activations to 8 bits. Against 32-bit float activati
 the next-token choice agrees 96-99.6% of the time and perplexity stays within 0.3%. An exact mode
 matches an independent NumPy forward pass (`scripts/ref_forward.py`) to within 4e-5 on the CPU.
 
+NVFP4 models (NVIDIA's ModelOpt checkpoints) keep 8-bit activations too, on GPUs as well: on an
+RTX 5090, Qwen3-8B-NVFP4 agrees with 32-bit activations on 99.2% of next tokens. `--fp4-acts`
+runs their prompts with 4-bit activations on Blackwell's FP4 tensor cores instead, as llama.cpp
+does by default: up to 1.8x faster over long prompts, but 90% agreement.
+
 ## Layout
 
 A Cargo workspace; dependencies flow downward only.
