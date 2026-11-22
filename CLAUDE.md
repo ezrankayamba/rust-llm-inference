@@ -130,7 +130,8 @@ Design points that span files:
   attention over a single 256-position chunk writes its result itself. Quantized matvecs take
   two rows a simdgroup (`MATVEC2`; four from 16384 rows, `MATVEC4`), read x once for them and
   build four weights per 32-bit word (`pair_*`, `two_*` in metal.metal); Q5_K, F16 and F32
-  still take a row and a chunk per lane. Kernels avoid arrays and
+  take a row a simdgroup, lanes over four values at a time (`MATVEC_FLOAT`; a 32-value chunk
+  a lane left 28 of 32 idle on a 128-column matrix). Kernels avoid arrays and
   vectors indexed by a loop: the compiler keeps them in memory. `Batch::start` submits a
   token's first layer while the rest is encoded.
 - **`RLI_METAL_PROF=1` times every Metal dispatch** alone in its own command buffer and prints
@@ -181,7 +182,10 @@ Design points that span files:
   holds a row's output in registers, at most 256 dims); 2.1x the decode kernel a row at a time.
   Over an f16 cache it splits each query into two halves, its rounding and the rest: absorbed
   queries are large, and one half moved V2-Lite's logits by 0.72 (0.009 split, 4% slower).
-  Decode keeps `attention_part`, split over positions. Only softmax routing without bias, groups or scale runs on the GPU in decode
+  Decode keeps `attention_part`, split over positions, and takes `Metal::mla_token`: each
+  head's `k_b` and `v_b` as one `matvec_id` over the heads (ids 0..n_head, the heads' stride
+  in their tensor), reading the heads' inputs and writing their outputs in place, ordered so
+  that a layer waits 6 times in attention where the general order waited 14 (+3.7%). Only softmax routing without bias, groups or scale runs on the GPU in decode
   (`gpu_routes`); V3's takes the CPU-routed path.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there

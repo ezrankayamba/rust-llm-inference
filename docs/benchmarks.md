@@ -36,6 +36,30 @@ top 5 identical, 473.5. Against llama.cpp (as above, 35 s rests, two rounds):
 | pp64 | | 289.6, 282.3 | 295.1, 296.0 | 0.97 |
 | pp512 | 227.3, 223.8 | 483.6, 467.0 | 528.9, 527.7 | 0.90 |
 
+**Decode: fewer waits and the heads' matvecs as one dispatch each.** In decode, each head's
+`k_b` and `v_b` (16 + 16 matvecs a layer) were a dispatch each and a layer's attention waited
+14 times (`Metal::mla_token` now: one `matvec_id` per matrix over the heads, reading and
+writing each head in place, and 6 waits; the ungated shared experts' fused gate and up beside
+the router, their down beside `moe_topk`): tg128 42.7 -> 44.6. Skipping the f32 `k_b` (wrong
+output, a timing experiment) gave 50.0, 2.4 ms a token for 113 MB, because the f32 and f16
+matvecs gave each lane a 32-value chunk of a row, 4 lanes of 32 busy on 128 columns.
+`MATVEC_FLOAT` deals four values at a time to the lanes (`bench --pp 0 --tg 128 --reps 3
+--gpu-layers 999`, before and after alternating, 30 s rests):
+
+| | before | after |
+|---|---:|---:|
+| V2-Lite | 44.6, 44.4 | 47.5, 47.5 |
+| Qwen3-30B-A3B (f32 router) | 39.6, 39.2 | 39.7, 38.9 |
+
+Qwen3-30B-A3B against the build before any of this (13264d4): 38.9, 39.5 there, 39.6, 39.2
+here. Precise logits 1.5e-5 per token, 3.8e-5 batched. Against llama.cpp (as above):
+
+| | rli | llama.cpp | ratio |
+|---|---:|---:|---:|
+| pp64 | 284.2, 284.7 | 294.1, 296.4 | 0.96 |
+| pp512 | 471.4, 479.1 | 513.9, 517.4 | 0.92 |
+| tg128 | 47.3, 47.6 | 52.0, 51.7 | 0.91 |
+
 ## 2026-11-22: DeepSeek V2-Lite on the CPU, first support
 
 DeepSeek-V2-Lite-Chat Q4_K_M (mradermacher's conversion of 2025-03, the older `attn_kv_b`

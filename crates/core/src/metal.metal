@@ -20,20 +20,6 @@ constant uint ROWS_PER_TG = 4;
 
 inline float h(device const uchar* p) { return float(*(device const half*)p); }
 
-inline float chunk_f32(device const uchar* r, uint c, device const float* x) {
-    device const float* w = (device const float*)r + c * 32;
-    float s = 0;
-    for (uint i = 0; i < 32; i++) s += w[i] * x[i];
-    return s;
-}
-
-inline float chunk_f16(device const uchar* r, uint c, device const float* x) {
-    device const half* w = (device const half*)r + c * 32;
-    float s = 0;
-    for (uint i = 0; i < 32; i++) s += float(w[i]) * x[i];
-    return s;
-}
-
 // A bf16 is the upper half of an f32.
 inline float4 bf16x4(ushort4 v) { return as_type<float4>(uint4(v) << 16); }
 
@@ -320,8 +306,28 @@ MATVEC_SWIGLU(matvec_swiglu_q4_0, two_q4_0, 32)
 MATVEC_SWIGLU(matvec_swiglu_q5_0, two_q5_0, 32)
 MATVEC_SWIGLU(matvec_swiglu_q8_0, two_q8_0, 32)
 
-MATVEC(matvec_f32, chunk_f32)
-MATVEC(matvec_f16, chunk_f16)
+// f32 and f16 rows: lane l takes values 4l.. of every 128, so a simdgroup's reads are adjacent
+// and every lane has work however few the columns (a 32-value chunk a lane left 28 of 32 idle
+// on DeepSeek's 128-column k_b, 2.4 ms of a 22 ms token).
+#define MATVEC_FLOAT(NAME, T)                                                                 \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant Params& p [[buffer(3)]],            \
+                 device const float* bias [[buffer(4)]],                                     \
+                 uint tg [[threadgroup_position_in_grid]],                                    \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = tg * ROWS_PER_TG + sg;                                                         \
+    if (row >= p.rows) return;                                                                \
+    device const packed_##T##4* r = (device const packed_##T##4*)(w + p.offset + ulong(row) * p.row_bytes); \
+    device const packed_float4* x4 = (device const packed_float4*)x;                          \
+    float acc = 0;                                                                            \
+    for (uint i = lane; i < p.cols / 4; i += 32) acc += dot(float4(r[i]), float4(x4[i]));     \
+    acc = simd_sum(acc);                                                                      \
+    if (lane == 0) y[row] = acc + mv_base(p.add, y, bias, row);                               \
+}
+
+MATVEC_FLOAT(matvec_f32, float)
+MATVEC_FLOAT(matvec_f16, half)
 MATVEC(matvec_bf16, chunk_bf16)
 MATVEC2(matvec_q4_0, two_q4_0, 32)
 MATVEC2(matvec_q5_0, two_q5_0, 32)
@@ -386,8 +392,28 @@ kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[bu
     }                                                                                         \
 }
 
-MATVEC_ID(matvec_id_f32, chunk_f32)
-MATVEC_ID(matvec_id_f16, chunk_f16)
+// MATVEC_FLOAT by expert id.
+#define MATVEC_ID_FLOAT(NAME, T)                                                              \
+kernel void NAME(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]],   \
+                 device float* y [[buffer(2)]], constant IdParams& p [[buffer(3)]],          \
+                 device const uint* ids [[buffer(4)]],                                        \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint lane [[thread_index_in_simdgroup]]) {                                   \
+    uint row = tg.x * ROWS_PER_TG + sg;                                                       \
+    if (row >= p.rows) return;                                                                \
+    uint slot = tg.y;                                                                         \
+    device const packed_##T##4* r = (device const packed_##T##4*)(                            \
+        w + p.offset + ulong(ids[slot]) * p.expert_stride + ulong(row) * p.row_bytes);        \
+    device const packed_float4* x4 = (device const packed_float4*)(x + slot * p.x_stride);    \
+    float acc = 0;                                                                            \
+    for (uint i = lane; i < p.cols / 4; i += 32) acc += dot(float4(r[i]), float4(x4[i]));     \
+    acc = simd_sum(acc);                                                                      \
+    if (lane == 0) y[slot * p.y_stride + row] = acc;                                          \
+}
+
+MATVEC_ID_FLOAT(matvec_id_f32, float)
+MATVEC_ID_FLOAT(matvec_id_f16, half)
 MATVEC2_ID(matvec_id_q4_0, two_q4_0, 32)
 MATVEC2_ID(matvec_id_q5_0, two_q5_0, 32)
 MATVEC2_ID(matvec_id_q8_0, two_q8_0, 32)

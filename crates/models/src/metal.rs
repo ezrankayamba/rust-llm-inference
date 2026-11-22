@@ -34,6 +34,9 @@ struct GpuLayer {
     /// DeepSeek's latent attention: the latent's norm, and the low-rank queries' norm.
     kv_norm: Option<GpuBuf>,
     q_a_norm: Option<GpuBuf>,
+    /// Byte distance between consecutive heads' `k_b` and `v_b`, when they are evenly spaced
+    /// slices of one tensor of a type with id kernels: a token's heads are then one dispatch.
+    head_strides: Option<[usize; 2]>,
     /// Byte distance between consecutive experts' gate, up and down matrices, when the experts
     /// are evenly spaced slices of stacked tensors (needed for routing on the GPU).
     expert_strides: Option<[usize; 3]>,
@@ -184,6 +187,8 @@ struct Metal {
     /// What attention runs over: the cache row for latent attention.
     head_dim: usize,
     mla: bool,
+    /// The ids 0..n_head, for [`Batch::matvec_id`] over a layer's heads.
+    head_ids: GpuBuf,
     /// KV cache stored as f16 and prompt matmuls on half tiles (chosen at attach: f32 when the
     /// model is in precise mode).
     kv_half: bool,
@@ -439,9 +444,26 @@ impl Metal {
         if let Some((gi, _)) = shared {
             mm(b, gi, At(&s.xb, 0), At(&s.shared_gate, 0), 1);
         }
+        // The ungated shared experts, fused, into `s.up` (which the fused experts don't use)
+        // beside the router, and their down into the stream beside `moe_topk`. Else after the
+        // experts.
+        let fused = |e: &Expert| Batch::has_matvec_swiglu(e.gate.ty) && e.gate.ty == e.up.ty;
+        let early = ungated.filter(|e| fused(e) && fused(&experts[0]));
+        if let Some(e) = early {
+            b.free = true;
+            let (g, u) = (&e.gate, &e.up);
+            let (xb, up) = (At(&s.xb, 0), At(&s.up, 0));
+            b.matvec_swiglu(g.ty, g.rows, g.cols, g.offset, u.offset, xb, up);
+            b.free = false;
+        }
         let (ids, w) = (At(&s.route, 0), At(&s.route, s.route.len() / 2));
         let (rx, sg) = (At(&s.router, 0), At(&s.shared_gate, 0));
         b.moe_topk(rx, sg, ids, w, ne, k, c.norm_topk, shared.is_some());
+        if let Some(e) = early {
+            b.free = true;
+            mm_add(b, &e.down, At(&s.up, 0), x, 1);
+            b.free = false;
+        }
         let e = &experts[0];
         let ff = e.gate.rows;
         let (xb, gate, up, tmp) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.up, 0), At(&s.tmp, 0));
@@ -495,11 +517,14 @@ impl Metal {
         if let Some((_, e)) = shared {
             ffn(b, s, e, xb, At(&s.tmp, k * n_embd), 1);
         }
-        if let Some(e) = ungated {
-            assert!(shared.is_none(), "one kind of shared expert");
-            let out = At(&s.tmp, k * n_embd);
-            ffn(b, s, e, xb, out, 1);
-            b.add(x, out, n_embd);
+        match (early, ungated) {
+            (Some(_), _) | (None, None) => {}
+            (None, Some(e)) => {
+                assert!(shared.is_none(), "one kind of shared expert");
+                let out = At(&s.tmp, k * n_embd);
+                ffn(b, s, e, xb, out, 1);
+                b.add(x, out, n_embd);
+            }
         }
         let n_shared = usize::from(shared.is_some());
         if !fused {
@@ -611,6 +636,90 @@ impl Metal {
         b
     }
 
+    /// [`Metal::mla`] where one row takes queries (the last of `n`, at `pos + n - 1`) and each
+    /// head's `k_b` and `v_b` is one id-indexed matvec, arranged for few waits: a dispatch that
+    /// waits for the one before costs 5-9 us, and the general order had 14 a layer, this 6.
+    /// `k_b` reads each head's query in place and writes into its row of `s.qr`, `v_b` reads
+    /// each head's output in place and writes `s.att`, so no head is copied out and back.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_token(
+        &self,
+        model: &Model,
+        b: &mut Batch<'_>,
+        s: &Scratch,
+        kv: &Kv,
+        l: usize,
+        g: &GpuLayer,
+        layer: &Layer,
+        a: &MlaLayer,
+        n: usize,
+        pos: usize,
+        [k_stride, v_stride]: [usize; 2],
+    ) {
+        let c = &model.cfg;
+        let mla = c.mla.expect("an MLA layer has an MLA config");
+        let (nh, lat, rd, nope, vh) = (c.n_head, mla.kv_lora, mla.rope, mla.nope, mla.v_head);
+        let (row, hd) = (lat + rd, nope + rd);
+        let rope = |n_heads, n_tokens, pos| RopeArgs {
+            n_tokens,
+            n_heads,
+            head_dim: row,
+            rope_dim: rd,
+            pos,
+            theta: c.rope_theta,
+            neox: false,
+            freq_factors: self.rope_freqs.as_ref(),
+        };
+        let ids = At(&self.head_ids, 0);
+        // `kv_a` and the queries read the same input.
+        mm(b, &layer.wk, At(&s.xb, 0), At(&s.k, 0), n);
+        b.free = true;
+        mm(b, &layer.wq, At(&s.xb, (n - 1) * c.n_embd), At(&s.q, 0), 1);
+        b.free = false;
+        // The cache rows' rotated dims and normed latent, the query's rotated dims and its
+        // `k_b` products: four dispatches into different places.
+        let in_row = |off| Heads { row, head: 0, off };
+        b.copy_heads(At(&s.k, 0), in_row(lat), At(&s.v, 0), in_row(0), n, 1, rd);
+        b.free = true;
+        let norm = g.kv_norm.as_ref().expect("an MLA layer has a latent norm");
+        b.rmsnorm_strided(At(&s.k, 0), At(&s.v, rd), norm, n, lat, row, c.rms_eps);
+        let q_at = Heads {
+            row: nh * hd,
+            head: hd,
+            off: nope,
+        };
+        let qr_at = Heads {
+            row: nh * row,
+            head: row,
+            off: 0,
+        };
+        b.copy_heads(At(&s.q, 0), q_at, At(&s.qr, 0), qr_at, 1, nh, rd);
+        let (w, x, y) = (&a.k_b[0], At(&s.q, 0), At(&s.qr, rd));
+        b.matvec_id(
+            w.ty, w.rows, w.cols, w.offset, k_stride, nh, ids, x, hd, y, row, nh,
+        );
+        b.free = false;
+        // Rotating the query touches only its first `rd` dims of each head.
+        b.rope(At(&s.v, 0), &rope(1, n, pos));
+        b.free = true;
+        b.rope(At(&s.qr, 0), &rope(nh, 1, pos + n - 1));
+        b.free = false;
+        b.store_kv(At(&s.v, 0), &kv.k[l], pos * row, n * row);
+        let p = AttnParams {
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: row as u32,
+            n_pos: (pos + n) as u32,
+            kv_dim: row as u32,
+            scale: c.kq_scale(),
+        };
+        b.attention(At(&s.qr, 0), &kv.k[l], &kv.k[l], At(&s.ao, 0), &kv.part, &p);
+        let (w, x, y) = (&a.v_b[0], At(&s.ao, rd), At(&s.att, 0));
+        b.matvec_id(
+            w.ty, w.rows, w.cols, w.offset, v_stride, nh, ids, x, row, y, vh, nh,
+        );
+    }
+
     /// Queues DeepSeek's latent attention for one layer: the cache rows of all `n` tokens (the
     /// rotated key dims, then the normed latent), then, for the rows from `lo`, the queries
     /// absorbed into ones against those rows, attention whose values are the rows' latent part,
@@ -644,6 +753,9 @@ impl Metal {
             neox: false,
             freq_factors: self.rope_freqs.as_ref(),
         };
+        if let (1, Some(strides), None) = (m, g.head_strides, &a.q_a) {
+            return self.mla_token(model, b, s, kv, l, g, layer, a, n, pos, strides);
+        }
         // `kv_a` gives the latent, then the key dims that are rotated.
         mm(b, &layer.wk, At(&s.xb, 0), At(&s.k, 0), n);
         let in_row = |off| Heads { row, head: 0, off };
@@ -696,9 +808,21 @@ impl Metal {
         b.free = true;
         b.copy_heads(At(&s.q, 0), q_at(nope), At(&s.qr, 0), qr_at(0), m, nh, rd);
         b.free = false;
-        for (h, k_b) in a.k_b.iter().enumerate() {
-            mm(b, k_b, At(&s.hx, h * m * nope), At(&s.hy, h * m * lat), m);
-            b.free = true; // heads write their own rows
+        let ids = At(&self.head_ids, 0);
+        match g.head_strides {
+            Some([stride, _]) if m == 1 => {
+                let w = &a.k_b[0];
+                let (x, y) = (At(&s.hx, 0), At(&s.hy, 0));
+                b.matvec_id(
+                    w.ty, w.rows, w.cols, w.offset, stride, nh, ids, x, nope, y, lat, nh,
+                );
+            }
+            _ => {
+                for (h, k_b) in a.k_b.iter().enumerate() {
+                    mm(b, k_b, At(&s.hx, h * m * nope), At(&s.hy, h * m * lat), m);
+                    b.free = true; // heads write their own rows
+                }
+            }
         }
         b.free = false;
         b.copy_heads(
@@ -751,9 +875,20 @@ impl Metal {
             nh,
             lat,
         );
-        for (h, v_b) in a.v_b.iter().enumerate() {
-            mm(b, v_b, At(&s.hx, h * m * lat), At(&s.hy, h * m * vh), m);
-            b.free = true;
+        match g.head_strides {
+            Some([_, stride]) if m == 1 => {
+                let w = &a.v_b[0];
+                let (x, y) = (At(&s.hx, 0), At(&s.hy, 0));
+                b.matvec_id(
+                    w.ty, w.rows, w.cols, w.offset, stride, nh, ids, x, lat, y, vh, nh,
+                );
+            }
+            _ => {
+                for (h, v_b) in a.v_b.iter().enumerate() {
+                    mm(b, v_b, At(&s.hx, h * m * lat), At(&s.hy, h * m * vh), m);
+                    b.free = true;
+                }
+            }
         }
         b.free = false;
         let att_at = Heads {
@@ -890,6 +1025,23 @@ impl Accelerator for Metal {
         }
         done
     }
+}
+
+/// The byte distance between consecutive matrices of `heads`, when it is the same throughout
+/// and their shapes and type match.
+fn uniform_stride(heads: &[Weight]) -> Option<usize> {
+    let first = heads.first()?;
+    let stride = heads
+        .get(1)
+        .map_or(0, |w| w.offset.wrapping_sub(first.offset));
+    heads
+        .iter()
+        .enumerate()
+        .all(|(h, w)| {
+            (w.ty, w.rows, w.cols) == (first.ty, first.rows, first.cols)
+                && w.offset == first.offset + h * stride
+        })
+        .then_some(stride)
 }
 
 /// Whether `moe_topk` routes like `route` for this model: a softmax's top k, no bias, groups
@@ -1058,6 +1210,10 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
                 .as_ref()
                 .and_then(|a| a.q_a.as_ref())
                 .map(|(_, w)| gpu.upload(w)),
+            head_strides: l.mla.as_ref().and_then(|a| {
+                let ok = |w: &[Weight]| uniform_stride(w).filter(|_| gpu.has_matvec_id(w[0].ty));
+                Some([ok(&a.k_b)?, ok(&a.v_b)?])
+            }),
             // Experts of a type without id kernels (NVFP4, BF16) take the CPU-routed path.
             expert_strides: match &l.ffn {
                 Ffn::Moe { experts, .. }
@@ -1087,6 +1243,12 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
         n_head: c.n_head,
         head_dim: c.mla.map_or(c.head_dim, |m| m.kv_lora + m.rope),
         mla: c.mla.is_some(),
+        head_ids: {
+            let ids = gpu.alloc(c.n_head);
+            // SAFETY: freshly allocated, not yet used by the GPU.
+            unsafe { ids.write_u32(0, &(0..c.n_head as u32).collect::<Vec<_>>()) };
+            ids
+        },
         scratch: Mutex::new(scratch),
         gpu,
     };
