@@ -1545,6 +1545,123 @@ kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffe
 ATTENTION_BATCH(attention_batch_f32, float, simdgroup_float8x8)
 ATTENTION_BATCH(attention_batch_f16, half, simdgroup_half8x8)
 
+// DeepSeek's latent attention over a chunk of queries: one cache row of MLA_ROW values per
+// position (MLA_ROPE rotated key dims, then the latent) is the key of every head, and its
+// latent part the value. A threadgroup takes 8 heads of token tg.y (heads 8 * tg.x..), so the
+// 8 query rows share one causal limit and each key is read once for all of them. Its four
+// simdgroups each score 8 of a block's 32 keys (all MLA_ROW dims) into `ss`; each then takes
+// the same online softmax over the block and multiplies P into its own quarter of the
+// MLA_LAT value dims. Loop bounds are compile-time constants (see attention_batch_staged).
+// Over an f16 cache (SPLIT) each query is the sum of two halves, its rounding and what that
+// leaves, both multiplied: an absorbed query is large, and one half alone moved V2-Lite's
+// logits by 0.72 against 0.007 with f32 queries.
+constant uint MLA_ROPE = 64;
+constant uint MLA_LAT = 512;
+constant uint MLA_ROW = MLA_ROPE + MLA_LAT;
+constant uint MLA_SG_DIMS = MLA_LAT / 4;
+
+template <typename T, typename M, bool SPLIT>
+inline void attention_mla_impl(device const float* q, device const T* kc, device float* out,
+                               constant BatchAttnParams& p, threadgroup float* tm,
+                               threadgroup float* ss, threadgroup T* sp, threadgroup float* sd,
+                               uint2 tg, uint lane, uint sg, uint tid) {
+    uint h0 = tg.x * 8, t = tg.y;
+    uint last = p.pos + t;  // the last position this token sees
+    uint n_pos = last + 1;
+    ulong q_row = ulong(p.n_head) * MLA_ROW;
+    threadgroup T* sq = (threadgroup T*)tm;
+    threadgroup T* sl = sq + 8 * MLA_ROW;  // the rest of each split query
+    for (uint e = tid; e < 8 * MLA_ROW; e += 128) {
+        float v = q[t * q_row + (h0 + e / MLA_ROW) * MLA_ROW + e % MLA_ROW] * p.scale;
+        sq[e] = T(v);
+        if (SPLIT) sl[e] = T(v - float(T(v)));
+    }
+    if (tid < 64) sd[tid] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 o[MLA_SG_DIMS / 8];
+    for (uint d = 0; d < MLA_SG_DIMS / 8; d++) o[d] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    float m[8], l[8];
+    for (uint r = 0; r < 8; r++) {
+        m[r] = -INFINITY;
+        l[r] = 0;
+    }
+    for (uint base = 0; base < n_pos; base += 32) {
+        uint blocks = min(4u, (n_pos - base + 7) / 8);
+        if (sg < blocks) {
+            simdgroup_float8x8 sc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            device const T* kp = kc + ulong(base + 8 * sg) * MLA_ROW;
+            for (uint d = 0; d < MLA_ROW / 8; d++) {
+                M mq, mk;
+                simdgroup_load(mq, sq + 8 * d, MLA_ROW);
+                simdgroup_load(mk, kp + 8 * d, MLA_ROW, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sc, mq, mk, sc);
+                if (SPLIT) {
+                    simdgroup_load(mq, sl + 8 * d, MLA_ROW);
+                    simdgroup_multiply_accumulate(sc, mq, mk, sc);
+                }
+            }
+            simdgroup_store(sc, ss + 8 * sg, 32);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Every simdgroup keeps the same running max and sum; the first writes P and the
+        // rescaling for all.
+        uint j = base + lane;
+        bool seen = j <= last;
+        float corr[8];
+        for (uint r = 0; r < 8; r++) {
+            float sv = seen ? ss[r * 32 + lane] : -INFINITY;
+            float m_new = max(m[r], simd_max(sv));
+            corr[r] = exp(m[r] - m_new);
+            float pj = seen ? exp(sv - m_new) : 0.0f;
+            l[r] = l[r] * corr[r] + simd_sum(pj);
+            m[r] = m_new;
+            if (sg == 0) sp[r * 32 + lane] = T(pj);
+        }
+        if (sg == 0 && lane < 8) sd[lane * 9] = corr[lane];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 md;
+        simdgroup_load(md, sd, 8);
+        for (uint d = 0; d < MLA_SG_DIMS / 8; d++) simdgroup_multiply(o[d], md, o[d]);
+        for (uint pb = 0; pb < blocks; pb++) {
+            M mp;
+            simdgroup_load(mp, sp + 8 * pb, 32);
+            device const T* vp = kc + ulong(base + 8 * pb) * MLA_ROW + MLA_ROPE + sg * MLA_SG_DIMS;
+            for (uint d = 0; d < MLA_SG_DIMS / 8; d++) {
+                M mv;
+                simdgroup_load(mv, vp + 8 * d, MLA_ROW);
+                simdgroup_multiply_accumulate(o[d], mp, mv, o[d]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The queries are no longer needed: their memory takes the outputs.
+    threadgroup float* so = tm;
+    for (uint d = 0; d < MLA_SG_DIMS / 8; d++)
+        simdgroup_store(o[d], so + sg * MLA_SG_DIMS + 8 * d, MLA_LAT);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < 8 * MLA_LAT; e += 128) {
+        uint r = e / MLA_LAT;
+        out[t * q_row + (h0 + r) * MLA_ROW + MLA_ROPE + e % MLA_LAT] = so[e] / l[r];
+    }
+}
+
+#define ATTENTION_MLA(NAME, T, M, SPLIT)                                                      \
+kernel void NAME(device const float* q [[buffer(0)]], device const T* kc [[buffer(1)]],      \
+                 device float* out [[buffer(3)]], constant BatchAttnParams& p [[buffer(4)]],  \
+                 uint2 tg [[threadgroup_position_in_grid]],                                   \
+                 uint lane [[thread_index_in_simdgroup]],                                     \
+                 uint sg [[simdgroup_index_in_threadgroup]],                                  \
+                 uint tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup float tm[8 * MLA_ROW]; /* the queries (as T, split), then the outputs */      \
+    threadgroup float ss[8 * 32];                                                             \
+    threadgroup T sp[8 * 32];                                                                 \
+    threadgroup float sd[64];                                                                 \
+    attention_mla_impl<T, M, SPLIT>(q, kc, out, p, tm, ss, sp, sd, tg, lane, sg, tid);        \
+}
+
+ATTENTION_MLA(attention_mla_f32, float, simdgroup_float8x8, false)
+ATTENTION_MLA(attention_mla_f16, half, simdgroup_half8x8, true)
+
 // attention_batch_f16 for the usual head sizes, with the head size a compile-time constant and
 // the cache staged in threadgroup memory. With run-time loop bounds the compiler kept the
 // matrices in memory, which cost more than the products themselves (a 2048-token prompt on

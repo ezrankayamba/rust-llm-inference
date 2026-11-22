@@ -113,7 +113,9 @@ const FEW_SIMDGROUPS: usize = 8;
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
 const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
-const OTHER_KERNELS: [&str; 44] = [
+const OTHER_KERNELS: [&str; 46] = [
+    "attention_mla_f16",
+    "attention_mla_f32",
     "copy_heads",
     "matvec4_q4_k",
     "matvec4_q6_k",
@@ -529,6 +531,10 @@ pub struct AttnParams {
 
 /// Cached positions per decode-attention threadgroup (`ATTN_CHUNK` in metal.metal).
 pub const ATTN_CHUNK: usize = 256;
+/// The rotated key dims and latent of the cache rows [`Batch::attention_mla`] takes (`MLA_ROPE`
+/// and `MLA_LAT` in metal.metal): DeepSeek V2's and V3's.
+const MLA_ROPE: usize = 64;
+const MLA_LAT: usize = 512;
 const ATTN_THREADS: usize = 128;
 
 /// f32s of scratch [`Batch::attention`] needs for `n_pos` positions.
@@ -1919,6 +1925,46 @@ impl Batch<'_> {
             "attention_batch_f32"
         };
         self.dispatch2(self.gpu.other(kernel), (p.n_head as usize, tiles), 32);
+    }
+
+    /// Whether [`Batch::attention_mla`] takes latent attention with these dims.
+    pub fn has_attention_mla(rope: usize, latent: usize, n_head: usize) -> bool {
+        (rope, latent) == (MLA_ROPE, MLA_LAT) && n_head.is_multiple_of(8)
+    }
+
+    /// DeepSeek's latent attention for `n` query rows at positions `p.pos..p.pos + n`: `q` holds
+    /// a cache row's worth per head (`p.head_dim`, the rotated dims then the latent), `k` is the
+    /// cache, both keys and values (its latent part). Each head's output goes past its rotated
+    /// dims in `out`, laid out as `q`; the rest of `out` is left alone.
+    pub fn attention_mla(
+        &mut self,
+        q: At<'_>,
+        k: &KvBuf,
+        out: At<'_>,
+        n: usize,
+        p: &BatchAttnParams,
+    ) {
+        let (nh, row) = (p.n_head as usize, p.head_dim as usize);
+        assert!(Self::has_attention_mla(MLA_ROPE, row - MLA_ROPE, nh) && row == MLA_ROPE + MLA_LAT);
+        assert!(p.n_kv == 1 && p.kv_dim == p.head_dim);
+        assert!(q.1 + n * nh * row <= q.0.len && out.1 + n * nh * row <= out.0.len);
+        let rows = (p.pos as usize + n).next_multiple_of(8);
+        assert!(rows * row <= k.len, "the cache holds a multiple of 8 rows");
+        self.bind(0, q);
+        self.bind_kv(1, k);
+        self.bind(3, out);
+        #[repr(C)]
+        struct Params {
+            p: BatchAttnParams,
+            n: u32,
+        }
+        self.params(4, &Params { p: *p, n: n as u32 });
+        let kernel = if k.half {
+            "attention_mla_f16"
+        } else {
+            "attention_mla_f32"
+        };
+        self.dispatch2(self.gpu.other(kernel), (nh / 8, n), 128);
     }
 
     /// Submits what is recorded so far without waiting, and goes on recording: the GPU starts

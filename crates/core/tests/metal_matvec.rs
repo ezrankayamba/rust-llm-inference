@@ -625,3 +625,80 @@ fn metal_nvfp4_kernels_match_cpu_with_their_tensor_scale() {
         }
     }
 }
+
+/// DeepSeek's latent attention kernel against a plain softmax over the cache rows, with queries
+/// past the first chunk of positions and a row count that isn't a multiple of 8, over f32 and
+/// f16 caches.
+#[test]
+fn metal_attention_mla_matches_cpu() {
+    use rli_core::metal::{At, BatchAttnParams};
+    const ROPE: usize = 64;
+    const LAT: usize = 512;
+    const ROW: usize = ROPE + LAT;
+    let (nh, pos, n): (usize, usize, usize) = (16, 300, 13);
+    let mut page = Pages::new(PAGE);
+    // SAFETY: page-aligned memory that outlives the device; no weights are read.
+    let gpu = unsafe { Gpu::new(page.bytes(), &[]) }.expect("Metal device");
+    let wave = |i: usize, k: usize| ((i * k) % 997) as f32 / 498.5 - 1.0;
+    let rows = (pos + n).next_multiple_of(8);
+    let cache: Vec<f32> = (0..rows * ROW).map(|i| wave(i, 31) * 0.5).collect();
+    let q: Vec<f32> = (0..n * nh * ROW).map(|i| wave(i, 17)).collect();
+    let scale = 1.0 / (192f32).sqrt();
+    for half in [false, true] {
+        // f16 rounds the cache; the reference sees what the kernel sees.
+        let seen: Vec<f32> = if half {
+            cache
+                .iter()
+                .map(|&v| rli_core::half::f16_to_f32(f32_to_f16(v)))
+                .collect()
+        } else {
+            cache.clone()
+        };
+        let kv = gpu.alloc_kv(rows * ROW, half);
+        let (qb, src, out) = (gpu.upload(&q), gpu.upload(&cache), gpu.alloc(n * nh * ROW));
+        let mut b = gpu.batch();
+        b.store_kv(At(&src, 0), &kv, 0, rows * ROW);
+        let p = BatchAttnParams {
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: ROW as u32,
+            pos: pos as u32,
+            kv_dim: ROW as u32,
+            scale,
+        };
+        b.attention_mla(At(&qb, 0), &kv, At(&out, 0), n, &p);
+        b.finish();
+        // SAFETY: the batch has completed.
+        let got = unsafe { out.as_slice() };
+        let mut err = 0f32;
+        for t in 0..n {
+            for h in 0..nh {
+                let qh = &q[(t * nh + h) * ROW..][..ROW];
+                let mut s: Vec<f32> = (0..=pos + t)
+                    .map(|j| {
+                        scale
+                            * qh.iter()
+                                .zip(&seen[j * ROW..])
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>()
+                    })
+                    .collect();
+                let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                s.iter_mut().for_each(|v| *v = (*v - mx).exp());
+                let sum: f32 = s.iter().sum();
+                for d in 0..LAT {
+                    let want: f32 = s
+                        .iter()
+                        .enumerate()
+                        .map(|(j, w)| w * seen[j * ROW + ROPE + d])
+                        .sum::<f32>()
+                        / sum;
+                    err = err.max((got[(t * nh + h) * ROW + ROPE + d] - want).abs());
+                }
+            }
+        }
+        // f16 queries and probabilities on the f16 path.
+        let tol = if half { 2e-3 } else { 1e-5 };
+        assert!(err < tol, "half {half}: max |diff| = {err}");
+    }
+}

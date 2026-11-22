@@ -175,9 +175,13 @@ Design points that span files:
   On Metal (`Metal::mla`) the cache row is the key cache and the value cache at once (the
   values are its dims past the rotated ones; no V cache is allocated), `copy_heads` moves each
   head's part of a row out for its own `k_b` / `v_b` matmul and back, and `Gpu::add_owned`
-  copies `Model.owned` into a buffer at those offsets. Attention runs the decode kernel a query
-  row at a time, also in prompts: the batched kernels take heads of at most 256 dims and the
-  row is 576. Only softmax routing without bias, groups or scale runs on the GPU in decode
+  copies `Model.owned` into a buffer at those offsets. Prompts take `attention_mla`: 8 heads of
+  one token a threadgroup (one causal limit, each key read once for the 8), four simdgroups
+  scoring 8 keys each and taking a quarter of the 512 value dims (the general batched kernel
+  holds a row's output in registers, at most 256 dims); 2.1x the decode kernel a row at a time.
+  Over an f16 cache it splits each query into two halves, its rounding and the rest: absorbed
+  queries are large, and one half moved V2-Lite's logits by 0.72 (0.009 split, 4% slower).
+  Decode keeps `attention_part`, split over positions. Only softmax routing without bias, groups or scale runs on the GPU in decode
   (`gpu_routes`); V3's takes the CPU-routed path.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there

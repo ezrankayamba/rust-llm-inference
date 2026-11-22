@@ -22,6 +22,20 @@ on the 13-token prompt of the CPU section against `ref_forward.py`: `--precise` 
 Attention runs the decode kernel one query row at a time (its head is the 576-wide cache row),
 and each head's `k_b` and `v_b` is a matmul of its own; prompts are where that costs.
 
+**Prompt attention on the matrix units (`attention_mla`).** `RLI_METAL_PROF=1
+RLI_METAL_PROF_REPEAT=4` on pp512 put 62% of the prompt in `attention_part_f16` (26626
+dispatches of 125 us: a query row each, every one reading the cache rows again), 22% in the Q4_K
+tiles. The new kernel takes 8 heads of a token per threadgroup, so a key is read once for 8
+query rows, and splits the 512 value dims over four simdgroups. Its f32 path is 7.8e-8 from a
+CPU softmax (`metal_attention_mla_matches_cpu`). Half queries alone: pp512 492.9 tok/s but
+logits 0.72 from the reference (top 4 and 5 swapped); each query split into two halves: 0.0088,
+top 5 identical, 473.5. Against llama.cpp (as above, 35 s rests, two rounds):
+
+| | before | after | llama.cpp | ratio |
+|---|---:|---:|---:|---:|
+| pp64 | | 289.6, 282.3 | 295.1, 296.0 | 0.97 |
+| pp512 | 227.3, 223.8 | 483.6, 467.0 | 528.9, 527.7 | 0.90 |
+
 ## 2026-11-22: DeepSeek V2-Lite on the CPU, first support
 
 DeepSeek-V2-Lite-Chat Q4_K_M (mradermacher's conversion of 2025-03, the older `attn_kv_b`

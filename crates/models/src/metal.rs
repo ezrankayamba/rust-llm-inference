@@ -712,10 +712,21 @@ impl Metal {
         );
         b.rope(At(&s.qr, 0), &rope(nh, m, pos + lo));
 
-        // A query row at a time, over the cache rows up to its own: the batched kernels take
-        // heads of at most 256 dims. Rows within one chunk of positions write their results
-        // themselves, so only those past it (which share `kv.part`) wait for the one before.
-        for t in 0..m {
+        // Several rows: 8 heads of a token a threadgroup. One row, or dims that kernel lacks:
+        // the decode kernel a row at a time, whose rows within one chunk of positions write
+        // their results themselves, so only those past it (sharing `kv.part`) wait.
+        if m > 1 && Batch::has_attention_mla(rd, lat, nh) {
+            let p = BatchAttnParams {
+                n_head: nh as u32,
+                n_kv: 1,
+                head_dim: row as u32,
+                pos: (pos + lo) as u32,
+                kv_dim: row as u32,
+                scale: c.kq_scale(),
+            };
+            b.attention_mla(At(&s.qr, 0), &kv.k[l], At(&s.ao, 0), m, &p);
+        }
+        for t in (0..m).filter(|_| m == 1 || !Batch::has_attention_mla(rd, lat, nh)) {
             let n_pos = pos + lo + t + 1;
             let p = AttnParams {
                 n_head: nh as u32,
