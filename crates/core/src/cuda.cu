@@ -3131,21 +3131,6 @@ extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulon
     }
 }
 
-// RMSNorm of the first n values of each row, rows in_stride apart in x and out_stride apart in
-// out: DeepSeek's latent, inside a row with the rotated key dims.
-extern "C" __global__ void rmsnorm_strided(const float* x, ulong x_off, uint in_stride, float* out,
-                                           ulong out_off, uint out_stride, const float* w, uint n,
-                                           float eps) {
-    __shared__ float red[32];
-    const float* xr = x + x_off + (ulong)blockIdx.x * in_stride;
-    float* o = out + out_off + (ulong)blockIdx.x * out_stride;
-    float s = 0;
-    for (uint i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
-    s = block_sum(s, red);
-    float scale = rsqrtf(s / (float)n + eps);
-    for (uint i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * scale * w[i];
-}
-
 // Moves w values per (token, head) between layouts: dst[t * out_row + h * out_head + out_off + j]
 // = src[t * in_row + h * in_head + in_off + j], for m tokens of nh heads.
 extern "C" __global__ void copy_heads(const float* src, ulong src_off, float* dst, ulong dst_off,
@@ -3308,6 +3293,49 @@ extern "C" __global__ void attention_mla(const float* q, const float* kc, float*
         float inv = sc[pr + r];
         #pragma unroll
         for (uint i = 0; i < 8; i++) od[i] = o[r][i] * inv;
+    }
+}
+
+// DeepSeek's cache rows and rotated query dims, one launch where copying, norming and rotating
+// them took five (a decoded token's launches are most of its time). Blocks 0..n_kv each make
+// cache row b from kv_a's row b (lat latent values, then rd key dims): the rotated key dims at
+// position pos_kv + b, then the normed latent. Blocks from n_kv take a (token, head) pair p of
+// the queries (q_hd values a head, the rotated ones last) and write its rotated dims at the
+// start of its row of qr (lat + rd values a head), at position pos_q + p / n_head. The
+// rotation is `rope`'s, interleaved pairs.
+extern "C" __global__ void mla_rows(const float* kva, ulong kva_off, float* cache, ulong cache_off,
+                                    const float* wn, uint n_kv, uint pos_kv, const float* q,
+                                    ulong q_off, float* qr, ulong qr_off, uint q_hd, uint n_head,
+                                    uint pos_q, uint lat, uint rd, const float* ff, uint has_ff,
+                                    float theta, float eps) {
+    __shared__ float red[32];
+    uint b = blockIdx.x, tid = threadIdx.x, row = lat + rd;
+    const float* src;
+    float* dst;
+    uint pos;
+    if (b < n_kv) {
+        const float* in = kva + kva_off + (ulong)b * row;
+        float* out = cache + cache_off + (ulong)b * row;
+        float s = 0;
+        for (uint i = tid; i < lat; i += blockDim.x) s += in[i] * in[i];
+        s = block_sum(s, red);
+        float sc = rsqrtf(s / (float)lat + eps);
+        for (uint i = tid; i < lat; i += blockDim.x) out[rd + i] = in[i] * sc * wn[i];
+        src = in + lat, dst = out, pos = pos_kv + b;
+    } else {
+        uint p = b - n_kv;
+        src = q + q_off + (ulong)p * q_hd + (q_hd - rd);
+        dst = qr + qr_off + (ulong)p * row;
+        pos = pos_q + p / n_head;
+    }
+    if (tid < rd / 2) {
+        float freq = powf(theta, -2.0f * (float)tid / (float)rd);
+        if (has_ff) freq /= ff[tid];
+        float s, c;
+        sincosf((float)pos * freq, &s, &c);
+        float x0 = src[2 * tid], x1 = src[2 * tid + 1];
+        dst[2 * tid] = x0 * c - x1 * s;
+        dst[2 * tid + 1] = x0 * s + x1 * c;
     }
 }
 

@@ -3,6 +3,15 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek cache rows and query rotation in one launch on CUDA (RTX 5090)
+
+`mla_rows` writes the cache rows (rotated key dims, normed latent) and the queries' rotated
+dims in one launch where copies, a strided norm and two ropes took five, and the attention
+norm quantizes the input `kv_a` and the queries share. V2-Lite Q4_K_M: tg128 347.2 -> 370.0,
+369.5 tok/s (0.95x llama.cpp's 390); pp64 4693 -> 4778, pp512 14079 -> 14187. Logits:
+`--precise` 1.2e-5 batched, 8.8e-6 per token (13 tokens), 1.4e-5 (40 tokens), top 5
+identical; default KL 0.0002 / 0.0001 / 0.0043 (CPU int8 on 40 tokens: 0.0063).
+
 ## 2026-11-22: DeepSeek heads in one launch on CUDA (RTX 5090, Windows)
 
 `head_matmuls` ran a launch per head (and for int8 heads a quantize and a zeroing per head):

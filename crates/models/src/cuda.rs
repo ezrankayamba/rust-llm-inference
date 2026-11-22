@@ -740,68 +740,60 @@ impl Cuda {
         let mla = c.mla.expect("an MLA layer has an MLA config");
         let (nh, lat, rd, nope, vh) = (c.n_head, mla.kv_lora, mla.rope, mla.nope, mla.v_head);
         let (row, hd, m, eps) = (lat + rd, nope + rd, n - lo, c.rms_eps);
-        let rope = |n_tok, n_heads, pos| RopeArgs {
-            n_tok,
-            n_heads,
-            n_heads2: 0,
-            head_dim: row,
-            rope_dim: rd,
-            pos,
-            theta: c.rope_theta,
-            neox: false,
-            freq_factors: self.rope_freqs.as_ref(),
-            pos_dev: None,
-            store: None,
-        };
         let xb = At(&s.xb, 0);
-        b.rmsnorm(At(&s.x, 0), xb, &g.attn_norm, n, c.n_embd, eps, None, None);
-        // `kv_a` gives the latent, then the key dims that are rotated.
-        mm_each(b, s, &[&layer.wk], xb, &[At(&s.kva, 0)], n, int8, Fed::No);
         let (cache, at) = (&kv.k[l], pos * row);
-        let in_row = |off| Heads { row, head: 0, off };
-        b.copy_heads(
-            At(&s.kva, 0),
-            in_row(lat),
-            At(cache, at),
-            in_row(0),
-            n,
-            1,
-            rd,
-        );
         let norm = g.kv_norm.as_ref().expect("an MLA layer has a latent norm");
-        b.rmsnorm_strided(
-            At(&s.kva, 0),
-            row,
-            At(cache, at + rd),
-            row,
-            norm,
+        let rope = (self.rope_freqs.as_ref(), c.rope_theta);
+        // `kv_a` gives the latent, then the key dims that are rotated. Where every row takes
+        // queries, the first query matrix reads the same input, which the norm quantizes once.
+        let first_q = match &a.q_a {
+            Some((q_a, _)) => (q_a, At(&s.qa, 0)),
+            None => (&layer.wq, At(&s.q, 0)),
+        };
+        let joint = lo == 0;
+        let ws = [&layer.wk, first_q.0];
+        let ws = &ws[..1 + usize::from(joint)];
+        let f = fed(b, ws, n, int8);
+        b.rmsnorm(
+            At(&s.x, 0),
+            xb,
+            &g.attn_norm,
             n,
-            lat,
+            c.n_embd,
             eps,
+            f.q(s),
+            f.half(s),
         );
-        let r = rope(n, 1, pos);
-        b.rope(At(cache, at), At(cache, at), &r);
-        if m == 0 {
-            return;
-        }
-
-        let xq = At(&s.xb, lo * c.n_embd);
-        match (&a.q_a, &g.q_a_norm) {
-            (Some((q_a, _)), Some(w)) => {
-                mm_each(b, s, &[q_a], xq, &[At(&s.qa, 0)], m, int8, Fed::No);
-                b.rmsnorm(At(&s.qa, 0), At(&s.qa, 0), w, m, q_a.rows, eps, None, None);
-                mm_each(
-                    b,
-                    s,
-                    &[&layer.wq],
-                    At(&s.qa, 0),
-                    &[At(&s.q, 0)],
-                    m,
-                    int8,
-                    Fed::No,
-                );
+        mm_each(
+            b,
+            s,
+            ws,
+            xb,
+            &[At(&s.kva, 0), first_q.1][..ws.len()],
+            n,
+            int8,
+            f,
+        );
+        let kv_rows = Some((At(&s.kva, 0), At(cache, at), norm, n));
+        let q_rows = Some((At(&s.q, 0), At(&s.qr, 0), m, nh, hd));
+        // The cache rows, and the queries' rotated dims where they are made by now: one launch.
+        if joint && a.q_a.is_none() {
+            b.mla_rows((lat, rd), kv_rows, q_rows, (pos, pos + lo), rope, eps);
+        } else {
+            b.mla_rows((lat, rd), kv_rows, None, (pos, 0), rope, eps);
+            if m == 0 {
+                return;
             }
-            _ => mm_each(b, s, &[&layer.wq], xq, &[At(&s.q, 0)], m, int8, Fed::No),
+            let xq = At(&s.xb, lo * c.n_embd);
+            if !joint {
+                mm_each(b, s, &[first_q.0], xq, &[first_q.1], m, int8, Fed::No);
+            }
+            if let (Some(_), Some(w)) = (&a.q_a, &g.q_a_norm) {
+                let (qa, rows) = (At(&s.qa, 0), first_q.0.rows);
+                b.rmsnorm(qa, qa, w, m, rows, eps, None, None);
+                mm_each(b, s, &[&layer.wq], qa, &[At(&s.q, 0)], m, int8, Fed::No);
+            }
+            b.mla_rows((lat, rd), None, q_rows, (0, pos + lo), rope, eps);
         }
         // Each head's query: its rotated dims, then `k_b` times the others.
         let (q_at, qr_at) = (
@@ -816,7 +808,6 @@ impl Cuda {
                 off: 0,
             },
         );
-        b.copy_heads(At(&s.q, 0), q_at, At(&s.qr, 0), qr_at, m, nh, rd);
         let [k_stride, v_stride] = g.head_strides.expect("checked at attach");
         let (w, ids) = (&a.k_b[0], &self.head_ids);
         let (x, y) = (At(&s.q, 0), At(&s.qr, rd));
@@ -838,8 +829,6 @@ impl Cuda {
                 w.ty, w.rows, w.cols, w.offset, k_stride, nh, ids, x, hd, 1, y, row, pairs,
             );
         }
-        let r = rope(m, nh, pos + lo);
-        b.rope(At(&s.qr, 0), At(&s.qr, 0), &r);
         let p = AttnParams {
             n_head: nh as u32,
             n_kv: 1,

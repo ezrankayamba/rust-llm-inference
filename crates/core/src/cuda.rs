@@ -137,9 +137,9 @@ const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 129;
 const OTHER_KERNELS: [&str; 23] = [
+    "mla_rows",
     "attention_mla_merge",
     "attention_mla",
-    "rmsnorm_strided",
     "copy_heads",
     "quant_x",
     "to_f16_zero",
@@ -2588,39 +2588,6 @@ impl<'a> Batch<'a> {
         (q.unwrap_or(&gpu.no_q), q.is_some() as u32)
     }
 
-    /// [`Batch::rmsnorm`] of the first `n` values of `rows` rows, `x_stride` apart at `x` and
-    /// `out_stride` apart at `out`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_strided(
-        &mut self,
-        x: At<'_>,
-        x_stride: usize,
-        out: At<'_>,
-        out_stride: usize,
-        w: &GpuBuf,
-        rows: usize,
-        n: usize,
-        eps: f32,
-    ) {
-        assert!(rows >= 1 && n <= x_stride.min(out_stride) && n <= w.len());
-        assert!(x.1 + (rows - 1) * x_stride + n <= x.0.len());
-        assert!(out.1 + (rows - 1) * out_stride + n <= out.0.len());
-        let (x_off, o_off) = (x.1 as u64, out.1 as u64);
-        let (xs, os, n_u) = (x_stride as u32, out_stride as u32, n as u32);
-        let mut a = self.call(self.gpu.other("rmsnorm_strided"));
-        a.arg(&x.0.0)
-            .arg(&x_off)
-            .arg(&xs)
-            .arg(&out.0.0)
-            .arg(&o_off)
-            .arg(&os)
-            .arg(&w.0)
-            .arg(&n_u)
-            .arg(&eps);
-        let threads = (n.next_multiple_of(32) as u32).min(REDUCE_THREADS);
-        self.launch(a, grid(rows, threads));
-    }
-
     /// `w` values of each of `m` tokens' `nh` heads from `src` laid out as `from` into `dst`
     /// laid out as `to`.
     #[allow(clippy::too_many_arguments)]
@@ -3075,6 +3042,58 @@ impl<'a> Batch<'a> {
         if let Some(h) = half_out {
             self.to_f16(At(out, 0), q_len, h);
         }
+    }
+
+    /// DeepSeek's cache rows and rotated query dims in one launch (`mla_rows` in cuda.cu):
+    /// with `kv` = (kv_a's rows, the cache at the first row's position, the latent norm, rows),
+    /// each cache row is the row's `rd` key dims rotated at `pos_kv` on, then its `lat` latent
+    /// values normed; with `q` = (queries, `s.qr`-style rows, tokens, heads, a head's dims),
+    /// each head's last `rd` dims rotated at `pos_q` on go to the start of its row of `lat +
+    /// rd`. `rope` is the frequency factors and theta.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_rows(
+        &mut self,
+        (lat, rd): (usize, usize),
+        kv: Option<(At<'_>, At<'_>, &GpuBuf, usize)>,
+        q: Option<(At<'_>, At<'_>, usize, usize, usize)>,
+        (pos_kv, pos_q): (usize, usize),
+        (ff, theta): (Option<&GpuBuf>, f32),
+        eps: f32,
+    ) {
+        let row = lat + rd;
+        assert!(rd.is_multiple_of(2) && rd / 2 <= 256 && (kv.is_some() || q.is_some()));
+        let gpu: &'a Gpu = self.gpu;
+        // The part not given is passed the other's buffers, which it doesn't touch.
+        let some = kv.map_or_else(|| q.expect("checked").0, |k| k.0);
+        let (kva, cache, wn, n_kv) = kv.unwrap_or((some, some, some.0, 0));
+        if n_kv > 0 {
+            assert!(kva.1 + n_kv * row <= kva.0.len() && cache.1 + n_kv * row <= cache.0.len());
+            assert!(wn.len() >= lat);
+        }
+        let (qa, qr, n_tok, n_head, q_hd) = q.unwrap_or((some, some, 0, 1, rd));
+        let pairs = n_tok * n_head;
+        if pairs > 0 {
+            assert!(q_hd >= rd && qa.1 + pairs * q_hd <= qa.0.len());
+            assert!(qr.1 + pairs * row <= qr.0.len());
+        }
+        let u = |v: usize| u32::try_from(v).expect("fits u32");
+        let (a1, a2, a3) = (kva.1 as u64, cache.1 as u64, qa.1 as u64);
+        let a4 = qr.1 as u64;
+        let ints = [u(n_kv), u(pos_kv)];
+        let qints = [u(q_hd), u(n_head), u(pos_q), u(lat), u(rd)];
+        let has_ff = u32::from(ff.is_some());
+        let ff = ff.unwrap_or(wn);
+        let mut l = self.call(gpu.other("mla_rows"));
+        l.arg(&kva.0.0).arg(&a1).arg(&cache.0.0).arg(&a2).arg(&wn.0);
+        for v in &ints {
+            l.arg(v);
+        }
+        l.arg(&qa.0.0).arg(&a3).arg(&qr.0.0).arg(&a4);
+        for v in &qints {
+            l.arg(v);
+        }
+        l.arg(&ff.0).arg(&has_ff).arg(&theta).arg(&eps);
+        self.launch(l, grid(n_kv + pairs, 256));
     }
 
     /// Whether [`Batch::attention_mla`] takes latent attention with these dims (`MLA_ROPE`,
