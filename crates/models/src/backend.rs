@@ -81,6 +81,11 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
     if layers == 0 {
         return Ok(());
     }
+    if model.cfg.mla.is_some() {
+        return Err(BackendError(
+            "DeepSeek's latent attention has no GPU kernels yet; use --gpu-layers 0".into(),
+        ));
+    }
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         return crate::metal::attach(model, layers);

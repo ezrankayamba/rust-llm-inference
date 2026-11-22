@@ -1,6 +1,6 @@
-"""Write tiny random MoE GGUFs (Mixtral-style llama, Qwen2-MoE with a shared expert, and the
-Mixtral-style one with NVFP4 weights and their tensor scales) using the reference `gguf` writer,
-for crates/models/tests/moe_reference.rs.
+"""Write tiny random MoE GGUFs (Mixtral-style llama, Qwen2-MoE with a shared expert, the
+Mixtral-style one with NVFP4 weights and their tensor scales, and DeepSeek V2- and V3-style
+ones) using the reference `gguf` writer, for crates/models/tests/moe_reference.rs.
 
 usage: python scripts/make_tiny_moe.py <out_dir>    (needs `pip install gguf numpy`)
 """
@@ -87,6 +87,95 @@ def build(arch: str, path: Path, seed: int, nvfp4: bool = False):
     w.close()
 
 
+def build_deepseek(path: Path, seed: int, v3: bool):
+    """DeepSeek's latent attention with YaRN, a dense first layer, then MoE with shared experts.
+    V2-style: full queries, `attn_kv_b` (files converted before llama.cpp split it), softmax
+    routing. V3-style: low-rank queries, `attn_k_b` / `attn_v_b`, sigmoid routing with a bias,
+    in 2 of 4 expert groups, normalized and scaled."""
+    arch, n_exp, top_k, kvl, nope, rd, vd, ql = "deepseek2", 8, 3, 32, 32, 16, 32, 32
+    rng = np.random.default_rng(seed)
+    r = lambda *shape: (rng.standard_normal(shape) * 0.2).astype(np.float32)
+    w = GGUFWriter(str(path), arch)
+    w.add_block_count(3)
+    w.add_context_length(256)
+    w.add_embedding_length(D)
+    w.add_head_count(HEADS)
+    w.add_layer_norm_rms_eps(1e-6)
+    w.add_rope_freq_base(10000.0)
+    w.add_rope_dimension_count(rd)
+    w.add_expert_count(n_exp)
+    w.add_expert_used_count(top_k)
+    w.add_feed_forward_length(FF)
+    w.add_expert_feed_forward_length(32)
+    w.add_uint32(f"{arch}.leading_dense_block_count", 1)
+    w.add_uint32(f"{arch}.expert_shared_count", 2)
+    w.add_uint32(f"{arch}.attention.kv_lora_rank", kvl)
+    w.add_string(f"{arch}.rope.scaling.type", "yarn")
+    w.add_float32(f"{arch}.rope.scaling.factor", 4.0)
+    w.add_uint32(f"{arch}.rope.scaling.original_context_length", 64)
+    w.add_float32(f"{arch}.rope.scaling.yarn_log_multiplier", 0.1)
+    if v3:
+        # As llama.cpp writes them for split k_b / v_b: one KV head of latent plus rotated dims.
+        w.add_head_count_kv(1)
+        w.add_key_length(kvl + rd)
+        w.add_value_length(kvl)
+        w.add_uint32(f"{arch}.attention.key_length_mla", nope + rd)
+        w.add_uint32(f"{arch}.attention.value_length_mla", vd)
+        w.add_uint32(f"{arch}.attention.q_lora_rank", ql)
+        w.add_uint32(f"{arch}.expert_gating_func", 2)
+        w.add_uint32(f"{arch}.expert_group_count", 4)
+        w.add_uint32(f"{arch}.expert_group_used_count", 2)
+        w.add_bool(f"{arch}.expert_weights_norm", True)
+        w.add_float32(f"{arch}.expert_weights_scale", 2.5)
+    else:
+        w.add_head_count_kv(HEADS)
+        w.add_key_length(nope + rd)
+        w.add_value_length(vd)
+    w.add_tokenizer_model("gpt2")
+    w.add_token_list(VOCAB)
+    w.add_token_merges(["h e"])
+    q8 = lambda name, a: w.add_tensor(name, quantize(a, Q.Q8_0), raw_dtype=Q.Q8_0)
+    w.add_tensor("token_embd.weight", r(len(VOCAB), D))
+    w.add_tensor("output_norm.weight", 1 + r(D))
+    q8("output.weight", r(len(VOCAB), D))
+    for i in range(3):
+        p = f"blk.{i}."
+        w.add_tensor(p + "attn_norm.weight", 1 + r(D))
+        w.add_tensor(p + "ffn_norm.weight", 1 + r(D))
+        if v3:
+            q8(p + "attn_q_a.weight", r(ql, D))
+            w.add_tensor(p + "attn_q_a_norm.weight", 1 + r(ql))
+            q8(p + "attn_q_b.weight", r(HEADS * (nope + rd), ql))
+            q8(p + "attn_k_b.weight", r(HEADS, kvl, nope))
+            q8(p + "attn_v_b.weight", r(HEADS, vd, kvl))
+        else:
+            q8(p + "attn_q.weight", r(HEADS * (nope + rd), D))
+            q8(p + "attn_kv_b.weight", r(HEADS * (nope + vd), kvl))
+        q8(p + "attn_kv_a_mqa.weight", r(kvl + rd, D))
+        w.add_tensor(p + "attn_kv_a_norm.weight", 1 + r(kvl))
+        q8(p + "attn_output.weight", r(D, HEADS * vd))
+        if i == 0:
+            q8(p + "ffn_gate.weight", r(FF, D))
+            q8(p + "ffn_up.weight", r(FF, D))
+            q8(p + "ffn_down.weight", r(D, FF))
+            continue
+        w.add_tensor(p + "ffn_gate_inp.weight", r(n_exp, D) * 5)
+        if v3:
+            w.add_tensor(p + "exp_probs_b.bias", r(n_exp) * 0.5)
+        q8(p + "ffn_gate_exps.weight", r(n_exp, 32, D))
+        q8(p + "ffn_up_exps.weight", r(n_exp, 32, D))
+        q8(p + "ffn_down_exps.weight", r(n_exp, D, 32))
+        q8(p + "ffn_gate_shexp.weight", r(64, D))
+        q8(p + "ffn_up_shexp.weight", r(64, D))
+        q8(p + "ffn_down_shexp.weight", r(D, 64))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 build("llama", out / "tiny_mixtral.gguf", 1)
 build("qwen2moe", out / "tiny_qwen2moe.gguf", 2)
 build("llama", out / "tiny_nvfp4.gguf", 3, nvfp4=True)
+build_deepseek(out / "tiny_deepseek_v2.gguf", 4, v3=False)
+build_deepseek(out / "tiny_deepseek_v3.gguf", 5, v3=True)

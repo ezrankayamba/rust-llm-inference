@@ -16,7 +16,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 | Backends | CPU SIMD (baseline, always built) → Apple Metal → CUDA |
 | Weight format | GGUF only, memory-mapped |
 | Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels; on CUDA, int8 activations unless `--fp4-acts`) |
-| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE) |
+| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE, DeepSeek V2/V3: CPU only so far, `backend::attach` refuses MLA) |
 | Interfaces | CLI and an OpenAI-compatible HTTP server (`/v1/chat/completions`, SSE streaming) |
 | Layout | Cargo workspace; GPU backends behind cargo features |
 | Toolchain | Latest stable Rust, pinned in `rust-toolchain.toml`; SIMD via `std::arch` intrinsics |
@@ -46,9 +46,12 @@ Workspace crates (dependencies flow downward only):
   `cuda.cu` (feature `cuda`); both compile their kernel source at runtime.
 - **rli-gguf** (`crates/gguf`): mmap GGUF parser; tensor offsets are absolute file offsets, and
   weights stay zero-copy. `writer.rs` is a minimal writer for tests.
-- **rli-models** (`crates/models`): `config.rs` (`Arch`: Llama, Qwen2, Qwen3, Qwen2Moe, Qwen3Moe),
+- **rli-models** (`crates/models`): `config.rs` (`Arch`: Llama, Qwen2, Qwen3, Qwen2Moe, Qwen3Moe,
+  Deepseek2 with `Mla`, `Yarn`, `Gating` and expert groups),
   `model.rs` (decoder forward, KV `Session`, MoE routing, the `Accelerator` trait), `tokenizer.rs`
-  (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers), `chat.rs` (format chosen by
+  (SPM and GPT-2 byte-level BPE with per-model pre-tokenizers; DeepSeek's are HF `Split`
+  sequences, `split_seq`, V3's over Unicode classes generated into `unicode_classes.rs` by
+  `scripts/gen_unicode_classes.py`), `chat.rs` (format chosen by
   fingerprinting the GGUF Jinja template, default system text read from it), `sampler.rs`, `tools.rs` (OpenAI tools in Qwen's Hermes format: schema subset, rendering, `<tool_call>`
   parsing, and the byte-level grammar that masks logits inside a call; `Constraint::jump` gives the text
   it forces, which `Engine::generate` evaluates in one batch with the token sampled before it), and `engine.rs` (the generation API the
@@ -158,6 +161,17 @@ Design points that span files:
   can go the other way: on the 5090 one of 12 eval replies (an open-ended greeting) diverged
   partway through its text; the tool calls were identical. `examples/spec_accept.rs` measures how often a
   draft's guesses would stand on the tool-call cases.
+- **DeepSeek's latent attention (MLA) caches one row per token and layer**: the rotated key
+  dims, then the normed latent (64 + 512 values on V2-Lite, where full keys and values would be
+  16 heads of 192 + 128). Each head's query is absorbed into one against that row (`k_b` times
+  its unrotated dims), so attention is a single shared KV head whose values are the row's
+  latent part, and a head's output goes back through `v_b` (`Model::mla_attention`). Files
+  converted before llama.cpp split `attn_kv_b` (most V2 GGUFs) have `k_b`'s transpose there,
+  so it is transposed at load into f32 in `Model.owned`, addressed past the end of the file
+  (108 MB on V2-Lite). YaRN goes into `rope_freqs` as frequency factors and its magnitude
+  correction into `Config::kq_scale`, as llama.cpp does for DeepSeek. Routing (`route`):
+  softmax (V2) or sigmoid plus a bias (V3), within the best expert groups, then
+  `expert_weights_norm` and `expert_weights_scale`; the shared experts (`ungated`) have no gate.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there
   (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep

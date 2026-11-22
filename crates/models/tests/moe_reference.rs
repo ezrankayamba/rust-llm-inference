@@ -1,7 +1,10 @@
 //! Tiny random MoE models (written by scripts/make_tiny_moe.py with the reference `gguf` writer)
 //! checked against logits from the independent NumPy forward pass in scripts/ref_forward.py.
 //! `tiny_nvfp4` has NVFP4 attention and expert weights, each with its tensor scale (per expert
-//! for the stacks).
+//! for the stacks). `tiny_deepseek_v2` and `_v3` have DeepSeek's latent attention with YaRN and
+//! its MoE: V2 as files converted before llama.cpp split `attn_kv_b`, with softmax routing; V3
+//! with low-rank queries, split `attn_k_b` / `attn_v_b`, and sigmoid routing with a bias within
+//! expert groups.
 
 use rli_models::Engine;
 
@@ -12,6 +15,11 @@ fn check(name: &str) {
 }
 
 fn check_with(name: &str, gpu_layers: usize) {
+    check_pass(name, gpu_layers, false);
+}
+
+/// `batched` runs the prompt as one pass, else one token at a time.
+fn check_pass(name: &str, gpu_layers: usize, batched: bool) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     let mut engine = Engine::load(format!("{dir}/{name}.gguf")).expect("load fixture model");
     // Exact f32 activations: this test checks model math, not 8-bit activation rounding.
@@ -22,8 +30,12 @@ fn check_with(name: &str, gpu_layers: usize) {
         .encode(PROMPT, engine.tokenizer.add_bos, true);
     let mut sess = engine.new_session(256);
     let mut logits = None;
-    for (i, &t) in tokens.iter().enumerate() {
-        logits = engine.model.forward(&mut sess, t, i + 1 == tokens.len());
+    if batched {
+        logits = engine.model.forward_batch(&mut sess, &tokens, true);
+    } else {
+        for (i, &t) in tokens.iter().enumerate() {
+            logits = engine.model.forward(&mut sess, t, i + 1 == tokens.len());
+        }
     }
     let got = logits.expect("non-empty prompt");
     let want: Vec<f32> = std::fs::read(format!("{dir}/{name}.ref.f32"))
@@ -55,6 +67,18 @@ fn qwen2moe_with_shared_expert_matches_reference_logits() {
 #[test]
 fn nvfp4_with_tensor_scales_matches_reference_logits() {
     check("tiny_nvfp4");
+}
+
+#[test]
+fn deepseek_v2_matches_reference_logits() {
+    check("tiny_deepseek_v2");
+    check_pass("tiny_deepseek_v2", 0, true);
+}
+
+#[test]
+fn deepseek_v3_matches_reference_logits() {
+    check("tiny_deepseek_v3");
+    check_pass("tiny_deepseek_v3", 0, true);
 }
 
 /// Full and partial (1 of 2 layers) GPU offload must reproduce the same logits. With the `cuda`

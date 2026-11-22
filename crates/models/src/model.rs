@@ -1,6 +1,7 @@
-//! Decoder-only transformer (Llama family, Qwen2/3, and their MoE variants) over a mapped GGUF.
+//! Decoder-only transformer (Llama family, Qwen2/3, DeepSeek V2/V3, and their MoE variants)
+//! over a mapped GGUF.
 
-use crate::config::Config;
+use crate::config::{Config, Gating};
 use rayon::prelude::*;
 use rli_core::half::f32_to_f16;
 use rli_core::ops::{self, Rope};
@@ -160,7 +161,25 @@ pub(crate) enum Ffn {
         router: Weight,
         experts: Vec<Expert>,
         shared: Option<(Weight, Expert)>,
+        /// DeepSeek's shared experts (one matrix for all of them): no gate, added to every row.
+        ungated: Option<Box<Expert>>,
+        /// Added to the router's scores to choose experts, not to weight them (DeepSeek V3).
+        bias: Option<Vec<f32>>,
     },
+}
+
+/// A layer's latent attention weights ([`crate::config::Mla`]). The layer's `wq` makes the
+/// queries (from `q_a`'s output where there is one), `wk` is `kv_a`: the latent then the
+/// rotated key dims. Its `wv` is `wk` again; the values come through `v_b`.
+pub(crate) struct MlaLayer {
+    /// Low-rank queries: `x -> q_a`, normed, then `wq`.
+    pub(crate) q_a: Option<(Weight, Vec<f32>)>,
+    pub(crate) kv_norm: Vec<f32>,
+    /// Per head: the latent's rows by the query's unrotated dims, so `k_b · q` is the query
+    /// that scores the latent itself.
+    pub(crate) k_b: Vec<Weight>,
+    /// Per head: the value dims by the latent.
+    pub(crate) v_b: Vec<Weight>,
 }
 
 pub(crate) struct Layer {
@@ -176,6 +195,7 @@ pub(crate) struct Layer {
     pub(crate) k_norm: Option<Vec<f32>>,
     pub(crate) ffn_norm: Vec<f32>,
     pub(crate) ffn: Ffn,
+    pub(crate) mla: Option<MlaLayer>,
 }
 
 pub struct Model {
@@ -201,6 +221,9 @@ pub struct Model {
     pub fp4_acts: bool,
     /// Interleaved copies of weights ([`Model::repack`]), by file offset and row count.
     packed: HashMap<(usize, usize), Vec<u8>>,
+    /// Weights made at load, addressed by [`Weight::offset`] past the end of the file: f32
+    /// transposes of older DeepSeek files' `attn_kv_b` key halves (`MlaLayer::k_b`).
+    owned: Vec<u8>,
 }
 
 /// One layer's cached keys or values for the CPU layers: f16 (half the memory), or f32 when the
@@ -445,10 +468,11 @@ impl Model {
         let g = &gguf;
         let (n_embd, q_dim, kv_dim) = (cfg.n_embd, cfg.q_dim(), cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.n_layer);
+        let mut owned = Vec::new();
         for i in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{i}.{s}");
             let w = |s: &str| weight(g, &p(s));
-            let ffn = if cfg.n_expert > 0 {
+            let ffn = if cfg.n_expert > 0 && i >= cfg.n_dense_lead {
                 let experts = if g.tensor(&p("ffn_gate_exps.weight")).is_some() {
                     let s = |n: &str| stacked(g, &p(n), cfg.n_expert);
                     split_experts(
@@ -488,12 +512,25 @@ impl Model {
                     check_shape(&p("shared gate input"), gate_inp, 1, n_embd)?;
                     check_expert(&p("shared expert"), e, e.gate.rows, n_embd)?;
                 }
+                let ungated = match (&shared, g.tensor(&p("ffn_gate_shexp.weight"))) {
+                    (None, Some(_)) => Some(Box::new(Expert {
+                        gate: w("ffn_gate_shexp.weight")?,
+                        up: w("ffn_up_shexp.weight")?,
+                        down: w("ffn_down_shexp.weight")?,
+                    })),
+                    _ => None,
+                };
+                if let Some(e) = &ungated {
+                    check_expert(&p("shared experts"), e, e.gate.rows, n_embd)?;
+                }
                 let router = w("ffn_gate_inp.weight")?;
                 check_shape(&p("router"), &router, cfg.n_expert, n_embd)?;
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
+                    ungated,
+                    bias: opt_vector(g, &p("exp_probs_b.bias"), cfg.n_expert)?,
                 }
             } else {
                 let e = Expert {
@@ -501,19 +538,47 @@ impl Model {
                     up: w("ffn_up.weight")?,
                     down: w("ffn_down.weight")?,
                 };
-                check_expert(&p("ffn"), &e, cfg.n_ff, n_embd)?;
+                check_expert(&p("ffn"), &e, cfg.n_ff_dense, n_embd)?;
                 Ffn::Dense(e)
             };
-            let (wq, wk, wv, wo) = (
-                w("attn_q.weight")?,
-                w("attn_k.weight")?,
-                w("attn_v.weight")?,
-                w("attn_output.weight")?,
-            );
-            check_shape(&p("attn_q"), &wq, q_dim, n_embd)?;
-            check_shape(&p("attn_k"), &wk, kv_dim, n_embd)?;
-            check_shape(&p("attn_v"), &wv, kv_dim, n_embd)?;
-            check_shape(&p("attn_output"), &wo, n_embd, q_dim)?;
+            let wo = w("attn_output.weight")?;
+            check_shape(&p("attn_output"), &wo, n_embd, cfg.att_dim())?;
+            let (wq, wk, wv, mla) = match cfg.mla {
+                Some(m) => {
+                    let (wq, q_a) = if m.q_lora > 0 {
+                        let (qa, qb) = (w("attn_q_a.weight")?, w("attn_q_b.weight")?);
+                        check_shape(&p("attn_q_a"), &qa, m.q_lora, n_embd)?;
+                        check_shape(&p("attn_q_b"), &qb, q_dim, m.q_lora)?;
+                        let norm = vector(g, &p("attn_q_a_norm.weight"), m.q_lora)?;
+                        (qb, Some((qa, norm)))
+                    } else {
+                        let wq = w("attn_q.weight")?;
+                        check_shape(&p("attn_q"), &wq, q_dim, n_embd)?;
+                        (wq, None)
+                    };
+                    let kv_a = w("attn_kv_a_mqa.weight")?;
+                    check_shape(&p("attn_kv_a_mqa"), &kv_a, kv_dim, n_embd)?;
+                    let (k_b, v_b) = mla_heads(g, &p, &cfg, &mut owned)?;
+                    let layer = MlaLayer {
+                        q_a,
+                        kv_norm: vector(g, &p("attn_kv_a_norm.weight"), m.kv_lora)?,
+                        k_b,
+                        v_b,
+                    };
+                    (wq, kv_a, kv_a, Some(layer))
+                }
+                None => {
+                    let (wq, wk, wv) = (
+                        w("attn_q.weight")?,
+                        w("attn_k.weight")?,
+                        w("attn_v.weight")?,
+                    );
+                    check_shape(&p("attn_q"), &wq, q_dim, n_embd)?;
+                    check_shape(&p("attn_k"), &wk, kv_dim, n_embd)?;
+                    check_shape(&p("attn_v"), &wv, kv_dim, n_embd)?;
+                    (wq, wk, wv, None)
+                }
+            };
             layers.push(Layer {
                 attn_norm: vector(g, &p("attn_norm.weight"), n_embd)?,
                 wq,
@@ -527,6 +592,7 @@ impl Model {
                 k_norm: opt_vector(g, &p("attn_k_norm.weight"), cfg.head_dim)?,
                 ffn_norm: vector(g, &p("ffn_norm.weight"), n_embd)?,
                 ffn,
+                mla,
             });
         }
         let embd = weight(g, "token_embd.weight")?;
@@ -538,7 +604,13 @@ impl Model {
         check_shape("token_embd", &embd, embd.rows, n_embd)?;
         check_shape("output", &output, embd.rows, n_embd)?;
         let output_norm = vector(g, "output_norm.weight", n_embd)?;
-        let rope_freqs = opt_vector(g, "rope_freqs.weight", cfg.rope_dim / 2)?;
+        let mut rope_freqs = opt_vector(g, "rope_freqs.weight", cfg.rope_dim / 2)?;
+        if let Some(y) = &cfg.yarn {
+            // A frequency factor divides the frequency.
+            let scales = y.freq_scales(cfg.rope_dim, cfg.rope_theta);
+            let ff = rope_freqs.get_or_insert_with(|| vec![1.0; scales.len()]);
+            ff.iter_mut().zip(scales).for_each(|(f, s)| *f /= s);
+        }
         if cfg.n_expert > 0 && cfg.n_expert_used == 0 {
             return Err(Error::Missing(format!(
                 "{}.expert_used_count",
@@ -558,6 +630,7 @@ impl Model {
             coarse_acts: false,
             fp4_acts: false,
             packed: HashMap::new(),
+            owned,
         })
     }
 
@@ -600,12 +673,12 @@ impl Model {
     }
 
     pub(crate) fn mat(&self, w: &Weight) -> QMatrix<'_> {
-        QMatrix::new(
-            w.ty,
-            w.rows,
-            w.cols,
-            &self.gguf.mapped_bytes()[w.offset..w.offset + w.n_bytes()],
-        )
+        let file = self.gguf.mapped_bytes();
+        let bytes = match w.offset.checked_sub(file.len()) {
+            Some(at) => &self.owned[at..at + w.n_bytes()],
+            None => &file[w.offset..w.offset + w.n_bytes()],
+        };
+        QMatrix::new(w.ty, w.rows, w.cols, bytes)
     }
 
     /// Copies the weights of the layers that run on the CPU into the layout the CPU's decode
@@ -617,6 +690,9 @@ impl Model {
         let mut ws = vec![self.output];
         for layer in &self.layers[self.accelerator().map_or(0, |(_, n)| n)..] {
             ws.extend([layer.wq, layer.wk, layer.wv, layer.wo]);
+            if let Some(m) = &layer.mla {
+                ws.extend(m.q_a.iter().map(|(w, _)| *w));
+            }
             let expert = |e: &Expert| [e.gate, e.up, e.down];
             match &layer.ffn {
                 Ffn::Dense(e) => ws.extend(expert(e)),
@@ -624,8 +700,11 @@ impl Model {
                     router,
                     experts,
                     shared,
+                    ungated,
+                    ..
                 } => {
                     ws.push(*router);
+                    ws.extend(ungated.iter().flat_map(|e| expert(e)));
                     ws.extend(experts.iter().flat_map(expert));
                     if let Some((gate, e)) = shared {
                         ws.push(*gate);
@@ -815,7 +894,8 @@ impl Model {
         let mut q = vec![0.0; n * q_dim];
         let mut k = vec![0.0; n * kv_dim];
         let mut v = vec![0.0; n * kv_dim];
-        let mut att = vec![0.0; n * q_dim];
+        let att_dim = c.att_dim();
+        let mut att = vec![0.0; n * q_dim.max(att_dim)];
         let mut tmp = vec![0.0; n * n_embd];
         let scale = 1.0 / (hd as f32).sqrt();
         // The per-token steps between matmuls run on the pool too: left on one thread they
@@ -830,12 +910,24 @@ impl Model {
             // The rows whose queries, attention and FFN this layer computes: `lo..`.
             let m = if l + 1 == self.layers.len() { tail } else { n };
             let lo = n - m;
-            let (q, att, tmp) = (
-                &mut q[..m * q_dim],
-                &mut att[..m * q_dim],
-                &mut tmp[..m * n_embd],
-            );
+            let tmp = &mut tmp[..m * n_embd];
             norm_rows(&mut xb, xs, &layer.attn_norm);
+            if let Some(mla) = &layer.mla {
+                let att = &mut att[..m * att_dim];
+                self.mla_attention(layer, mla, &mut sess.k[l], &xb, pos, lo, att);
+                if m == 0 {
+                    break;
+                }
+                let xs = &mut xs[lo * n_embd..];
+                self.matmul(&layer.wo, att, tmp, m);
+                ops::add_assign(xs, tmp);
+                let xb = &mut xb[..m * n_embd];
+                norm_rows(xb, xs, &layer.ffn_norm);
+                self.ffn_any(&layer.ffn, xb, tmp, m);
+                ops::add_assign(xs, tmp);
+                continue;
+            }
+            let (q, att) = (&mut q[..m * q_dim], &mut att[..m * q_dim]);
             if m > 0 {
                 self.matmul(&layer.wq, &xb[lo * n_embd..], q, m);
             }
@@ -891,45 +983,144 @@ impl Model {
 
             let xb = &mut xb[..m * n_embd];
             norm_rows(xb, xs, &layer.ffn_norm);
-            match &layer.ffn {
-                Ffn::Dense(e) => self.ffn(e, xb, tmp, m),
-                Ffn::Moe {
-                    router,
-                    experts,
-                    shared,
-                } => self.moe(router, experts, shared.as_ref(), xb, tmp, m),
-            }
+            self.ffn_any(&layer.ffn, xb, tmp, m);
             ops::add_assign(xs, tmp);
+        }
+    }
+
+    fn ffn_any(&self, ffn: &Ffn, xb: &[f32], out: &mut [f32], m: usize) {
+        match ffn {
+            Ffn::Dense(e) => self.ffn(e, xb, out, m),
+            Ffn::Moe { .. } => self.moe(ffn, xb, out, m),
+        }
+    }
+
+    /// Latent attention ([`crate::config::Mla`]) of the `n` rows of `xb` (normed, at positions
+    /// `pos..`): appends their cache rows to `kv`, then writes the outputs of rows `lo..` to
+    /// `att`, one `n_head * v_head` row each. A cache row is the rotated key dims, then the
+    /// normed latent, which is also the values: each head's query is turned into one against
+    /// that row (`k_b`), and its output, a weighted sum of latents, into values (`v_b`).
+    #[allow(clippy::too_many_arguments)]
+    fn mla_attention(
+        &self,
+        layer: &Layer,
+        a: &MlaLayer,
+        kv: &mut KvCache,
+        xb: &[f32],
+        pos: usize,
+        lo: usize,
+        att: &mut [f32],
+    ) {
+        let c = &self.cfg;
+        let mla = c.mla.expect("an MLA layer has an MLA config");
+        let (n_embd, nh) = (c.n_embd, c.n_head);
+        let (lat, rd, nope, vh) = (mla.kv_lora, mla.rope, mla.nope, mla.v_head);
+        let (row, hd) = (lat + rd, nope + rd);
+        let n = xb.len() / n_embd;
+        let m = n - lo;
+        let rope = Rope {
+            head_dim: row,
+            rope_dim: rd,
+            theta: c.rope_theta,
+            neox: false,
+            freq_factors: self.rope_freqs.as_deref(),
+        };
+        let mut kv_a = vec![0.0; n * row];
+        self.matmul(&layer.wk, xb, &mut kv_a, n);
+        let mut rows = vec![0.0; n * row];
+        rows.par_chunks_exact_mut(row)
+            .zip(kv_a.par_chunks_exact(row))
+            .enumerate()
+            .for_each(|(i, (r, a_))| {
+                let (k_pe, latent) = r.split_at_mut(rd);
+                k_pe.copy_from_slice(&a_[lat..]);
+                ops::rmsnorm(latent, &a_[..lat], &a.kv_norm, c.rms_eps);
+                rope.apply(r, 1, pos + i);
+            });
+        kv.push(&rows);
+        if m == 0 {
+            return;
+        }
+
+        let xq = &xb[lo * n_embd..];
+        let mut q = vec![0.0; m * nh * hd];
+        match &a.q_a {
+            Some((qa, norm)) => {
+                let mut t = vec![0.0; m * qa.rows];
+                self.matmul(qa, xq, &mut t, m);
+                for r in t.chunks_exact_mut(qa.rows) {
+                    let src = r.to_vec();
+                    ops::rmsnorm(r, &src, norm, c.rms_eps);
+                }
+                self.matmul(&layer.wq, &t, &mut q, m);
+            }
+            None => self.matmul(&layer.wq, xq, &mut q, m),
+        }
+        // Per (token, head): the rotated query dims, then k_b times the others.
+        let mut qr = vec![0.0; m * nh * row];
+        let (mut part, mut out) = (vec![0.0; m * nope], vec![0.0; m * lat]);
+        for (h, k_b) in a.k_b.iter().enumerate() {
+            for (i, p) in part.chunks_exact_mut(nope).enumerate() {
+                p.copy_from_slice(&q[(i * nh + h) * hd..][..nope]);
+            }
+            self.matmul(k_b, &part, &mut out, m);
+            for (i, o) in out.chunks_exact(lat).enumerate() {
+                let (dst, src) = (&mut qr[(i * nh + h) * row..][..row], (i * nh + h) * hd);
+                dst[..rd].copy_from_slice(&q[src + nope..][..rd]);
+                dst[rd..].copy_from_slice(o);
+            }
+        }
+        qr.par_chunks_exact_mut(nh * row)
+            .enumerate()
+            .for_each(|(i, r)| rope.apply(r, nh, pos + lo + i));
+
+        let kv = &*kv;
+        let scale = c.kq_scale();
+        let mut o = vec![0.0; m * nh * lat];
+        o.par_chunks_mut(lat)
+            .zip(qr.par_chunks(row))
+            .enumerate()
+            .for_each_init(Vec::new, |scores, (j, (out, qh))| {
+                scores.resize(pos + lo + j / nh + 1, 0.0);
+                kv.dots(0, row, qh, scores);
+                scores.iter_mut().for_each(|s| *s *= scale);
+                ops::softmax(scores);
+                kv.weighted_sum(rd, row, scores, out);
+            });
+        let (mut part, mut out) = (vec![0.0; m * lat], vec![0.0; m * vh]);
+        for (h, v_b) in a.v_b.iter().enumerate() {
+            for (i, p) in part.chunks_exact_mut(lat).enumerate() {
+                p.copy_from_slice(&o[(i * nh + h) * lat..][..lat]);
+            }
+            self.matmul(v_b, &part, &mut out, m);
+            for (i, v) in out.chunks_exact(vh).enumerate() {
+                att[(i * nh + h) * vh..][..vh].copy_from_slice(v);
+            }
         }
     }
 
     /// MoE FFN of `n` rows: routes each row, then runs every used expert once, over the rows
     /// that picked it, so its weights are read once per call as in the dense case.
-    fn moe(
-        &self,
-        router: &Weight,
-        experts: &[Expert],
-        shared: Option<&(Weight, Expert)>,
-        xs: &[f32],
-        out: &mut [f32],
-        n: usize,
-    ) {
+    fn moe(&self, ffn: &Ffn, xs: &[f32], out: &mut [f32], n: usize) {
+        let Ffn::Moe {
+            router,
+            experts,
+            shared,
+            ungated,
+            bias,
+        } = ffn
+        else {
+            unreachable!("moe takes an MoE layer")
+        };
         let c = &self.cfg;
         let mut probs = vec![0.0; n * experts.len()];
         self.matmul(router, xs, &mut probs, n);
         let mut rows: Vec<Vec<(usize, f32)>> = vec![Vec::new(); experts.len()];
-        let mut order: Vec<usize> = (0..experts.len()).collect();
+        let mut chosen = Vec::new();
         for (t, p) in probs.chunks_exact_mut(experts.len()).enumerate() {
-            ops::softmax(p);
-            order.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]));
-            let chosen = &order[..c.n_expert_used];
-            let norm = if c.norm_topk {
-                chosen.iter().map(|&e| p[e]).sum::<f32>()
-            } else {
-                1.0
-            };
-            for &e in chosen {
-                rows[e].push((t, p[e] / norm));
+            route(c, p, bias.as_deref(), &mut chosen);
+            for &(e, w) in &chosen {
+                rows[e].push((t, w));
             }
         }
 
@@ -946,6 +1137,11 @@ impl Model {
                 axpy(&mut out[t * c.n_embd..(t + 1) * c.n_embd], w, r);
             }
         }
+        if let Some(e) = ungated {
+            y.resize(out.len(), 0.0);
+            self.ffn(e, xs, &mut y, n);
+            ops::add_assign(out, &y);
+        }
         if let Some((gate_inp, e)) = shared {
             let mut g = vec![0.0; n];
             self.matmul(gate_inp, xs, &mut g, n);
@@ -960,6 +1156,107 @@ impl Model {
             }
         }
     }
+}
+
+/// Turns one token's router logits `p` (overwritten) into its chosen experts and their weights.
+/// Experts are ranked by score plus `bias`, within the best groups when there are several (a
+/// group's score is its best expert's for a softmax, as DeepSeek V2 has it, and its best two's
+/// sum for a sigmoid, as V3 has it), and weighted by score alone.
+fn route(c: &Config, p: &mut [f32], bias: Option<&[f32]>, chosen: &mut Vec<(usize, f32)>) {
+    match c.gating {
+        Gating::Softmax => ops::softmax(p),
+        Gating::Sigmoid => p.iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-*v).exp())),
+    }
+    let mut rank: Vec<f32> = match bias {
+        Some(b) => p.iter().zip(b).map(|(v, b)| v + b).collect(),
+        None => p.to_vec(),
+    };
+    if c.n_group > 1 {
+        let size = p.len() / c.n_group;
+        let score = |g: &[f32]| {
+            let mut best = [f32::NEG_INFINITY; 2];
+            for &v in g {
+                if v > best[0] {
+                    best = [v, best[0]];
+                } else if v > best[1] {
+                    best[1] = v;
+                }
+            }
+            match c.gating {
+                Gating::Softmax => best[0],
+                Gating::Sigmoid => best[0] + best[1],
+            }
+        };
+        let scores: Vec<f32> = rank.chunks_exact(size).map(score).collect();
+        let mut groups: Vec<usize> = (0..c.n_group).collect();
+        groups.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        for &g in &groups[c.n_group_used..] {
+            rank[g * size..(g + 1) * size].fill(f32::NEG_INFINITY);
+        }
+    }
+    let mut order: Vec<usize> = (0..p.len()).collect();
+    order.sort_unstable_by(|&a, &b| rank[b].total_cmp(&rank[a]));
+    let top = &order[..c.n_expert_used];
+    let norm = if c.norm_topk {
+        top.iter().map(|&e| p[e]).sum::<f32>()
+    } else {
+        1.0
+    };
+    chosen.clear();
+    chosen.extend(top.iter().map(|&e| (e, p[e] / norm * c.expert_scale)));
+}
+
+/// Per-head `k_b` and `v_b` of an MLA layer: from `attn_k_b` and `attn_v_b`, or, in files
+/// converted before llama.cpp split them, from `attn_kv_b` (per head, the unrotated key dims'
+/// rows then the value dims', by the latent). Its key halves are the transpose of `k_b`, so they
+/// are transposed into `owned`, in f32, once.
+#[allow(clippy::type_complexity)]
+fn mla_heads(
+    g: &Gguf,
+    p: &dyn Fn(&str) -> String,
+    cfg: &Config,
+    owned: &mut Vec<u8>,
+) -> Result<(Vec<Weight>, Vec<Weight>)> {
+    let m = cfg.mla.expect("MLA config");
+    let nh = cfg.n_head;
+    let heads = |w: &Weight, rows: usize| (0..nh).map(|h| w.rows_slice(h * rows, rows)).collect();
+    if g.tensor(&p("attn_k_b.weight")).is_some() {
+        let (k_b, v_b) = (
+            weight(g, &p("attn_k_b.weight"))?,
+            weight(g, &p("attn_v_b.weight"))?,
+        );
+        check_shape(&p("attn_k_b"), &k_b, nh * m.kv_lora, m.nope)?;
+        check_shape(&p("attn_v_b"), &v_b, nh * m.v_head, m.kv_lora)?;
+        return Ok((heads(&k_b, m.kv_lora), heads(&v_b, m.v_head)));
+    }
+    let kv_b = weight(g, &p("attn_kv_b.weight"))?;
+    let per = m.nope + m.v_head;
+    check_shape(&p("attn_kv_b"), &kv_b, nh * per, m.kv_lora)?;
+    let t = g.tensor(&p("attn_kv_b.weight")).expect("checked above");
+    let mat = QMatrix::new(kv_b.ty, kv_b.rows, kv_b.cols, g.tensor_data(t)?);
+    let base = g.mapped_bytes().len();
+    let (mut k_b, mut row) = (Vec::with_capacity(nh), vec![0.0; m.kv_lora]);
+    for h in 0..nh {
+        let mut tr = vec![0.0f32; m.kv_lora * m.nope];
+        for j in 0..m.nope {
+            mat.dequantize_row_into(h * per + j, &mut row);
+            for (c, &v) in row.iter().enumerate() {
+                tr[c * m.nope + j] = v;
+            }
+        }
+        k_b.push(Weight {
+            ty: GgmlType::F32,
+            rows: m.kv_lora,
+            cols: m.nope,
+            offset: base + owned.len(),
+            scale: kv_b.scale,
+        });
+        owned.extend(tr.iter().flat_map(|v| v.to_le_bytes()));
+    }
+    let v_b = (0..nh)
+        .map(|h| kv_b.rows_slice(h * per + m.nope, m.v_head))
+        .collect();
+    Ok((k_b, v_b))
 }
 
 /// Multiplies a product of `w` by its tensor scale.

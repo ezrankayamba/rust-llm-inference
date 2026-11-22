@@ -16,6 +16,28 @@ pub enum ChatTemplate {
     Mistral,
     /// `<|user|>\n...</s>\n<|assistant|>\n` (TinyLlama chat, Zephyr).
     Zephyr,
+    /// `User: ...\n\nAssistant: ...<｜end▁of▁sentence｜>` (DeepSeek V2).
+    DeepSeek2,
+    /// `<｜User｜>...<｜Assistant｜>...<｜end▁of▁sentence｜>` after the system text (DeepSeek V3,
+    /// R1 and V3.1, which differ in their think tags: [`ChatDefaults::think`]).
+    DeepSeek3,
+}
+
+/// DeepSeek's end of a reply in its templates.
+const DS_EOS: &str = "<｜end▁of▁sentence｜>";
+
+/// How a DeepSeek V3-family template opens a reply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Think {
+    /// No think tags (V3).
+    #[default]
+    None,
+    /// The reply opens a think block (R1), and replies in the history keep only the text after
+    /// their last `</think>`.
+    Open,
+    /// The reply opens with a closed one, `</think>` (V3.1 without `thinking`), in the history
+    /// too, where replies keep the text after their first `</think>`.
+    Closed,
 }
 
 /// A rendered prompt and the byte ranges of `text` that hold client-supplied text.
@@ -86,6 +108,8 @@ pub struct ChatDefaults {
     pub tools: bool,
     /// The template can open a reply with an empty think block (Qwen3's `enable_thinking`).
     pub thinking: bool,
+    /// DeepSeek V3-family think tags.
+    pub think: Think,
 }
 
 impl ChatDefaults {
@@ -101,6 +125,13 @@ impl ChatDefaults {
                 && jinja.contains("<tools>")
                 && jinja.contains("<tool_call>"),
             thinking: template == ChatTemplate::ChatMl && jinja.contains("enable_thinking"),
+            think: match template {
+                ChatTemplate::DeepSeek3 if jinja.contains("<｜Assistant｜><think>") => {
+                    Think::Open
+                }
+                ChatTemplate::DeepSeek3 if jinja.contains("{{'</think>'}}") => Think::Closed,
+                _ => Think::None,
+            },
         }
     }
 }
@@ -178,6 +209,8 @@ impl ChatTemplate {
             t if t.contains("<|user|>") => Some(Self::Zephyr),
             t if t.contains("<<SYS>>") => Some(Self::Llama2),
             t if t.contains("[INST]") => Some(Self::Mistral),
+            t if t.contains("<｜User｜>") => Some(Self::DeepSeek3),
+            t if t.contains("'User: '") && t.contains("'Assistant:'") => Some(Self::DeepSeek2),
             _ => None,
         }
     }
@@ -325,6 +358,66 @@ impl ChatTemplate {
                     r.text += " [/INST]";
                 }
             }
+            Self::DeepSeek2 => {
+                for m in messages {
+                    match m.role.as_str() {
+                        "user" => {
+                            r.text += "User: ";
+                            r.push_untrusted(&m.content);
+                            r.text += "\n\n";
+                        }
+                        "assistant" => {
+                            r.text += "Assistant: ";
+                            r.push_untrusted(&m.content);
+                            r.text += DS_EOS;
+                        }
+                        "system" | "developer" => {
+                            r.push_untrusted(&m.content);
+                            r.text += "\n\n";
+                        }
+                        _ => {}
+                    }
+                }
+                r.text += "Assistant:";
+            }
+            Self::DeepSeek3 => {
+                // Every system message goes first, joined by a blank line.
+                let system = |m: &&Message| matches!(m.role.as_str(), "system" | "developer");
+                for (i, m) in messages.iter().filter(system).enumerate() {
+                    if i > 0 {
+                        r.text += "\n\n";
+                    }
+                    r.push_untrusted(&m.content);
+                }
+                let opener = match defaults.think {
+                    Think::Closed => "<｜Assistant｜></think>",
+                    _ => "<｜Assistant｜>",
+                };
+                for m in messages {
+                    match m.role.as_str() {
+                        "user" => {
+                            r.text += "<｜User｜>";
+                            r.push_untrusted(&m.content);
+                        }
+                        "assistant" => {
+                            let c = m.content.as_str();
+                            let c = match defaults.think {
+                                Think::None => c,
+                                Think::Open => c.rsplit("</think>").next().unwrap_or(c),
+                                Think::Closed => c.split_once("</think>").map_or(c, |(_, t)| t),
+                            };
+                            r.text += opener;
+                            r.push_untrusted(c);
+                            r.text += DS_EOS;
+                        }
+                        _ => {}
+                    }
+                }
+                r.text += opener;
+                if defaults.think == Think::Open {
+                    r.text += "<think>\n";
+                }
+            }
         }
         r
     }
@@ -336,6 +429,47 @@ mod tests {
 
     fn plain(t: ChatTemplate, msgs: &[Message]) -> Rendered {
         t.render(msgs, &ChatDefaults::default(), "")
+    }
+
+    /// Expected texts from the models' own templates (tokenizer_config.json) through jinja2,
+    /// with an empty BOS.
+    #[test]
+    fn deepseek_formats_match_their_templates() {
+        let msgs = [
+            Message::new("system", "Be brief."),
+            Message::new("user", "Hi"),
+            Message::new("assistant", "<think>x</think>Hello!"),
+            Message::new("system", "Also kind."),
+            Message::new("user", "Bye"),
+        ];
+        for (jinja, want) in [
+            (
+                "{{ 'User: ' + message['content'] + '\\n\\n' }}{{ 'Assistant:' }}",
+                "Be brief.\n\nUser: Hi\n\nAssistant: <think>x</think>Hello!<｜end▁of▁sentence｜>\
+                 Also kind.\n\nUser: Bye\n\nAssistant:",
+            ),
+            (
+                "{{'<｜User｜>' + message['content']}}{{'<｜Assistant｜>'}}",
+                "Be brief.\n\nAlso kind.<｜User｜>Hi<｜Assistant｜><think>x</think>Hello!\
+                 <｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜>",
+            ),
+            (
+                "{{'<｜User｜>' + message['content']}}{{'<｜Assistant｜><think>\\n'}}",
+                "Be brief.\n\nAlso kind.<｜User｜>Hi<｜Assistant｜>Hello!<｜end▁of▁sentence｜>\
+                 <｜User｜>Bye<｜Assistant｜><think>\n",
+            ),
+            (
+                "{{'<｜User｜>' + message['content']}}{%- if not thinking %}{{'</think>'}}",
+                "Be brief.\n\nAlso kind.<｜User｜>Hi<｜Assistant｜></think>Hello!\
+                 <｜end▁of▁sentence｜><｜User｜>Bye<｜Assistant｜></think>",
+            ),
+        ] {
+            let t = ChatTemplate::detect(jinja).expect("detected");
+            let got = t
+                .render(&msgs, &ChatDefaults::from_jinja(t, jinja), "")
+                .text;
+            assert_eq!(got, want, "{jinja}");
+        }
     }
 
     #[test]

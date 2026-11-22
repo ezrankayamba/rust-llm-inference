@@ -347,10 +347,12 @@ impl Metal {
                     ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
                     b.add(x_at, At(&s.tmp, 0), n * n_embd);
                 }
+                // DeepSeek's `ungated` and `bias` belong to MLA models, which `attach` refuses.
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
+                    ..
                 } => match g.expert_strides {
                     Some(strides) if n == 1 => self.moe_decode(
                         model,

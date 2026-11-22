@@ -8,6 +8,7 @@ pub mod sampler;
 mod stop;
 pub mod tokenizer;
 pub mod tools;
+mod unicode_classes;
 
 pub use chat::{ChatDefaults, ChatTemplate, Message, RenderOpts, Rendered};
 pub use engine::{Engine, Finish, GenOutput, GenParams};

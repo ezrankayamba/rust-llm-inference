@@ -20,6 +20,10 @@ enum PreTokenizer {
     Gpt2 { single_digits: bool },
     /// Llama 3 pattern; Qwen2 is the same with `max_digits == 1`.
     Llama3 { max_digits: usize },
+    /// DeepSeek LLM (V2): a sequence of splits, each regex applied to the pieces of the last.
+    DeepSeekLlm,
+    /// DeepSeek V3's sequence of splits.
+    DeepSeek3,
 }
 
 enum Model {
@@ -137,6 +141,8 @@ impl Tokenizer {
                         PreTokenizer::Llama3 { max_digits: 3 }
                     }
                     "qwen2" | "deepseek-r1-qwen" => PreTokenizer::Llama3 { max_digits: 1 },
+                    "deepseek-llm" => PreTokenizer::DeepSeekLlm,
+                    "deepseek-v3" => PreTokenizer::DeepSeek3,
                     "smollm" => PreTokenizer::Gpt2 {
                         single_digits: true,
                     },
@@ -607,6 +613,33 @@ fn whitespace_len(cs: &[char], i: usize) -> usize {
 }
 
 fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
+    match pre {
+        PreTokenizer::DeepSeekLlm => {
+            return split_seq(
+                text,
+                &[
+                    |p, i| usize::from(is_newline(p[i])),
+                    |p, i| space_then_run(p, i, ds_letter),
+                    |p, i| space_then_run(p, i, ds_punct),
+                    trailing_space,
+                    |p, i| run(p, i, ds_cjk),
+                    // HF's Digits pre-tokenizer: each digit alone.
+                    |p, i| usize::from(is_number(p[i])),
+                ],
+            );
+        }
+        PreTokenizer::DeepSeek3 => {
+            return split_seq(
+                text,
+                &[
+                    |p, i| run(p, i, is_number).min(3),
+                    |p, i| run(p, i, ds3_cjk),
+                    ds3_match,
+                ],
+            );
+        }
+        _ => {}
+    }
     let cs: Vec<char> = text.chars().collect();
     let mut words = Vec::new();
     let mut i = 0;
@@ -614,12 +647,141 @@ fn pre_tokenize(text: &str, pre: PreTokenizer) -> Vec<String> {
         let len = match pre {
             PreTokenizer::Llama3 { max_digits } => llama3_match(&cs, i, max_digits),
             PreTokenizer::Gpt2 { single_digits } => gpt2_match(&cs, i, single_digits),
+            PreTokenizer::DeepSeekLlm | PreTokenizer::DeepSeek3 => unreachable!("split above"),
         }
         .max(1);
         words.push(cs[i..i + len].iter().collect());
         i += len;
     }
     words
+}
+
+/// The length of a match at `p[i]` within a piece `p`, 0 for none.
+type Matcher = fn(&[char], usize) -> usize;
+
+/// HF's `Sequence` of `Split` pre-tokenizers with `Isolated` behavior: each step splits every
+/// piece of the step before into its leftmost-first matches and the text between them.
+fn split_seq(text: &str, steps: &[Matcher]) -> Vec<String> {
+    let cs: Vec<char> = text.chars().collect();
+    // One piece, the whole text: a list of ranges, not a range's indices.
+    #[allow(clippy::single_range_in_vec_init)]
+    let mut pieces = vec![0..cs.len()];
+    for step in steps {
+        let mut next = Vec::with_capacity(pieces.len());
+        for r in pieces {
+            let p = &cs[r.clone()];
+            let (mut i, mut gap) = (0, 0);
+            while i < p.len() {
+                match step(p, i) {
+                    0 => i += 1,
+                    n => {
+                        if gap < i {
+                            next.push(r.start + gap..r.start + i);
+                        }
+                        next.push(r.start + i..r.start + i + n);
+                        i += n;
+                        gap = i;
+                    }
+                }
+            }
+            if gap < p.len() {
+                next.push(r.start + gap..r.end);
+            }
+        }
+        pieces = next;
+    }
+    pieces.into_iter().map(|r| cs[r].iter().collect()).collect()
+}
+
+/// Length of the run of `class` chars at `p[i]` (0 past the end).
+fn run(p: &[char], i: usize, class: fn(char) -> bool) -> usize {
+    p.get(i..)
+        .map_or(0, |p| p.iter().take_while(|&&c| class(c)).count())
+}
+
+/// `\s?[class]+` at `p[i]`.
+fn space_then_run(p: &[char], i: usize, class: fn(char) -> bool) -> usize {
+    match run(p, i + 1, class) {
+        n if n > 0 && p[i].is_whitespace() => 1 + n,
+        _ => run(p, i, class),
+    }
+}
+
+/// `\s+$`: the whitespace that ends a piece. Only a run's first char is tried, so a long run
+/// is scanned once.
+fn trailing_space(p: &[char], i: usize) -> usize {
+    if i > 0 && p[i - 1].is_whitespace() {
+        return 0;
+    }
+    match run(p, i, char::is_whitespace) {
+        n if i + n == p.len() => n,
+        _ => 0,
+    }
+}
+
+fn ds_letter(c: char) -> bool {
+    let ranges = &crate::unicode_classes::DEEPSEEK_LETTERS;
+    let i = ranges.partition_point(|&(lo, _)| lo <= c);
+    i > 0 && c <= ranges[i - 1].1
+}
+
+/// `[!-/:-~！-／：-～‘-‟　-。]`
+fn ds_punct(c: char) -> bool {
+    matches!(c, '!'..='/' | ':'..='~' | '！'..='／' | '：'..='～' | '‘'..='‟' | '　'..='。')
+}
+
+/// `[一-龥ࠀ-一가-퟿]`, whose first two ranges meet.
+fn ds_cjk(c: char) -> bool {
+    matches!(c, '\u{800}'..='\u{9fa5}' | '\u{ac00}'..='\u{d7ff}')
+}
+
+/// `[一-龥぀-ゟ゠-ヿ]`
+fn ds3_cjk(c: char) -> bool {
+    matches!(c, '\u{4e00}'..='\u{9fa5}' | '\u{3040}'..='\u{309f}' | '\u{30a0}'..='\u{30ff}')
+}
+
+/// A char's general category as the V3 pattern uses it: 1 letter, 2 mark, 3 punctuation or
+/// symbol, 0 anything else.
+fn category(c: char) -> u32 {
+    let runs = &crate::unicode_classes::RUNS;
+    let at = runs.partition_point(|&r| r >> 2 <= c as u32);
+    runs[at - 1] & 3
+}
+
+/// DeepSeek V3's last split: an ASCII punctuation mark and ASCII letters, an optional char
+/// that is no newline, letter, punctuation or symbol and then letters and marks, an optional
+/// space and punctuation or symbols and newlines, and the Llama 3 whitespace rules:
+/// `[!-/:-@[-`{-~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|`
+/// `\s*[\r\n]+|\s+(?!\S)|\s+`
+fn ds3_match(p: &[char], i: usize) -> usize {
+    let c = p[i];
+    let alpha = |c: char| c.is_ascii_alphabetic();
+    if c.is_ascii_punctuation() && p.get(i + 1).is_some_and(|&d| alpha(d)) {
+        return 1 + run(p, i + 1, alpha);
+    }
+    let letter_or_mark = |c: char| matches!(category(c), 1 | 2);
+    let prefix = !is_newline(c) && !matches!(category(c), 1 | 3);
+    match run(p, i + 1, letter_or_mark) {
+        n if n > 0 && prefix => return 1 + n,
+        _ => {
+            let n = run(p, i, letter_or_mark);
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let s = i + usize::from(c == ' ');
+    let punct = |c: char| category(c) == 3;
+    if s < p.len() && punct(p[s]) {
+        let n = run(p, s, punct);
+        return s - i + n + run(p, s + n, is_newline);
+    }
+    // \s*[\r\n]+: the longest whitespace prefix ending in a newline.
+    let ws = run(p, i, char::is_whitespace);
+    if let Some(k) = p[i..i + ws].iter().rposition(|&d| is_newline(d)) {
+        return k + 1;
+    }
+    whitespace_len(p, i)
 }
 
 fn llama3_match(cs: &[char], i: usize, max_digits: usize) -> usize {
@@ -766,7 +928,8 @@ mod tests {
 
     #[test]
     fn pretokenizers_match_python_regex_reference() {
-        // Generated with the `regex` package from the patterns llama.cpp uses for each pre type.
+        // Generated with the `regex` package from the patterns llama.cpp uses for each pre type;
+        // DeepSeek's with HF `tokenizers` from the models' own tokenizer.json, over more cases.
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../tests/pretok_ref.json")).unwrap();
         let cases: Vec<&str> = v["cases"]
@@ -790,8 +953,22 @@ mod tests {
                     single_digits: true,
                 },
             ),
+            ("deepseek-llm", PreTokenizer::DeepSeekLlm),
+            ("deepseek-v3", PreTokenizer::DeepSeek3),
         ] {
-            for (case, want) in cases.iter().zip(v[name].as_array().unwrap()) {
+            let mut cases = cases.clone();
+            if name.starts_with("deepseek") {
+                cases.extend(
+                    v["deepseek_cases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| c.as_str().unwrap()),
+                );
+            }
+            let want = v[name].as_array().unwrap();
+            assert_eq!(want.len(), cases.len(), "{name}");
+            for (case, want) in cases.iter().zip(want) {
                 let want: Vec<&str> = want
                     .as_array()
                     .unwrap()

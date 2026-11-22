@@ -825,10 +825,13 @@ impl Cuda {
                 b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, f.q(s), f.half(s));
                 match &layer.ffn {
                     Ffn::Dense(e) => ffn(b, s, e, x_at, n, int8, f, true),
+                    // DeepSeek's `ungated` and `bias` belong to MLA models, which `attach`
+                    // refuses.
                     Ffn::Moe {
                         router,
                         experts,
                         shared,
+                        ..
                     } => {
                         if let Some(strides) = g.expert_strides {
                             let shared = shared.as_ref();

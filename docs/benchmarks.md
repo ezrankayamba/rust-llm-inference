@@ -3,6 +3,35 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek V2-Lite on the CPU, first support
+
+DeepSeek-V2-Lite-Chat Q4_K_M (mradermacher's conversion of 2025-03, the older `attn_kv_b`
+layout), on the RTX 5090 PC's CPU (Core Ultra 9 285, 24 threads, Windows). GPU backends refuse
+MLA for now.
+
+**Correctness.** `dump_logits --precise --gpu-layers=0` on "The capital of France is Paris. The
+capital of Tanzania is" (13 tokens) against `ref_forward.py` (HF's DeepSeek attention as
+written: full keys and values per head, YaRN, softmax routing): max |logit diff| 3.96e-5
+batched and per token, top 5 identical; int8 activations 0.75, top 4 identical.
+`check_tokenizer.py ... deepseek-ai/DeepSeek-V2-Lite-Chat`: 17/17; `check_chat_template.py`:
+4/4. The tiny V2- and V3-style fixtures (`make_tiny_moe.py`) match the reference to 4e-6.
+`rli --temp 0 -p "What is the capital of Tanzania? Answer in two sentences."`: "The capital of
+Tanzania is Dodoma, which was designated as the official capital in 1974 and serves as a
+center for government administration. However, Dar es Salaam remains the largest city and
+primary economic hub of Tanzania."
+
+**Int8 accuracy** (`eval_quant ... README.md --tokens 256`, CPU): perplexity f32 15.9527, int8
+15.9794 (+0.167%), KL mean 0.006992, max 0.1740, top-1 agreement 96.48% (Qwen3-30B-A3B,
+the other MoE, measured KL 0.004-0.015).
+
+**Speed** (`bench --pp 128 --tg 64 --reps 2 --gpu-layers 0` against `llama-bench -ngl 0 -nopo 1
+-p 128 -n 64 -r 2`, llama.cpp v0.9.0):
+
+| | rli | llama.cpp | ratio |
+|---|---:|---:|---:|
+| pp128 | 119.0 | 250.7 | 0.47 |
+| tg64 | 26.0 | 39.2 | 0.66 |
+
 ## 2026-11-22: NVFP4 prompts on CUDA tensor cores: int8 (default) and FP4 (`--fp4-acts`)
 
 Two kernels for NVFP4 chunks of 8+ tokens on the RTX 5090. `mmk_nvfp4_t*` (lean compile) is

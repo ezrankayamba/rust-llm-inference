@@ -193,6 +193,16 @@ fn corrupted_nvfp4_header_never_panics() {
     check("tiny_nvfp4");
 }
 
+#[test]
+fn corrupted_deepseek_v2_header_never_panics() {
+    check("tiny_deepseek_v2");
+}
+
+#[test]
+fn corrupted_deepseek_v3_header_never_panics() {
+    check("tiny_deepseek_v3");
+}
+
 /// The byte offset just past the first occurrence of `needle` in a header.
 fn after(bytes: &[u8], needle: &str) -> usize {
     let n = needle.as_bytes();
@@ -324,5 +334,35 @@ fn rejects_non_finite_nvfp4_tensor_scales() {
             got.contains("blk.1.attn_k.scale") && got.contains("not finite"),
             "{got}"
         );
+    }
+}
+
+#[test]
+fn rejects_latent_attention_that_disagrees_with_its_tensors() {
+    for (fixture_name, want, edit) in [
+        (
+            "tiny_deepseek_v2",
+            "attn_kv_b",
+            &(|b: &mut Vec<u8>| set_dim(b, "blk.1.attn_kv_b.weight", 1, 64))
+                as &dyn Fn(&mut Vec<u8>),
+        ),
+        ("tiny_deepseek_v2", "attn_kv_a_mqa", &|b| {
+            set_u32_metadata(b, "deepseek2.attention.kv_lora_rank", 64)
+        }),
+        ("tiny_deepseek_v3", "attn_k_b", &|b| {
+            set_dim(b, "blk.2.attn_k_b.weight", 2, 3)
+        }),
+        ("tiny_deepseek_v3", "attn_q_a", &|b| {
+            set_u32_metadata(b, "deepseek2.attention.q_lora_rank", 16)
+        }),
+        ("tiny_deepseek_v3", "groups", &|b| {
+            set_u32_metadata(b, "deepseek2.expert_group_count", 3)
+        }),
+        ("tiny_deepseek_v3", "exp_probs_b", &|b| {
+            set_dim(b, "blk.1.exp_probs_b.bias", 0, 7)
+        }),
+    ] {
+        let got = load_error_of(fixture_name, "mla", edit);
+        assert!(got.contains(want), "{want}: {got}");
     }
 }

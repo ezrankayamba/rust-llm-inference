@@ -16,7 +16,7 @@ kernels, the GGUF loader, the tokenizers and the model graphs are all implemente
 |---|---|
 | Weights | GGUF, memory-mapped and read in place |
 | Quantization | F16/BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, NVFP4; Q4_1, Q5_0 and Q5_1 also load |
-| Models | Llama family (Llama 2/3, Mistral, dense Qwen) and mixture-of-experts (Mixtral, Qwen MoE) |
+| Models | Llama family (Llama 2/3, Mistral, dense Qwen) and mixture-of-experts (Mixtral, Qwen MoE, DeepSeek V2 and V3 on the CPU) |
 | CPU | AVX2 and AVX-512 VNNI on x86, NEON on ARM, chosen at runtime, with a portable fallback |
 | GPU | Apple Metal, and CUDA (checked by hand on an NVIDIA A100; CI only compiles it) |
 
