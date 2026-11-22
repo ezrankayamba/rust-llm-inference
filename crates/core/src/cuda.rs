@@ -45,6 +45,10 @@ const ATTN_PART_STEP: usize = 8;
 /// against 37-55 at 512).
 const ATTN_PART_MIN: u32 = 128;
 const ELT_THREADS: usize = 256;
+/// Positions a part of one token's latent attention takes (`attention_mla` with `split`), and
+/// the values a part keeps per head (`MLA_PART` in cuda.cu).
+const MLA_PART_LEN: usize = 32;
+const MLA_PART: usize = 514;
 /// Weight placement alignment in the device arena (f32 weights are read as `float*`).
 const WEIGHT_ALIGN: usize = 256;
 /// Bytes past the last weight that kernels may read (and ignore): the Q6_K matvec takes its
@@ -132,7 +136,9 @@ const GEMM_PARTS_MAX: usize = 16;
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 129;
-const OTHER_KERNELS: [&str; 21] = [
+const OTHER_KERNELS: [&str; 23] = [
+    "attention_mla_merge",
+    "attention_mla",
     "rmsnorm_strided",
     "copy_heads",
     "quant_x",
@@ -3046,6 +3052,75 @@ impl<'a> Batch<'a> {
         }
     }
 
+    /// Whether [`Batch::attention_mla`] takes latent attention with these dims (`MLA_ROPE`,
+    /// `MLA_LAT` and `MLA_H` in cuda.cu: DeepSeek V2's and V3's).
+    pub fn has_attention_mla(rope: usize, latent: usize, n_head: usize) -> bool {
+        (rope, latent) == (64, 512) && n_head.is_multiple_of(16)
+    }
+
+    /// DeepSeek's latent attention for `n_tok` query tokens, the first seeing `n_pos` cached
+    /// positions and each later one one more: `q` holds a cache row's worth per head (the
+    /// rotated dims, then the latent), `cache` is the keys and, past the rotated dims, the
+    /// values. Each head's output goes past its rotated dims in `out`, laid out as `q`; the
+    /// rest of `out` is left alone. One token's context is split into parts of
+    /// [`MLA_PART_LEN`] positions, run side by side through `scores` (scratch of
+    /// [`Batch::attention_scratch`] for a 576-dim head) and merged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_mla(
+        &mut self,
+        q: &GpuBuf,
+        cache: &GpuBuf,
+        out: &GpuBuf,
+        scores: &GpuBuf,
+        n_head: usize,
+        n_tok: usize,
+        n_pos: usize,
+        scale: f32,
+    ) {
+        let row = 576;
+        assert!(Self::has_attention_mla(64, row - 64, n_head) && n_tok > 0 && n_pos > 0);
+        assert!(q.len() >= n_tok * n_head * row && out.len() >= n_tok * n_head * row);
+        assert!(cache.len() >= (n_pos + n_tok - 1) * row);
+        // Even at short context: one block for every position took V2-Lite decode (128 tokens
+        // from position 0) from 347 tok/s to 316.
+        let split = n_tok == 1;
+        // Parts in multiples of 8, those past the context left empty, so that the grid
+        // changes once in 8 parts and not every part.
+        let room = scores.len() / (n_head * MLA_PART);
+        let n_parts = match split {
+            true => n_pos.div_ceil(MLA_PART_LEN).next_multiple_of(8).min(room),
+            false => 1,
+        };
+        assert!(
+            !split || n_parts * MLA_PART_LEN >= n_pos,
+            "attention scratch too small"
+        );
+        let (nh, np, part_len) = (n_head as u32, n_pos as u32, MLA_PART_LEN as u32);
+        let split_u = u32::from(split);
+        let mut l = self.call(self.gpu.other("attention_mla"));
+        l.arg(&q.0)
+            .arg(&cache.0)
+            .arg(&out.0)
+            .arg(&nh)
+            .arg(&np)
+            .arg(&scale)
+            .arg(&split_u)
+            .arg(&part_len)
+            .arg(&scores.0);
+        let cfg = LaunchConfig {
+            grid_dim: ((n_head / 16) as u32, n_tok as u32, n_parts as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.launch(l, cfg);
+        if split {
+            let mut l = self.call(self.gpu.other("attention_mla_merge"));
+            let n_parts = n_parts as u32;
+            l.arg(&scores.0).arg(&out.0).arg(&n_parts);
+            self.launch(l, grid(n_head, 256));
+        }
+    }
+
     /// Waits for all queued work.
     pub fn finish(self) {
         self.gpu.stream.synchronize().expect("CUDA command failed");
@@ -3281,6 +3356,67 @@ mod tests {
                 "f16 {ty:?}: {err} of {size}"
             );
         }
+    }
+
+    /// The latent attention kernel against the general one over the same random queries and
+    /// cache (one KV head of 576 dims): they differ in the order of their sums. Needs an
+    /// NVIDIA GPU.
+    #[test]
+    fn attention_mla_matches_attention() {
+        let (nh, row, pos, n) = (16, 576, 300, 13);
+        let max_ctx = pos + n;
+        let mut seed = 5u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / 8388608.0 - 1.0
+        };
+        let q: Vec<f32> = (0..n * nh * row).map(|_| 4.0 * next()).collect();
+        let k: Vec<f32> = (0..max_ctx * row).map(|_| next()).collect();
+        let w = vec![0u8; 64];
+        let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+        let (qb, kb) = (gpu.upload(&q), gpu.upload(&k));
+        let (want_b, got_b) = (gpu.alloc(n * nh * row), gpu.alloc(n * nh * row));
+        let scores = gpu.alloc(n * nh * max_ctx.max(Batch::attention_scratch(nh, row, max_ctx)));
+        let p = AttnParams {
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: row as u32,
+            n_tok: n as u32,
+            n_pos: (pos + 1) as u32,
+            kv_dim: row as u32,
+            max_ctx: max_ctx as u32,
+            scale: 0.07,
+            half: false,
+            pos_dev: None,
+        };
+        let mut b = gpu.batch();
+        b.attention(&qb, &kb, &kb, &want_b, &scores, &p, None, None);
+        b.attention_mla(&qb, &kb, &got_b, &scores, nh, n, pos + 1, 0.07);
+        // The last token alone, its context split into parts.
+        let last = (n - 1) * nh * row;
+        let one = gpu.alloc(nh * row);
+        let ql = gpu.upload(&q[last..]);
+        b.attention_mla(&ql, &kb, &one, &scores, nh, 1, pos + n, 0.07);
+        b.finish();
+        let mut split = vec![0f32; nh * row];
+        gpu.read(&one, &mut split);
+        let (mut want, mut got) = (vec![0f32; n * nh * row], vec![0f32; n * nh * row]);
+        gpu.read(&want_b, &mut want);
+        gpu.read(&got_b, &mut got);
+        let mut err = 0f32;
+        for (w, g) in want.chunks_exact(row).zip(got.chunks_exact(row)) {
+            for (a, b) in w[64..].iter().zip(&g[64..]) {
+                err = err.max((a - b).abs());
+            }
+        }
+        assert!(err < 1e-5, "max |diff| {err}");
+        let mut err = 0f32;
+        for (w, g) in want[last..].chunks_exact(row).zip(split.chunks_exact(row)) {
+            for (a, b) in w[64..].iter().zip(&g[64..]) {
+                err = err.max((a - b).abs());
+            }
+        }
+        assert!(err < 1e-5, "one token split: max |diff| {err}");
     }
 
     /// The f16 matmul over stacked experts for the 32-weight block types, whose columns need

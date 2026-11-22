@@ -3158,6 +3158,175 @@ extern "C" __global__ void copy_heads(const float* src, ulong src_off, float* ds
         src[src_off + (ulong)t * in_row + h * in_head + in_off + j];
 }
 
+// DeepSeek's latent attention over a chunk of query tokens: a cache row of MLA_ROW values per
+// position (MLA_ROPE rotated key dims, then the latent) is the key of every head, and its latent
+// part the value. A block takes MLA_H heads of token blockIdx.y, which share its causal limit,
+// so each key is read once for all of them (the general kernel read it once per head). A step
+// takes MLA_K keys: thread i holds dims MLA_SL (i / MLA_K).. of key i % MLA_K in registers
+// (one read a step, and the next step's issued before this one's softmax and sums) and forms
+// partial scores with all 16 heads' queries in shared memory, which warp shuffles and `ps`
+// add up. Scoring in chunks staged through shared memory instead, with two barriers and a
+// wait on memory per 64 dims, ran V2-Lite decode at 290 tok/s where this runs 347. The
+// online softmax takes a thread per head; then each thread adds 4 heads by 8 value dims,
+// read as float4s straight from the cache. f32 throughout: absorbed queries are large (on
+// Metal, half precision moved V2-Lite's logits by 0.72).
+// With `split` (one token: decode), block z takes positions z * part_len.. only and writes its
+// sums unnormalized to `part`, MLA_PART values per head and part (the output dims, then the
+// running maximum and sum), which attention_mla_merge combines: one block for a token's 16
+// heads left the GPU idle (V2-Lite decode at 2048 positions 69 tok/s, llama.cpp 219).
+#define MLA_ROPE 64
+#define MLA_LAT 512
+#define MLA_ROW 576
+#define MLA_H 16
+#define MLA_K 16
+#define MLA_SL (MLA_ROW / 16)
+#define MLA_QS (MLA_ROW + 1)
+#define MLA_PART (MLA_LAT + 2)
+extern "C" __global__ void attention_mla(const float* q, const float* kc, float* out, uint n_head,
+                                         uint n_pos, float scale, uint split, uint part_len,
+                                         float* part) {
+    __shared__ float sq[MLA_H * MLA_QS];
+    __shared__ float ps[8 * MLA_H * MLA_K];
+    __shared__ float sp[MLA_H * MLA_K];
+    __shared__ float sc[MLA_H];
+    uint tid = threadIdx.x, lane = tid % 32, warp = tid / 32, h0 = blockIdx.x * MLA_H;
+    uint t = blockIdx.y;
+    uint seen = n_pos + t;  // positions 0..seen - 1
+    uint lo = split ? blockIdx.z * part_len : 0, hi = split ? min(seen, lo + part_len) : seen;
+    uint pr = 4 * (tid / 64), pc = 8 * (tid % 64);  // the outputs this thread holds
+    float o[4][8];
+    #pragma unroll
+    for (uint r = 0; r < 4; r++)
+        #pragma unroll
+        for (uint c = 0; c < 8; c++) o[r][c] = 0;
+    float m = NEG_INF, l = 0;  // row tid's, for tid < MLA_H
+    if (lo < hi) {
+        const float* qt = q + ((ulong)t * n_head + h0) * MLA_ROW;
+        for (uint e = tid; e < MLA_H * MLA_ROW; e += 256)
+            sq[e / MLA_ROW * MLA_QS + e % MLA_ROW] = qt[e] * scale;
+        uint kj = tid % MLA_K, sl = (tid / MLA_K) * MLA_SL;
+        float4 kr[MLA_SL / 4];
+        {
+            const float4* kp = (const float4*)(kc + (ulong)min(lo + kj, hi - 1) * MLA_ROW + sl);
+            #pragma unroll
+            for (uint i = 0; i < MLA_SL / 4; i++) kr[i] = kp[i];
+        }
+        __syncthreads();
+        for (uint base = lo; base < hi; base += MLA_K) {
+            float s[MLA_H];
+            #pragma unroll
+            for (uint r = 0; r < MLA_H; r++) {
+                const float* qr = sq + r * MLA_QS + sl;
+                float a = 0;
+                #pragma unroll
+                for (uint i = 0; i < MLA_SL / 4; i++)
+                    a += qr[4 * i] * kr[i].x + qr[4 * i + 1] * kr[i].y + qr[4 * i + 2] * kr[i].z +
+                         qr[4 * i + 3] * kr[i].w;
+                s[r] = a;
+            }
+            // The next step's slice, read while this one finishes.
+            if (base + MLA_K < hi) {
+                uint pos = min(base + MLA_K + kj, hi - 1);
+                const float4* kp = (const float4*)(kc + (ulong)pos * MLA_ROW + sl);
+                #pragma unroll
+                for (uint i = 0; i < MLA_SL / 4; i++) kr[i] = kp[i];
+            }
+            // Lanes 16.. hold the next slice of the same keys.
+            #pragma unroll
+            for (uint r = 0; r < MLA_H; r++) s[r] += __shfl_xor_sync(0xffffffffu, s[r], 16);
+            if (lane < MLA_K) {
+                #pragma unroll
+                for (uint r = 0; r < MLA_H; r++) ps[(warp * MLA_H + r) * MLA_K + lane] = s[r];
+            }
+            __syncthreads();
+            {
+                uint r = tid / MLA_K, j = tid % MLA_K;
+                float v = 0;
+                #pragma unroll
+                for (uint w = 0; w < 8; w++) v += ps[(w * MLA_H + r) * MLA_K + j];
+                sp[tid] = base + j < hi ? v : NEG_INF;
+            }
+            __syncthreads();
+            if (tid < MLA_H) {
+                float* row = sp + tid * MLA_K;
+                float mx = m;
+                for (uint j = 0; j < MLA_K; j++) mx = fmaxf(mx, row[j]);
+                float sum = 0;
+                for (uint j = 0; j < MLA_K; j++) {
+                    float pj = __expf(row[j] - mx);
+                    row[j] = pj;
+                    sum += pj;
+                }
+                float corr = __expf(m - mx);
+                l = l * corr + sum;
+                m = mx;
+                sc[tid] = corr;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (uint r = 0; r < 4; r++) {
+                float c = sc[pr + r];
+                #pragma unroll
+                for (uint i = 0; i < 8; i++) o[r][i] *= c;
+            }
+            uint nk = min((uint)MLA_K, hi - base);
+            for (uint j = 0; j < nk; j++) {
+                const float4* vp =
+                    (const float4*)(kc + (ulong)(base + j) * MLA_ROW + MLA_ROPE + pc);
+                float4 a = vp[0], b = vp[1];
+                #pragma unroll
+                for (uint r = 0; r < 4; r++) {
+                    float p = sp[(pr + r) * MLA_K + j];
+                    o[r][0] += p * a.x, o[r][1] += p * a.y, o[r][2] += p * a.z, o[r][3] += p * a.w;
+                    o[r][4] += p * b.x, o[r][5] += p * b.y, o[r][6] += p * b.z, o[r][7] += p * b.w;
+                }
+            }
+            // `sp` and `ps` are written again next step.
+            __syncthreads();
+        }
+    }
+    if (split) {
+        // An empty part (past the context) leaves maximum -inf, sum 0 and zeros.
+        ulong at = ((ulong)h0 * gridDim.z + blockIdx.z) * MLA_PART;
+        if (tid < MLA_H) {
+            part[at + (ulong)tid * gridDim.z * MLA_PART + MLA_LAT] = m;
+            part[at + (ulong)tid * gridDim.z * MLA_PART + MLA_LAT + 1] = l;
+        }
+        #pragma unroll
+        for (uint r = 0; r < 4; r++) {
+            float* od = part + at + (ulong)(pr + r) * gridDim.z * MLA_PART + pc;
+            #pragma unroll
+            for (uint i = 0; i < 8; i++) od[i] = o[r][i];
+        }
+        return;
+    }
+    if (tid < MLA_H) sc[tid] = 1.0f / l;
+    __syncthreads();
+    #pragma unroll
+    for (uint r = 0; r < 4; r++) {
+        float* od = out + ((ulong)t * n_head + h0 + pr + r) * MLA_ROW + MLA_ROPE + pc;
+        float inv = sc[pr + r];
+        #pragma unroll
+        for (uint i = 0; i < 8; i++) od[i] = o[r][i] * inv;
+    }
+}
+
+// attention_mla's parts of one token's head blockIdx.x, combined into its output.
+extern "C" __global__ void attention_mla_merge(const float* part, float* out, uint n_parts) {
+    uint h = blockIdx.x;
+    const float* p = part + (ulong)h * n_parts * MLA_PART;
+    float mx = NEG_INF, l = 0;
+    for (uint i = 0; i < n_parts; i++) mx = fmaxf(mx, p[i * MLA_PART + MLA_LAT]);
+    for (uint i = 0; i < n_parts; i++)
+        l += p[i * MLA_PART + MLA_LAT + 1] * __expf(p[i * MLA_PART + MLA_LAT] - mx);
+    for (uint c = threadIdx.x; c < MLA_LAT; c += blockDim.x) {
+        float acc = 0;
+        for (uint i = 0; i < n_parts; i++)
+            acc += p[i * MLA_PART + c] * __expf(p[i * MLA_PART + MLA_LAT] - mx);
+        out[(ulong)h * MLA_ROW + MLA_ROPE + c] = acc / l;
+    }
+}
+
 extern "C" __global__ void axpy(float* a, ulong a_off, const float* b, ulong b_off, uint n, float alpha) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) a[a_off + i] += alpha * b[b_off + i];

@@ -191,8 +191,14 @@ Design points that span files:
   `v_b`'s heads are views into `attn_kv_b` with `k`'s rows between them): `k_b` and `v_b` are
   one `matvec_id` over the (token, head) pairs under 8 tokens (`MLA_HEAD_MATMUL`) and a matmul
   per head from there (`head_matmuls`; the id matvec reads a head's matrix again per token, 66%
-  of a 512-token prompt), and attention is the general kernel over 576-dim heads, half of a
-  prompt's time. On CUDA a V3 layer (sigmoid routing) runs one token at a time.
+  of a 512-token prompt; F32 heads take `matmul_f32_tiled`). Attention is `attention_mla`
+  (f32): a block takes 16 heads of one token, each thread a 36-dim slice of one of 16 keys in
+  registers against all 16 queries in shared memory, the next step's slice read before this
+  one's softmax and value sums (staging keys through shared memory 64 dims at a time waited on
+  memory nine times a step: decode 290 tok/s, now 347). One token's context is split into
+  parts of 32 positions (`MLA_PART_LEN`, in multiples of 8) and merged, at any length (a block
+  for all of them was 69 tok/s at 2048 positions, now 308). On CUDA a V3 layer (sigmoid
+  routing) runs one token at a time.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there
   (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep

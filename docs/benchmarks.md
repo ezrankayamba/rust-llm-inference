@@ -3,6 +3,38 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek latent attention kernel on CUDA (RTX 5090, Windows)
+
+`attention_mla` in place of the general attention kernel over 576-dim heads, and the
+`k_b` heads of old files (F32) through `matmul_f32_tiled`. V2-Lite Q4_K_M, steps one after
+another (best of two runs, tok/s; d2048 is `--depth 2048`):
+
+| step | pp64 | pp512 | tg128 | tg64 @ d2048 |
+|---|---|---|---|---|
+| before (37e6c13) | 3170 | 5270 | 355 | 69 |
+| `attention_mla` for prompts (K staged 64 dims at a time) | 3120 | 9640 | 355 | 69 |
+| tiled f32 matmul for F32 heads | 3780 | 10890 | | |
+| one token split into 32-position parts, merged | | | 290 | 260 |
+| keys in registers, a slice a thread, next step read ahead | 3910 | 13280 | 347 | 308 |
+| no split under 128 positions (dropped) | | | 316 | |
+
+Final, alternated with llama.cpp (cd959bae9) with 30 s rests, two rounds (2925-2932 MHz SM,
+13801-14001 MHz memory, 92-168 W, 42-43 C):
+
+| test | rli | llama.cpp | ratio |
+|---|---|---|---|
+| pp64 | 3888, 3890 | 5257, 5303 | 0.74 |
+| pp512 | 13287, 13278 | 17194, 17248 | 0.77 |
+| tg128 | 346.7, 346.5 | 389.5, 390.2 | 0.89 |
+| tg64 @ d2048 | 308.3, 308.6 | 219.8, 219.8 | 1.40 |
+
+Logits on the 13-token prompt against `ref_forward.py`: `--precise` 1.1e-5 batched, 1.2e-5
+per token, top 5 identical; default KL 0.00001 both ways. `attention_mla_matches_attention`
+(rli-core) checks the kernel against the general one, a chunk of 13 tokens and one token
+split, to 1e-5. Under `RLI_CUDA_PROF=1` a 512-token prompt's attention went from 120 ms to
+32 ms (prompt kernel before the register rewrite); short decode is 0.89x llama.cpp, the rest
+of it outside attention.
+
 ## 2026-11-22: DeepSeek V2-Lite on CUDA, first support (RTX 5090, Windows)
 
 DeepSeek-V2-Lite-Chat Q4_K_M, every layer offloaded. `dump_logits ... --gpu-layers=99` on the

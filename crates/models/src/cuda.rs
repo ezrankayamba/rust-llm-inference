@@ -847,7 +847,14 @@ impl Cuda {
             half: int8,
             pos_dev: None,
         };
-        b.attention(&s.qr, cache, cache, &s.ao, &kv.scores, &p, None, None);
+        // 16 heads of a token a block, each key read once for them; one token's context in
+        // parts side by side.
+        if Batch::has_attention_mla(rd, lat, nh) {
+            let (scale, scores) = (c.kq_scale(), &kv.scores);
+            b.attention_mla(&s.qr, cache, &s.ao, scores, nh, m, pos + lo + 1, scale);
+        } else {
+            b.attention(&s.qr, cache, cache, &s.ao, &kv.scores, &p, None, None);
+        }
         // Each head's weighted latent (past the key dims) through its `v_b`, into `s.att`.
         let (w, x, y) = (&a.v_b[0], At(&s.ao, rd), At(&s.att, 0));
         if m >= MLA_HEAD_MATMUL {
@@ -886,9 +893,20 @@ impl Cuda {
             off: 0,
         };
         b.copy_heads(src, from, At(&s.hx, 0), packed(cols), m, nh, cols);
+        // F32 heads (old files' transposed `k_b`) take the tiled f32 matmul, which adds into
+        // results zeroed here for every head at once: V2-Lite pp512 on an RTX 5090 spent 18%
+        // of its time in the plain one, at 2 TFLOPS.
+        let tiled = heads[0].ty == GgmlType::F32 && m >= ROUTER_TILED_TOKENS;
+        if tiled {
+            b.to_f16_zero(At(&s.hx, 0), 0, &s.xh, &[(At(&s.hy, 0), nh * m * rows)]);
+        }
         for (h, w) in heads.iter().enumerate() {
             let (x, y) = (At(&s.hx, h * m * cols), At(&s.hy, h * m * rows));
-            mm_each(b, s, &[w], x, &[y], m, int8, Fed::No);
+            if tiled {
+                b.matmul_f32_add(rows, cols, w.offset, x, y, m);
+            } else {
+                mm_each(b, s, &[w], x, &[y], m, int8, Fed::No);
+            }
         }
         b.copy_heads(At(&s.hy, 0), packed(rows), dst, to, m, nh, rows);
     }
