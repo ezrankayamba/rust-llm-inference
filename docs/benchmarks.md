@@ -18,7 +18,19 @@ before). `bench --pp 128 --tg 0 --reps 3 --gpu-layers 0` alternating with `llama
 | DeepSeek-V2-Lite Q4_K_M pp128 | 117.1 | 214.0, 210.4 | 198.7 ± 57.4, 235.9 ± 8.0 |
 | Qwen3-30B-A3B Q4_K_M pp128 | 95.1, 92.9 | 199.0, 194.2 | |
 
-V2-Lite prompts went from ~0.6x llama.cpp to 0.9-1.07x.
+V2-Lite prompts of 128 tokens went from ~0.6x llama.cpp to 0.9-1.07x. Longer ones did not
+close as far: in a later run (same setup, `--pp 512 --tg 64 --reps 2`, two rounds) pp512 was
+158.9, 162.1 against llama.cpp's 258.3, 260.4 (0.62x) and tg64 31.6, 31.8 against 37.4, 37.5
+(0.85x); `tg32 --depth 1024` 27.7, 27.8 against 32.8, 33.0 (0.84x). `sample` of pp512 on the
+M4 puts ~60% of the time in the int8 matmul kernel (`qdot::neon::dot_block`), ~19% waiting,
+~12% in attention (`dot_f16_rows`, `weighted_rows_f16`) and 5% in the F32 `k_b` dots: the rest
+of the gap is the CPU matmul kernels every model shares, not DeepSeek's code.
+
+**Tried and dropped: MLA attention by position span for all heads at once.** Jobs of all of a
+token's heads over 32 positions (scores) or 32 latent dims (values), so each cached row is read
+once for the 16 heads, and a decoded token has more than 16 jobs. Slower on every measure (same
+runs as above): `tg32 --depth 1024` 27.7, 27.8 -> 25.6, 25.8; pp512 158.9, 162.1 -> 146.1,
+143.2; tg64 31.6, 31.8 -> 30.8, 30.9.
 
 ## 2026-11-22: DeepSeek cache rows and query rotation in one launch on CUDA (RTX 5090)
 
