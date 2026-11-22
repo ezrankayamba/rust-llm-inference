@@ -3,6 +3,23 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: CPU MoE experts and MLA heads side by side (Core Ultra 9 285, Windows)
+
+A CPU prompt ran each used expert's matmuls, and each MLA head's `k_b` / `v_b`, as a parallel
+pass of its own: too small to keep 24 threads busy (`sample` on the M4: ~40% of a V2-Lite prompt
+in the pool's waiting). Now the used experts run side by side (`par_iter`, with the ungated
+shared expert beside them through `rayon::join`), as do the heads; results are summed in the
+same order, so outputs are unchanged (`--precise` V2-Lite 3.96e-5 from `ref_forward.py`, as
+before). `bench --pp 128 --tg 0 --reps 3 --gpu-layers 0` alternating with `llama-bench -ngl 0
+-dev none -nopo 1 -p 128 -n 0 -r 3` (v0.9.0), 30 s rests, two rounds, tok/s:
+
+| | before | after | llama.cpp |
+|---|---:|---:|---:|
+| DeepSeek-V2-Lite Q4_K_M pp128 | 117.1 | 214.0, 210.4 | 198.7 ± 57.4, 235.9 ± 8.0 |
+| Qwen3-30B-A3B Q4_K_M pp128 | 95.1, 92.9 | 199.0, 194.2 | |
+
+V2-Lite prompts went from ~0.6x llama.cpp to 0.9-1.07x.
+
 ## 2026-11-22: DeepSeek cache rows and query rotation in one launch on CUDA (RTX 5090)
 
 `mla_rows` writes the cache rows (rotated key dims, normed latent) and the queries' rotated

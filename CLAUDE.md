@@ -148,7 +148,9 @@ Design points that span files:
 - **CPU prompts are batched too**, in chunks of 128 tokens (`CPU_CHUNK`): `QMatrix::matmul_with`
   runs each block of weight rows against every token of the chunk while it is in cache. One
   row is the decode case, so CPU decode and prompts share `Model::cpu_layers`. CPU MoE layers
-  route each row, then run each used expert once over the rows that picked it.
+  route each row, then run each used expert once over the rows that picked it, the experts
+  side by side (each one's matmul alone left the threads waiting: prompts 2x for running them
+  together), as are MLA's per-head `k_b` / `v_b` matmuls.
 - **Speculative decoding checks a batch, which costs more than a token.** A pass of 2-5 rows ran
   1.75-2.1x a one-token pass on Qwen3-14B (Metal: a batch takes the prompt kernels, a token the
   fused decode ones), so a draft guesses its full `--draft-tokens` every pass and drafting pauses

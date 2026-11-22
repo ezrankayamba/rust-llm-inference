@@ -1071,7 +1071,6 @@ impl Model {
         }
         // Per (token, head): the rotated query dims, then k_b times the others.
         let mut qr = vec![0.0; m * nh * row];
-        let (mut part, mut out) = (vec![0.0; m * nope], vec![0.0; m * lat]);
         if m == 1 {
             let mut jobs: Vec<_> = a
                 .k_b
@@ -1084,15 +1083,29 @@ impl Model {
                 .collect();
             self.matvecs(&mut jobs);
         }
-        for (h, k_b) in a.k_b.iter().enumerate().filter(|_| m > 1) {
-            for (i, p) in part.chunks_exact_mut(nope).enumerate() {
-                p.copy_from_slice(&q[(i * nh + h) * hd..][..nope]);
-            }
-            self.matmul(k_b, &part, &mut out, m);
-            for (i, o) in out.chunks_exact(lat).enumerate() {
-                let (dst, src) = (&mut qr[(i * nh + h) * row..][..row], (i * nh + h) * hd);
-                dst[..rd].copy_from_slice(&q[src + nope..][..rd]);
-                dst[rd..].copy_from_slice(o);
+        // A head's matmul is a small parallel pass of its own, so the heads run side by side.
+        let head_matmul = |heads: &[Weight], x: &[f32], (x_hd, x_off, w): (usize, usize, usize)| {
+            heads
+                .par_iter()
+                .enumerate()
+                .map(|(h, wt)| {
+                    let mut part = vec![0.0; m * w];
+                    for (i, p) in part.chunks_exact_mut(w).enumerate() {
+                        p.copy_from_slice(&x[(i * nh + h) * x_hd + x_off..][..w]);
+                    }
+                    let mut out = vec![0.0; m * wt.rows];
+                    self.matmul(wt, &part, &mut out, m);
+                    out
+                })
+                .collect::<Vec<_>>()
+        };
+        if m > 1 {
+            for (h, out) in head_matmul(&a.k_b, &q, (hd, 0, nope)).iter().enumerate() {
+                for (i, o) in out.chunks_exact(lat).enumerate() {
+                    let (dst, src) = (&mut qr[(i * nh + h) * row..][..row], (i * nh + h) * hd);
+                    dst[..rd].copy_from_slice(&q[src + nope..][..rd]);
+                    dst[rd..].copy_from_slice(o);
+                }
             }
         }
         qr.par_chunks_exact_mut(nh * row)
@@ -1121,12 +1134,7 @@ impl Model {
                 .collect();
             return self.matvecs(&mut jobs);
         }
-        let (mut part, mut out) = (vec![0.0; m * lat], vec![0.0; m * vh]);
-        for (h, v_b) in a.v_b.iter().enumerate() {
-            for (i, p) in part.chunks_exact_mut(lat).enumerate() {
-                p.copy_from_slice(&o[(i * nh + h) * lat..][..lat]);
-            }
-            self.matmul(v_b, &part, &mut out, m);
+        for (h, out) in head_matmul(&a.v_b, &o, (lat, 0, lat)).iter().enumerate() {
             for (i, v) in out.chunks_exact(vh).enumerate() {
                 att[(i * nh + h) * vh..][..vh].copy_from_slice(v);
             }
@@ -1161,22 +1169,43 @@ impl Model {
         if n == 1 {
             return self.moe_token(ffn, &chosen, xs, out);
         }
+        // The used experts side by side: each one's matmuls over its few rows were a parallel
+        // pass too small to keep the threads busy (V2-Lite's 64 experts a layer).
+        let used: Vec<_> = experts
+            .iter()
+            .zip(&rows)
+            .filter(|(_, r)| !r.is_empty())
+            .collect();
+        let (ys, shared_y) = rayon::join(
+            || {
+                used.par_iter()
+                    .map(|(e, rows)| {
+                        let mut gathered = Vec::with_capacity(rows.len() * c.n_embd);
+                        for &(t, _) in rows.iter() {
+                            gathered.extend_from_slice(&xs[t * c.n_embd..(t + 1) * c.n_embd]);
+                        }
+                        let mut y = vec![0.0; gathered.len()];
+                        self.ffn(e, &gathered, &mut y, rows.len());
+                        y
+                    })
+                    .collect::<Vec<_>>()
+            },
+            || {
+                ungated.as_ref().map(|e| {
+                    let mut y = vec![0.0; xs.len()];
+                    self.ffn(e, xs, &mut y, n);
+                    y
+                })
+            },
+        );
         out.fill(0.0);
-        let (mut gathered, mut y) = (Vec::new(), Vec::new());
-        for (e, rows) in experts.iter().zip(&rows).filter(|(_, r)| !r.is_empty()) {
-            gathered.clear();
-            for &(t, _) in rows {
-                gathered.extend_from_slice(&xs[t * c.n_embd..(t + 1) * c.n_embd]);
-            }
-            y.resize(gathered.len(), 0.0);
-            self.ffn(e, &gathered, &mut y, rows.len());
+        for ((_, rows), y) in used.iter().zip(&ys) {
             for (&(t, w), r) in rows.iter().zip(y.chunks_exact(c.n_embd)) {
                 axpy(&mut out[t * c.n_embd..(t + 1) * c.n_embd], w, r);
             }
         }
-        if let Some(e) = ungated {
-            y.resize(out.len(), 0.0);
-            self.ffn(e, xs, &mut y, n);
+        let mut y = shared_y.unwrap_or_default();
+        if !y.is_empty() {
             ops::add_assign(out, &y);
         }
         if let Some((gate_inp, e)) = shared {
