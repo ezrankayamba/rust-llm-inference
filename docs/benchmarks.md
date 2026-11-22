@@ -3,6 +3,24 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: NVFP4 int8 matvecs on CUDA (decode)
+
+`mvq_nvfp4` and `mvq_nvfp4_pair` (gate and up in one launch, a tensor scale each): int8
+activations as for Q4_K, a lane per two sub-blocks, the E2M1 codes turned into int8 by byte
+permutes (`fp4x8`, ggml's lookup) and summed with `dp4a`. Chunks of 2 to 7 tokens run them a
+token per grid row; 8 and more keep the f32 matmul for now. Qwen3-8B-NVFP4 on the RTX 5090:
+
+| | before | after | llama.cpp v0.9.0 | ratio | GPU (rli, after) |
+|---|---:|---:|---:|---:|---|
+| tg128 (`cmpc.py "" Qwen3-8B-NVFP4.gguf 128`, 2 rounds) | 135.9 | 229.5 | 236.7 | 0.970 | 2.92 GHz, 13801 MHz, 95-96%, 448-453 W, 46-50 C |
+
+`RLI_CUDA_PROF=1` (`bench --pp 1 --tg 64`), per token: the NVFP4 matvecs 8.29 -> 4.46 ms, 6
+launches a layer where the f32 matvecs took 7 and two `axpy` (the int8 ones add into the
+residual stream themselves). Logits
+(`dump_logits`, "The capital of Tanzania is"): int8 0.213 from `--precise`, batched and per
+token alike (a 6-token prompt is matvecs either way); the CPU's int8 path is 0.235 from it.
+Top-1 unchanged.
+
 ## 2026-11-21: NVFP4 weights, first support (generic kernels)
 
 nvidia/Qwen3-8B-NVFP4 (ModelOpt) converted with llama.cpp v0.9.0's `convert_hf_to_gguf.py`:

@@ -483,6 +483,7 @@ impl Gpu {
             .collect::<Result<_, String>>()?;
         let mvq = MMQ_KERNELS
             .iter()
+            .chain(&[(GgmlType::NVFP4, "mmq_nvfp4")])
             .map(|&(t, n)| {
                 let n = n.replace("mmq", "mvq");
                 Ok((t, func(&n)?, func(&format!("{n}_pair"))?))
@@ -644,10 +645,12 @@ impl Gpu {
     }
 
     /// Whether the int8 kernels can run the matrix of `ty` and `cols` columns at byte `offset`
-    /// of the model file: [`Gpu::has_matmul_q`], and a start at a multiple of 16 bytes on the
-    /// device, which the matvecs' 16-byte reads assume (GGUF aligns tensors to 32).
+    /// of the model file: [`Gpu::has_matmul_q`] (or NVFP4, which has only the matvecs: see
+    /// [`Batch::has_int8`]), and a start at a multiple of 16 bytes on the device, which the
+    /// matvecs' 16-byte reads assume (GGUF aligns tensors to 32).
     pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
-        Self::has_matmul_q(ty, cols) && self.device_offset(offset, 1).is_multiple_of(16)
+        let nvfp4 = ty == GgmlType::NVFP4 && cols.is_multiple_of(256);
+        (Self::has_matmul_q(ty, cols) || nvfp4) && self.device_offset(offset, 1).is_multiple_of(16)
     }
 
     pub fn alloc_half(&self, n: usize) -> GpuHalf {
@@ -1264,9 +1267,10 @@ pub struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
-    /// [`Gpu::has_int8`] of the batch's device.
-    pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize) -> bool {
-        self.gpu.has_int8(ty, cols, offset)
+    /// Whether [`Batch::matmul_q`] takes the matrix over `n_tok` tokens: [`Gpu::has_int8`],
+    /// and for NVFP4 under [`MMQ_MIN_TOKENS`], since it has only the int8 matvecs.
+    pub fn has_int8(&self, ty: GgmlType, cols: usize, offset: usize, n_tok: usize) -> bool {
+        self.gpu.has_int8(ty, cols, offset) && (ty != GgmlType::NVFP4 || n_tok < MMQ_MIN_TOKENS)
     }
 
     /// `y = W x`, `W` being `rows x cols` of `ty` at byte `offset` of the model file.
@@ -1778,7 +1782,7 @@ impl<'a> Batch<'a> {
         n_tok: usize,
         add: bool,
     ) {
-        assert!(self.gpu.has_int8(ty, cols, offset) && rows > 0 && n_tok > 0);
+        assert!(self.has_int8(ty, cols, offset, n_tok) && rows > 0 && n_tok > 0);
         assert!(xq.q.len() * 4 >= n_tok * cols && y.1 + n_tok * rows <= y.0.len());
         // A few tokens of a Q4_K or Q6_K matrix share one read of each row.
         let multi = match ty {
@@ -2026,6 +2030,7 @@ impl<'a> Batch<'a> {
         let span = (n_stack - 1) * stride + rows * row_bytes;
         let w_off = self.gpu.device_offset(offset, span) as u64;
         // The kernel adds the second stack's distance to the offset, modulo 2^64.
+        let second_offset = second.map(|(offset2, _)| offset2);
         let second = second.map(|(offset2, y2)| {
             assert!(self.gpu.has_int8(ty, cols, offset2));
             assert!(y2.1 + (n - 1) * y_stride + rows <= y2.0.len());
@@ -2033,8 +2038,16 @@ impl<'a> Batch<'a> {
             (w2.wrapping_sub(w_off), y2)
         });
         let (id_stride, xs, xd) = (stride as u64, x_stride as u32, x_div as u32);
+        // NVFP4 stacks have a tensor scale per matrix, which the kernel doesn't take.
+        assert!(ty != GgmlType::NVFP4 || n_stack == 1);
+        let scales = [
+            self.gpu.scale(ty, offset),
+            second.map_or(1.0, |_| {
+                self.gpu.scale(ty, second_offset.expect("set with second"))
+            }),
+        ];
         self.launch_mvq(
-            ty, rows, cols, w_off, id_stride, ids, xq, xs, xd, y, y_stride, n, add, second,
+            ty, rows, cols, w_off, id_stride, ids, xq, xs, xd, y, y_stride, n, add, second, scales,
         );
     }
 
@@ -2087,6 +2100,7 @@ impl<'a> Batch<'a> {
         n: usize,
         add: bool,
         second: Option<(u64, At<'_>)>,
+        scales: [f32; 2],
     ) {
         let (_, one, pair) = self
             .gpu
@@ -2125,6 +2139,12 @@ impl<'a> Batch<'a> {
             .arg(&add);
         if second.is_some() {
             a.arg(&y2.0.0).arg(&y2_off).arg(&z_stride);
+        }
+        if ty == GgmlType::NVFP4 {
+            a.arg(&scales[0]);
+            if second.is_some() {
+                a.arg(&scales[1]);
+            }
         }
         let mut cfg = grid2(
             rows.div_ceil(MATVEC_ROWS_PER_BLOCK),
@@ -3209,6 +3229,77 @@ mod tests {
                 (g - w).abs() <= 1e-3 * (1.0 + w.abs()),
                 "dequant [{i}]: {g} vs {w}"
             );
+        }
+    }
+
+    /// The NVFP4 int8 matvecs (one token, a few as a row each, added into y, and the pair
+    /// kernel with a tensor scale per matrix) against the CPU's f32 product. Each 32 activations
+    /// are whole numbers that include 127, which int8 holds exactly, so only float rounding
+    /// separates them. Steps of 8 units of 256 columns are left partly filled. Needs an NVIDIA GPU.
+    #[test]
+    fn nvfp4_int8_matvecs_match_the_cpu() {
+        let ty = GgmlType::NVFP4;
+        for (rows, cols) in [(37, 768), (6, 2304)] {
+            let mut seed = 5u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let len = rows * ty.row_bytes(cols);
+            let mut w: Vec<u8> = (0..2 * len).map(|_| next() as u8).collect();
+            for b in w.chunks_exact_mut(ty.block_bytes()) {
+                b[..4].iter_mut().for_each(|d| *d = 0x20 | (*d & 15));
+            }
+            let scales = [0.37f32, 1.9];
+            let mut gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            gpu.set_scale(0, scales[0]);
+            gpu.set_scale(len, scales[1]);
+            let n = 3;
+            let x: Vec<f32> = (0..n * cols)
+                .map(|i| match i % 32 {
+                    7 => 127.0,
+                    _ => (next() % 255) as f32 - 127.0,
+                })
+                .collect();
+            let want: Vec<Vec<f32>> = (0..2)
+                .map(|m| {
+                    let q = crate::QMatrix::new(ty, rows, cols, &w[m * len..(m + 1) * len]);
+                    let mut y = vec![0f32; n * rows];
+                    for (xt, yt) in x.chunks_exact(cols).zip(y.chunks_exact_mut(rows)) {
+                        q.matvec_with(xt, yt, true);
+                    }
+                    y.iter().map(|v| v * scales[m]).collect()
+                })
+                .collect();
+            let (xb, xq) = (gpu.upload(&x), gpu.alloc_q(n * cols));
+            let (one, many, pair) = (gpu.alloc(rows), gpu.alloc(n * rows), gpu.alloc(2 * rows));
+            let mut b = gpu.batch();
+            b.quantize(At(&xb, 0), n * cols, &xq);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&one, 0), 1, false);
+            // Twice the product: stored, then added.
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), n, false);
+            b.matmul_q(ty, rows, cols, 0, &xq, At(&many, 0), n, true);
+            b.matvec_q_pair(ty, rows, cols, [0, len], &xq, At(&pair, 0));
+            b.finish();
+            let read = |buf: &GpuBuf, len| {
+                let mut v = vec![0f32; len];
+                gpu.read(buf, &mut v);
+                v
+            };
+            let check = |what: &str, got: &[f32], want: &[f32], k: f32| {
+                for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                    let w = k * w;
+                    assert!(
+                        (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                        "{rows}x{cols} {what} [{i}]: {g} vs {w}"
+                    );
+                }
+            };
+            check("one token", &read(&one, rows), &want[0][..rows], 1.0);
+            check("3 tokens, added", &read(&many, n * rows), &want[0], 2.0);
+            let p = read(&pair, 2 * rows);
+            check("pair, first", &p[..rows], &want[0][..rows], 1.0);
+            check("pair, second", &p[rows..], &want[1][..rows], 1.0);
         }
     }
 

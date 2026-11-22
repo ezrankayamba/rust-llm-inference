@@ -190,8 +190,8 @@ const ROUTER_MATVEC_TOKENS: usize = 64;
 const ROUTER_TILED_TOKENS: usize = 16;
 
 /// Whether any of `ws` runs in int8, so that their input is wanted quantized.
-fn wants_q(b: &Batch<'_>, ws: &[&Weight], int8: bool) -> bool {
-    int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset))
+fn wants_q(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> bool {
+    int8 && ws.iter().any(|w| b.has_int8(w.ty, w.cols, w.offset, n))
 }
 
 /// What the kernel that produced a matmul's input wrote besides the f32: nothing, the int8
@@ -221,7 +221,7 @@ fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
     let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
     if int8 && (rest.is_empty() || (!rest.iter().any(float) && b.has_gemm(ws[0].cols, n))) {
         Fed::Half
-    } else if wants_q(b, ws, int8) {
+    } else if wants_q(b, ws, n, int8) {
         Fed::Q
     } else {
         Fed::No
@@ -235,7 +235,7 @@ fn fed_add(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> Fed {
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
         && b.has_gemm(w.cols, n);
     let q = n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm);
-    if !dense && q && wants_q(b, &[w], int8) {
+    if !dense && q && wants_q(b, &[w], n, int8) {
         Fed::Q
     } else {
         fed(b, &[w], n, int8)
@@ -286,14 +286,14 @@ fn mm_each(
         }
         return;
     }
-    if fed != Fed::Q && wants_q(b, ws, int8) {
+    if fed != Fed::Q && wants_q(b, ws, n, int8) {
         b.quantize(x, n * ws[0].cols, &s.xq);
     }
     // Where the int8 matmul adds its parts into y, one launch zeroes every result first
     // (the launch per matrix it would make was 2-3% of a 16-token prompt).
     let adds = n >= MMQ_MIN_TOKENS && b.has_matmul_q_add();
     if adds {
-        let q = |(w, _): &(&&Weight, &At<'_>)| wants_q(b, &[**w], int8);
+        let q = |(w, _): &(&&Weight, &At<'_>)| wants_q(b, &[**w], n, int8);
         let zs: Vec<_> = ws
             .iter()
             .zip(ys)
@@ -305,7 +305,7 @@ fn mm_each(
         }
     }
     for (w, &y) in ws.iter().zip(ys) {
-        if wants_q(b, &[w], int8) {
+        if wants_q(b, &[w], n, int8) {
             b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, y, n, adds);
         } else {
             mm(b, w, x, y, n);
@@ -336,7 +336,7 @@ fn mm_add(
     let gemm = int8
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
         && b.has_gemm(w.cols, n);
-    if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], int8) {
+    if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], n, int8) {
         if fed != Fed::Q {
             b.quantize(src, n * w.cols, &s.xq);
         }
@@ -374,7 +374,7 @@ fn ffn(
     let (g, u, ff) = (&e.gate, &e.up, e.gate.rows);
     let (xb, gate, up) = (At(&s.xb, 0), At(&s.gate, 0), At(&s.gate, n * ff));
     // One token's gate and up are one launch when they are alike.
-    if n == 1 && wants_q(b, &[g], int8) && wants_q(b, &[u], int8) && g.ty == u.ty {
+    if n == 1 && wants_q(b, &[g], n, int8) && wants_q(b, &[u], n, int8) && g.ty == u.ty {
         if fed != Fed::Q {
             b.quantize(xb, g.cols, &s.xq);
         }
@@ -460,7 +460,7 @@ fn moe(
         && int8
         && b.has_gemm_id(d.ty, d.cols, d.offset, down_stride)
         && !(grouped && lean(b, d, down_stride));
-    if (grouped || down_half) && wants_q(b, &[&e.gate, &e.up, &e.down], int8) {
+    if (grouped || down_half) && wants_q(b, &[&e.gate, &e.up, &e.down], n, int8) {
         b.moe_group(ids, &s.perm, &s.starts, n * k, ne);
     }
     let groups = (&s.perm, &s.starts);
@@ -468,7 +468,7 @@ fn moe(
         grouped && int8 && b.has_gemm_id(m.ty, m.cols, m.offset, stride) && !lean(b, m, stride)
     };
     let halves = [half(b, &e.gate, gate_stride), half(b, &e.up, up_stride)];
-    if halves != [true; 2] && fed != Fed::Q && wants_q(b, &[&e.gate, &e.up], int8) {
+    if halves != [true; 2] && fed != Fed::Q && wants_q(b, &[&e.gate, &e.up], n, int8) {
         b.quantize(xb, n * n_embd, &s.xq);
     }
     if halves != [false; 2] && fed != Fed::Half {
@@ -477,16 +477,16 @@ fn moe(
     let paired = n < MMQ_MIN_TOKENS
         && e.gate.ty == e.up.ty
         && gate_stride == up_stride
-        && wants_q(b, &[&e.gate, &e.up], int8);
+        && wants_q(b, &[&e.gate, &e.up], n, int8);
     let stacks = [(&e.gate, gate_stride, gate), (&e.up, up_stride, up)];
     for (m, stride, out) in &stacks[..2 - paired as usize] {
         let (m, stride, out) = (*m, *stride, *out);
         let (ty, at) = (m.ty, m.offset);
         if half(b, m, stride) {
             b.gemm_id(ty, ff, n_embd, at, stride, ne, groups, &s.xh, k, out, n * k);
-        } else if grouped && wants_q(b, &[m], int8) {
+        } else if grouped && wants_q(b, &[m], n, int8) {
             b.matmul_q_id(ty, ff, n_embd, at, stride, ne, groups, &s.xq, k, out, n * k);
-        } else if wants_q(b, &[m], int8) {
+        } else if wants_q(b, &[m], n, int8) {
             let xq = &s.xq;
             let second = paired.then_some((e.up.offset, up));
             b.matvec_q_id(
@@ -540,7 +540,7 @@ fn moe(
             tmp,
             n * k,
         );
-    } else if wants_q(b, &[d], int8) {
+    } else if wants_q(b, &[d], n, int8) {
         b.swiglu(gate, up, n * k * ff, Some(&s.xq), None);
         let xq = &s.xq;
         if grouped {
@@ -777,7 +777,7 @@ impl Cuda {
                         };
                         match g.expert_strides {
                             Some([gs, us, _]) if half(&e.gate, gs) && half(&e.up, us) => Fed::Half,
-                            Some(_) if wants_q(b, &[&e.gate, &e.up], int8) => Fed::Q,
+                            Some(_) if wants_q(b, &[&e.gate, &e.up], n, int8) => Fed::Q,
                             _ => Fed::No,
                         }
                     }

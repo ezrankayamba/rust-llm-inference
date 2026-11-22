@@ -759,6 +759,62 @@ __device__ inline float mvq_q4_k_step8(const uchar* r, const int* xq, const floa
            (hf ? fo1 : f[1]) * (float)s0[1] + (hf ? f[1] : fo1) * (float)s1[1] - mins[1];
 }
 
+// The 8 weights of E2M1 codes q (bytes i..i + 3 of a sub-block: low nibbles weights i..,
+// high ones i + 8..) as int8, doubled as in fp4(): lo gets the low nibbles', hi the high ones'.
+// __byte_perm picks bytes by 3-bit index, so each code's magnitude is looked up in the
+// positive and the negative halves of the table and a third pick takes one by its sign bit
+// (ggml's way); the codes come out in nibble order, which the last two picks sort.
+__device__ inline void fp4x8(uint q, uint* lo, uint* hi) {
+    const uint p0 = 0x03020100u, p1 = 0x0C080604u, n0 = 0xFDFEFF00u, n1 = 0xF4F8FAFCu;
+    uint sign = 0x32103210u | ((q & 0x88888888u) >> 1);
+    uint t0 = __byte_perm(__byte_perm(p0, p1, q), __byte_perm(n0, n1, q), sign);
+    uint t1 = __byte_perm(__byte_perm(p0, p1, q >> 16), __byte_perm(n0, n1, q >> 16), sign >> 16);
+    *lo = __byte_perm(t0, t1, 0x6420);
+    *hi = __byte_perm(t0, t1, 0x7531);
+}
+
+// NVFP4, a unit of 4 blocks (256 weights, 144 bytes) per 8 lanes and 8 units a step, every
+// read issued before any is used, as in mvq_q4_k_step8. Lane 8u + j takes block j / 2,
+// sub-blocks 2 (j % 2) and 2 (j % 2) + 1: 16 bytes of codes in 4-byte reads (blocks are 36
+// bytes), the block's 4 scale bytes, and the 32 activations under them, one int8 block.
+__device__ inline float mvq_nvfp4_step8(const uchar* r, const int* xq, const float* xd,
+                                        const float* xs, uint left, uint lane) {
+    uint u = lane / 8, j = lane % 8, hf = j % 2;
+    uint q[2][4], sc[2];
+    U128 xa[2], xb[2];
+    float d[2];
+    #pragma unroll
+    for (uint t = 0; t < 2; t++) {
+        uint v = u + 4 * t;
+        if (v >= left) continue;
+        const uint* b = (const uint*)(r + v * 144 + 36 * (j / 2));
+        sc[t] = b[0];
+        #pragma unroll
+        for (uint k = 0; k < 4; k++) q[t][k] = b[1 + 4 * hf + k];
+        xa[t] = *(const U128*)(xq + 64 * v + 8 * j);
+        xb[t] = *(const U128*)(xq + 64 * v + 8 * j + 4);
+        d[t] = xd[8 * v + j];
+    }
+    float acc = 0;
+    #pragma unroll
+    for (uint t = 0; t < 2; t++) {
+        if (u + 4 * t >= left) continue;
+        uint l[4], hi[4];
+        #pragma unroll
+        for (uint k = 0; k < 4; k++) fp4x8(q[t][k], &l[k], &hi[k]);
+        int sa = dp4a(l[0], xa[t].v[0], 0), sb = dp4a(l[2], xb[t].v[0], 0);
+        sa = dp4a(l[1], xa[t].v[1], sa);
+        sb = dp4a(l[3], xb[t].v[1], sb);
+        sa = dp4a(hi[0], xa[t].v[2], sa);
+        sb = dp4a(hi[2], xb[t].v[2], sb);
+        sa = dp4a(hi[1], xa[t].v[3], sa);
+        sb = dp4a(hi[3], xb[t].v[3], sb);
+        uint s = sc[t] >> 16 * hf;
+        acc += d[t] * (ue4m3(s & 255) * (float)sa + ue4m3((s >> 8) & 255) * (float)sb);
+    }
+    return acc;
+}
+
 struct __attribute__((aligned(16))) UL2 {
     ulong v[2];
 };
@@ -903,7 +959,7 @@ extern "C" __global__ void dequant_q6_k(const uchar* w, ulong w_off, unsigned sh
         y = y2;                                                                                \
         y_off = y2_off;                                                                        \
     }
-#define MATVEC_Q(NAME, STEP, SB_BYTES, NSB, ARGS, PICK)                                        \
+#define MATVEC_Q(NAME, STEP, SB_BYTES, NSB, ARGS, PICK, SCALE)                                 \
 extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, const float* xd,   \
                                 const float* xs, float* y, ulong y_off, uint rows, uint cols,  \
                                 uint row_bytes, const uint* ids, ulong id_stride,              \
@@ -921,17 +977,25 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, const int* xq, cons
     float acc = 0;                                                                             \
     for (uint c = 0; c < n_sb; c += NSB)                                                       \
         acc += STEP(r + c * SB_BYTES, q + 64 * c, d + 8 * c, s + 16 * c, n_sb - c, lane);      \
-    acc = warp_sum(acc);                                                                       \
+    acc = warp_sum(acc) * SCALE;                                                               \
     float* yr = y + y_off + (ulong)e * y_stride + row;                                         \
     if (lane == 0) *yr = add ? *yr + acc : acc;                                                \
 }
 
 #ifndef RLI_MMA
-MATVEC_Q(mvq_q4_k, mvq_q4_k_step8, 144, 8, , )
-MATVEC_Q(mvq_q4_k_many, mvq_q4_k_step, 144, 4, , )
-MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4, , )
-MATVEC_Q(mvq_q4_k_pair, mvq_q4_k_step8, 144, 8, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
-MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK)
+MATVEC_Q(mvq_q4_k, mvq_q4_k_step8, 144, 8, , , 1.0f)
+MATVEC_Q(mvq_q4_k_many, mvq_q4_k_step, 144, 4, , , 1.0f)
+MATVEC_Q(mvq_q6_k, mvq_q6_k_step, 210, 4, , , 1.0f)
+MATVEC_Q(mvq_q4_k_pair, mvq_q4_k_step8, 144, 8, MVQ_PAIR_ARGS, MVQ_PAIR_PICK, 1.0f)
+MATVEC_Q(mvq_q6_k_pair, mvq_q6_k_step, 210, 4, MVQ_PAIR_ARGS, MVQ_PAIR_PICK, 1.0f)
+// NVFP4 matrices take their tensor scales: the pair's second matrix has its own.
+#define MVQ_SCALE_ARGS , float scale
+#define MVQ_PAIR_SCALE_ARGS MVQ_PAIR_ARGS, float scale, float scale2
+#define MVQ_PAIR_SCALE_PICK                                                                    \
+    MVQ_PAIR_PICK                                                                              \
+    if (blockIdx.z) scale = scale2;
+MATVEC_Q(mvq_nvfp4, mvq_nvfp4_step8, 144, 8, MVQ_SCALE_ARGS, , scale)
+MATVEC_Q(mvq_nvfp4_pair, mvq_nvfp4_step8, 144, 8, MVQ_PAIR_SCALE_ARGS, MVQ_PAIR_SCALE_PICK, scale)
 
 // mvq_q4_k for a few tokens of one matrix: a warp takes a weight row and up to MVM_P tokens
 // a pass, so the row's weights and scales are read and decoded once for all of them, where

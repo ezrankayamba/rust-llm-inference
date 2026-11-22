@@ -300,7 +300,10 @@ Design points that span files:
   chunk's last layer and output head launch other kernels): with one, a prompt of several
   chunks recaptured it every chunk, 3.2 ms of CPU with the GPU idle on Qwen3-30B-A3B (+2-6%
   at 1024 and 2048 tokens on the 5090 for it). Stacked MoE experts run
-  the int8 matvec too (`matvec_q_id`); other weight types stay f32. `dp4a` has no header
+  the int8 matvec too (`matvec_q_id`); other weight types stay f32, except NVFP4, which has
+  int8 matvecs only (`mvq_nvfp4`, `_pair`: E2M1 codes to int8 by byte permutes, `fp4x8`), so
+  `Batch::has_int8` takes the chunk's tokens and says no to NVFP4 from `MMQ_MIN_TOKENS`
+  (decode 136 -> 229.5 tok/s on Qwen3-8B, llama.cpp 236.7). `dp4a` has no header
   under NVRTC, so it is inline PTX, and the source is compiled for compute capability 6.1.
   On capability 8.0+ (Ampere) `mma_q4_k` / `mma_q6_k` take their place (`RLI_CUDA_NO_MMA=1`
   keeps `dp4a`): int8 tensor cores through inline `mma.sync`, blocks of 128 rows x 64 tokens
