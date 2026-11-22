@@ -1429,18 +1429,39 @@ impl<'a> Batch<'a> {
         y: At<'_>,
         n_tok: usize,
     ) {
-        let span = rows * cols * 4;
+        self.matmul_f32_add_heads(rows, cols, offset, (1, 0), (x, 0), (y, 0), n_tok);
+    }
+
+    /// [`Batch::matmul_f32_add`] for `n` matrices `w_stride` bytes apart, each over its own
+    /// `n_tok` tokens: matrix `h` reads x from `h * x_stride` and adds into y from
+    /// `h * y_stride` (values), all in one launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_f32_add_heads(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        offset: usize,
+        (n, w_stride): (usize, usize),
+        (x, x_stride): (At<'_>, usize),
+        (y, y_stride): (At<'_>, usize),
+        n_tok: usize,
+    ) {
+        let span = (n - 1) * w_stride + rows * cols * 4;
         let (_, w_off, _) = self.matrix(GgmlType::F32, rows, cols, offset, span, true);
         assert!(
-            n_tok > 0 && x.1 + n_tok * cols <= x.0.len() && y.1 + n_tok * rows <= y.0.len(),
+            n > 0
+                && n_tok > 0
+                && x.1 + (n - 1) * x_stride + n_tok * cols <= x.0.len()
+                && y.1 + (n - 1) * y_stride + n_tok * rows <= y.0.len(),
             "matmul buffer too small"
         );
-        let tiles = rows.div_ceil(32) * n_tok.div_ceil(32);
+        let tiles = rows.div_ceil(32) * n_tok.div_ceil(32) * n;
         let parts = (2 * self.gpu.gemm_room.0)
             .div_ceil(tiles)
             .clamp(1, cols / 32);
         let (x_off, y_off) = (x.1 as u64, y.1 as u64);
-        let (rows_u, cols_u, nt) = (rows as u32, cols as u32, n_tok as u32);
+        let (rows_u, cols_u, nt, parts_u) = (rows as u32, cols as u32, n_tok as u32, parts as u32);
+        let strides = [w_stride as u64, x_stride as u64, y_stride as u64];
         let mut a = self.call(self.gpu.other("matmul_f32_tiled"));
         a.arg(&self.gpu.weights)
             .arg(&w_off)
@@ -1450,12 +1471,16 @@ impl<'a> Batch<'a> {
             .arg(&y_off)
             .arg(&rows_u)
             .arg(&cols_u)
-            .arg(&nt);
+            .arg(&nt)
+            .arg(&parts_u);
+        for v in &strides {
+            a.arg(v);
+        }
         let cfg = LaunchConfig {
             grid_dim: (
                 rows.div_ceil(32) as u32,
                 n_tok.div_ceil(32) as u32,
-                parts as u32,
+                (parts * n) as u32,
             ),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,

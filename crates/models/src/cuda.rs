@@ -84,6 +84,9 @@ struct Scratch {
     /// A chunk's heads laid out one after another, into and out of their `k_b` / `v_b`.
     hx: GpuBuf,
     hy: GpuBuf,
+    /// The (token, head) pairs of a chunk grouped by head, for the heads' grouped matmul.
+    hperm: GpuIds,
+    hstart: GpuIds,
 }
 
 impl Scratch {
@@ -118,7 +121,7 @@ impl Scratch {
             perm: gpu.alloc_ids(n * k),
             starts: gpu.alloc_ids(c.n_expert + 1),
             route_w: gpu.alloc(n * (k + 1)),
-            xq: gpu.alloc_q(n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)),
+            xq: gpu.alloc_q((n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)).max(heads)),
             xf: gpu.alloc_q(if half {
                 n * c.n_embd.max(c.q_dim()).max(k.max(1) * max_ff)
             } else {
@@ -140,6 +143,8 @@ impl Scratch {
             ao: gpu.alloc(c.mla.map_or(1, |_| n * c.n_head * c.kv_dim())),
             hx: gpu.alloc(heads),
             hy: gpu.alloc(heads),
+            hperm: gpu.alloc_ids(if heads > 1 { n * c.n_head } else { 1 }),
+            hstart: gpu.alloc_ids(c.n_head + 1),
         }
     }
 }
@@ -822,7 +827,7 @@ impl Cuda {
             self.head_matmuls(
                 b,
                 s,
-                &a.k_b,
+                (&a.k_b, k_stride),
                 (At(&s.q, 0), from),
                 (At(&s.qr, 0), to),
                 m,
@@ -864,7 +869,8 @@ impl Cuda {
                 head: vh,
                 off: 0,
             };
-            self.head_matmuls(b, s, &a.v_b, (At(&s.ao, 0), from), (y, to), m, int8);
+            let heads = (a.v_b.as_slice(), v_stride);
+            self.head_matmuls(b, s, heads, (At(&s.ao, 0), from), (y, to), m, int8);
         } else {
             b.matvec_id(
                 w.ty, w.rows, w.cols, w.offset, v_stride, nh, ids, x, row, 1, y, vh, pairs,
@@ -872,43 +878,59 @@ impl Cuda {
         }
     }
 
-    /// Each head's matrix of `heads` over its part of `m` tokens: the heads' inputs copied
-    /// from `src` (laid out as its `Heads`) into `s.hx` one head after another, a matmul per
-    /// head into `s.hy`, and the results copied into `dst`.
+    /// Each head's matrix of `heads` (`stride` bytes apart) over its part of `m` tokens: the
+    /// heads' inputs copied from `src` (laid out as its `Heads`) into `s.hx`, the products
+    /// into `s.hy`, and the results copied into `dst`. A launch per head was most of a prompt's
+    /// launches (V2-Lite: 1700 a pass), so F32 heads (old files' transposed `k_b`) are one
+    /// tiled f32 matmul over every head, and heads with int8 kernels one matmul grouped by
+    /// head, as MoE experts are (`moe_group` over the pairs' head ids).
     #[allow(clippy::too_many_arguments)]
     fn head_matmuls(
         &self,
         b: &mut Batch<'_>,
         s: &Scratch,
-        heads: &[Weight],
+        (heads, stride): (&[Weight], usize),
         (src, from): (At<'_>, Heads),
         (dst, to): (At<'_>, Heads),
         m: usize,
         int8: bool,
     ) {
-        let (nh, cols, rows) = (heads.len(), heads[0].cols, heads[0].rows);
-        let packed = |w| Heads {
+        let (nh, w) = (heads.len(), &heads[0]);
+        let (cols, rows) = (w.cols, w.rows);
+        // Head by head, or (grouped) token by token as the head ids are.
+        let by_head = |w| Heads {
             row: w,
             head: m * w,
             off: 0,
         };
-        b.copy_heads(src, from, At(&s.hx, 0), packed(cols), m, nh, cols);
-        // F32 heads (old files' transposed `k_b`) take the tiled f32 matmul, which adds into
-        // results zeroed here for every head at once: V2-Lite pp512 on an RTX 5090 spent 18%
-        // of its time in the plain one, at 2 TFLOPS.
-        let tiled = heads[0].ty == GgmlType::F32 && m >= ROUTER_TILED_TOKENS;
-        if tiled {
-            b.to_f16_zero(At(&s.hx, 0), 0, &s.xh, &[(At(&s.hy, 0), nh * m * rows)]);
-        }
-        for (h, w) in heads.iter().enumerate() {
-            let (x, y) = (At(&s.hx, h * m * cols), At(&s.hy, h * m * rows));
-            if tiled {
-                b.matmul_f32_add(rows, cols, w.offset, x, y, m);
-            } else {
+        let by_token = |w| Heads {
+            row: nh * w,
+            head: w,
+            off: 0,
+        };
+        let (hx, hy) = (At(&s.hx, 0), At(&s.hy, 0));
+        if w.ty == GgmlType::F32 && m >= ROUTER_TILED_TOKENS {
+            b.copy_heads(src, from, hx, by_head(cols), m, nh, cols);
+            b.to_f16_zero(hx, 0, &s.xh, &[(hy, nh * m * rows)]);
+            let n = (nh, stride);
+            b.matmul_f32_add_heads(rows, cols, w.offset, n, (hx, m * cols), (hy, m * rows), m);
+            b.copy_heads(hy, by_head(rows), dst, to, m, nh, rows);
+        } else if wants_q(b, &[w], m, int8) && w.ty != GgmlType::NVFP4 {
+            b.copy_heads(src, from, hx, by_token(cols), m, nh, cols);
+            b.quantize(hx, m * nh * cols, &s.xq);
+            let (pairs, groups) = (m * nh, (&s.hperm, &s.hstart));
+            b.moe_group(&self.head_ids, &s.hperm, &s.hstart, pairs, nh);
+            let (ty, at) = (w.ty, w.offset);
+            b.matmul_q_id(ty, rows, cols, at, stride, nh, groups, &s.xq, 1, hy, pairs);
+            b.copy_heads(hy, by_token(rows), dst, to, m, nh, rows);
+        } else {
+            b.copy_heads(src, from, hx, by_head(cols), m, nh, cols);
+            for (h, w) in heads.iter().enumerate() {
+                let (x, y) = (At(&s.hx, h * m * cols), At(&s.hy, h * m * rows));
                 mm_each(b, s, &[w], x, &[y], m, int8, Fed::No);
             }
+            b.copy_heads(hy, by_head(rows), dst, to, m, nh, rows);
         }
-        b.copy_heads(At(&s.hy, 0), packed(rows), dst, to, m, nh, rows);
     }
 
     /// Runs the offloaded layers over the tokens of `xs` (row-major embeddings, in place) at

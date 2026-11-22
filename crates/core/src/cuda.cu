@@ -3891,21 +3891,25 @@ extern "C" __global__ void attn_pv(const float* scores, const float* vc, float* 
     }
 }
 // y += W x for an F32 matrix over many tokens (the MoE router): a block of 256 threads takes
-// 32 rows by 32 tokens and part blockIdx.z of the columns, 32 at a time through shared
+// 32 rows by 32 tokens and part blockIdx.z % parts of the columns, 32 at a time through shared
 // memory, a thread 2 rows by 2 tokens; the parts add into y, which the caller zeroes. The
-// one-warp-per-row matmul ran 128 x 2048 by 512 tokens at 2 TFLOPS on an RTX 5090.
+// one-warp-per-row matmul ran 128 x 2048 by 512 tokens at 2 TFLOPS on an RTX 5090. Matrix
+// blockIdx.z / parts of a stack (DeepSeek's heads) is w_stride bytes on, its x and y
+// x_stride and y_stride values.
 extern "C" __global__ void matmul_f32_tiled(const uchar* w, ulong w_off, const float* x,
                                             ulong x_off, float* y, ulong y_off, uint rows,
-                                            uint cols, uint n_tok) {
+                                            uint cols, uint n_tok, uint parts, ulong w_stride,
+                                            ulong x_stride, ulong y_stride) {
     __shared__ float ws[32][33];
     __shared__ float xs[32][33];
-    const float* W = (const float*)(w + w_off);
-    x += x_off;
-    y += y_off;
+    uint hb = blockIdx.z / parts, pz = blockIdx.z % parts;
+    const float* W = (const float*)(w + w_off + hb * w_stride);
+    x += x_off + hb * x_stride;
+    y += y_off + hb * y_stride;
     uint tid = threadIdx.x, r0 = blockIdx.x * 32, t0 = blockIdx.y * 32;
     uint tr = tid % 16, tt = tid / 16;
-    uint steps = cols / 32, s0 = blockIdx.z * steps / gridDim.z;
-    uint s1 = (blockIdx.z + 1) * steps / gridDim.z;
+    uint steps = cols / 32, s0 = pz * steps / parts;
+    uint s1 = (pz + 1) * steps / parts;
     float a00 = 0, a01 = 0, a10 = 0, a11 = 0;
     float wv[4], xv[4];
     #define MF_READ(S)                                                                         \

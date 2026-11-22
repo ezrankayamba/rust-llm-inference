@@ -189,9 +189,12 @@ Design points that span files:
   (`gpu_routes`); V3's takes the CPU-routed path. CUDA (`Cuda::mla`) has the same layout
   (`Gpu::with_owned` uploads `Model.owned`; each head stack is uploaded as one range, since
   `v_b`'s heads are views into `attn_kv_b` with `k`'s rows between them): `k_b` and `v_b` are
-  one `matvec_id` over the (token, head) pairs under 8 tokens (`MLA_HEAD_MATMUL`) and a matmul
-  per head from there (`head_matmuls`; the id matvec reads a head's matrix again per token, 66%
-  of a 512-token prompt; F32 heads take `matmul_f32_tiled`). Attention is `attention_mla`
+  one `matvec_id` over the (token, head) pairs under 8 tokens (`MLA_HEAD_MATMUL`) and from
+  there (`head_matmuls`; the id matvec reads a head's matrix again per token, 66% of a
+  512-token prompt) one launch over every head: F32 heads (old files' `k_b`) through
+  `matmul_f32_add_heads`, the head in the grid's z with the column parts, and int8 types as
+  MoE experts, `moe_group` over the pairs' head ids then `matmul_q_id` (a launch per head and
+  its quantizing was 1700 launches a pass: pp64 +21%, pp512 +6%). Attention is `attention_mla`
   (f32): a block takes 16 heads of one token, each thread a 36-dim slice of one of 16 keys in
   registers against all 16 queries in shared memory, the next step's slice read before this
   one's softmax and value sums (staging keys through shared memory 64 dims at a time waited on

@@ -3,6 +3,16 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek heads in one launch on CUDA (RTX 5090, Windows)
+
+`head_matmuls` ran a launch per head (and for int8 heads a quantize and a zeroing per head):
+about 1700 launches a 512-token pass of V2-Lite. Now F32 heads (`k_b`) are one
+`matmul_f32_add_heads` and Q4_K heads (`v_b`) one `matmul_q_id` grouped by head. V2-Lite
+Q4_K_M, two runs each, tok/s: pp64 3888, 3890 -> 4693, 4699 (+21%); pp512 13287, 13278 ->
+14079, 14064 (+6%); tg128 346.7 -> 347.2 (decode doesn't take this path). Logits against
+`ref_forward.py` on a 40-token prompt (which reaches the tiled F32 path, from 16 tokens):
+`--precise` 1.9e-5, top 5 identical; default KL 0.0020 (CPU int8: 0.0063).
+
 ## 2026-11-22: DeepSeek latent attention kernel on CUDA (RTX 5090, Windows)
 
 `attention_mla` in place of the general attention kernel over 576-dim heads, and the
