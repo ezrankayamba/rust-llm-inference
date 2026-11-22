@@ -6,14 +6,16 @@
 //! instead of matvec, one sync per chunk), unless an offloaded layer is routed on the CPU.
 
 use crate::backend::BackendError;
+use crate::config::{Config, Gating};
 use crate::model::{
-    Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each, rows_in,
+    Accelerator, Expert, Ffn, Layer, MlaLayer, Model, Weight, expert_strides, forward_each, route,
+    rows_in,
 };
+use rli_core::GgmlType;
 use rli_core::cuda::{
     ATTN_THREADS, At, AttnParams, Batch, GEMM_MIN_TOKENS, Gpu, GpuBuf, GpuHalf, GpuIds, GpuQ,
-    Graph, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
+    Graph, Heads, MMQ_MIN_TOKENS, MOE_MAX_EXPERTS, RopeArgs,
 };
-use rli_core::{GgmlType, ops};
 use std::any::Any;
 use std::sync::Mutex;
 
@@ -34,6 +36,11 @@ struct GpuLayer {
     bv: Option<GpuBuf>,
     q_norm: Option<GpuBuf>,
     k_norm: Option<GpuBuf>,
+    /// DeepSeek's latent attention: the latent's norm, and the low-rank queries' norm.
+    kv_norm: Option<GpuBuf>,
+    q_a_norm: Option<GpuBuf>,
+    /// Byte distance between consecutive heads' `k_b` and `v_b` (see `uniform_stride`).
+    head_strides: Option<[usize; 2]>,
     /// Set when the layer's experts can be picked by id on the GPU.
     expert_strides: Option<[usize; 3]>,
 }
@@ -68,6 +75,15 @@ struct Scratch {
     pos: GpuIds,
     k_new: GpuBuf,
     v_new: GpuBuf,
+    /// Latent attention: `kv_a`'s rows, the low-rank queries, each token's queries against
+    /// the cache row and the attention output (a cache row per head).
+    kva: GpuBuf,
+    qa: GpuBuf,
+    qr: GpuBuf,
+    ao: GpuBuf,
+    /// A chunk's heads laid out one after another, into and out of their `k_b` / `v_b`.
+    hx: GpuBuf,
+    hy: GpuBuf,
 }
 
 impl Scratch {
@@ -83,6 +99,10 @@ impl Scratch {
         // followed by the shared expert's, one row per token.
         let k = c.n_expert_used;
         let (gemm, half) = (n >= GEMM_MIN_TOKENS, n >= MMQ_MIN_TOKENS);
+        let heads = match c.mla {
+            Some(m) if n >= MLA_HEAD_MATMUL => n * c.n_head * m.kv_lora.max(m.nope).max(m.v_head),
+            _ => 1,
+        };
         Self {
             x: gpu.alloc(n * c.n_embd),
             xb: gpu.alloc(n * c.n_embd),
@@ -114,6 +134,12 @@ impl Scratch {
             pos: gpu.alloc_ids(1),
             k_new: gpu.alloc(c.kv_dim()),
             v_new: gpu.alloc(c.kv_dim()),
+            kva: gpu.alloc(c.mla.map_or(1, |_| n * c.kv_dim())),
+            qa: gpu.alloc(c.mla.map_or(1, |m| n * m.q_lora.max(1))),
+            qr: gpu.alloc(c.mla.map_or(1, |_| n * c.n_head * c.kv_dim())),
+            ao: gpu.alloc(c.mla.map_or(1, |_| n * c.n_head * c.kv_dim())),
+            hx: gpu.alloc(heads),
+            hy: gpu.alloc(heads),
         }
     }
 }
@@ -150,7 +176,11 @@ struct Cuda {
     sizes: (usize, usize),
     kv_dim: usize,
     n_head: usize,
+    /// What attention runs over: the cache row for latent attention.
     head_dim: usize,
+    mla: bool,
+    /// Latent attention's head of each (token, head) pair of a chunk: `i % n_head`.
+    head_ids: GpuIds,
     scratch: Mutex<Scratch>,
     /// Scratch for [`BATCH_CHUNK`] tokens, allocated by the first batched prompt.
     batch: Mutex<Option<Scratch>>,
@@ -160,10 +190,14 @@ fn experts_of(f: &Ffn) -> Vec<&Expert> {
     match f {
         Ffn::Dense(e) => vec![e],
         Ffn::Moe {
-            experts, shared, ..
+            experts,
+            shared,
+            ungated,
+            ..
         } => experts
             .iter()
             .chain(shared.as_ref().map(|(_, e)| e))
+            .chain(ungated.as_deref())
             .collect(),
     }
 }
@@ -176,6 +210,12 @@ fn mv(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>) {
 fn mm(b: &mut Batch<'_>, w: &Weight, x: At<'_>, y: At<'_>, n: usize) {
     b.matmul(w.ty, w.rows, w.cols, w.offset, x, y, n);
 }
+
+/// Fewest tokens of a chunk whose latent attention heads run their `k_b` and `v_b` as a matmul
+/// per head, copied out and back, and not as one id matvec over the (token, head) pairs, which
+/// reads a head's matrix again for each token: V2-Lite pp512 on an RTX 5090 spent 66% of its
+/// time in those.
+const MLA_HEAD_MATMUL: usize = MMQ_MIN_TOKENS;
 
 /// Fewest tokens of a chunk whose expert matrices run grouped by expert. Qwen3-30B-A3B (8 of
 /// 128 experts a token) on an A100: 16 tokens 621 tok/s a pair at a time and 594 grouped,
@@ -237,7 +277,8 @@ fn fed(b: &Batch<'_>, ws: &[&Weight], n: usize, int8: bool) -> Fed {
     let float = |w: &&&Weight| matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
     let dense = |w: &&&Weight| b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let rest: Vec<_> = ws.iter().filter(|w| !dense(w)).collect();
-    if int8 && (rest.is_empty() || (!rest.iter().any(float) && b.has_gemm(ws[0].cols, n))) {
+    let gemm = |w: &&&Weight| b.has_gemm(w.ty, w.cols, n);
+    if int8 && (rest.is_empty() || (!rest.iter().any(float) && rest.iter().all(gemm))) {
         Fed::Half
     } else if wants_q(b, ws, n, int8) {
         Fed::Q
@@ -254,7 +295,7 @@ fn fed_add(b: &Batch<'_>, w: &Weight, n: usize, int8: bool) -> Fed {
     let dense = int8 && b.has_gemm_dense(w.ty, w.cols, w.offset, n);
     let gemm = int8
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
-        && b.has_gemm(w.cols, n);
+        && b.has_gemm(w.ty, w.cols, n);
     let q = n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm);
     if !dense && q && wants_q(b, &[w], n, int8) {
         Fed::Q
@@ -310,7 +351,7 @@ fn mm_each(
     }
     let (ws, ys): (Vec<&Weight>, Vec<At<'_>>) = rest.into_iter().map(|(&w, &y)| (w, y)).unzip();
     let (ws, ys) = (&ws[..], &ys[..]);
-    if int8 && !ws.iter().any(float) && b.has_gemm(ws[0].cols, n) {
+    if int8 && !ws.iter().any(float) && ws.iter().all(|w| b.has_gemm(w.ty, w.cols, n)) {
         if fed != Fed::Half {
             b.to_f16(x, n * ws[0].cols, &s.xh);
         }
@@ -374,7 +415,7 @@ fn mm_add(
     }
     let gemm = int8
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
-        && b.has_gemm(w.cols, n);
+        && b.has_gemm(w.ty, w.cols, n);
     if (n < MMQ_MIN_TOKENS || (b.has_matmul_q_add() && !gemm)) && wants_q(b, &[w], n, int8) {
         if fed != Fed::Q {
             b.quantize(src, n * w.cols, &s.xq);
@@ -382,7 +423,7 @@ fn mm_add(
         b.matmul_q(w.ty, w.rows, w.cols, w.offset, &s.xq, x, n, true);
     } else if int8
         && !matches!(w.ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
-        && b.has_gemm_add(w.rows, w.cols, n)
+        && b.has_gemm_add(w.ty, w.rows, w.cols, n)
     {
         // As in `mm_each`, by the kernel that adds.
         if fed != Fed::Half {
@@ -444,8 +485,7 @@ fn moe(
     s: &Scratch,
     x: At<'_>,
     router: &Weight,
-    experts: &[Expert],
-    shared: Option<&(Weight, Expert)>,
+    (experts, shared, ungated): (&[Expert], Option<&(Weight, Expert)>, Option<&Expert>),
     [gate_stride, up_stride, down_stride]: [usize; 3],
     n: usize,
     int8: bool,
@@ -640,9 +680,219 @@ fn moe(
         ffn(b, s, e, out, n, false, Fed::No, false);
         b.moe_combine(x, out, At(&s.route_w, k), w_stride, 1, n_embd, n);
     }
+    if let Some(e) = ungated {
+        ffn(b, s, e, x, n, int8, Fed::No, true);
+    }
+}
+
+/// Whether `moe_topk` routes like `route` for this model: a softmax's top k, no bias, groups
+/// or scale (DeepSeek V3's sigmoid and groups are routed on the CPU).
+fn gpu_routes(c: &Config, bias: Option<&[f32]>) -> bool {
+    c.gating == Gating::Softmax && bias.is_none() && c.n_group <= 1 && c.expert_scale == 1.0
+}
+
+/// The byte distance between consecutive matrices of `heads`, when it is the same throughout
+/// and their shapes and type match.
+fn uniform_stride(heads: &[Weight]) -> Option<usize> {
+    let first = heads.first()?;
+    let stride = heads
+        .get(1)
+        .map_or(0, |w| w.offset.wrapping_sub(first.offset));
+    heads
+        .iter()
+        .enumerate()
+        .all(|(h, w)| {
+            (w.ty, w.rows, w.cols) == (first.ty, first.rows, first.cols)
+                && w.offset == first.offset + h * stride
+        })
+        .then_some(stride)
 }
 
 impl Cuda {
+    /// Queues DeepSeek's latent attention for one layer, from the attention norm to `s.att`:
+    /// the cache rows of all `n` tokens (the rotated key dims, then the normed latent) straight
+    /// into the cache, then, for the rows from `lo`, the queries absorbed into ones against those
+    /// rows, attention whose values are the rows' latent part, and each head's output through
+    /// its `v_b`. Each head's `k_b` and `v_b` are one id-indexed matvec over every (token, head)
+    /// pair, reading and writing the heads in place. As `Model::mla_attention` on the CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn mla(
+        &self,
+        model: &Model,
+        b: &mut Batch<'_>,
+        s: &Scratch,
+        kv: &Kv,
+        l: usize,
+        g: &GpuLayer,
+        layer: &Layer,
+        a: &MlaLayer,
+        n: usize,
+        lo: usize,
+        pos: usize,
+        int8: bool,
+    ) {
+        let c = &model.cfg;
+        let mla = c.mla.expect("an MLA layer has an MLA config");
+        let (nh, lat, rd, nope, vh) = (c.n_head, mla.kv_lora, mla.rope, mla.nope, mla.v_head);
+        let (row, hd, m, eps) = (lat + rd, nope + rd, n - lo, c.rms_eps);
+        let rope = |n_tok, n_heads, pos| RopeArgs {
+            n_tok,
+            n_heads,
+            n_heads2: 0,
+            head_dim: row,
+            rope_dim: rd,
+            pos,
+            theta: c.rope_theta,
+            neox: false,
+            freq_factors: self.rope_freqs.as_ref(),
+            pos_dev: None,
+            store: None,
+        };
+        let xb = At(&s.xb, 0);
+        b.rmsnorm(At(&s.x, 0), xb, &g.attn_norm, n, c.n_embd, eps, None, None);
+        // `kv_a` gives the latent, then the key dims that are rotated.
+        mm_each(b, s, &[&layer.wk], xb, &[At(&s.kva, 0)], n, int8, Fed::No);
+        let (cache, at) = (&kv.k[l], pos * row);
+        let in_row = |off| Heads { row, head: 0, off };
+        b.copy_heads(
+            At(&s.kva, 0),
+            in_row(lat),
+            At(cache, at),
+            in_row(0),
+            n,
+            1,
+            rd,
+        );
+        let norm = g.kv_norm.as_ref().expect("an MLA layer has a latent norm");
+        b.rmsnorm_strided(
+            At(&s.kva, 0),
+            row,
+            At(cache, at + rd),
+            row,
+            norm,
+            n,
+            lat,
+            eps,
+        );
+        let r = rope(n, 1, pos);
+        b.rope(At(cache, at), At(cache, at), &r);
+        if m == 0 {
+            return;
+        }
+
+        let xq = At(&s.xb, lo * c.n_embd);
+        match (&a.q_a, &g.q_a_norm) {
+            (Some((q_a, _)), Some(w)) => {
+                mm_each(b, s, &[q_a], xq, &[At(&s.qa, 0)], m, int8, Fed::No);
+                b.rmsnorm(At(&s.qa, 0), At(&s.qa, 0), w, m, q_a.rows, eps, None, None);
+                mm_each(
+                    b,
+                    s,
+                    &[&layer.wq],
+                    At(&s.qa, 0),
+                    &[At(&s.q, 0)],
+                    m,
+                    int8,
+                    Fed::No,
+                );
+            }
+            _ => mm_each(b, s, &[&layer.wq], xq, &[At(&s.q, 0)], m, int8, Fed::No),
+        }
+        // Each head's query: its rotated dims, then `k_b` times the others.
+        let (q_at, qr_at) = (
+            Heads {
+                row: nh * hd,
+                head: hd,
+                off: nope,
+            },
+            Heads {
+                row: nh * row,
+                head: row,
+                off: 0,
+            },
+        );
+        b.copy_heads(At(&s.q, 0), q_at, At(&s.qr, 0), qr_at, m, nh, rd);
+        let [k_stride, v_stride] = g.head_strides.expect("checked at attach");
+        let (w, ids) = (&a.k_b[0], &self.head_ids);
+        let (x, y) = (At(&s.q, 0), At(&s.qr, rd));
+        let pairs = m * nh;
+        if m >= MLA_HEAD_MATMUL {
+            let from = Heads { off: 0, ..q_at };
+            let to = Heads { off: rd, ..qr_at };
+            self.head_matmuls(
+                b,
+                s,
+                &a.k_b,
+                (At(&s.q, 0), from),
+                (At(&s.qr, 0), to),
+                m,
+                int8,
+            );
+        } else {
+            b.matvec_id(
+                w.ty, w.rows, w.cols, w.offset, k_stride, nh, ids, x, hd, 1, y, row, pairs,
+            );
+        }
+        let r = rope(m, nh, pos + lo);
+        b.rope(At(&s.qr, 0), At(&s.qr, 0), &r);
+        let p = AttnParams {
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: row as u32,
+            n_tok: m as u32,
+            n_pos: (pos + lo + 1) as u32,
+            kv_dim: row as u32,
+            max_ctx: kv.max_ctx as u32,
+            scale: c.kq_scale(),
+            half: int8,
+            pos_dev: None,
+        };
+        b.attention(&s.qr, cache, cache, &s.ao, &kv.scores, &p, None, None);
+        // Each head's weighted latent (past the key dims) through its `v_b`, into `s.att`.
+        let (w, x, y) = (&a.v_b[0], At(&s.ao, rd), At(&s.att, 0));
+        if m >= MLA_HEAD_MATMUL {
+            let from = Heads { off: rd, ..qr_at };
+            let to = Heads {
+                row: nh * vh,
+                head: vh,
+                off: 0,
+            };
+            self.head_matmuls(b, s, &a.v_b, (At(&s.ao, 0), from), (y, to), m, int8);
+        } else {
+            b.matvec_id(
+                w.ty, w.rows, w.cols, w.offset, v_stride, nh, ids, x, row, 1, y, vh, pairs,
+            );
+        }
+    }
+
+    /// Each head's matrix of `heads` over its part of `m` tokens: the heads' inputs copied
+    /// from `src` (laid out as its `Heads`) into `s.hx` one head after another, a matmul per
+    /// head into `s.hy`, and the results copied into `dst`.
+    #[allow(clippy::too_many_arguments)]
+    fn head_matmuls(
+        &self,
+        b: &mut Batch<'_>,
+        s: &Scratch,
+        heads: &[Weight],
+        (src, from): (At<'_>, Heads),
+        (dst, to): (At<'_>, Heads),
+        m: usize,
+        int8: bool,
+    ) {
+        let (nh, cols, rows) = (heads.len(), heads[0].cols, heads[0].rows);
+        let packed = |w| Heads {
+            row: w,
+            head: m * w,
+            off: 0,
+        };
+        b.copy_heads(src, from, At(&s.hx, 0), packed(cols), m, nh, cols);
+        for (h, w) in heads.iter().enumerate() {
+            let (x, y) = (At(&s.hx, h * m * cols), At(&s.hy, h * m * rows));
+            mm_each(b, s, &[w], x, &[y], m, int8, Fed::No);
+        }
+        b.copy_heads(At(&s.hy, 0), packed(rows), dst, to, m, nh, rows);
+    }
+
     /// Runs the offloaded layers over the tokens of `xs` (row-major embeddings, in place) at
     /// positions `pos..`; `s` must hold that many tokens. More than one token needs
     /// `self.batchable`. Returns whether it filled `logits` (those of the last
@@ -726,84 +976,93 @@ impl Cuda {
                 };
                 let lo = n - m;
                 let x_at = At(&s.x, lo * n_embd);
-                // With no row to finish, the queries are left as they were: nothing reads
-                // what the rotation and the attention below make of them.
-                let qkv = [&layer.wq, &layer.wk, &layer.wv];
-                let outs = [At(&s.q, 0), k_at, v_at];
-                let skip = usize::from(m == 0);
-                let (qkv, outs) = (&qkv[skip..], &outs[skip..]);
-                // A kernel whose result feeds int8 matrices quantizes it on the way out.
-                let f = fed(b, qkv, n, int8);
-                b.rmsnorm(
-                    At(&s.x, 0),
-                    xb,
-                    &g.attn_norm,
-                    n,
-                    n_embd,
-                    eps,
-                    f.q(s),
-                    f.half(s),
-                );
-                mm_each(b, s, qkv, xb, outs, n, int8, f);
-                for (t, bias, len) in [
-                    (At(&s.q, 0), &g.bq, c.q_dim()),
-                    (k_at, &g.bk, kv_dim),
-                    (v_at, &g.bv, kv_dim),
-                ] {
-                    if let Some(bias) = bias {
-                        b.add_bias(t, bias, n * len);
+                if let Some(a) = &layer.mla {
+                    self.mla(model, b, s, kv, l, g, layer, a, n, lo, pos, int8);
+                    if m == 0 {
+                        break;
                     }
-                }
-                match (&g.q_norm, &g.k_norm) {
-                    (Some(wq), Some(wk)) if Batch::has_norm_rope(hd) => {
-                        b.norm_rope(At(&s.q, 0), k_at, wq, wk, eps, &rope);
-                    }
-                    (wq, wk) => {
-                        if let Some(w) = wq {
-                            b.rmsnorm(
-                                At(&s.q, 0),
-                                At(&s.q, 0),
-                                w,
-                                n * c.n_head,
-                                hd,
-                                eps,
-                                None,
-                                None,
-                            );
+                    mm_add(b, s, &layer.wo, At(&s.att, 0), x_at, m, int8, Fed::No);
+                } else {
+                    // With no row to finish, the queries are left as they were: nothing reads
+                    // what the rotation and the attention below make of them.
+                    let qkv = [&layer.wq, &layer.wk, &layer.wv];
+                    let outs = [At(&s.q, 0), k_at, v_at];
+                    let skip = usize::from(m == 0);
+                    let (qkv, outs) = (&qkv[skip..], &outs[skip..]);
+                    // A kernel whose result feeds int8 matrices quantizes it on the way out.
+                    let f = fed(b, qkv, n, int8);
+                    b.rmsnorm(
+                        At(&s.x, 0),
+                        xb,
+                        &g.attn_norm,
+                        n,
+                        n_embd,
+                        eps,
+                        f.q(s),
+                        f.half(s),
+                    );
+                    mm_each(b, s, qkv, xb, outs, n, int8, f);
+                    for (t, bias, len) in [
+                        (At(&s.q, 0), &g.bq, c.q_dim()),
+                        (k_at, &g.bk, kv_dim),
+                        (v_at, &g.bv, kv_dim),
+                    ] {
+                        if let Some(bias) = bias {
+                            b.add_bias(t, bias, n * len);
                         }
-                        if let Some(w) = wk {
-                            b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None, None);
-                        }
-                        b.rope(At(&s.q, 0), k_at, &rope);
                     }
+                    match (&g.q_norm, &g.k_norm) {
+                        (Some(wq), Some(wk)) if Batch::has_norm_rope(hd) => {
+                            b.norm_rope(At(&s.q, 0), k_at, wq, wk, eps, &rope);
+                        }
+                        (wq, wk) => {
+                            if let Some(w) = wq {
+                                b.rmsnorm(
+                                    At(&s.q, 0),
+                                    At(&s.q, 0),
+                                    w,
+                                    n * c.n_head,
+                                    hd,
+                                    eps,
+                                    None,
+                                    None,
+                                );
+                            }
+                            if let Some(w) = wk {
+                                b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, eps, None, None);
+                            }
+                            b.rope(At(&s.q, 0), k_at, &rope);
+                        }
+                    }
+                    let p = AttnParams {
+                        n_head: c.n_head as u32,
+                        n_kv: c.n_head_kv as u32,
+                        head_dim: hd as u32,
+                        n_tok: n as u32,
+                        n_pos: (pos + 1) as u32,
+                        kv_dim: kv_dim as u32,
+                        max_ctx: kv.max_ctx as u32,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        half: int8,
+                        pos_dev: dev.then_some((&s.pos, pos as u32)),
+                    };
+                    if m == 0 {
+                        break;
+                    }
+                    // The attention's quantized copy starts at row 0, so it serves only when the
+                    // output projection takes every row.
+                    let f = match lo == 0 && hd.is_multiple_of(32) {
+                        true => fed_add(b, &layer.wo, m, int8),
+                        false => Fed::No,
+                    };
+                    let (k, v) = (&kv.k[l], &kv.v[l]);
+                    b.attention(&s.q, k, v, &s.att, &kv.scores, &p, f.q(s), f.half(s));
+                    // From here on the layer's rows are the `m` from `lo`.
+                    let n = m;
+                    let att = At(&s.att, lo * c.q_dim());
+                    mm_add(b, s, &layer.wo, att, x_at, n, int8, f);
                 }
-                let p = AttnParams {
-                    n_head: c.n_head as u32,
-                    n_kv: c.n_head_kv as u32,
-                    head_dim: hd as u32,
-                    n_tok: n as u32,
-                    n_pos: (pos + 1) as u32,
-                    kv_dim: kv_dim as u32,
-                    max_ctx: kv.max_ctx as u32,
-                    scale: 1.0 / (hd as f32).sqrt(),
-                    half: int8,
-                    pos_dev: dev.then_some((&s.pos, pos as u32)),
-                };
-                if m == 0 {
-                    break;
-                }
-                // The attention's quantized copy starts at row 0, so it serves only when the
-                // output projection takes every row.
-                let f = match lo == 0 && hd.is_multiple_of(32) {
-                    true => fed_add(b, &layer.wo, m, int8),
-                    false => Fed::No,
-                };
-                let (k, v) = (&kv.k[l], &kv.v[l]);
-                b.attention(&s.q, k, v, &s.att, &kv.scores, &p, f.q(s), f.half(s));
-                // From here on the layer's rows are the `m` from `lo`.
                 let n = m;
-                let att = At(&s.att, lo * c.q_dim());
-                mm_add(b, s, &layer.wo, att, x_at, n, int8, f);
                 let f = match &layer.ffn {
                     Ffn::Dense(e) => fed(b, &[&e.gate, &e.up], n, int8),
                     Ffn::Moe { experts, .. } => {
@@ -825,17 +1084,16 @@ impl Cuda {
                 b.rmsnorm(x_at, xb, &g.ffn_norm, n, n_embd, eps, f.q(s), f.half(s));
                 match &layer.ffn {
                     Ffn::Dense(e) => ffn(b, s, e, x_at, n, int8, f, true),
-                    // DeepSeek's `ungated` and `bias` belong to MLA models, which `attach`
-                    // refuses.
                     Ffn::Moe {
                         router,
                         experts,
                         shared,
-                        ..
+                        ungated,
+                        bias,
                     } => {
                         if let Some(strides) = g.expert_strides {
-                            let shared = shared.as_ref();
-                            moe(c, b, s, x_at, router, experts, shared, strides, n, int8, f);
+                            let e = (experts.as_slice(), shared.as_ref(), ungated.as_deref());
+                            moe(c, b, s, x_at, router, e, strides, n, int8, f);
                             continue;
                         }
                         assert_eq!(n, 1, "CPU-routed MoE layers run one token at a time");
@@ -848,18 +1106,14 @@ impl Cuda {
                         }
                         let mut probs = vec![0.0; experts.len()];
                         self.gpu.read(&s.router, &mut probs);
-                        ops::softmax(&mut probs);
-                        let mut order: Vec<usize> = (0..experts.len()).collect();
-                        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-                        let chosen = &order[..c.n_expert_used];
-                        let norm = if c.norm_topk {
-                            chosen.iter().map(|&e| probs[e]).sum::<f32>()
-                        } else {
-                            1.0
-                        };
-                        for &e in chosen {
+                        let mut chosen = Vec::new();
+                        route(c, &mut probs, bias.as_deref(), &mut chosen);
+                        for (e, w) in chosen {
                             ffn(b, s, &experts[e], At(&s.tmp, 0), 1, false, Fed::No, false);
-                            b.axpy(x_at, At(&s.tmp, 0), probs[e] / norm, n_embd);
+                            b.axpy(x_at, At(&s.tmp, 0), w, n_embd);
+                        }
+                        if let Some(e) = ungated {
+                            ffn(b, s, e, x_at, 1, false, Fed::No, true);
                         }
                         if let Some((_, e)) = shared {
                             ffn(b, s, e, At(&s.tmp, 0), 1, false, Fed::No, false);
@@ -977,8 +1231,12 @@ impl Accelerator for Cuda {
             k: (0..n)
                 .map(|_| self.gpu.alloc(max_ctx * self.kv_dim))
                 .collect(),
+            // Latent attention reads its values from the key rows.
             v: (0..n)
-                .map(|_| self.gpu.alloc(max_ctx * self.kv_dim))
+                .map(|_| {
+                    self.gpu
+                        .alloc(if self.mla { 1 } else { max_ctx * self.kv_dim })
+                })
                 .collect(),
             scores: self.gpu.alloc(Batch::attention_scratch(
                 self.n_head,
@@ -1059,17 +1317,16 @@ impl Accelerator for Cuda {
 }
 
 pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
-    if model.cfg.mla.is_some() {
-        return Err(BackendError(
-            "DeepSeek's latent attention has no CUDA kernels yet; use --gpu-layers 0".into(),
-        ));
-    }
     let c = model.cfg.clone();
     let n = layers.min(c.n_layer);
     let covers_all = n == c.n_layer;
     let mut weights: Vec<&Weight> = Vec::new();
     for layer in &model.layers[..n] {
         weights.extend([&layer.wq, &layer.wk, &layer.wv, &layer.wo]);
+        if let Some(a) = &layer.mla {
+            weights.extend(a.q_a.as_ref().map(|(w, _)| w));
+            weights.extend(a.k_b.iter().chain(&a.v_b));
+        }
         if let Ffn::Moe { router, shared, .. } = &layer.ffn {
             weights.push(router);
             weights.extend(shared.as_ref().map(|(g, _)| g));
@@ -1096,8 +1353,18 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
             c.head_dim
         )));
     }
-    let ranges: Vec<(usize, usize)> = weights.iter().map(|w| (w.offset, w.n_bytes())).collect();
-    let mut gpu = Gpu::new(model.gguf().mapped_bytes(), &ranges).map_err(BackendError)?;
+    let mut ranges: Vec<(usize, usize)> = weights.iter().map(|w| (w.offset, w.n_bytes())).collect();
+    // Latent attention's heads run as one id matvec, which reads them at their stride: `v_b`'s
+    // are views into `attn_kv_b` with `k`'s rows between them, uploaded with those.
+    for a in model.layers[..n].iter().filter_map(|l| l.mla.as_ref()) {
+        for heads in [&a.k_b, &a.v_b] {
+            if let (Some(first), Some(last)) = (heads.first(), heads.last()) {
+                ranges.push((first.offset, last.offset + last.n_bytes() - first.offset));
+            }
+        }
+    }
+    let mapped = model.gguf().mapped_bytes();
+    let mut gpu = Gpu::with_owned(mapped, &model.owned, &ranges).map_err(BackendError)?;
     for w in weights.iter().filter(|w| w.ty == GgmlType::NVFP4) {
         gpu.set_scale(w.offset, w.scale);
     }
@@ -1119,11 +1386,23 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
             bv: opt(&l.bv),
             q_norm: opt(&l.q_norm),
             k_norm: opt(&l.k_norm),
+            kv_norm: l.mla.as_ref().map(|a| gpu.upload(&a.kv_norm)),
+            q_a_norm: l
+                .mla
+                .as_ref()
+                .and_then(|a| a.q_a.as_ref())
+                .map(|(_, w)| gpu.upload(w)),
+            head_strides: l.mla.as_ref().and_then(|a| {
+                // NVFP4 heads would each need their own scale.
+                let ok = |w: &[Weight]| uniform_stride(w).filter(|_| w[0].ty != GgmlType::NVFP4);
+                Some([ok(&a.k_b)?, ok(&a.v_b)?])
+            }),
             // NVFP4 experts have no id kernels (each expert has its own tensor scale), so they
             // are routed on the CPU and run one at a time.
             expert_strides: match &l.ffn {
-                Ffn::Moe { experts, .. }
+                Ffn::Moe { experts, bias, .. }
                     if experts.len() <= MOE_MAX_EXPERTS
+                        && gpu_routes(&c, bias.as_deref())
                         && [experts[0].gate, experts[0].up, experts[0].down]
                             .iter()
                             .all(|w| w.ty != GgmlType::NVFP4) =>
@@ -1147,6 +1426,15 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         .map(|w| w.rows * w.cols)
         .max()
         .unwrap_or(0);
+    if let Some(l) = model.layers[..n]
+        .iter()
+        .zip(&gpu_layers)
+        .position(|(l, g)| l.mla.is_some() && g.head_strides.is_none())
+    {
+        return Err(BackendError(format!(
+            "layer {l}'s latent attention heads are not evenly spaced matrices with CUDA id kernels"
+        )));
+    }
     let scratch = Scratch::new(&gpu, &c, (max_ff, max_w), logits, 1);
     let batchable = model.layers[..n]
         .iter()
@@ -1161,7 +1449,16 @@ pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
         sizes: (max_ff, max_w),
         kv_dim: c.kv_dim(),
         n_head: c.n_head,
-        head_dim: c.head_dim,
+        head_dim: c.mla.map_or(c.head_dim, |m| m.kv_lora + m.rope),
+        mla: c.mla.is_some(),
+        head_ids: {
+            let ids: Vec<u32> = (0..BATCH_CHUNK * c.n_head)
+                .map(|i| (i % c.n_head) as u32)
+                .collect();
+            let mut buf = gpu.alloc_ids(ids.len());
+            gpu.write_ids(&mut buf, &ids);
+            buf
+        },
         scratch: Mutex::new(scratch),
         graph: Mutex::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| (None, false))

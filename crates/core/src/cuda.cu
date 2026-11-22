@@ -2621,6 +2621,54 @@ __device__ inline void gq6_k_dec(const ulong* hdr, const ulong* raw, uint j, uin
     }
 }
 
+// Q8_0 and Q5_0 have no super-block: "b" is 8 blocks of 32 weights, and step j takes blocks
+// 2j (lo) and 2j + 1 (hi), so the columns need only be a multiple of 64. A block's scale and
+// (Q5_0) fifth bits ride in raw[2]; nothing is shared from step to step.
+__device__ inline void gq_none_hdr(const uchar*, ulong*) {}
+// Q8_0: 34 bytes, d then 32 int8.
+__device__ inline void gq8_0_load(const uchar* b, uint j, bool first, uint dp, ulong* raw) {
+    const uchar* a = b + 68 * j;
+    raw[0] = ld8(a + 2 + 8 * dp);
+    raw[1] = ld8(a + 36 + 8 * dp);
+    raw[2] = (ulong)*(const unsigned short*)a | ((ulong)*(const unsigned short*)(a + 34) << 16);
+}
+__device__ inline void gq8_0_dec(const ulong*, const ulong* raw, uint j, uint dp, V128& lo,
+                                 V128& hi) {
+    float da = h_bits((uint)raw[2] & 0xFFFF), db = h_bits((uint)(raw[2] >> 16) & 0xFFFF);
+    #pragma unroll
+    for (uint k = 0; k < 4; k++) {
+        float a0 = (float)(signed char)(raw[0] >> 16 * k), a1 = (float)(signed char)(raw[0] >> (16 * k + 8));
+        float c0 = (float)(signed char)(raw[1] >> 16 * k), c1 = (float)(signed char)(raw[1] >> (16 * k + 8));
+        lo.v[k] = f2h(da * a0) | ((uint)f2h(da * a1) << 16);
+        hi.v[k] = f2h(db * c0) | ((uint)f2h(db * c1) << 16);
+    }
+}
+// Q5_0: 22 bytes, d, 32 fifth bits, then 16 bytes whose low nibbles are weights 0..15 and high
+// ones 16..31. Columns 8 dp.. are nibbles 4 (dp / 2) of bytes 8 (dp % 2)..
+__device__ inline void gq5_0_load(const uchar* b, uint j, bool first, uint dp, ulong* raw) {
+    const uchar* a = b + 44 * j;
+    raw[0] = ld8(a + 6 + 8 * (dp % 2));
+    raw[1] = ld8(a + 28 + 8 * (dp % 2));
+    ulong ha = (ld8(a + 2) >> 8 * dp) & 0xFF, hb = (ld8(a + 24) >> 8 * dp) & 0xFF;
+    raw[2] = (ulong)*(const unsigned short*)a | ((ulong)*(const unsigned short*)(a + 22) << 16) |
+             (ha << 32) | (hb << 40);
+}
+__device__ inline void gq5_0_dec(const ulong*, const ulong* raw, uint j, uint dp, V128& lo,
+                                 V128& hi) {
+    float da = h_bits((uint)raw[2] & 0xFFFF), db = h_bits((uint)(raw[2] >> 16) & 0xFFFF);
+    uint sh = 4 * (dp / 2), ha = (uint)(raw[2] >> 32) & 0xFF, hb = (uint)(raw[2] >> 40) & 0xFF;
+    #pragma unroll
+    for (uint k = 0; k < 4; k++) {
+        uint qa = (uint)(raw[0] >> 16 * k) >> sh, qc = (uint)(raw[1] >> 16 * k) >> sh;
+        int a0 = (int)((qa & 15) | ((ha >> 2 * k) & 1) << 4) - 16;
+        int a1 = (int)(((qa >> 8) & 15) | ((ha >> (2 * k + 1)) & 1) << 4) - 16;
+        int c0 = (int)((qc & 15) | ((hb >> 2 * k) & 1) << 4) - 16;
+        int c1 = (int)(((qc >> 8) & 15) | ((hb >> (2 * k + 1)) & 1) << 4) - 16;
+        lo.v[k] = f2h(da * (float)a0) | ((uint)f2h(da * (float)a1) << 16);
+        hi.v[k] = f2h(db * (float)c0) | ((uint)f2h(db * (float)c1) << 16);
+    }
+}
+
 // GEMM_F16 for stacked experts over the pairs moe_group listed, the weights decoded to f16 on
 // the way into shared memory: block (x, e) takes 64 rows of expert e (matrices `stride` bytes
 // apart) and the pairs that chose e, 64 at a time. Pair p reads row p / x_div of xh and writes
@@ -2738,6 +2786,10 @@ extern "C" __global__ void NAME(const uchar* w, ulong w_off, ulong stride, const
 
 GEMM_ID(gemm_q4_k_id, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 0, , 0, 1, 64, 2, 1)
 GEMM_ID(gemm_q6_k_id, 210, gq6_k_hdr, gq6_k_load, gq6_k_dec, 0, , 0, 1, 64, 2, 0)
+// DeepSeek-V2-Lite's Q4_K_M experts have Q8_0 and Q5_0 down projections, which ran as an f32
+// matvec per (token, expert) pair: 5.8 ms a layer over 512 tokens on an RTX 5090.
+GEMM_ID(gemm_q8_0_id, 272, gq_none_hdr, gq8_0_load, gq8_0_dec, 0, , 0, 1, 64, 2, 1)
+GEMM_ID(gemm_q5_0_id, 176, gq_none_hdr, gq5_0_load, gq5_0_dec, 0, , 0, 1, 64, 2, 1)
 #define GEMM_DENSE_ARGS , uint n_tok, uint parts
 GEMM_ID(gemm_q4_k_dense, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 64, 2, 1)
 GEMM_ID(gemm_q4_k_dense128, 144, gq4_k_hdr, gq4_k_load, gq4_k_dec, 1, GEMM_DENSE_ARGS, n_tok, parts, 128, 4, 1)
@@ -3077,6 +3129,33 @@ extern "C" __global__ void rmsnorm(const float* x, ulong x_off, float* out, ulon
         if (quant == 1) quant_block(v, ((ulong)blockIdx.x * n + i) / 32, xq, xd, xs);
         if (quant == 2) ((unsigned short*)xq)[(ulong)blockIdx.x * n + i] = f2h(v);
     }
+}
+
+// RMSNorm of the first n values of each row, rows in_stride apart in x and out_stride apart in
+// out: DeepSeek's latent, inside a row with the rotated key dims.
+extern "C" __global__ void rmsnorm_strided(const float* x, ulong x_off, uint in_stride, float* out,
+                                           ulong out_off, uint out_stride, const float* w, uint n,
+                                           float eps) {
+    __shared__ float red[32];
+    const float* xr = x + x_off + (ulong)blockIdx.x * in_stride;
+    float* o = out + out_off + (ulong)blockIdx.x * out_stride;
+    float s = 0;
+    for (uint i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    s = block_sum(s, red);
+    float scale = rsqrtf(s / (float)n + eps);
+    for (uint i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * scale * w[i];
+}
+
+// Moves w values per (token, head) between layouts: dst[t * out_row + h * out_head + out_off + j]
+// = src[t * in_row + h * in_head + in_off + j], for m tokens of nh heads.
+extern "C" __global__ void copy_heads(const float* src, ulong src_off, float* dst, ulong dst_off,
+                                      uint m, uint nh, uint w, uint in_row, uint in_head,
+                                      uint in_off, uint out_row, uint out_head, uint out_off) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m * nh * w) return;
+    uint j = i % w, r = i / w, h = r % nh, t = r / nh;
+    dst[dst_off + (ulong)t * out_row + h * out_head + out_off + j] =
+        src[src_off + (ulong)t * in_row + h * in_head + in_off + j];
 }
 
 extern "C" __global__ void axpy(float* a, ulong a_off, const float* b, ulong b_off, uint n, float alpha) {

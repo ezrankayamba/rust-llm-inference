@@ -16,7 +16,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 | Backends | CPU SIMD (baseline, always built) → Apple Metal → CUDA |
 | Weight format | GGUF only, memory-mapped |
 | Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels; on CUDA, int8 activations unless `--fp4-acts`) |
-| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE, DeepSeek V2/V3: CPU and Metal; CUDA `attach` refuses MLA) |
+| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE, DeepSeek V2/V3: CPU, Metal and CUDA) |
 | Interfaces | CLI and an OpenAI-compatible HTTP server (`/v1/chat/completions`, SSE streaming) |
 | Layout | Cargo workspace; GPU backends behind cargo features |
 | Toolchain | Latest stable Rust, pinned in `rust-toolchain.toml`; SIMD via `std::arch` intrinsics |
@@ -186,7 +186,13 @@ Design points that span files:
   head's `k_b` and `v_b` as one `matvec_id` over the heads (ids 0..n_head, the heads' stride
   in their tensor), reading the heads' inputs and writing their outputs in place, ordered so
   that a layer waits 6 times in attention where the general order waited 14 (+3.7%). Only softmax routing without bias, groups or scale runs on the GPU in decode
-  (`gpu_routes`); V3's takes the CPU-routed path.
+  (`gpu_routes`); V3's takes the CPU-routed path. CUDA (`Cuda::mla`) has the same layout
+  (`Gpu::with_owned` uploads `Model.owned`; each head stack is uploaded as one range, since
+  `v_b`'s heads are views into `attn_kv_b` with `k`'s rows between them): `k_b` and `v_b` are
+  one `matvec_id` over the (token, head) pairs under 8 tokens (`MLA_HEAD_MATMUL`) and a matmul
+  per head from there (`head_matmuls`; the id matvec reads a head's matrix again per token, 66%
+  of a 512-token prompt), and attention is the general kernel over 576-dim heads, half of a
+  prompt's time. On CUDA a V3 layer (sigmoid routing) runs one token at a time.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there
   (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep
@@ -277,7 +283,9 @@ Design points that span files:
   don't: `moe_group` sorts the chunk's pairs by expert on the GPU, and a block of
   `gemm_q4_k_id` / `gemm_q6_k_id` takes 64 rows of one expert and the pairs that chose it,
   decoding the weights to f16 in shared memory on the way into f16 `mma.sync` (no scratch
-  copy; Qwen3-30B-A3B prompts 830 -> 3115 tok/s, 3900 with 512-token chunks). Without f16
+  copy; Qwen3-30B-A3B prompts 830 -> 3115 tok/s, 3900 with 512-token chunks; Q8_0 and Q5_0
+  have it too, `gemm_q8_0_id` / `gemm_q5_0_id`, 64 columns a step so 1408-column experts fit,
+  where an f32 matvec per pair cost DeepSeek-V2-Lite half its prompt time). Without f16
   tensor cores the same grouping runs `dp4a` (`mmq_*_id`, 1810 tok/s). File ranges
   that touch are uploaded as one, so stacked experts keep their stride in VRAM. Experts stored
   as separate tensors are routed on the CPU, one token at a time with a sync per layer.
@@ -449,7 +457,8 @@ Design points that span files:
   alignment attribute spelled for MSVC), not by reasoning. From compute capability 12.0 the
   int8 matmuls of 8+ tokens are the lean kernels (`MATMUL_MMK` Q4_K, `MATMUL_MMK6` Q6_K; a
   third compile with no register cap; `RLI_CUDA_LEAN=0/1`; `has_gemm` and `has_gemm_dense`
-  then say no, so every length is int8, logits ~0.15-0.19 from `precise` where the f16 paths
+  then say no for those types, so every length is int8 (types without lean kernels, Q8_0 and
+  Q5_0, take the f16 GEMM from 129 tokens: Qwen3-0.6B-Q8_0 pp512 5.3x), logits ~0.15-0.19 from `precise` where the f16 paths
   gave 0.07-0.10): llama.cpp's layout, 16-byte reads with every lane busy, `ldmatrix` into
   the multiply's registers, three float operations a result, two row groups a warp against
   one load of the tokens at 64 and 128 tokens a block, and the work (a tile's 128-column

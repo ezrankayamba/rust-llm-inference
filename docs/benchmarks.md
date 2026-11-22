@@ -3,6 +3,42 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek V2-Lite on CUDA, first support (RTX 5090, Windows)
+
+DeepSeek-V2-Lite-Chat Q4_K_M, every layer offloaded. `dump_logits ... --gpu-layers=99` on the
+13-token prompt of the CPU section against `ref_forward.py`: `--precise` max |logit diff|
+1.3e-5 batched, 1.5e-5 per token; default 1.10 batched, 0.84 per token (the CPU's int8: 0.75),
+KL from the reference 0.0003 batched and 0.00003 per token (CPU int8 0.00047); top 5 identical
+under `precise`, top 1 in all. `deepseek_on_gpu_matches_reference_logits` (both tiny
+fixtures, 3 and 1 layers, batched and per token) and the whole suite pass with
+`--features rli-models/cuda`.
+
+`RLI_CUDA_PROF=1`, one 512-token prompt (graphs off, so slower than the table below):
+
+| step | pp512 tok/s | where the time went |
+|---|---|---|
+| first version: `k_b` / `v_b` as one id matvec over (token, head) pairs | 1956 | `v_b`/expert f32 id matvecs 59%, attention 23% |
+| a matmul per head from 8 tokens (`head_matmuls`) | 1942 | the 59% was the experts' Q8_0/Q5_0 down (5.8 ms a layer) |
+| `gemm_q8_0_id` / `gemm_q5_0_id` (f16, grouped by expert) | 4226 | attention 51% (the general kernel over 576-dim heads) |
+
+Against llama.cpp (build cd959bae9, `llama-bench -ngl 99`), alternated with 30 s rests, two
+rounds (2925-2932 MHz SM, 13801-14001 MHz memory, 87-138 W, 42-44 C after each run):
+
+| test | rli | llama.cpp | ratio |
+|---|---|---|---|
+| pp64 | 3174, 3163 | 5297, 5280 | 0.60 |
+| pp512 | 5270, 5271 | 17233, 17188 | 0.31 |
+| tg128 | 355.4, 352.7 | 390.5, 389.8 | 0.91 |
+
+Before the two changes pp64 was 2125 and pp512 2007 (graphs on). What is left of the prompt
+gap is mostly attention: a CUDA kernel for latent attention, as Metal's `attention_mla`, is
+next.
+
+Types without the lean kernels now take the f16 GEMM from 129 tokens on this GPU (they ran
+the f32 matmul): Qwen3-0.6B-Q8_0 pp512 10175, 10199 -> 53555, 53007 tok/s (alternated against
+the previous build), KL from `precise` on a 215-token prompt 0.000004 -> 0.00001.
+Qwen3-30B-A3B pp512 level (13317, 13311 -> 13458, 13394).
+
 ## 2026-11-22: DeepSeek V2-Lite on Metal, first support
 
 DeepSeek-V2-Lite-Chat Q4_K_M on the M4, every layer offloaded. `dump_logits ... --gpu-layers=27`

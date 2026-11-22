@@ -92,12 +92,12 @@ fn gpu_offload_matches_reference_logits() {
     }
 }
 
-/// DeepSeek's latent attention and MoE on Metal: every layer and the first only, token by token
-/// and batched. V2's softmax experts route on the GPU in decode, V3's sigmoid and groups on the
-/// CPU. CUDA has no latent attention yet.
-#[cfg(all(feature = "metal", target_os = "macos"))]
+/// DeepSeek's latent attention and MoE on the GPU: every layer and the first only, token by
+/// token and batched. V2's softmax experts route on the GPU, V3's sigmoid and groups on the CPU
+/// (on CUDA a layer at a time, so its prompts run token by token).
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "cuda"))]
 #[test]
-fn deepseek_on_metal_matches_reference_logits() {
+fn deepseek_on_gpu_matches_reference_logits() {
     for name in ["tiny_deepseek_v2", "tiny_deepseek_v3"] {
         for (layers, batched) in [(3, false), (3, true), (1, false), (1, true)] {
             check_pass(name, layers, batched);

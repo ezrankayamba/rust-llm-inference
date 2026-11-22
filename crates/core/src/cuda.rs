@@ -66,6 +66,10 @@ const MATVEC_KERNELS: [(GgmlType, &str); 10] = [
 /// Weight types with an int8 matmul kernel, which needs whole 256-weight super-blocks.
 const MMQ_KERNELS: [(GgmlType, &str); 2] =
     [(GgmlType::Q4_K, "mmq_q4_k"), (GgmlType::Q6_K, "mmq_q6_k")];
+/// Types of 32-weight blocks with an f16 matmul over stacked experts ([`Batch::gemm_id`]),
+/// which takes them 64 columns at a time.
+const GEMM_ID_BLOCK32: [(GgmlType, &str); 2] =
+    [(GgmlType::Q8_0, "gemm_q8_0"), (GgmlType::Q5_0, "gemm_q5_0")];
 /// Tokens per block of the int8 matmul kernels (`MQ_T` in cuda.cu).
 const MMQ_TILE: usize = 64;
 /// Fewest tokens the int8 matmul kernels take; fewer run as an int8 matvec each.
@@ -128,7 +132,9 @@ const GEMM_PARTS_MAX: usize = 16;
 const GEMM_BLOCKS_MIN: usize = 256;
 /// Fewest tokens the f16 GEMM is used for.
 pub const GEMM_MIN_TOKENS: usize = 129;
-const OTHER_KERNELS: [&str; 19] = [
+const OTHER_KERNELS: [&str; 21] = [
+    "rmsnorm_strided",
+    "copy_heads",
     "quant_x",
     "to_f16_zero",
     "rmsnorm",
@@ -193,6 +199,14 @@ impl<'a> From<&'a GpuBuf> for At<'a> {
     fn from(b: &'a GpuBuf) -> Self {
         At(b, 0)
     }
+}
+
+/// One side of [`Batch::copy_heads`]: a head's values start at `t * row + h * head + off`.
+#[derive(Clone, Copy)]
+pub struct Heads {
+    pub row: usize,
+    pub head: usize,
+    pub off: usize,
 }
 
 pub struct AttnParams<'a> {
@@ -334,6 +348,16 @@ impl Gpu {
     /// Opens device 0, compiles the kernels and copies the byte `ranges` (offset, len) of
     /// `mapped` (the model file) into VRAM. Matvecs may only read weights inside those ranges.
     pub fn new(mapped: &[u8], ranges: &[(usize, usize)]) -> Result<Self, String> {
+        Self::with_owned(mapped, &[], ranges)
+    }
+
+    /// [`Gpu::new`] where offsets from `mapped.len()` on are in `owned`: matrices the loader
+    /// made (DeepSeek's transposed `k_b`), addressed past the end of the file.
+    pub fn with_owned(
+        mapped: &[u8],
+        owned: &[u8],
+        ranges: &[(usize, usize)],
+    ) -> Result<Self, String> {
         // cudarc panics on first use if a library is missing; probe so that becomes an error.
         // SAFETY: only attempts to load the driver/NVRTC libraries (running their initializers),
         // which cudarc would do anyway on first use.
@@ -469,8 +493,10 @@ impl Gpu {
             );
             gemm_id = MMQ_KERNELS
                 .iter()
-                .map(|&(t, n)| {
-                    let n = format!("{}_id", n.replace("mmq", "gemm"));
+                .map(|&(t, n)| (t, n.replace("mmq", "gemm")))
+                .chain(GEMM_ID_BLOCK32.map(|(t, n)| (t, n.to_string())))
+                .map(|(t, n)| {
+                    let n = format!("{n}_id");
                     Ok((t, module.load_function(&n).map_err(err(&n))?))
                 })
                 .collect::<Result<_, String>>()?;
@@ -535,14 +561,19 @@ impl Gpu {
         ranges.dedup();
         let mut placed = Vec::with_capacity(ranges.len());
         let mut total = 0;
+        let (file, end) = (mapped.len(), mapped.len() + owned.len());
         for &(file_off, len) in &ranges {
-            assert!(file_off + len <= mapped.len(), "weight range out of file");
-            // Ranges that touch in the file stay together, so a stack of experts keeps its
-            // stride on the device.
+            assert!(file_off + len <= end, "weight range out of file");
+            assert!(
+                file_off >= file || file_off + len <= file,
+                "a range across the file's end"
+            );
+            // Ranges that touch or overlap in the file stay together, so a stack of experts
+            // keeps its stride on the device.
             let last: Option<&mut Placed> = placed.last_mut();
             let p = match last {
-                Some(p) if p.file_off + p.len == file_off => {
-                    p.len += len;
+                Some(p) if p.file_off + p.len >= file_off && file_off != file => {
+                    p.len = p.len.max(file_off + len - p.file_off);
                     p
                 }
                 _ => {
@@ -566,7 +597,10 @@ impl Gpu {
             .alloc_zeros::<u8>(total + WEIGHT_SLACK)
             .map_err(err("allocate weight arena"))?;
         for p in &placed {
-            let src = &mapped[p.file_off..p.file_off + p.len];
+            let src = match p.file_off.checked_sub(file) {
+                Some(at) => &owned[at..at + p.len],
+                None => &mapped[p.file_off..p.file_off + p.len],
+            };
             stream
                 .memcpy_htod(src, &mut weights.slice_mut(p.dev_off..p.dev_off + p.len))
                 .map_err(err("upload weights"))?;
@@ -1423,13 +1457,16 @@ impl<'a> Batch<'a> {
         self.launch(a, cfg);
     }
 
-    /// Whether [`Batch::gemm`] takes `n_tok` tokens over a matrix of `cols` columns: it pays
-    /// for writing the matrix out as f16 from [`GEMM_MIN_TOKENS`].
-    pub fn has_gemm(&self, cols: usize, n_tok: usize) -> bool {
-        self.gpu.mmk.is_empty()
-            && self.gpu.gemm.is_some()
-            && cols.is_multiple_of(GEMM_COLS)
-            && n_tok >= GEMM_MIN_TOKENS
+    /// Whether [`Batch::gemm`] takes `n_tok` tokens over a matrix of `ty` and `cols` columns:
+    /// it pays for writing the matrix out as f16 from [`GEMM_MIN_TOKENS`]. Not for the types
+    /// of the lean int8 kernels, where the GPU has them (see `MATMUL_MMK`); the others (Q5_0,
+    /// Q8_0) ran in f32 there before, 6x slower over a 512-token chunk.
+    pub fn has_gemm(&self, ty: GgmlType, cols: usize, n_tok: usize) -> bool {
+        !self.gpu.mmk.iter().any(|(t, ..)| *t == ty) && self.gemm_fits(cols, n_tok)
+    }
+
+    fn gemm_fits(&self, cols: usize, n_tok: usize) -> bool {
+        self.gpu.gemm.is_some() && cols.is_multiple_of(GEMM_COLS) && n_tok >= GEMM_MIN_TOKENS
     }
 
     /// Whether [`Batch::matmul_q`] can add into y for chunks of [`MMQ_MIN_TOKENS`] or more.
@@ -1439,8 +1476,8 @@ impl<'a> Batch<'a> {
 
     /// Whether [`Batch::gemm_add`] takes this product: as [`Batch::has_gemm`], and the larger
     /// tile's blocks can be made to fill the GPU (see [`gemm_plan`]).
-    pub fn has_gemm_add(&self, rows: usize, cols: usize, n_tok: usize) -> bool {
-        self.has_gemm(cols, n_tok) && self.gemm_plan(rows, cols, n_tok).is_some()
+    pub fn has_gemm_add(&self, ty: GgmlType, rows: usize, cols: usize, n_tok: usize) -> bool {
+        self.has_gemm(ty, cols, n_tok) && self.gemm_plan(rows, cols, n_tok).is_some()
     }
 
     fn gemm_plan(
@@ -1534,7 +1571,7 @@ impl<'a> Batch<'a> {
         y: At<'_>,
         n_tok: usize,
     ) {
-        assert!(self.has_gemm(cols, n_tok) && rows > 0);
+        assert!(self.gemm_fits(cols, n_tok) && rows > 0);
         assert!(wh.0.len() >= rows * cols && xh.0.len() >= n_tok * cols);
         assert!(y.1 + n_tok * rows <= y.0.len());
         if let Some(plan) = self.gemm_plan(rows, cols, n_tok) {
@@ -1576,7 +1613,7 @@ impl<'a> Batch<'a> {
         assert!(wh.0.len() >= rows * cols && xh.0.len() >= n_tok * cols);
         assert!(y.1 + n_tok * rows <= y.0.len() && rows > 0);
         let plan = self.gemm_plan(rows, cols, n_tok);
-        let plan = plan.filter(|_| self.has_gemm(cols, n_tok));
+        let plan = plan.filter(|_| self.gemm_fits(cols, n_tok));
         for (row, n_rows, parts) in plan.expect("checked by has_gemm_add") {
             self.gemm_tile(2, parts, true, (row, n_rows, rows), cols, wh, xh, y, n_tok);
         }
@@ -1635,8 +1672,9 @@ impl<'a> Batch<'a> {
     /// cores, and for Q4_K every row at a multiple of 16 bytes on the device.
     pub fn has_gemm_id(&self, ty: GgmlType, cols: usize, offset: usize, stride: usize) -> bool {
         let aligned = stride.is_multiple_of(16) && self.gpu.has_int8(ty, cols, offset);
+        let block32 = GEMM_ID_BLOCK32.iter().any(|(t, _)| *t == ty);
         self.gpu.gemm_id.iter().any(|(t, _)| *t == ty)
-            && cols.is_multiple_of(256)
+            && cols.is_multiple_of(if block32 { 64 } else { 256 })
             && (ty != GgmlType::Q4_K || aligned)
     }
 
@@ -1671,7 +1709,8 @@ impl<'a> Batch<'a> {
         let w_off = gpu.device_offset(offset, span) as u64;
         let (stride, xd, y_off) = (stride as u64, x_div as u32, y.1 as u64);
         let (rows_u, cols_u, rb) = (rows as u32, cols as u32, row_bytes as u32);
-        let direct = n <= GEMM_DIRECT_ID_PAIRS * n_stack;
+        let direct =
+            n <= GEMM_DIRECT_ID_PAIRS * n_stack && gpu.gemm_direct_id.iter().any(|(t, _)| *t == ty);
         let f = if direct {
             &gpu.gemm_direct_id
         } else {
@@ -1708,6 +1747,7 @@ impl<'a> Batch<'a> {
         let lean = n_tok >= MMQ_MIN_TOKENS && self.gpu.mmk.iter().any(|(t, ..)| *t == ty);
         !lean
             && (min..=*GEMM_DENSE_TOKENS.end()).contains(&n_tok)
+            && self.gpu.gemm_dense.iter().any(|(t, _)| *t == ty)
             && self.has_gemm_id(ty, cols, offset, 0)
     }
 
@@ -2517,6 +2557,77 @@ impl<'a> Batch<'a> {
         (q.unwrap_or(&gpu.no_q), q.is_some() as u32)
     }
 
+    /// [`Batch::rmsnorm`] of the first `n` values of `rows` rows, `x_stride` apart at `x` and
+    /// `out_stride` apart at `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_strided(
+        &mut self,
+        x: At<'_>,
+        x_stride: usize,
+        out: At<'_>,
+        out_stride: usize,
+        w: &GpuBuf,
+        rows: usize,
+        n: usize,
+        eps: f32,
+    ) {
+        assert!(rows >= 1 && n <= x_stride.min(out_stride) && n <= w.len());
+        assert!(x.1 + (rows - 1) * x_stride + n <= x.0.len());
+        assert!(out.1 + (rows - 1) * out_stride + n <= out.0.len());
+        let (x_off, o_off) = (x.1 as u64, out.1 as u64);
+        let (xs, os, n_u) = (x_stride as u32, out_stride as u32, n as u32);
+        let mut a = self.call(self.gpu.other("rmsnorm_strided"));
+        a.arg(&x.0.0)
+            .arg(&x_off)
+            .arg(&xs)
+            .arg(&out.0.0)
+            .arg(&o_off)
+            .arg(&os)
+            .arg(&w.0)
+            .arg(&n_u)
+            .arg(&eps);
+        let threads = (n.next_multiple_of(32) as u32).min(REDUCE_THREADS);
+        self.launch(a, grid(rows, threads));
+    }
+
+    /// `w` values of each of `m` tokens' `nh` heads from `src` laid out as `from` into `dst`
+    /// laid out as `to`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_heads(
+        &mut self,
+        src: At<'_>,
+        from: Heads,
+        dst: At<'_>,
+        to: Heads,
+        m: usize,
+        nh: usize,
+        w: usize,
+    ) {
+        let last = |h: Heads| (m - 1) * h.row + (nh - 1) * h.head + h.off + w;
+        assert!(m >= 1 && nh >= 1 && src.1 + last(from) <= src.0.len());
+        assert!(dst.1 + last(to) <= dst.0.len());
+        let u = |v: usize| u32::try_from(v).expect("fits u32");
+        let (s_off, d_off) = (src.1 as u64, dst.1 as u64);
+        let a = [
+            u(m),
+            u(nh),
+            u(w),
+            u(from.row),
+            u(from.head),
+            u(from.off),
+            u(to.row),
+            u(to.head),
+            u(to.off),
+        ];
+        let mut l = self.call(self.gpu.other("copy_heads"));
+        l.arg(&src.0.0).arg(&s_off).arg(&dst.0.0).arg(&d_off);
+        for v in &a {
+            l.arg(v);
+        }
+        let n = m * nh * w;
+        self.launch(l, grid(n.div_ceil(ELT_THREADS), ELT_THREADS as u32));
+    }
+
     /// `a += alpha * b`
     pub fn axpy(&mut self, a: At<'_>, b: At<'_>, alpha: f32, n: usize) {
         assert!(a.1 + n <= a.0.len() && b.1 + n <= b.0.len());
@@ -3172,6 +3283,78 @@ mod tests {
         }
     }
 
+    /// The f16 matmul over stacked experts for the 32-weight block types, whose columns need
+    /// only be a multiple of 64 (1408: DeepSeek-V2-Lite's experts' down), against f32
+    /// matvecs. Needs an NVIDIA GPU with f16 tensor cores.
+    #[test]
+    fn gemm_id_takes_32_weight_blocks() {
+        // And tiny_mixtral's gate and up: one 64-column step, rows of a block partly filled.
+        let shapes = [(72, 1408), (96, 64)];
+        let (ne, k, n_tok) = (7, 3, 90);
+        for ((ty, _), (rows, cols)) in GEMM_ID_BLOCK32.iter().flat_map(|t| shapes.map(|s| (t, s))) {
+            let ty = *ty;
+            let mut seed = 11u32;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed >> 8
+            };
+            let stride = rows * ty.row_bytes(cols);
+            let mut w: Vec<u8> = (0..ne * stride).map(|_| next() as u8).collect();
+            for block in w.chunks_exact_mut(ty.block_bytes()) {
+                block[1] = 0x24 | (block[1] & 3); // an f16 in [2^-6, 2^-5)
+            }
+            let x: Vec<f32> = (0..n_tok * cols)
+                .map(|_| next() as f32 / 8388608.0 - 1.0)
+                .collect();
+            let n = n_tok * k;
+            let ids: Vec<u32> = (0..n)
+                .map(|_| if next() % 4 == 0 { next() % 5 } else { 2 })
+                .collect();
+            let gpu = Gpu::new(&w, &[(0, w.len())]).expect("CUDA device");
+            let mut b = gpu.batch();
+            if !b.has_gemm_id(ty, cols, 0, stride) {
+                return; // no f16 tensor cores
+            }
+            let ids = GpuIds(gpu.stream.clone_htod(&ids).expect("upload"));
+            let (perm, start) = (gpu.alloc_ids(n), gpu.alloc_ids(ne + 1));
+            let (xb, xh) = (gpu.upload(&x), gpu.alloc_half(n_tok * cols));
+            let (y_each, y_grouped) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
+            let (each, grouped) = (At(&y_each, 0), At(&y_grouped, 0));
+            let x0 = At(&xb, 0);
+            b.matvec_id(
+                ty, rows, cols, 0, stride, ne, &ids, x0, cols, k, each, rows, n,
+            );
+            b.moe_group(&ids, &perm, &start, n, ne);
+            b.to_f16(x0, n_tok * cols, &xh);
+            b.gemm_id(
+                ty,
+                rows,
+                cols,
+                0,
+                stride,
+                ne,
+                (&perm, &start),
+                &xh,
+                k,
+                grouped,
+                n,
+            );
+            b.finish();
+            let (mut want, mut got) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+            gpu.read(&y_each, &mut want);
+            gpu.read(&y_grouped, &mut got);
+            let size = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                size > 0.0 && err < 2e-3 * size,
+                "{ty:?} {rows}x{cols}: {err} of {size}"
+            );
+        }
+    }
+
     /// The f16 GEMM against the f32 matmul over the same random weights of every type: they
     /// differ by the rounding of weights and activations to f16. The sizes leave a row tile
     /// and a token tile partly filled. Needs an NVIDIA GPU with f16 tensor cores.
@@ -3254,14 +3437,14 @@ mod tests {
                 let (y_f32, y_h) = (gpu.alloc(n * rows), gpu.alloc(n * rows));
                 let mut b = gpu.batch();
                 let dense = b.has_gemm_dense(ty, cols, 0, n);
-                if !dense && !b.has_gemm(cols, n) {
+                if !dense && !b.has_gemm(ty, cols, n) {
                     continue; // no kernel for the type, no f16 tensor cores, or RLI_CUDA_NO_MMA
                 }
                 b.matmul(ty, rows, cols, 0, At(&xb, 0), At(&y_f32, 0), n);
                 b.to_f16(At(&xb, 0), n * cols, &xh);
                 // y_sum = y_f32 + W x, where there is a kernel for it.
                 let y_sum = gpu.alloc(n * rows);
-                let added = dense || b.has_gemm_add(rows, cols, n);
+                let added = dense || b.has_gemm_add(ty, rows, cols, n);
                 if added {
                     b.add(At(&y_sum, 0), At(&y_f32, 0), n * rows);
                 }

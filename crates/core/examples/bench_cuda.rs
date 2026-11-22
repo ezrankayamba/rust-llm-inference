@@ -67,7 +67,7 @@ fn main() {
     // and 128 tokens (the shapes of Mistral-7B and Llama-3.2-1B). Random activations, so the
     // products are ordinary numbers.
     for n_tok in [512, 256] {
-        if !gpu.batch().has_gemm(4096, n_tok) {
+        if !gpu.batch().has_gemm(GgmlType::Q4_K, 4096, n_tok) {
             continue;
         }
         let mut seed = 5u32;
@@ -121,7 +121,7 @@ fn main() {
             };
             let (d, g) = (time(true, 0), time(false, 1));
             let tflops = 2.0 * (rows * cols * n_tok) as f64 / g / 1e6;
-            let add = if gpu.batch().has_gemm_add(rows, cols, n_tok) {
+            let add = if gpu.batch().has_gemm_add(GgmlType::Q4_K, rows, cols, n_tok) {
                 format!(", adding {:7.1} us", time(false, 2))
             } else {
                 String::new()

@@ -95,12 +95,19 @@ fn serves_openai_compatible_endpoints() {
     assert_eq!(v["choices"][0]["message"]["role"], "assistant");
     let completion_tokens = v["usage"]["completion_tokens"].as_u64().unwrap();
     assert!(completion_tokens <= 5);
-    let full_text = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(v["choices"][0]["message"]["content"].is_string());
 
-    // Streaming the same greedy request yields the same text, chunked, ending in [DONE].
+    // Streaming the same greedy request yields the same text, chunked, ending in [DONE]. Both
+    // are compared as evaluated over the cached prompt: the first request evaluated it in
+    // full, where a GPU's batched kernels round differently from its one-token ones, and on a
+    // tiny random model that flips near-ties (CUDA's f16 expert matmuls did).
+    let (st, body) = request(a, "POST", "/v1/chat/completions", Some(&chat));
+    assert_eq!(st, 200, "{body}");
+    let full_text =
+        serde_json::from_str::<Value>(&body).unwrap()["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
     let mut stream_req = chat.clone();
     stream_req["stream"] = json!(true);
     let (st, sse) = request(a, "POST", "/v1/chat/completions", Some(&stream_req));
