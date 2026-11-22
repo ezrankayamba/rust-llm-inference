@@ -113,7 +113,8 @@ const FEW_SIMDGROUPS: usize = 8;
 /// the head sizes that kernel is compiled for; other sizes and f32 caches take the general one.
 const ATTN_STAGED_HEADS: u32 = 4;
 const ATTN_STAGED_DIMS: [usize; 5] = [16, 32, 64, 96, 128];
-const OTHER_KERNELS: [&str; 43] = [
+const OTHER_KERNELS: [&str; 44] = [
+    "copy_heads",
     "matvec4_q4_k",
     "matvec4_q6_k",
     "matvec4_q8_0",
@@ -478,6 +479,27 @@ struct CombineRowsParams {
 struct NormParams {
     n: u32,
     eps: f32,
+    stride: u32,
+}
+#[repr(C)]
+struct HeadsParams {
+    m: u32,
+    nh: u32,
+    w: u32,
+    in_row: u32,
+    in_head: u32,
+    in_off: u32,
+    out_row: u32,
+    out_head: u32,
+    out_off: u32,
+}
+
+/// One side of [`Batch::copy_heads`]: a head's values start at `t * row + h * head + off`.
+#[derive(Clone, Copy)]
+pub struct Heads {
+    pub row: usize,
+    pub head: usize,
+    pub off: usize,
 }
 #[repr(C)]
 struct EltParams {
@@ -506,7 +528,7 @@ pub struct AttnParams {
 }
 
 /// Cached positions per decode-attention threadgroup (`ATTN_CHUNK` in metal.metal).
-const ATTN_CHUNK: usize = 256;
+pub const ATTN_CHUNK: usize = 256;
 const ATTN_THREADS: usize = 128;
 
 /// f32s of scratch [`Batch::attention`] needs for `n_pos` positions.
@@ -697,6 +719,23 @@ impl Gpu {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Copies `bytes` into a buffer of their own that weight offsets `base..base + len` read:
+    /// matrices the loader made (DeepSeek's transposed `k_b`), addressed past the file's end.
+    pub fn add_owned(&mut self, base: usize, bytes: &[u8]) {
+        assert!(!bytes.is_empty() && self.weights.iter().all(|w| w.end <= base));
+        // SAFETY: `bytes` is a live slice of `len` bytes; Metal copies it.
+        let buf = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new(bytes.as_ptr() as *mut std::ffi::c_void).expect("non-null slice"),
+                bytes.len(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("Metal buffer allocation failed");
+        let end = base + bytes.len();
+        self.weights.push(WeightBuf { base, end, buf });
     }
 
     /// The buffer holding file bytes `offset..offset + bytes`, and `offset` rebased onto it.
@@ -1512,10 +1551,36 @@ impl Batch<'_> {
 
     /// RMS-normalizes `rows` consecutive rows of `n` from `x` into `out` (may alias).
     pub fn rmsnorm(&mut self, x: At<'_>, out: At<'_>, w: &GpuBuf, rows: usize, n: usize, eps: f32) {
+        self.rmsnorm_strided(x, out, w, rows, n, n, eps);
+    }
+
+    /// [`Batch::rmsnorm`] of the first `n` values of rows `stride` apart, in `x` and `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_strided(
+        &mut self,
+        x: At<'_>,
+        out: At<'_>,
+        w: &GpuBuf,
+        rows: usize,
+        n: usize,
+        stride: usize,
+        eps: f32,
+    ) {
+        assert!(n <= stride && rows >= 1);
+        let end = (rows - 1) * stride + n;
+        assert!(x.1 + end <= x.0.len && out.1 + end <= out.0.len && n <= w.len);
         self.bind(0, x);
         self.bind(1, out);
         self.bind(2, w.into());
-        self.params(3, &NormParams { n: n as u32, eps });
+        let stride = stride as u32;
+        self.params(
+            3,
+            &NormParams {
+                n: n as u32,
+                eps,
+                stride,
+            },
+        );
         // A thread per two values, up to the largest threadgroup: one that reads several
         // waits on each read in turn (2048 values: 3.7 us a dispatch with 256 threads, 2.7
         // with 1024).
@@ -1557,6 +1622,47 @@ impl Batch<'_> {
         );
         self.dispatch(
             self.gpu.other("add_bcast"),
+            n.div_ceil(ELT_THREADS),
+            ELT_THREADS,
+        );
+    }
+
+    /// `w` values of each of `m` tokens' `nh` heads from `src` laid out as `from` into `dst`
+    /// laid out as `to`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_heads(
+        &mut self,
+        src: At<'_>,
+        from: Heads,
+        dst: At<'_>,
+        to: Heads,
+        m: usize,
+        nh: usize,
+        w: usize,
+    ) {
+        let last = |h: Heads| (m - 1) * h.row + (nh - 1) * h.head + h.off + w;
+        assert!(m >= 1 && nh >= 1 && src.1 + last(from) <= src.0.len);
+        assert!(dst.1 + last(to) <= dst.0.len);
+        self.bind(0, src);
+        self.bind(1, dst);
+        let u = |v: usize| u32::try_from(v).expect("fits u32");
+        self.params(
+            2,
+            &HeadsParams {
+                m: u(m),
+                nh: u(nh),
+                w: u(w),
+                in_row: u(from.row),
+                in_head: u(from.head),
+                in_off: u(from.off),
+                out_row: u(to.row),
+                out_head: u(to.head),
+                out_off: u(to.off),
+            },
+        );
+        let n = m * nh * w;
+        self.dispatch(
+            self.gpu.other("copy_heads"),
             n.div_ceil(ELT_THREADS),
             ELT_THREADS,
         );

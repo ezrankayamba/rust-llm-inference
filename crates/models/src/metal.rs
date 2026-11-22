@@ -9,14 +9,16 @@
 //! token, then each used expert runs as one matmul over the rows gathered for it.
 
 use crate::backend::BackendError;
-use crate::config::Config;
+use crate::config::{Config, Gating};
 use crate::model::{
-    Accelerator, Expert, Ffn, Model, Weight, expert_strides, forward_each, rows_in,
+    Accelerator, Expert, Ffn, Layer, MlaLayer, Model, Weight, expert_strides, forward_each, route,
+    rows_in,
 };
+use rli_core::GgmlType;
 use rli_core::metal::{
-    At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, KvBuf, RopeArgs, attention_part_len,
+    ATTN_CHUNK, At, AttnParams, Batch, BatchAttnParams, Gpu, GpuBuf, Heads, KvBuf, RopeArgs,
+    attention_part_len,
 };
-use rli_core::{GgmlType, ops};
 use std::any::Any;
 use std::ops::Range;
 use std::sync::Mutex;
@@ -29,6 +31,9 @@ struct GpuLayer {
     bv: Option<GpuBuf>,
     q_norm: Option<GpuBuf>,
     k_norm: Option<GpuBuf>,
+    /// DeepSeek's latent attention: the latent's norm, and the low-rank queries' norm.
+    kv_norm: Option<GpuBuf>,
+    q_a_norm: Option<GpuBuf>,
     /// Byte distance between consecutive experts' gate, up and down matrices, when the experts
     /// are evenly spaced slices of stacked tensors (needed for routing on the GPU).
     expert_strides: Option<[usize; 3]>,
@@ -50,6 +55,12 @@ struct Scratch {
     k: GpuBuf,
     v: GpuBuf,
     att: GpuBuf,
+    /// Latent attention: each token's queries against the cache row and the attention output,
+    /// both a cache row per head, and two buffers of every head's rows, head after head.
+    qr: GpuBuf,
+    ao: GpuBuf,
+    hx: GpuBuf,
+    hy: GpuBuf,
     tmp: GpuBuf,
     gate: GpuBuf,
     up: GpuBuf,
@@ -78,17 +89,15 @@ struct Kv {
 
 impl Kv {
     fn new(m: &Metal, cap: usize, max_ctx: usize) -> Self {
-        let alloc = || {
+        let alloc = |dim: usize| {
             (0..m.layers.len())
-                .map(|_| {
-                    m.gpu
-                        .alloc_kv(cap.next_multiple_of(8) * m.kv_dim, m.kv_half)
-                })
+                .map(|_| m.gpu.alloc_kv(cap.next_multiple_of(8) * dim, m.kv_half))
                 .collect()
         };
         Kv {
-            k: alloc(),
-            v: alloc(),
+            k: alloc(m.kv_dim),
+            // Latent attention reads its values from the key rows.
+            v: alloc(if m.mla { 0 } else { m.kv_dim }),
             part: m.gpu.alloc(attention_part_len(m.n_head, m.head_dim, cap)),
             cap,
             max_ctx,
@@ -131,6 +140,9 @@ impl Scratch {
     ) -> Self {
         // An MoE layer keeps a row per token and chosen expert.
         let pairs = cap * c.n_expert_used;
+        let (row, head) = c.mla.map_or((0, 0), |m| {
+            (m.kv_lora + m.rope, m.kv_lora.max(m.nope).max(m.v_head))
+        });
         Scratch {
             cap,
             x: gpu.alloc(cap * c.n_embd),
@@ -139,6 +151,10 @@ impl Scratch {
             k: gpu.alloc(cap * c.kv_dim()),
             v: gpu.alloc(cap * c.kv_dim()),
             att: gpu.alloc(cap * c.q_dim()),
+            qr: gpu.alloc(cap * c.n_head * row),
+            ao: gpu.alloc(cap * c.n_head * row),
+            hx: gpu.alloc(cap * c.n_head * head),
+            hy: gpu.alloc(cap * c.n_head * head),
             // GPU-routed decode keeps a row per chosen expert, plus the shared one.
             tmp: gpu.alloc(cap.max(pairs).max(c.n_expert_used + 1) * c.n_embd),
             gate: gpu.alloc(cap.max(pairs) * max_ff),
@@ -165,7 +181,9 @@ struct Metal {
     covers_all: bool,
     kv_dim: usize,
     n_head: usize,
+    /// What attention runs over: the cache row for latent attention.
     head_dim: usize,
+    mla: bool,
     /// KV cache stored as f16 and prompt matmuls on half tiles (chosen at attach: f32 when the
     /// model is in precise mode).
     kv_half: bool,
@@ -178,10 +196,14 @@ fn experts_of(f: &Ffn) -> Vec<&Expert> {
     match f {
         Ffn::Dense(e) => vec![e],
         Ffn::Moe {
-            experts, shared, ..
+            experts,
+            shared,
+            ungated,
+            ..
         } => experts
             .iter()
             .chain(shared.as_ref().map(|(_, e)| e))
+            .chain(ungated.as_deref())
             .collect(),
     }
 }
@@ -249,82 +271,90 @@ impl Metal {
                 n_embd,
                 c.rms_eps,
             );
-            // Q, K and V read the same input and write different buffers, so they (and their
-            // biases, which one token's matvec adds itself) run together.
-            let qkv = [
-                (&layer.wk, k_at, &g.bk, n, 0),
-                (&layer.wv, v_at, &g.bv, n, 0),
-                (&layer.wq, At(&s.q, 0), &g.bq, m, lo),
-            ];
-            let qkv = &qkv[..if m == 0 { 2 } else { 3 }];
-            for (i, &(w, out, bias, rows, at)) in qkv.iter().enumerate() {
-                b.free = i > 0;
-                let x = At(&s.xb, at * n_embd);
-                match bias {
-                    Some(bias) if rows == 1 => {
-                        b.matvec_bias(w.ty, w.rows, w.cols, w.offset, x, out, bias.into());
+            if let Some(a) = &layer.mla {
+                self.mla(model, &mut b, s, kv, l, g, layer, a, n, lo, pos);
+                if m == 0 {
+                    break;
+                }
+            } else {
+                // Q, K and V read the same input and write different buffers, so they (and their
+                // biases, which one token's matvec adds itself) run together.
+                let qkv = [
+                    (&layer.wk, k_at, &g.bk, n, 0),
+                    (&layer.wv, v_at, &g.bv, n, 0),
+                    (&layer.wq, At(&s.q, 0), &g.bq, m, lo),
+                ];
+                let qkv = &qkv[..if m == 0 { 2 } else { 3 }];
+                for (i, &(w, out, bias, rows, at)) in qkv.iter().enumerate() {
+                    b.free = i > 0;
+                    let x = At(&s.xb, at * n_embd);
+                    match bias {
+                        Some(bias) if rows == 1 => {
+                            b.matvec_bias(w.ty, w.rows, w.cols, w.offset, x, out, bias.into());
+                        }
+                        _ => mm(&mut b, w, x, out, rows),
                     }
-                    _ => mm(&mut b, w, x, out, rows),
                 }
-            }
-            b.free = false;
-            for &(w, out, bias, rows, _) in qkv {
-                if let Some(bias) = bias.as_ref().filter(|_| rows > 1) {
-                    b.add_bcast(out, bias.into(), w.rows, rows * w.rows);
-                    b.free = true; // the first waits for the matmuls
+                b.free = false;
+                for &(w, out, bias, rows, _) in qkv {
+                    if let Some(bias) = bias.as_ref().filter(|_| rows > 1) {
+                        b.add_bcast(out, bias.into(), w.rows, rows * w.rows);
+                        b.free = true; // the first waits for the matmuls
+                    }
                 }
-            }
-            b.free = false;
-            if let Some(w) = g.q_norm.as_ref().filter(|_| m > 0) {
-                b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, m * c.n_head, hd, c.rms_eps);
-            }
-            if let Some(w) = &g.k_norm {
-                b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, c.rms_eps);
-            }
-            // Three dispatches that touch different buffers, so they run together; rotating K
-            // straight into the cache saves a fourth that would have to wait for them.
-            if m > 0 {
-                b.rope(At(&s.q, 0), &rope(c.n_head, m, pos + lo));
+                b.free = false;
+                if let Some(w) = g.q_norm.as_ref().filter(|_| m > 0) {
+                    b.rmsnorm(At(&s.q, 0), At(&s.q, 0), w, m * c.n_head, hd, c.rms_eps);
+                }
+                if let Some(w) = &g.k_norm {
+                    b.rmsnorm(k_at, k_at, w, n * c.n_head_kv, hd, c.rms_eps);
+                }
+                // Three dispatches that touch different buffers, so they run together; rotating K
+                // straight into the cache saves a fourth that would have to wait for them.
+                if m > 0 {
+                    b.rope(At(&s.q, 0), &rope(c.n_head, m, pos + lo));
+                    b.free = true;
+                }
+                b.store_kv(v_at, &kv.v[l], pos * kv_dim, n * kv_dim);
                 b.free = true;
+                if c.rope_dim == hd {
+                    b.rope_store(k_at, &kv.k[l], pos * kv_dim, &rope(c.n_head_kv, n, pos));
+                    b.free = false;
+                } else {
+                    b.rope(k_at, &rope(c.n_head_kv, n, pos));
+                    b.free = false;
+                    b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
+                }
+                if m == 0 {
+                    break;
+                }
+                // From here on the layer's rows are the `m` from `lo`.
+                let n = m;
+                if n == 1 {
+                    let p = AttnParams {
+                        n_head: c.n_head as u32,
+                        n_kv: c.n_head_kv as u32,
+                        head_dim: hd as u32,
+                        n_pos: (pos + lo + 1) as u32,
+                        kv_dim: kv_dim as u32,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                    };
+                    b.attention(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), &kv.part, &p);
+                } else {
+                    // The queries are rows `lo..`: after the last layer, only those the logits
+                    // come from.
+                    let p = BatchAttnParams {
+                        n_head: c.n_head as u32,
+                        n_kv: c.n_head_kv as u32,
+                        head_dim: hd as u32,
+                        pos: (pos + lo) as u32,
+                        kv_dim: kv_dim as u32,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                    };
+                    b.attention_batch(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), n, &p);
+                }
             }
-            b.store_kv(v_at, &kv.v[l], pos * kv_dim, n * kv_dim);
-            b.free = true;
-            if c.rope_dim == hd {
-                b.rope_store(k_at, &kv.k[l], pos * kv_dim, &rope(c.n_head_kv, n, pos));
-                b.free = false;
-            } else {
-                b.rope(k_at, &rope(c.n_head_kv, n, pos));
-                b.free = false;
-                b.store_kv(k_at, &kv.k[l], pos * kv_dim, n * kv_dim);
-            }
-            if m == 0 {
-                break;
-            }
-            // From here on the layer's rows are the `m` from `lo`.
             let n = m;
-            if n == 1 {
-                let p = AttnParams {
-                    n_head: c.n_head as u32,
-                    n_kv: c.n_head_kv as u32,
-                    head_dim: hd as u32,
-                    n_pos: (pos + lo + 1) as u32,
-                    kv_dim: kv_dim as u32,
-                    scale: 1.0 / (hd as f32).sqrt(),
-                };
-                b.attention(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), &kv.part, &p);
-            } else {
-                // The queries are rows `lo..`: after the last layer, only those the logits
-                // come from.
-                let p = BatchAttnParams {
-                    n_head: c.n_head as u32,
-                    n_kv: c.n_head_kv as u32,
-                    head_dim: hd as u32,
-                    pos: (pos + lo) as u32,
-                    kv_dim: kv_dim as u32,
-                    scale: 1.0 / (hd as f32).sqrt(),
-                };
-                b.attention_batch(At(&s.q, 0), &kv.k[l], &kv.v[l], At(&s.att, 0), n, &p);
-            }
             mm_add(&mut b, &layer.wo, At(&s.att, 0), x_at, n);
             b.rmsnorm(x_at, At(&s.xb, 0), &g.ffn_norm, n, n_embd, c.rms_eps);
             match &layer.ffn {
@@ -347,14 +377,15 @@ impl Metal {
                     ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
                     b.add(x_at, At(&s.tmp, 0), n * n_embd);
                 }
-                // DeepSeek's `ungated` and `bias` belong to MLA models, which `attach` refuses.
                 Ffn::Moe {
                     router,
                     experts,
                     shared,
-                    ..
+                    ungated,
+                    bias,
                 } => match g.expert_strides {
-                    Some(strides) if n == 1 => self.moe_decode(
+                    // `moe_topk` takes a softmax's top k, optionally renormalized.
+                    Some(strides) if n == 1 && gpu_routes(c, bias.as_deref()) => self.moe_decode(
                         model,
                         &mut b,
                         s,
@@ -362,9 +393,13 @@ impl Metal {
                         router,
                         experts,
                         shared.as_ref(),
+                        ungated.as_deref(),
                         strides,
                     ),
-                    _ => b = self.moe(model, b, s, x_at, router, experts, shared.as_ref(), n),
+                    _ => {
+                        let e = (experts.as_slice(), shared.as_ref(), ungated.as_deref());
+                        b = self.moe(model, b, s, x_at, router, e, bias.as_deref(), n);
+                    }
                 },
             }
         }
@@ -395,6 +430,7 @@ impl Metal {
         router: &Weight,
         experts: &[Expert],
         shared: Option<&(Weight, Expert)>,
+        ungated: Option<&Expert>,
         [gate_stride, up_stride, down_stride]: [usize; 3],
     ) {
         let (c, ne, n_embd) = (&model.cfg, experts.len(), model.cfg.n_embd);
@@ -459,6 +495,12 @@ impl Metal {
         if let Some((_, e)) = shared {
             ffn(b, s, e, xb, At(&s.tmp, k * n_embd), 1);
         }
+        if let Some(e) = ungated {
+            assert!(shared.is_none(), "one kind of shared expert");
+            let out = At(&s.tmp, k * n_embd);
+            ffn(b, s, e, xb, out, 1);
+            b.add(x, out, n_embd);
+        }
         let n_shared = usize::from(shared.is_some());
         if !fused {
             b.moe_combine(x, tmp, w, k + n_shared, n_embd);
@@ -478,8 +520,8 @@ impl Metal {
         s: &Scratch,
         x: At<'_>,
         router: &Weight,
-        experts: &[Expert],
-        shared: Option<&(Weight, Expert)>,
+        (experts, shared, ungated): (&[Expert], Option<&(Weight, Expert)>, Option<&Expert>),
+        bias: Option<&[f32]>,
         n: usize,
     ) -> Batch<'g> {
         let (c, ne, n_embd) = (&model.cfg, experts.len(), model.cfg.n_embd);
@@ -496,22 +538,14 @@ impl Metal {
                 s.shared_gate.as_slice()[..n].to_vec(),
             )
         };
-        // Softmax over all experts, top-k, optionally renormalized over the chosen k.
+        // As the CPU routes (`route`).
         let (k, ff) = (c.n_expert_used, experts[0].gate.rows);
         let mut lists: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne];
+        let mut chosen = Vec::new();
         for (t, row) in router_out.chunks_exact(ne).enumerate() {
-            let mut probs = row.to_vec();
-            ops::softmax(&mut probs);
-            let mut order: Vec<usize> = (0..ne).collect();
-            order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let chosen = &order[..k];
-            let norm = if c.norm_topk {
-                chosen.iter().map(|&e| probs[e]).sum::<f32>()
-            } else {
-                1.0
-            };
-            for &e in chosen {
-                lists[e].push((t as u32, probs[e] / norm));
+            route(c, &mut row.to_vec(), bias, &mut chosen);
+            for &(e, w) in &chosen {
+                lists[e].push((t as u32, w));
             }
         }
         // The (token, expert) pairs sorted by expert: pair p is a row of the scratch buffers.
@@ -570,7 +604,153 @@ impl Metal {
             let (i, w) = (At(&s.route, pairs), At(&s.route, 2 * r + pairs));
             b.scatter_axpy(x, At(&s.tmp, 0), i, w, n, n_embd);
         }
+        if let Some(e) = ungated {
+            ffn(&mut b, s, e, At(&s.xb, 0), At(&s.tmp, 0), n);
+            b.add(x, At(&s.tmp, 0), n * n_embd);
+        }
         b
+    }
+
+    /// Queues DeepSeek's latent attention for one layer: the cache rows of all `n` tokens (the
+    /// rotated key dims, then the normed latent), then, for the rows from `lo`, the queries
+    /// absorbed into ones against those rows, attention whose values are the rows' latent part,
+    /// and each head's output through `v_b` into `s.att`. As `Model::mla_attention` on the CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn mla(
+        &self,
+        model: &Model,
+        b: &mut Batch<'_>,
+        s: &Scratch,
+        kv: &Kv,
+        l: usize,
+        g: &GpuLayer,
+        layer: &Layer,
+        a: &MlaLayer,
+        n: usize,
+        lo: usize,
+        pos: usize,
+    ) {
+        let c = &model.cfg;
+        let mla = c.mla.expect("an MLA layer has an MLA config");
+        let (nh, lat, rd, nope, vh) = (c.n_head, mla.kv_lora, mla.rope, mla.nope, mla.v_head);
+        let (row, hd, m) = (lat + rd, nope + rd, n - lo);
+        let rope = |n_heads, n_tokens, pos| RopeArgs {
+            n_tokens,
+            n_heads,
+            head_dim: row,
+            rope_dim: rd,
+            pos,
+            theta: c.rope_theta,
+            neox: false,
+            freq_factors: self.rope_freqs.as_ref(),
+        };
+        // `kv_a` gives the latent, then the key dims that are rotated.
+        mm(b, &layer.wk, At(&s.xb, 0), At(&s.k, 0), n);
+        let in_row = |off| Heads { row, head: 0, off };
+        b.copy_heads(At(&s.k, 0), in_row(lat), At(&s.v, 0), in_row(0), n, 1, rd);
+        b.free = true;
+        let norm = g.kv_norm.as_ref().expect("an MLA layer has a latent norm");
+        b.rmsnorm_strided(At(&s.k, 0), At(&s.v, rd), norm, n, lat, row, c.rms_eps);
+        b.free = false;
+        b.rope(At(&s.v, 0), &rope(1, n, pos));
+        b.store_kv(At(&s.v, 0), &kv.k[l], pos * row, n * row);
+        if m == 0 {
+            return;
+        }
+
+        let xq = At(&s.xb, lo * c.n_embd);
+        match (&a.q_a, &g.q_a_norm) {
+            (Some((q_a, _)), Some(norm)) => {
+                mm(b, q_a, xq, At(&s.tmp, 0), m);
+                b.rmsnorm(At(&s.tmp, 0), At(&s.tmp, 0), norm, m, q_a.rows, c.rms_eps);
+                mm(b, &layer.wq, At(&s.tmp, 0), At(&s.q, 0), m);
+            }
+            _ => mm(b, &layer.wq, xq, At(&s.q, 0), m),
+        }
+        // Each head's query: its rotated dims, then `k_b` times the others. A head's own
+        // matrix takes its rows of every token, laid out head after head.
+        let q_at = |off| Heads {
+            row: nh * hd,
+            head: hd,
+            off,
+        };
+        let qr_at = |off| Heads {
+            row: nh * row,
+            head: row,
+            off,
+        };
+        let by_head = |w| Heads {
+            row: w,
+            head: m * w,
+            off: 0,
+        };
+        b.copy_heads(
+            At(&s.q, 0),
+            q_at(0),
+            At(&s.hx, 0),
+            by_head(nope),
+            m,
+            nh,
+            nope,
+        );
+        b.free = true;
+        b.copy_heads(At(&s.q, 0), q_at(nope), At(&s.qr, 0), qr_at(0), m, nh, rd);
+        b.free = false;
+        for (h, k_b) in a.k_b.iter().enumerate() {
+            mm(b, k_b, At(&s.hx, h * m * nope), At(&s.hy, h * m * lat), m);
+            b.free = true; // heads write their own rows
+        }
+        b.free = false;
+        b.copy_heads(
+            At(&s.hy, 0),
+            by_head(lat),
+            At(&s.qr, 0),
+            qr_at(rd),
+            m,
+            nh,
+            lat,
+        );
+        b.rope(At(&s.qr, 0), &rope(nh, m, pos + lo));
+
+        // A query row at a time, over the cache rows up to its own: the batched kernels take
+        // heads of at most 256 dims. Rows within one chunk of positions write their results
+        // themselves, so only those past it (which share `kv.part`) wait for the one before.
+        for t in 0..m {
+            let n_pos = pos + lo + t + 1;
+            let p = AttnParams {
+                n_head: nh as u32,
+                n_kv: 1,
+                head_dim: row as u32,
+                n_pos: n_pos as u32,
+                kv_dim: row as u32,
+                scale: c.kq_scale(),
+            };
+            b.free = t > 0 && n_pos <= ATTN_CHUNK;
+            let (q, out) = (At(&s.qr, t * nh * row), At(&s.ao, t * nh * row));
+            b.attention(q, &kv.k[l], &kv.k[l], out, &kv.part, &p);
+        }
+        b.free = false;
+        // Each head's weighted latent (past the key dims) through its `v_b`.
+        b.copy_heads(
+            At(&s.ao, 0),
+            qr_at(rd),
+            At(&s.hx, 0),
+            by_head(lat),
+            m,
+            nh,
+            lat,
+        );
+        for (h, v_b) in a.v_b.iter().enumerate() {
+            mm(b, v_b, At(&s.hx, h * m * lat), At(&s.hy, h * m * vh), m);
+            b.free = true;
+        }
+        b.free = false;
+        let att_at = Heads {
+            row: nh * vh,
+            head: vh,
+            off: 0,
+        };
+        b.copy_heads(At(&s.hy, 0), by_head(vh), At(&s.att, 0), att_at, m, nh, vh);
     }
 
     /// Uploads `xs` (rows of n_embd), runs them, and copies the rows (and logits) back.
@@ -701,9 +881,19 @@ impl Accelerator for Metal {
     }
 }
 
+/// Whether `moe_topk` routes like `route` for this model: a softmax's top k, no bias, groups
+/// or scale (DeepSeek V3's sigmoid and groups take the CPU-routed path).
+fn gpu_routes(c: &Config, bias: Option<&[f32]>) -> bool {
+    c.gating == Gating::Softmax && bias.is_none() && c.n_group <= 1 && c.expert_scale == 1.0
+}
+
 /// The matrices one layer's offload reads.
-fn layer_weights(layer: &crate::model::Layer) -> Vec<&Weight> {
+fn layer_weights(layer: &Layer) -> Vec<&Weight> {
     let mut weights = vec![&layer.wq, &layer.wk, &layer.wv, &layer.wo];
+    if let Some(a) = &layer.mla {
+        weights.extend(a.q_a.as_ref().map(|(w, _)| w));
+        weights.extend(a.k_b.iter().chain(&a.v_b));
+    }
     if let Ffn::Moe { router, shared, .. } = &layer.ffn {
         weights.push(router);
         weights.extend(shared.as_ref().map(|(g, _)| g));
@@ -738,9 +928,15 @@ fn span(weights: &[&Weight]) -> Range<usize> {
 /// The file ranges the GPU wraps when the first `n` layers are offloaded: one per layer (so a
 /// stacked expert tensor is never split across buffers) and the output head with all of them.
 fn offload_units(model: &Model, n: usize) -> Vec<Range<usize>> {
+    // Matrices made at load are past the file's end, in a buffer of their own.
+    let file = model.gguf().mapped_bytes().len();
     let mut units: Vec<Range<usize>> = model.layers[..n]
         .iter()
-        .map(|l| span(&layer_weights(l)))
+        .map(|l| {
+            let mut w = layer_weights(l);
+            w.retain(|w| w.offset < file);
+            span(&w)
+        })
         .collect();
     if n == model.cfg.n_layer {
         units.push(span(&[&model.output]));
@@ -801,6 +997,9 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
         Some(max) => unsafe { Gpu::new_capped(mapped, &units, max) },
     }
     .map_err(BackendError)?;
+    if weights.iter().any(|w| w.offset >= mapped.len()) {
+        gpu.add_owned(mapped.len(), &model.owned);
+    }
     for w in weights.iter().filter(|w| w.ty == GgmlType::NVFP4) {
         gpu.set_scale(w.offset, w.scale);
     }
@@ -842,6 +1041,12 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
             bv: opt(&l.bv),
             q_norm: opt(&l.q_norm),
             k_norm: opt(&l.k_norm),
+            kv_norm: l.mla.as_ref().map(|a| gpu.upload(&a.kv_norm)),
+            q_a_norm: l
+                .mla
+                .as_ref()
+                .and_then(|a| a.q_a.as_ref())
+                .map(|(_, w)| gpu.upload(w)),
             // Experts of a type without id kernels (NVFP4, BF16) take the CPU-routed path.
             expert_strides: match &l.ffn {
                 Ffn::Moe { experts, .. }
@@ -869,7 +1074,8 @@ fn attach_with(model: &mut Model, layers: usize, cap: Option<usize>) -> Result<(
         covers_all,
         kv_dim: c.kv_dim(),
         n_head: c.n_head,
-        head_dim: c.head_dim,
+        head_dim: c.mla.map_or(c.head_dim, |m| m.kv_lora + m.rope),
+        mla: c.mla.is_some(),
         scratch: Mutex::new(scratch),
         gpu,
     };

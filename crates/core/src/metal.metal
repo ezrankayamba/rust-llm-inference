@@ -1121,17 +1121,17 @@ inline float tg_reduce_max(float v, threadgroup float* red, uint lane, uint sg, 
     return r;
 }
 
-struct NormParams { uint n; float eps; };
+struct NormParams { uint n; float eps; uint stride; };
 
-// One threadgroup per row of `n`; `out` may alias `x`.
+// One threadgroup per row of `n`, rows `stride` apart in `x` and `out`; `out` may alias `x`.
 kernel void rmsnorm(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
                     device const float* w [[buffer(2)]], constant NormParams& p [[buffer(3)]],
                     uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
                     uint tgs [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[32];
-    device const float* xr = x + row * p.n;
-    device float* o = out + row * p.n;
+    device const float* xr = x + ulong(row) * p.stride;
+    device float* o = out + ulong(row) * p.stride;
     float s = 0;
     for (uint i = tid; i < p.n; i += tgs) s += xr[i] * xr[i];
     s = tg_reduce_sum(s, red, lane, sg, (tgs + 31) / 32);
@@ -1140,6 +1140,20 @@ kernel void rmsnorm(device const float* x [[buffer(0)]], device float* out [[buf
 }
 
 struct EltParams { uint n; float alpha; uint m; };
+
+// Moves `w` values per (token, head) between layouts: dst[t * out_row + h * out_head + out_off
+// + j] = src[t * in_row + h * in_head + in_off + j], for m tokens of nh heads. DeepSeek's latent
+// attention takes each head's part of a row out for its own matrix and puts the results back.
+struct HeadsParams { uint m; uint nh; uint w; uint in_row; uint in_head; uint in_off;
+                     uint out_row; uint out_head; uint out_off; };
+
+kernel void copy_heads(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                       constant HeadsParams& p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.m * p.nh * p.w) return;
+    uint j = i % p.w, r = i / p.w, h = r % p.nh, t = r / p.nh;
+    dst[ulong(t) * p.out_row + h * p.out_head + p.out_off + j] =
+        src[ulong(t) * p.in_row + h * p.in_head + p.in_off + j];
+}
 
 // The elementwise kernels over whole buffers take four values a thread (ELT4: the vector
 // expression V while four remain, the scalar S for a tail).

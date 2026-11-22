@@ -3,6 +3,25 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-22: DeepSeek V2-Lite on Metal, first support
+
+DeepSeek-V2-Lite-Chat Q4_K_M on the M4, every layer offloaded. `dump_logits ... --gpu-layers=27`
+on the 13-token prompt of the CPU section against `ref_forward.py`: `--precise` max |logit diff|
+1.7e-5 batched, 2.4e-5 per token (13 of 27 layers: 3.8e-5); default (f16 cache, half tiles)
+0.0073 batched, 0.0093 per token; top 5 identical in all. `moe_reference`'s
+`deepseek_on_metal_matches_reference_logits` runs both tiny fixtures with 3 and 1 layers.
+
+`bench --pp 512 --tg 128 --reps 3 --gpu-layers 999` against `llama-bench -ngl 99 -p 512 -n 128
+-r 3` (llama.cpp v0.9.0, cd959ba), alternating with 35 s rests, two rounds:
+
+| | rli | llama.cpp | ratio |
+|---|---:|---:|---:|
+| pp512 | 227.3, 223.8 | 523.9, 526.3 | 0.43 |
+| tg128 | 42.7, 42.7 | 52.1, 52.1 | 0.82 |
+
+Attention runs the decode kernel one query row at a time (its head is the 576-wide cache row),
+and each head's `k_b` and `v_b` is a matmul of its own; prompts are where that costs.
+
 ## 2026-11-22: DeepSeek V2-Lite on the CPU, first support
 
 DeepSeek-V2-Lite-Chat Q4_K_M (mradermacher's conversion of 2025-03, the older `attn_kv_b`

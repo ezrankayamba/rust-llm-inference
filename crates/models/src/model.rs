@@ -223,7 +223,7 @@ pub struct Model {
     packed: HashMap<(usize, usize), Vec<u8>>,
     /// Weights made at load, addressed by [`Weight::offset`] past the end of the file: f32
     /// transposes of older DeepSeek files' `attn_kv_b` key halves (`MlaLayer::k_b`).
-    owned: Vec<u8>,
+    pub(crate) owned: Vec<u8>,
 }
 
 /// One layer's cached keys or values for the CPU layers: f16 (half the memory), or f32 when the
@@ -1245,7 +1245,12 @@ impl Model {
 /// Experts are ranked by score plus `bias`, within the best groups when there are several (a
 /// group's score is its best expert's for a softmax, as DeepSeek V2 has it, and its best two's
 /// sum for a sigmoid, as V3 has it), and weighted by score alone.
-fn route(c: &Config, p: &mut [f32], bias: Option<&[f32]>, chosen: &mut Vec<(usize, f32)>) {
+pub(crate) fn route(
+    c: &Config,
+    p: &mut [f32],
+    bias: Option<&[f32]>,
+    chosen: &mut Vec<(usize, f32)>,
+) {
     match c.gating {
         Gating::Softmax => ops::softmax(p),
         Gating::Sigmoid => p.iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-*v).exp())),

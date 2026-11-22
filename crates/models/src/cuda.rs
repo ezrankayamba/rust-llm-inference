@@ -1059,6 +1059,11 @@ impl Accelerator for Cuda {
 }
 
 pub fn attach(model: &mut Model, layers: usize) -> Result<(), BackendError> {
+    if model.cfg.mla.is_some() {
+        return Err(BackendError(
+            "DeepSeek's latent attention has no CUDA kernels yet; use --gpu-layers 0".into(),
+        ));
+    }
     let c = model.cfg.clone();
     let n = layers.min(c.n_layer);
     let covers_all = n == c.n_layer;

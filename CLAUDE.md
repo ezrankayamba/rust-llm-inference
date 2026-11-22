@@ -16,7 +16,7 @@ tensors, kernels, the GGUF loader, and model graphs are all implemented here.
 | Backends | CPU SIMD (baseline, always built) → Apple Metal → CUDA |
 | Weight format | GGUF only, memory-mapped |
 | Quantization | F16/BF16 (reference path), Q4_0/Q8_0, then K-quants (Q4_K, Q5_K, Q6_K); Q4_1/Q5_0/Q5_1 also load (Q4_K_M files contain Q5_0); NVFP4 (ModelOpt checkpoints: a UE4M3 scale per 16 E2M1 weights and a per-tensor `.scale` that multiplies `W x`, applied by the CPU after the matvec and by the GPU kernels through `Gpu::set_scale`; NVFP4 experts are routed on the CPU; their BF16 `lm_head` has GPU matvec and f32 matmul kernels; on CUDA, int8 activations unless `--fp4-acts`) |
-| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE, DeepSeek V2/V3: CPU only so far, `backend::attach` refuses MLA) |
+| Models | Llama family (Llama 2/3, Mistral, Qwen dense), then MoE (Mixtral, Qwen-MoE, DeepSeek V2/V3: CPU and Metal; CUDA `attach` refuses MLA) |
 | Interfaces | CLI and an OpenAI-compatible HTTP server (`/v1/chat/completions`, SSE streaming) |
 | Layout | Cargo workspace; GPU backends behind cargo features |
 | Toolchain | Latest stable Rust, pinned in `rust-toolchain.toml`; SIMD via `std::arch` intrinsics |
@@ -172,6 +172,13 @@ Design points that span files:
   correction into `Config::kq_scale`, as llama.cpp does for DeepSeek. Routing (`route`):
   softmax (V2) or sigmoid plus a bias (V3), within the best expert groups, then
   `expert_weights_norm` and `expert_weights_scale`; the shared experts (`ungated`) have no gate.
+  On Metal (`Metal::mla`) the cache row is the key cache and the value cache at once (the
+  values are its dims past the rotated ones; no V cache is allocated), `copy_heads` moves each
+  head's part of a row out for its own `k_b` / `v_b` matmul and back, and `Gpu::add_owned`
+  copies `Model.owned` into a buffer at those offsets. Attention runs the decode kernel a query
+  row at a time, also in prompts: the batched kernels take heads of at most 256 dims and the
+  row is 576. Only softmax routing without bias, groups or scale runs on the GPU in decode
+  (`gpu_routes`); V3's takes the CPU-routed path.
 - **The last layer of a prompt computes one row.** Nothing reads the other rows after it, so
   they get their keys and values only, and a batch that returns no logits stops there
   (`cpu_layers`' `tail`, `m` and `lo` in the Metal and CUDA layer loops; on CUDA those rows keep
