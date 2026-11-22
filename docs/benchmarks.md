@@ -24,13 +24,31 @@ primary economic hub of Tanzania."
 15.9794 (+0.167%), KL mean 0.006992, max 0.1740, top-1 agreement 96.48% (Qwen3-30B-A3B,
 the other MoE, measured KL 0.004-0.015).
 
-**Speed** (`bench --pp 128 --tg 64 --reps 2 --gpu-layers 0` against `llama-bench -ngl 0 -nopo 1
--p 128 -n 64 -r 2`, llama.cpp v0.9.0):
+**Speed** (`bench --pp 128 --tg 64 --reps 3 --gpu-layers 0` against `llama-bench -ngl 0 -dev none
+-nopo 1 -p 128 -n 64 -r 3`, llama.cpp v0.9.0, alternating with 30 s rests, two rounds). `-dev
+none` matters: llama.cpp's CUDA build with `-ngl 0` alone still sends prompt batches to the GPU
+(pp128 245 tok/s that way), which the first comparison of this section did by mistake.
 
 | | rli | llama.cpp | ratio |
 |---|---:|---:|---:|
-| pp128 | 119.0 | 250.7 | 0.47 |
-| tg64 | 26.0 | 39.2 | 0.66 |
+| pp128 | 115.8, 112.0 | 199.2 ± 16.5, 184.4 ± 54.9 | ~0.6 |
+| tg64 | 32.9, 29.5 | 37.6, 37.7 | 0.83 |
+
+**Decode: a token's small matvecs in one parallel pass** (`matrix::matvec_jobs`, `Model::matvecs`).
+A V2-Lite decode step had 32 per-head `k_b` / `v_b` matvecs a layer and 18-24 expert ones, each a
+parallel pass of its own; `sample` on the M4 put 65k samples in the pool's waiting
+(`swtch_pri`, `__psynch_cvwait`) against 26k in `dot_rows_q8`. Now the heads' `k_b` are one pass,
+their `v_b` another, the chosen and shared experts' gates and ups one and their downs one
+(`Model::moe_token`, every MoE model's one-token step on the CPU). `bench --pp 0 --tg 64 --reps 2
+--gpu-layers 0`, before and after alternating with 30 s rests, two rounds:
+
+| | before | after | |
+|---|---:|---:|---:|
+| V2-Lite, M4 (10 threads) | 24.3, 25.1 | 36.9, 36.6 | +49% |
+| Qwen3-30B-A3B, M4 | 21.0, 21.4 | 30.2, 30.2 | +42% |
+| V2-Lite, Core Ultra 9 285 (24) | 22.1, 23.4 | 30.7, 31.7 | +37% |
+
+Precise per-token logits still match `ref_forward.py` (4.4e-5).
 
 ## 2026-11-22: NVFP4 prompts on CUDA tensor cores: int8 (default) and FP4 (`--fp4-acts`)
 

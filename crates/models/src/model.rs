@@ -731,6 +731,19 @@ impl Model {
         apply_scale(w, y);
     }
 
+    /// One token's `y = W x` for each job, in one parallel pass: small matvecs each in their
+    /// own pass (a head's `k_b`, a chosen expert) spent their time waking the pool.
+    fn matvecs(&self, jobs: &mut [(&Weight, &[f32], &mut [f32])]) {
+        let mut q: Vec<_> = jobs
+            .iter_mut()
+            .map(|(w, x, y)| (self.mat(w), &**x, &mut **y))
+            .collect();
+        rli_core::matrix::matvec_jobs(&mut q, self.precise);
+        for (w, _, y) in jobs {
+            apply_scale(w, y);
+        }
+    }
+
     fn matmul(&self, w: &Weight, xs: &[f32], ys: &mut [f32], n: usize) {
         if n == 1 {
             return self.matvec(w, xs, ys);
@@ -1059,7 +1072,19 @@ impl Model {
         // Per (token, head): the rotated query dims, then k_b times the others.
         let mut qr = vec![0.0; m * nh * row];
         let (mut part, mut out) = (vec![0.0; m * nope], vec![0.0; m * lat]);
-        for (h, k_b) in a.k_b.iter().enumerate() {
+        if m == 1 {
+            let mut jobs: Vec<_> = a
+                .k_b
+                .iter()
+                .zip(q.chunks_exact(hd).zip(qr.chunks_exact_mut(row)))
+                .map(|(k_b, (qh, dst))| {
+                    dst[..rd].copy_from_slice(&qh[nope..]);
+                    (k_b, &qh[..nope], &mut dst[rd..])
+                })
+                .collect();
+            self.matvecs(&mut jobs);
+        }
+        for (h, k_b) in a.k_b.iter().enumerate().filter(|_| m > 1) {
             for (i, p) in part.chunks_exact_mut(nope).enumerate() {
                 p.copy_from_slice(&q[(i * nh + h) * hd..][..nope]);
             }
@@ -1087,6 +1112,15 @@ impl Model {
                 ops::softmax(scores);
                 kv.weighted_sum(rd, row, scores, out);
             });
+        if m == 1 {
+            let mut jobs: Vec<_> = a
+                .v_b
+                .iter()
+                .zip(o.chunks_exact(lat).zip(att.chunks_exact_mut(vh)))
+                .map(|(v_b, (x, y))| (v_b, x, y))
+                .collect();
+            return self.matvecs(&mut jobs);
+        }
         let (mut part, mut out) = (vec![0.0; m * lat], vec![0.0; m * vh]);
         for (h, v_b) in a.v_b.iter().enumerate() {
             for (i, p) in part.chunks_exact_mut(lat).enumerate() {
@@ -1124,6 +1158,9 @@ impl Model {
             }
         }
 
+        if n == 1 {
+            return self.moe_token(ffn, &chosen, xs, out);
+        }
         out.fill(0.0);
         let (mut gathered, mut y) = (Vec::new(), Vec::new());
         for (e, rows) in experts.iter().zip(&rows).filter(|(_, r)| !r.is_empty()) {
@@ -1154,6 +1191,52 @@ impl Model {
             {
                 axpy(o, 1.0 / (1.0 + (-g).exp()), r);
             }
+        }
+    }
+}
+
+impl Model {
+    /// [`Model::moe`] for one token: every chosen expert's gate and up, with the shared ones',
+    /// in one parallel pass, then every down in another.
+    fn moe_token(&self, ffn: &Ffn, chosen: &[(usize, f32)], x: &[f32], out: &mut [f32]) {
+        let Ffn::Moe {
+            experts,
+            shared,
+            ungated,
+            ..
+        } = ffn
+        else {
+            unreachable!("moe takes an MoE layer")
+        };
+        let mut list: Vec<(&Expert, f32)> = chosen.iter().map(|&(e, w)| (&experts[e], w)).collect();
+        list.extend(ungated.as_deref().map(|e| (e, 1.0)));
+        let mut g = [0.0f32];
+        if let Some((gate_inp, e)) = shared {
+            self.matvec(gate_inp, x, &mut g);
+            list.push((e, 1.0 / (1.0 + (-g[0]).exp())));
+        }
+        let mut gate: Vec<Vec<f32>> = list.iter().map(|(e, _)| vec![0.0; e.gate.rows]).collect();
+        let mut up: Vec<Vec<f32>> = list.iter().map(|(e, _)| vec![0.0; e.up.rows]).collect();
+        let mut jobs: Vec<(&Weight, &[f32], &mut [f32])> = Vec::with_capacity(2 * list.len());
+        for ((e, _), (g, u)) in list.iter().zip(gate.iter_mut().zip(up.iter_mut())) {
+            jobs.push((&e.gate, x, g));
+            jobs.push((&e.up, x, u));
+        }
+        self.matvecs(&mut jobs);
+        drop(jobs);
+        for (g, u) in gate.iter_mut().zip(&up) {
+            ops::swiglu(g, u);
+        }
+        let mut ys = vec![vec![0.0; out.len()]; list.len()];
+        let mut jobs: Vec<_> = list
+            .iter()
+            .zip(gate.iter().zip(ys.iter_mut()))
+            .map(|((e, _), (g, y))| (&e.down, &g[..], &mut y[..]))
+            .collect();
+        self.matvecs(&mut jobs);
+        out.fill(0.0);
+        for ((_, w), y) in list.iter().zip(&ys) {
+            axpy(out, *w, y);
         }
     }
 }

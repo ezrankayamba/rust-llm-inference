@@ -184,6 +184,40 @@ impl<'a> QMatrix<'a> {
     }
 }
 
+/// `y = W x` for each `(W, x, y)` of `jobs`, all in one parallel pass: a decode step's small
+/// matvecs (a layer's chosen experts, an attention head's own matrices) each split into tasks of
+/// their own pass spent most of their time waking and waiting for the pool. Each `x` is
+/// quantized once, as [`QMatrix::matvec_with`] would.
+pub fn matvec_jobs(jobs: &mut [(QMatrix<'_>, &[f32], &mut [f32])], precise: bool) {
+    let acts: Vec<Option<Q8Act>> = jobs
+        .par_iter()
+        .map(|(m, x, y)| {
+            assert_eq!((x.len(), y.len()), (m.cols, m.rows));
+            (!precise && qdot::supports(m.ty)).then(|| Q8Act::new(x))
+        })
+        .collect();
+    let mut tasks = Vec::new();
+    for ((m, x, y), act) in jobs.iter_mut().zip(&acts) {
+        let rb = m.row_bytes();
+        for (ys, rows) in y
+            .chunks_mut(ROWS_PER_TASK)
+            .zip(m.data.chunks(rb * ROWS_PER_TASK))
+        {
+            tasks.push((m.ty, rb, *x, act, ys, rows));
+        }
+    }
+    tasks
+        .into_par_iter()
+        .for_each(|(ty, rb, x, act, ys, rows)| match act {
+            Some(a) => qdot::matvec_q8(ty, rows, rb, a, ys),
+            None => {
+                for (out, row) in ys.iter_mut().zip(rows.chunks_exact(rb)) {
+                    *out = dot_row(ty, row, x);
+                }
+            }
+        });
+}
+
 /// A slice that parallel tasks write disjoint elements of.
 struct Scatter(*mut f32);
 
