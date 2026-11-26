@@ -1,0 +1,15 @@
+# One model behind the OpenAI-compatible API on :8080.
+#   MODEL_DIR=./models RLI_MODEL=/models/Qwen3-4B-Q4_K_M.gguf docker compose up -d
+services:
+  rli:
+    image: ${RLI_IMAGE:-ezrankayamba/rli-server:latest}
+    ports:
+      - "${RLI_PUBLISH_PORT:-8080}:8080"
+    volumes:
+      - ${MODEL_DIR:-./models}:/models:ro
+    environment:
+      RLI_MODEL: ${RLI_MODEL:-/models/model.gguf}
+      RLI_CTX: ${RLI_CTX:-}
+      RLI_THREADS: ${RLI_THREADS:-}
+      RLI_EXTRA_ARGS: ${RLI_EXTRA_ARGS:-}
+    restart: unless-stopped
