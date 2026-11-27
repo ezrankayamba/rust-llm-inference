@@ -36,6 +36,41 @@ target/release/rli-server -m model.gguf --port 8080
 Useful flags: `--gpu-layers N` (`0` keeps everything on the CPU), `--threads N`, `--ctx N`,
 `--temp F`, and `--repack` (see below). `rli --help` lists the rest.
 
+## Docker
+
+`ezrankayamba/rli-server` is a CPU-only image of the server (linux/amd64 and linux/arm64) that
+serves one model. The model is not in the image: mount the folder that holds it and name the
+file with `RLI_MODEL`.
+
+```sh
+docker run -d --name rli --restart unless-stopped -p 8080:8080 \
+  -v /srv/models:/models:ro \
+  -e RLI_MODEL=/models/Qwen3-4B-Q4_K_M.gguf \
+  ezrankayamba/rli-server:latest
+
+curl localhost:8080/healthz   # ok
+```
+
+Or with `compose.yaml` from this repo:
+`MODEL_DIR=/srv/models RLI_MODEL=/models/Qwen3-4B-Q4_K_M.gguf docker compose up -d`.
+
+| Variable | Flag | Default |
+|---|---|---|
+| `RLI_MODEL` | `--model` | `/models/model.gguf` |
+| `RLI_CTX` | `--ctx` | 4096 |
+| `RLI_THREADS` | `--threads` | one per core the container may use |
+| `RLI_DRAFT`, `RLI_DRAFT_TOKENS` | `--draft`, `--draft-tokens` | none |
+| `RLI_EXTRA_ARGS` | switches such as `--repack` | none |
+| `RLI_PORT` | `--port` | 8080 |
+
+Arguments after the image name go to `rli-server` as they are. The container runs as uid 10001,
+which must be able to read the model, and reports healthy once `/healthz` answers. The weights
+are memory-mapped, so give it RAM for the model file plus about 1 GB. The API has no
+authentication: keep the port on a trusted network or behind a reverse proxy.
+
+Build it yourself with `docker build -t rli-server .`, or for both architectures with
+`docker buildx build --platform linux/amd64,linux/arm64 -t <name> --push .`.
+
 ## Tool calls
 
 On models whose chat template has Qwen's tool format (Qwen2.5, Qwen3), `/v1/chat/completions`
