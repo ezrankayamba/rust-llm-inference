@@ -23,9 +23,13 @@ Both scale close to linearly to 4 threads and flatten at 6; 8 adds nothing (the 
 and decode near the VM's memory bandwidth). One thread reads weights at the 10 GB/s the Xeon
 8573C runner gave on Llama-3.2-1B. At 6 threads a 32-token prompt ran 49.4 ± 2.2 tok/s (a pass's
 fixed costs, such as the output head, spread over fewer tokens); the
-server's chat page saw 38 tok/s on a 21-token prompt. `RLI_AMX=0` (AVX-512 VNNI) at 6 threads
-gave pp256 78.5 ± 2.0 against AMX's 74.2 ± 0.4: not alternated and run last, so not a verdict,
-but no sign of AMX's 5% gain on the Xeon 6975P-C; whether AMX loses here under VMware is open.
+server's chat page saw 38 tok/s on a 21-token prompt.
+
+**AMX is slower here.** `--pp 256 --tg 0 --reps 3 --threads 6`, AMX (default) and `RLI_AMX=0`
+(the AVX-512 VNNI kernel) alternated five times with 5 s rests: AMX 73.8, 70.2, 72.7, 73.1, 70.7
+(mean 72.1); VNNI 82.1, 81.4, 81.0, 79.4, 79.1 (mean 80.6). VNNI won every round, by 11.8% on the
+means, where AMX was 5% ahead on the Xeon 6975P-C (Granite Rapids, bare runner). Not yet known
+whether it is this CPU generation (Emerald Rapids) or AMX under VMware; decode doesn't use AMX.
 
 ## 2026-11-22: CPU MoE experts and MLA heads side by side (Core Ultra 9 285, Windows)
 
