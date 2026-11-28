@@ -630,7 +630,8 @@ async function generate() {
   let failure = null;
   let stopped = false;
   try {
-    const response = await fetch("/v1/chat/completions", {
+    // Relative, so the page also works behind a proxy that serves it under a prefix.
+    const response = await fetch("v1/chat/completions", {
       method: "POST",
       body: JSON.stringify(requestBody()),
       signal: abort.signal,
@@ -801,7 +802,7 @@ $("reset").addEventListener("click", () => {
   saveSettings();
 });
 
-fetch("/v1/models")
+fetch("v1/models")
   .then((r) => r.json())
   .then((v) => {
     $("model").textContent = v.data[0].id;
