@@ -14,6 +14,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p rli-server --no-default-features \
  && cp target/release/rli-server /rli-server
 
+# The throughput benchmark (crates/models/examples/bench.rs) on its own, to measure a host:
+#   docker build --target bench -t ezrankayamba/rli-server:bench .
+#   docker run --rm --volumes-from <server container> ezrankayamba/rli-server:bench <model> --threads N
+FROM build AS bench-build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p rli-models --example bench --no-default-features \
+ && cp target/release/examples/bench /rli-bench
+
+FROM debian:trixie-slim AS bench
+COPY --from=bench-build /rli-bench /usr/local/bin/rli-bench
+ENTRYPOINT ["rli-bench"]
+
+# The server, the default target.
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends tini curl ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
