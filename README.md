@@ -54,9 +54,26 @@ curl localhost:8080/healthz   # ok
 Or with `compose.yaml` from this repo:
 `MODEL_DIR=/srv/models RLI_MODEL=/models/Qwen3-4B-Q4_K_M.gguf docker compose up -d`.
 
+With `RLI_MODEL_URL` set, a model missing at `RLI_MODEL` is downloaded there on first start and
+reused after that. The folder must then be writable by uid 10001 (drop the `:ro`), or use a
+named volume, which already is:
+
+```sh
+docker run -d --name rli --restart unless-stopped -p 8080:8080 -v rli-models:/models \
+  -e RLI_MODEL=/models/Qwen3-4B-Q4_K_M.gguf \
+  -e RLI_MODEL_URL=https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf \
+  ezrankayamba/rli-server:latest
+```
+
+The download goes to `<model>.part` and is renamed when whole; a restart resumes it. Set
+`RLI_MODEL_SHA256` to have it checked first (a mismatch removes it and stops the container), and
+`HF_TOKEN` for gated Hugging Face repos. The healthcheck allows two minutes to start, so the
+container shows unhealthy during a longer download (`docker logs rli` says when it is done).
+
 | Variable | Flag | Default |
 |---|---|---|
 | `RLI_MODEL` | `--model` | `/models/model.gguf` |
+| `RLI_MODEL_URL`, `RLI_MODEL_SHA256` | (download, above) | none |
 | `RLI_CTX` | `--ctx` | 4096 |
 | `RLI_THREADS` | `--threads` | one per core the container may use |
 | `RLI_DRAFT`, `RLI_DRAFT_TOKENS` | `--draft`, `--draft-tokens` | none |
@@ -64,7 +81,7 @@ Or with `compose.yaml` from this repo:
 | `RLI_PORT` | `--port` | 8080 |
 
 Arguments after the image name go to `rli-server` as they are. The container runs as uid 10001,
-which must be able to read the model, and reports healthy once `/healthz` answers. The weights
+which must be able to read the model (and write its folder to download it), and reports healthy once `/healthz` answers. The weights
 are memory-mapped, so give it RAM for the model file plus about 1 GB. The API has no
 authentication: keep the port on a trusted network or behind a reverse proxy.
 

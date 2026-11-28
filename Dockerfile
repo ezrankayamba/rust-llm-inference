@@ -1,6 +1,7 @@
 # CPU-only rli-server image:
 #   docker build -t ezrankayamba/rli-server:latest .
-# The model is not in the image: mount it and point RLI_MODEL at it (see docker/entrypoint.sh).
+# The model is not in the image: mount it and point RLI_MODEL at it, or set RLI_MODEL_URL to
+# download it on first start (see docker/entrypoint.sh).
 
 ARG RUST_VERSION=1.99.1
 
@@ -14,9 +15,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/rli-server /rli-server
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends tini \
+RUN apt-get update && apt-get install -y --no-install-recommends tini curl ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --no-create-home rli
+ && useradd --system --uid 10001 --no-create-home rli \
+ && install -d -o rli -g rli /models
 COPY --from=build /rli-server /usr/local/bin/rli-server
 COPY docker/entrypoint.sh /usr/local/bin/rli-entrypoint
 ENV RLI_MODEL=/models/model.gguf RLI_HOST=0.0.0.0 RLI_PORT=8080
