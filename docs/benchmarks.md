@@ -3,6 +3,30 @@
 Measured numbers, newest first. Each section says how to reproduce it. GitHub runners vary in CPU
 from run to run, so compare numbers only within one table.
 
+## 2026-11-28: thread scaling on x86 (Xeon Platinum 8562Y+, VMware VM)
+
+The first x86 thread scaling: CI runners have 2 vCPUs. A UAT VM with 8 vCPUs (one thread a core
+as the guest sees it) of a Xeon Platinum 8562Y+ (Emerald Rapids: AVX-512 VNNI and AMX), one
+socket, 16 GB, shared with other services; its endpoint agent keeps one core busy. Qwen3-8B
+Q4_K_M (Qwen's file), the Docker `bench` target at 42f6e8f,
+`rli-bench <model> --pp 256 --tg 64 --reps 3 --threads T`, run in that order, tok/s:
+
+| threads | pp256 | x | tg64 | x | weights read in decode |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 15.4 ± 0.4 | 1.0 | 2.2 ± 0.0 | 1.0 | 11 GB/s |
+| 2 | 28.6 ± 0.5 | 1.9 | 4.3 ± 0.0 | 2.0 | 22 GB/s |
+| 4 | 55.4 ± 0.3 | 3.6 | 7.9 ± 0.0 | 3.6 | 40 GB/s |
+| 6 | 74.2 ± 0.4 | 4.8 | 10.5 ± 0.2 | 4.8 | 53 GB/s |
+| 8 | 77.1 ± 1.7 | 5.0 | 10.1 ± 0.3 | 4.6 | 51 GB/s |
+
+Both scale close to linearly to 4 threads and flatten at 6; 8 adds nothing (the agent's core,
+and decode near the VM's memory bandwidth). One thread reads weights at the 10 GB/s the Xeon
+8573C runner gave on Llama-3.2-1B. At 6 threads a 32-token prompt ran 49.4 ± 2.2 tok/s (a pass's
+fixed costs, such as the output head, spread over fewer tokens); the
+server's chat page saw 38 tok/s on a 21-token prompt. `RLI_AMX=0` (AVX-512 VNNI) at 6 threads
+gave pp256 78.5 ± 2.0 against AMX's 74.2 ± 0.4: not alternated and run last, so not a verdict,
+but no sign of AMX's 5% gain on the Xeon 6975P-C; whether AMX loses here under VMware is open.
+
 ## 2026-11-22: CPU MoE experts and MLA heads side by side (Core Ultra 9 285, Windows)
 
 A CPU prompt ran each used expert's matmuls, and each MLA head's `k_b` / `v_b`, as a parallel
